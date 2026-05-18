@@ -406,6 +406,97 @@ fn grow_node48_to_node256(
     Ok(out.slot)
 }
 
+// ---------- node shrink (erase-time, hysteresis-aware) ----------
+
+/// Threshold below which a `Node16` shrinks to `Node4`. The
+/// `Node4` capacity is 4; we shrink at `count ≤ 3` so the next
+/// insert at this byte position doesn't immediately re-grow.
+pub(super) const SHRINK_NODE16_TO_NODE4_AT: u8 = 3;
+
+/// Threshold below which a `Node48` shrinks to `Node16`. The
+/// `Node16` capacity is 16; we shrink at `count ≤ 12` for
+/// hysteresis vs the grow threshold.
+pub(super) const SHRINK_NODE48_TO_NODE16_AT: u8 = 12;
+
+/// Threshold below which a `Node256` shrinks to `Node48`. The
+/// `Node48` capacity is 48; we shrink at `count ≤ 37` for
+/// hysteresis vs the grow threshold.
+pub(super) const SHRINK_NODE256_TO_NODE48_AT: u8 = 37;
+
+pub(super) fn shrink_node16_to_node4(
+    frame: &mut BlobFrame<'_>,
+    old_slot: u16,
+    old: Node16,
+) -> Result<u16> {
+    debug_assert!(old.count <= 4, "shrink target must fit in Node4");
+    let out = frame.alloc_node(NodeType::Node4)?;
+    let mut n = Node4::empty();
+    n.count = old.count;
+    for i in 0..old.count as usize {
+        n.keys[i] = old.keys[i];
+        n.children[i] = old.children[i];
+    }
+    write_struct_to_slot(frame, out.slot, &n)?;
+    frame.free_node(old_slot)?;
+    Ok(out.slot)
+}
+
+pub(super) fn shrink_node48_to_node16(
+    frame: &mut BlobFrame<'_>,
+    old_slot: u16,
+    old: Node48,
+) -> Result<u16> {
+    debug_assert!(old.count <= 16, "shrink target must fit in Node16");
+    let out = frame.alloc_node(NodeType::Node16)?;
+    let mut n = Node16::empty();
+    n.count = old.count;
+    // Walk index[] in byte order so the destination Node16's
+    // `keys[]` stays sorted (Node16 lookup expects ascending order
+    // — both SIMD and scalar paths bail at the first key > byte).
+    let mut i = 0usize;
+    for byte in 0..256usize {
+        let idx = old.index[byte];
+        if idx == 0 {
+            continue;
+        }
+        n.keys[i] = byte as u8;
+        n.children[i] = old.children[idx as usize - 1];
+        i += 1;
+    }
+    debug_assert_eq!(i, old.count as usize);
+    write_struct_to_slot(frame, out.slot, &n)?;
+    frame.free_node(old_slot)?;
+    Ok(out.slot)
+}
+
+pub(super) fn shrink_node256_to_node48(
+    frame: &mut BlobFrame<'_>,
+    old_slot: u16,
+    old: Node256,
+) -> Result<u16> {
+    debug_assert!(old.count <= 48, "shrink target must fit in Node48");
+    let out = frame.alloc_node(NodeType::Node48)?;
+    let mut n = Node48::empty();
+    n.count = old.count;
+    // Pack the populated children into the first `count` slots
+    // of the destination `children[]`; rewrite `index[byte]` to
+    // point at the new packed position.
+    let mut packed = 0usize;
+    for byte in 0..256usize {
+        let child = old.children[byte];
+        if child == 0 {
+            continue;
+        }
+        n.children[packed] = child;
+        n.index[byte] = (packed + 1) as u8;
+        packed += 1;
+    }
+    debug_assert_eq!(packed, old.count as usize);
+    write_struct_to_slot(frame, out.slot, &n)?;
+    frame.free_node(old_slot)?;
+    Ok(out.slot)
+}
+
 /// Shared collapse / writeback for the Node4 + Node16 arms whose
 /// `keys[]` array is sorted in-place; `surviving_byte` and
 /// `surviving_child` are `keys[0]` / `children[0]` (only consulted

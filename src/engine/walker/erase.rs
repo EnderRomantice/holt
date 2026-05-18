@@ -16,7 +16,9 @@ use super::readers::{
 use super::types::{EraseOutcome, EraseReturn, EraseSignal};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
-    write_prefix_chain, write_struct_to_slot,
+    shrink_node16_to_node4, shrink_node256_to_node48, shrink_node48_to_node16, write_prefix_chain,
+    write_struct_to_slot, SHRINK_NODE16_TO_NODE4_AT, SHRINK_NODE256_TO_NODE48_AT,
+    SHRINK_NODE48_TO_NODE16_AT,
 };
 
 // ---------- public entry points ----------
@@ -236,21 +238,22 @@ fn erase_at_inner(
 }
 
 /// Remove `byte` from `slot`'s child set. After removal:
-/// - `count == 0` → free the inner node, signal SubtreeGone
+/// - `count == 0` → free the inner node, signal `SubtreeGone`.
 /// - `count == 1` → free the inner node, wrap the lone child in a
 ///   `Prefix([surviving_byte])` so descendant depth indexing stays
-///   valid, signal Replaced(prefix_slot)
-/// - otherwise → rewrite the body, signal Unchanged
+///   valid, signal `Replaced(prefix_slot)`.
+/// - `count` dropped to the shrink threshold for the current
+///   `NodeType` → allocate the next-smaller variant
+///   (`Node256→Node48`, `Node48→Node16`, `Node16→Node4`), copy the
+///   remaining children across, free the old slot, signal
+///   `Replaced(new_slot)`. Thresholds (12, 37, 3) leave hysteresis
+///   so a single re-insert doesn't immediately grow back.
+/// - otherwise → rewrite the body in place, signal `Unchanged`.
 ///
 /// The `Prefix` wrap on lone-child collapse is load-bearing: an
 /// inner-node child sits one byte deeper in the descent than its
 /// parent, so dropping the inner node without re-inserting its
 /// pointing-byte breaks every leaf below it.
-///
-/// Shrinking-back-to-smaller-NodeType (Node256→48, Node48→16,
-/// Node16→4) is **not** wired in Stage 2c; the binary stays at the
-/// larger variant — correctness-preserving, mild space waste that
-/// compaction (Stage 6) reclaims.
 fn inner_remove_child_and_collapse(
     frame: &mut BlobFrame<'_>,
     slot: u16,
@@ -300,6 +303,15 @@ fn inner_remove_child_and_collapse(
             n.keys[count - 1] = 0;
             n.children[count - 1] = 0;
             n.count -= 1;
+
+            // Try shrinking to Node4 before the count<=1 paths so
+            // that the freed Node16 slot is the only old slot we
+            // hand back to the free list (the Prefix-wrap below
+            // already does that for count==1).
+            if n.count >= 2 && n.count <= SHRINK_NODE16_TO_NODE4_AT {
+                let shrunk = shrink_node16_to_node4(frame, slot, n)?;
+                return Ok(EraseSignal::Replaced(shrunk));
+            }
             finish_inner_with_sorted(frame, slot, n.count, &n, n.keys[0], n.children[0])
         }
         NodeType::Node48 => {
@@ -337,6 +349,10 @@ fn inner_remove_child_and_collapse(
                 )?;
                 return Ok(EraseSignal::Replaced(new_slot));
             }
+            if n.count <= SHRINK_NODE48_TO_NODE16_AT {
+                let shrunk = shrink_node48_to_node16(frame, slot, n)?;
+                return Ok(EraseSignal::Replaced(shrunk));
+            }
             write_struct_to_slot(frame, slot, &n)?;
             Ok(EraseSignal::Unchanged)
         }
@@ -372,6 +388,10 @@ fn inner_remove_child_and_collapse(
                     surviving_child as u16,
                 )?;
                 return Ok(EraseSignal::Replaced(new_slot));
+            }
+            if n.count <= SHRINK_NODE256_TO_NODE48_AT {
+                let shrunk = shrink_node256_to_node48(frame, slot, n)?;
+                return Ok(EraseSignal::Replaced(shrunk));
             }
             write_struct_to_slot(frame, slot, &n)?;
             Ok(EraseSignal::Unchanged)

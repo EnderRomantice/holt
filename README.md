@@ -38,7 +38,7 @@ parallel without coordinating with each other.
 
 ## Project status
 
-**v0.1 in active development.** 170 tests pass; `cargo bench --bench main`
+**v0.1 in active development.** 174 tests pass; `cargo bench --bench main`
 runs a side-by-side comparison with RocksDB (memory + persistent
 variants, both showing artisan **~3.5–5× faster** on small-metadata
 workloads — see [benches/README.md](benches/README.md)).
@@ -99,6 +99,12 @@ Done — algorithm core:
   the BM-cached blob and resumes `next_seq` past every replayed
   record. `Tree::checkpoint` writes the BM root through, flushes,
   then atomically truncates the WAL.
+
+- **Erase-time node shrink** (Node256→48→16→4 at thresholds 37 /
+  12 / 3, with hysteresis vs the grow thresholds 48 / 16 / 4) —
+  the inner-node body shrinks to the smallest variant that fits
+  after every erase. The terminal `Node4 → Prefix([byte])`
+  lone-child collapse is unchanged.
 
 Queued — see [ROADMAP.md](ROADMAP.md):
 - `Tree::range` / `Tree::txn` iterators

@@ -300,6 +300,192 @@ fn erase_collapses_node256_lone_child() {
     assert_eq!(get(&frame, &k_last).as_deref(), Some(&v_last[..]));
 }
 
+/// Walk through the root's `Prefix` chain and return the slot of
+/// the first node that isn't a Prefix — the test's "inner node"
+/// of interest.
+fn inner_node_slot(frame: &BlobFrame<'_>) -> u16 {
+    let mut s = frame.header().root_slot;
+    loop {
+        let ntype = frame.slot_entry(s).unwrap().node_type().unwrap();
+        if ntype != NodeType::Prefix {
+            return s;
+        }
+        let p = read_prefix(frame.as_ref(), s).unwrap();
+        s = p.child as u16;
+    }
+}
+
+#[test]
+fn shrink_node16_to_node4_at_three_remaining() {
+    // 5 children → grows to Node16. Erase down to 3 children →
+    // shrinks to Node4. (Threshold is `count <= 3`.)
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    for i in 0..5u8 {
+        let k = [b'k', b'0' + i];
+        put(&mut frame, &k, &[i], i as u64 + 1);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node16),
+    );
+    // Erase two so 3 children remain.
+    del(&mut frame, &[b'k', b'0' + 0]);
+    del(&mut frame, &[b'k', b'0' + 1]);
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node4),
+        "Node16 with 3 remaining children should shrink to Node4",
+    );
+    // All survivors readable.
+    for i in 2..5u8 {
+        let k = [b'k', b'0' + i];
+        assert_eq!(get(&frame, &k).as_deref(), Some(&[i][..]));
+    }
+}
+
+#[test]
+fn shrink_node48_to_node16_at_twelve_remaining() {
+    // 20 children → grows through Node16 → Node48. Erase down to
+    // 12 children → shrinks to Node16. Threshold `count <= 12`.
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    for i in 0..20u8 {
+        let k = [b'p', i];
+        put(&mut frame, &k, &[i], i as u64 + 1);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node48),
+    );
+    // Erase 8 so 12 children remain (still above the Node16
+    // shrink-to-Node4 threshold of 3).
+    for i in 0..8u8 {
+        let k = [b'p', i];
+        del(&mut frame, &k);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node16),
+        "Node48 with 12 remaining children should shrink to Node16",
+    );
+    for i in 8..20u8 {
+        let k = [b'p', i];
+        assert_eq!(get(&frame, &k).as_deref(), Some(&[i][..]));
+    }
+}
+
+#[test]
+fn shrink_node256_to_node48_at_thirty_seven_remaining() {
+    // 60 children → grows through Node48 → Node256. Erase down to
+    // 37 children → shrinks to Node48. Threshold `count <= 37`.
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    for i in 0..60u8 {
+        let k = [b'q', i];
+        put(&mut frame, &k, &[i, i ^ 0xFF], i as u64 + 1);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node256),
+    );
+    // Erase 23 so 37 children remain.
+    for i in 0..23u8 {
+        let k = [b'q', i];
+        del(&mut frame, &k);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node48),
+        "Node256 with 37 remaining children should shrink to Node48",
+    );
+    for i in 23..60u8 {
+        let k = [b'q', i];
+        let v = [i, i ^ 0xFF];
+        assert_eq!(get(&frame, &k).as_deref(), Some(&v[..]));
+    }
+}
+
+#[test]
+fn shrink_chain_node256_node48_node16_node4() {
+    // One sustained churn: grow up through Node256, then erase
+    // back down past every shrink threshold in order. Confirms
+    // the shrink rules compose end-to-end.
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    for i in 0..60u8 {
+        let k = [b'q', i];
+        put(&mut frame, &k, &[i], i as u64 + 1);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node256),
+    );
+
+    // Erase 23 → Node48.
+    for i in 0..23u8 {
+        del(&mut frame, &[b'q', i]);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node48),
+    );
+
+    // Erase another 25 (total 48) so 12 children remain → Node16.
+    for i in 23..48u8 {
+        del(&mut frame, &[b'q', i]);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node16),
+    );
+
+    // Erase another 9 (total 57) so 3 children remain → Node4.
+    for i in 48..57u8 {
+        del(&mut frame, &[b'q', i]);
+    }
+    assert_eq!(
+        frame
+            .slot_entry(inner_node_slot(&frame))
+            .unwrap()
+            .node_type(),
+        Some(NodeType::Node4),
+    );
+
+    // The last three keys (57, 58, 59) still readable.
+    for i in 57..60u8 {
+        let k = [b'q', i];
+        assert_eq!(get(&frame, &k).as_deref(), Some(&[i][..]));
+    }
+}
+
 #[test]
 fn erase_all_returns_to_empty_root() {
     let (mut buf, _) = fresh_blob();

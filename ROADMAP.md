@@ -12,7 +12,7 @@ workloads (both `memory` and `persistent` variants).
 
 Concurrency model is settled: per-blob `HybridLatch` (LeanStore
 3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 170 tests + a
+writes with **no Tree-wide writer mutex**. 174 tests + a
 4-readers × 1-writer concurrent stress test all green.
 
 The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
@@ -53,9 +53,14 @@ Required for the v0.1 tag:
   - [x] BlobNode insert arm with auto-spillover (Stage 2d phase B)
   - [x] BlobNode erase arm + child-blob delete-on-empty
         (Stage 2d phase C)
-  - [ ] Shrink chain on erase (Node256 → 48 → 16 → 4) — collapse
-        currently always wraps surviving child in `Prefix([byte])`
-        to preserve descent invariants
+  - [x] **Shrink chain on erase** (Node256 → 48 → 16 → 4) —
+        thresholds 37 / 12 / 3 give hysteresis vs the grow
+        thresholds 48 / 16 / 4. Below the shrink point the
+        smaller variant is allocated, the surviving children
+        are copied across, the old slot freed, and the parent's
+        child pointer rewired via `EraseSignal::Replaced`. The
+        terminal `Node4 → Prefix([byte])` lone-child collapse
+        is unchanged.
   - [ ] Tombstone + lazy reclaim
 - [x] `make_blob_from_node` deep-clone primitive
 - [x] `splitBlob` automatic spillover trigger (in-band on OOM)
