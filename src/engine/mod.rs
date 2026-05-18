@@ -11,4 +11,7 @@ pub mod compact;
 pub mod iter;
 pub mod simd;
 
-pub use walker::{erase, insert, lookup, EraseOutcome, InsertOutcome, LookupResult};
+pub use walker::{
+    erase, insert, lookup, lookup_at, make_blob_from_node, BlobNodeCrossing, EraseOutcome,
+    InsertOutcome, LookupResult, MakeBlobOutcome,
+};

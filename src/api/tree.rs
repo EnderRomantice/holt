@@ -130,15 +130,45 @@ impl Tree {
 
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
     /// matches.
+    ///
+    /// Transparently follows `BlobNode` crossings — the lookup may
+    /// span multiple blobs when the tree has been split by Stage 2d
+    /// spillover.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-        let mut buf = AlignedBlobBuf::zeroed();
-        self.backend.read_blob(self.root_guid, &mut buf)?;
-        let frame = BlobFrame::wrap(buf.as_mut_slice());
-        let root_slot = frame.header().root_slot;
-        match engine::lookup(&frame, root_slot, &padded)? {
-            LookupResult::Found(v) => Ok(Some(v.to_vec())),
-            LookupResult::NotFound => Ok(None),
+
+        // Each iteration loads the current blob, does a single-blob
+        // descent, then either resolves (Found/NotFound) or hands
+        // off to the next blob via Crossing. Worst case is one
+        // backend read per blob on the descent path.
+        let mut current_guid = self.root_guid;
+        let mut start_slot: u16 = 0; // overwritten on iter 1 from header.root_slot
+        let mut depth: usize = 0;
+        let mut first_iter = true;
+
+        loop {
+            let mut buf = AlignedBlobBuf::zeroed();
+            self.backend.read_blob(current_guid, &mut buf)?;
+            let frame = BlobFrame::wrap(buf.as_mut_slice());
+
+            // First iteration: start at this blob's header.root_slot.
+            // Subsequent iterations: start at the slot the Crossing
+            // pointed us at.
+            if first_iter {
+                start_slot = frame.header().root_slot;
+                first_iter = false;
+            }
+
+            match engine::lookup_at(&frame, start_slot, &padded, depth)? {
+                LookupResult::Found(v) => return Ok(Some(v.to_vec())),
+                LookupResult::NotFound => return Ok(None),
+                LookupResult::Crossing(c) => {
+                    current_guid = c.child_guid;
+                    start_slot = c.child_slot;
+                    depth = c.child_depth;
+                    // Loop again — load the child blob.
+                }
+            }
         }
     }
 
@@ -219,10 +249,20 @@ impl Tree {
 
             // Step 1: probe src to make sure it exists.
             //         Probe dst to honour the !force guard.
+            //
+            // Stage 2d phase A: cross-blob rename surfaces
+            // NotYetImplemented (insert + erase don't yet follow
+            // BlobNode crossings — that's phase B). Single-blob
+            // renames work the same as before.
             let value: Vec<u8> = {
                 match engine::lookup(&frame, root_slot, &src_padded)? {
                     LookupResult::Found(v) => v.to_vec(),
                     LookupResult::NotFound => return Err(Error::NotFound),
+                    LookupResult::Crossing(_) => {
+                        return Err(Error::NotYetImplemented(
+                            "Tree::rename across BlobNode — Stage 2d phase B",
+                        ));
+                    }
                 }
             };
 
@@ -233,10 +273,15 @@ impl Tree {
             }
 
             if !force {
-                let dst_exists = matches!(
-                    engine::lookup(&frame, root_slot, &dst_padded)?,
-                    LookupResult::Found(_),
-                );
+                let dst_exists = match engine::lookup(&frame, root_slot, &dst_padded)? {
+                    LookupResult::Found(_) => true,
+                    LookupResult::NotFound => false,
+                    LookupResult::Crossing(_) => {
+                        return Err(Error::NotYetImplemented(
+                            "Tree::rename dst probe across BlobNode — Stage 2d phase B",
+                        ));
+                    }
+                };
                 if dst_exists {
                     return Err(Error::DstExists);
                 }

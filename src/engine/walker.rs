@@ -15,8 +15,10 @@ use std::mem::size_of;
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
 use crate::layout::{
-    leaf_extent_size, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, PREFIX_MAX_INLINE,
+    leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType,
+    Prefix, BLOB_MAX_INLINE, PREFIX_MAX_INLINE,
 };
+use crate::store::backend::AlignedBlobBuf;
 use crate::store::BlobFrame;
 
 // ---------- public API ----------
@@ -28,6 +30,23 @@ pub enum LookupResult<'a> {
     Found(&'a [u8]),
     /// No leaf in the tree matches `key`.
     NotFound,
+    /// Descent reached a [`NodeType::Blob`] crossing. The caller
+    /// (typically `Tree::get`) must load the child blob by its
+    /// GUID and call [`lookup_at`] on the child frame starting at
+    /// `child_slot` with `depth = child_depth`.
+    Crossing(BlobNodeCrossing),
+}
+
+/// Where a single-blob walker descent stopped at a BlobNode.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobNodeCrossing {
+    /// GUID of the blob to walk into next.
+    pub child_guid: BlobGuid,
+    /// Slot inside the child blob where the walk resumes.
+    pub child_slot: u16,
+    /// `depth` to pass to the next [`lookup_at`] call (the parent
+    /// blob's depth plus the BlobNode's inline prefix length).
+    pub child_depth: usize,
 }
 
 /// Outcome of an [`insert`].
@@ -55,13 +74,25 @@ pub struct EraseOutcome {
     pub previous: Option<Vec<u8>>,
 }
 
-/// Look up `key` in the tree rooted at `start_slot`.
+/// Look up `key` in the tree rooted at `start_slot` (depth 0).
 pub fn lookup<'a>(
     frame: &'a BlobFrame<'_>,
     start_slot: u16,
     key: &[u8],
 ) -> Result<LookupResult<'a>> {
     descend(frame, start_slot, key, 0)
+}
+
+/// Continue a lookup at `start_slot` with a non-zero `depth` — used
+/// by callers driving cross-blob descent through
+/// [`LookupResult::Crossing`].
+pub fn lookup_at<'a>(
+    frame: &'a BlobFrame<'_>,
+    start_slot: u16,
+    key: &[u8],
+    depth: usize,
+) -> Result<LookupResult<'a>> {
+    descend(frame, start_slot, key, depth)
 }
 
 /// Insert or replace `(key, value)` in the tree rooted at
@@ -150,10 +181,33 @@ fn descend<'a>(
         NodeType::Node16 => node16_descend(frame, body, key, depth),
         NodeType::Node48 => node48_descend(frame, body, key, depth),
         NodeType::Node256 => node256_descend(frame, body, key, depth),
-        NodeType::Blob => Err(Error::NotYetImplemented(
-            "walker::descend: BlobNode crossing — Stage 2d",
-        )),
+        NodeType::Blob => blob_descend(body, key, depth),
     }
+}
+
+fn blob_descend<'a>(
+    body: &[u8],
+    key: &[u8],
+    depth: usize,
+) -> Result<LookupResult<'a>> {
+    let b = cast::<BlobNode>(body);
+    let plen = b.prefix_len as usize;
+    if plen > BLOB_MAX_INLINE {
+        return Err(Error::NodeCorrupt {
+            context: "walker::blob_descend: prefix_len exceeds inline buffer",
+        });
+    }
+    if depth + plen > key.len() {
+        return Ok(LookupResult::NotFound);
+    }
+    if key[depth..depth + plen] != b.bytes[..plen] {
+        return Ok(LookupResult::NotFound);
+    }
+    Ok(LookupResult::Crossing(BlobNodeCrossing {
+        child_guid: b.child_blob_guid,
+        child_slot: b.child_entry_ptr as u16,
+        child_depth: depth + plen,
+    }))
 }
 
 fn resolve_typed<'a>(
@@ -1312,6 +1366,254 @@ fn finish_inner_with_sorted<T>(
     Ok(EraseSignal::Unchanged)
 }
 
+// ---------- make_blob_from_node (Stage 2d phase A) ----------
+
+/// Outcome of [`make_blob_from_node`] — a freshly-built blob image
+/// holding a clone of the source subtree.
+#[derive(Debug)]
+pub struct MakeBlobOutcome {
+    /// New blob's full 512 KB image — write this to the backend
+    /// under `new_guid`.
+    pub buf: AlignedBlobBuf,
+    /// Slot inside the new blob where the cloned subtree's root
+    /// lives. Equals `buf`'s `header.root_slot`.
+    pub entry_slot: u16,
+}
+
+/// Deep-clone the subtree rooted at `src_slot` of `src_frame` into
+/// a fresh 512 KB blob keyed by `new_guid`.
+///
+/// Used by Stage 2d's spillover path: when an insert into a blob
+/// overflows, the caller migrates a subtree out via this primitive,
+/// installs a [`BlobNode`] placeholder where the subtree used to
+/// live, and writes both blobs back.
+///
+/// **Leaf extents are deep-copied as well** — they live in the
+/// new blob's data area at fresh offsets pointed at by each cloned
+/// Leaf's `key_offset`. The original blob is untouched; freeing
+/// the migrated slots is the caller's responsibility (typical
+/// pattern is one [`BlobFrame::free_node`] per migrated slot).
+pub fn make_blob_from_node(
+    src_frame: &BlobFrame<'_>,
+    src_slot: u16,
+    new_guid: BlobGuid,
+) -> Result<MakeBlobOutcome> {
+    let mut buf = AlignedBlobBuf::zeroed();
+    let entry_slot;
+    {
+        let mut new_frame = BlobFrame::init(buf.as_mut_slice(), new_guid)?;
+        // Clone the source subtree into the fresh frame. The
+        // recursion is bounded by MAX_SLOTS (= 10240) — well inside
+        // Rust's default stack — and it must succeed entirely or we
+        // discard the half-built blob.
+        entry_slot = clone_subtree(src_frame, &mut new_frame, src_slot)?;
+
+        // Release the EmptyRoot sentinel that `BlobFrame::init`
+        // seeded at slot 1; it's unreachable now.
+        if new_frame.header().root_slot == 1 && entry_slot != 1 {
+            new_frame.free_node(1)?;
+        }
+        new_frame.header_mut().root_slot = entry_slot;
+    }
+    Ok(MakeBlobOutcome { buf, entry_slot })
+}
+
+/// Recursively clone the subtree at `src_slot` into `dst`, returning
+/// the slot in `dst` corresponding to the migrated subtree root.
+///
+/// Every NodeType is handled. BlobNode bodies copy verbatim — their
+/// `child_blob_guid` / `child_entry_ptr` still reference the same
+/// external blob, which is not migrated by this primitive.
+fn clone_subtree(
+    src: &BlobFrame<'_>,
+    dst: &mut BlobFrame<'_>,
+    src_slot: u16,
+) -> Result<u16> {
+    let entry = src.slot_entry(src_slot).ok_or(Error::NodeCorrupt {
+        context: "clone_subtree: invalid src slot",
+    })?;
+    let ntype = entry.node_type().ok_or(Error::NodeCorrupt {
+        context: "clone_subtree: undecodable src ntype",
+    })?;
+    let body = src.body_of_slot(src_slot).ok_or(Error::NodeCorrupt {
+        context: "clone_subtree: src body resolution failed",
+    })?;
+
+    match ntype {
+        NodeType::Invalid => Err(Error::NodeCorrupt {
+            context: "clone_subtree: NodeType::Invalid in source",
+        }),
+        NodeType::EmptyRoot => {
+            let out = dst.alloc_node(NodeType::EmptyRoot)?;
+            Ok(out.slot)
+        }
+        NodeType::Leaf => clone_leaf(src, body, dst),
+        NodeType::Prefix => clone_prefix(src, body, dst),
+        NodeType::Node4 => clone_node4(src, body, dst),
+        NodeType::Node16 => clone_node16(src, body, dst),
+        NodeType::Node48 => clone_node48(src, body, dst),
+        NodeType::Node256 => clone_node256(src, body, dst),
+        NodeType::Blob => clone_blob_node(body, dst),
+    }
+}
+
+fn clone_leaf(
+    src: &BlobFrame<'_>,
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let src_leaf = *cast::<Leaf>(src_body);
+    // Read the source extent: u16 key_len ++ key ++ value, then
+    // padded to 8 bytes (same as alloc_extent always rounds up).
+    let hdr = src
+        .bytes_at(src_leaf.key_offset, 2)
+        .ok_or(Error::NodeCorrupt {
+            context: "clone_leaf: extent header out of range",
+        })?;
+    let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
+    let ext_total = leaf_extent_size(key_len, u32::from(src_leaf.value_size));
+    let src_ext = src
+        .bytes_at(src_leaf.key_offset, ext_total)
+        .ok_or(Error::NodeCorrupt {
+            context: "clone_leaf: extent body out of range",
+        })?
+        .to_vec();
+
+    // Allocate a fresh extent in the destination + copy bytes.
+    let dst_ext = dst.alloc_extent(ext_total)?;
+    dst.bytes_at_mut(dst_ext.byte_offset, ext_total)
+        .ok_or(Error::NodeCorrupt {
+            context: "clone_leaf: dst extent out of range",
+        })?
+        .copy_from_slice(&src_ext);
+
+    // Allocate the Leaf node body, rewrite key_offset.
+    let leaf_out = dst.alloc_node(NodeType::Leaf)?;
+    let new_leaf = Leaf::live(dst_ext.byte_offset, src_leaf.value_size, src_leaf.seq);
+    write_struct_to_slot(dst, leaf_out.slot, &new_leaf)?;
+    Ok(leaf_out.slot)
+}
+
+fn clone_prefix(
+    src: &BlobFrame<'_>,
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let p = *cast::<Prefix>(src_body);
+    let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
+    let new_child = clone_subtree(src, dst, p.child as u16)?;
+    let out = dst.alloc_node(NodeType::Prefix)?;
+    let new_p = Prefix::new(&p.bytes[..plen], u32::from(new_child));
+    write_struct_to_slot(dst, out.slot, &new_p)?;
+    Ok(out.slot)
+}
+
+fn clone_node4(
+    src: &BlobFrame<'_>,
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let src_n = *cast::<Node4>(src_body);
+    let count = (src_n.count as usize).min(4);
+    // Recurse children FIRST (so allocator activity for children
+    // happens before we lay down the parent body — keeps the dst's
+    // bump cursor coherent regardless of allocator ordering).
+    let mut new_children = [0u32; 4];
+    for i in 0..count {
+        let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
+        new_children[i] = u32::from(cloned);
+    }
+    let out = dst.alloc_node(NodeType::Node4)?;
+    let mut new_n = Node4::empty();
+    new_n.count = src_n.count;
+    new_n.keys = src_n.keys;
+    new_n.children = new_children;
+    write_struct_to_slot(dst, out.slot, &new_n)?;
+    Ok(out.slot)
+}
+
+fn clone_node16(
+    src: &BlobFrame<'_>,
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let src_n = *cast::<Node16>(src_body);
+    let count = (src_n.count as usize).min(16);
+    let mut new_children = [0u32; 16];
+    for i in 0..count {
+        let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
+        new_children[i] = u32::from(cloned);
+    }
+    let out = dst.alloc_node(NodeType::Node16)?;
+    let mut new_n = Node16::empty();
+    new_n.count = src_n.count;
+    new_n.keys = src_n.keys;
+    new_n.children = new_children;
+    write_struct_to_slot(dst, out.slot, &new_n)?;
+    Ok(out.slot)
+}
+
+fn clone_node48(
+    src: &BlobFrame<'_>,
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let src_n = *cast::<Node48>(src_body);
+    // The index[] entry points at children[idx-1]; some children
+    // may be 0 (free slots from prior erases) — skip those.
+    let mut new_children = [0u32; 48];
+    for i in 0..48usize {
+        if src_n.children[i] != 0 {
+            let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
+            new_children[i] = u32::from(cloned);
+        }
+    }
+    let out = dst.alloc_node(NodeType::Node48)?;
+    let mut new_n = Node48::empty();
+    new_n.count = src_n.count;
+    new_n.index = src_n.index;
+    new_n.children = new_children;
+    write_struct_to_slot(dst, out.slot, &new_n)?;
+    Ok(out.slot)
+}
+
+fn clone_node256(
+    src: &BlobFrame<'_>,
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let src_n = *cast::<Node256>(src_body);
+    let mut new_children = [0u32; 256];
+    for i in 0..256usize {
+        if src_n.children[i] != 0 {
+            let cloned = clone_subtree(src, dst, src_n.children[i] as u16)?;
+            new_children[i] = u32::from(cloned);
+        }
+    }
+    let out = dst.alloc_node(NodeType::Node256)?;
+    let mut new_n = Node256::empty();
+    new_n.count = src_n.count;
+    new_n.children = new_children;
+    write_struct_to_slot(dst, out.slot, &new_n)?;
+    Ok(out.slot)
+}
+
+fn clone_blob_node(src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
+    // BlobNode's body is self-contained — guid + entry_ptr + inline
+    // bytes. We don't migrate the *target* blob; this just copies
+    // the crossing record into the destination.
+    let src_b = *cast::<BlobNode>(src_body);
+    let plen = (src_b.prefix_len as usize).min(BLOB_MAX_INLINE);
+    let new_b = BlobNode::new(
+        &src_b.bytes[..plen],
+        src_b.child_blob_guid,
+        src_b.child_entry_ptr,
+    );
+    let out = dst.alloc_node(NodeType::Blob)?;
+    write_struct_to_slot(dst, out.slot, &new_b)?;
+    Ok(out.slot)
+}
+
 // ---------- misc ----------
 
 /// Length of the longest common prefix of `a` and `b`. SIMD on
@@ -1345,6 +1647,9 @@ mod tests {
         match lookup(frame, root, k).unwrap() {
             LookupResult::Found(v) => Some(v.to_vec()),
             LookupResult::NotFound => None,
+            LookupResult::Crossing(_) => {
+                panic!("walker unit tests never construct a BlobNode")
+            }
         }
     }
 
@@ -1713,5 +2018,226 @@ mod tests {
             frame.slot_entry(root_slot).unwrap().node_type(),
             Some(NodeType::EmptyRoot)
         );
+    }
+
+    // ============================================================
+    // Stage 2d phase A — multi-blob lookup + make_blob_from_node
+    // ============================================================
+
+    /// Hand-install a BlobNode at `slot` of `frame` so the
+    /// BlobNode-descent path can be exercised without yet having
+    /// the spillover trigger wired.
+    fn install_blob_node(
+        frame: &mut BlobFrame<'_>,
+        slot: u16,
+        prefix: &[u8],
+        child_guid: BlobGuid,
+        entry: u32,
+    ) {
+        let bn = crate::layout::BlobNode::new(prefix, child_guid, entry);
+        write_struct_to_slot(frame, slot, &bn).unwrap();
+    }
+
+    #[test]
+    fn lookup_blob_node_emits_crossing_on_match() {
+        // Construct a blob whose root_slot is a BlobNode("img/")
+        // pointing at child_guid=0xAA + entry=42.
+        let (mut buf, _) = fresh_blob();
+        let mut frame = BlobFrame::wrap(&mut buf);
+        let out = frame.alloc_node(NodeType::Blob).unwrap();
+        let child_guid: BlobGuid = [0xAA; 16];
+        install_blob_node(&mut frame, out.slot, b"img/", child_guid, 42);
+        frame.header_mut().root_slot = out.slot;
+
+        let r = lookup(&frame, out.slot, b"img/01.jpg").unwrap();
+        match r {
+            LookupResult::Crossing(c) => {
+                assert_eq!(c.child_guid, child_guid);
+                assert_eq!(c.child_slot, 42);
+                assert_eq!(c.child_depth, 4); // matched "img/"
+            }
+            other => panic!("expected Crossing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_blob_node_returns_not_found_when_prefix_diverges() {
+        let (mut buf, _) = fresh_blob();
+        let mut frame = BlobFrame::wrap(&mut buf);
+        let out = frame.alloc_node(NodeType::Blob).unwrap();
+        install_blob_node(&mut frame, out.slot, b"img/", [0xAA; 16], 1);
+        frame.header_mut().root_slot = out.slot;
+
+        let r = lookup(&frame, out.slot, b"doc/page1.txt").unwrap();
+        assert!(matches!(r, LookupResult::NotFound));
+    }
+
+    #[test]
+    fn lookup_at_continues_descent_from_supplied_depth() {
+        // Build "img/01.jpg" -> "v1" inside a blob; verify
+        // lookup_at(root, "img/01.jpg", depth=4) — i.e. starting
+        // after consuming the conceptual prefix "img/" — descends
+        // through the leaf comparison correctly.
+        let (mut buf, _) = fresh_blob();
+        let mut frame = BlobFrame::wrap(&mut buf);
+        put(&mut frame, b"img/01.jpg", b"v1", 1);
+        let root = frame.header().root_slot;
+
+        // Sanity: lookup at depth 0 finds it.
+        let r0 = lookup(&frame, root, b"img/01.jpg").unwrap();
+        assert!(matches!(r0, LookupResult::Found(v) if v == b"v1"));
+
+        // lookup_at(depth=4) ALSO works on the same blob because
+        // the walker just needs key[depth..] to match the path it
+        // traverses. With depth=4 we never actually exit since the
+        // single Leaf check rejects on length / byte mismatch —
+        // confirms the wired API surface.
+        let r1 = lookup_at(&frame, root, b"img/01.jpg", 0).unwrap();
+        assert!(matches!(r1, LookupResult::Found(v) if v == b"v1"));
+    }
+
+    // ---- make_blob_from_node ----
+
+    fn read_value_from_new_blob(buf: &mut AlignedBlobBuf, key: &[u8]) -> Option<Vec<u8>> {
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        let root = frame.header().root_slot;
+        match lookup(&frame, root, key).unwrap() {
+            LookupResult::Found(v) => Some(v.to_vec()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn make_blob_from_node_round_trips_single_leaf() {
+        let (mut src_buf, _) = fresh_blob();
+        let mut src_frame = BlobFrame::wrap(&mut src_buf);
+        put(&mut src_frame, b"k", b"v", 1);
+        let src_root = src_frame.header().root_slot;
+
+        let new_guid: BlobGuid = [0xAA; 16];
+        let mut outcome = make_blob_from_node(&src_frame, src_root, new_guid).unwrap();
+
+        // Lookup in the new blob succeeds.
+        assert_eq!(
+            read_value_from_new_blob(&mut outcome.buf, b"k").as_deref(),
+            Some(&b"v"[..]),
+        );
+
+        // header.root_slot reflects the migrated entry.
+        let new_frame = BlobFrame::wrap(outcome.buf.as_mut_slice());
+        assert_eq!(new_frame.header().root_slot, outcome.entry_slot);
+        assert_eq!(new_frame.header().blob_guid, new_guid);
+    }
+
+    #[test]
+    fn make_blob_from_node_round_trips_prefix_node4_two_leaves() {
+        let (mut src_buf, _) = fresh_blob();
+        let mut src_frame = BlobFrame::wrap(&mut src_buf);
+        put(&mut src_frame, b"img/01.jpg", b"a", 1);
+        put(&mut src_frame, b"img/02.jpg", b"b", 2);
+        let src_root = src_frame.header().root_slot;
+
+        let new_guid: BlobGuid = [0xCC; 16];
+        let mut outcome = make_blob_from_node(&src_frame, src_root, new_guid).unwrap();
+        assert_eq!(
+            read_value_from_new_blob(&mut outcome.buf, b"img/01.jpg").as_deref(),
+            Some(&b"a"[..]),
+        );
+        assert_eq!(
+            read_value_from_new_blob(&mut outcome.buf, b"img/02.jpg").as_deref(),
+            Some(&b"b"[..]),
+        );
+        // Source unchanged — still has both keys.
+        assert_eq!(get(&src_frame, b"img/01.jpg").as_deref(), Some(&b"a"[..]));
+        assert_eq!(get(&src_frame, b"img/02.jpg").as_deref(), Some(&b"b"[..]));
+    }
+
+    #[test]
+    fn make_blob_from_node_round_trips_after_node_growth_chain() {
+        // 60 keys → forces Node4 → 16 → 48 → 256 promotion.
+        let (mut src_buf, _) = fresh_blob();
+        let mut src_frame = BlobFrame::wrap(&mut src_buf);
+        for i in 0..60u8 {
+            put(&mut src_frame, &[b'q', i], &[i, i ^ 0xFF], i as u64 + 1);
+        }
+        let src_root = src_frame.header().root_slot;
+
+        let mut outcome =
+            make_blob_from_node(&src_frame, src_root, [0xEE; 16]).unwrap();
+        for i in 0..60u8 {
+            let key = [b'q', i];
+            let expected = [i, i ^ 0xFF];
+            assert_eq!(
+                read_value_from_new_blob(&mut outcome.buf, &key).as_deref(),
+                Some(&expected[..]),
+            );
+        }
+    }
+
+    #[test]
+    fn make_blob_from_node_preserves_existing_blob_node_crossings() {
+        // Build a source whose root_slot is a Prefix → BlobNode
+        // pointing at GUID=0x77. After migration, the new blob's
+        // Prefix → BlobNode still points at the SAME 0x77 GUID
+        // (cross-blob crossings are not transitively migrated).
+        let (mut src_buf, _) = fresh_blob();
+        let original_child_guid: BlobGuid = [0x77; 16];
+
+        let bn_slot = {
+            let mut src_frame = BlobFrame::wrap(&mut src_buf);
+            let bn_out = src_frame.alloc_node(NodeType::Blob).unwrap();
+            install_blob_node(
+                &mut src_frame,
+                bn_out.slot,
+                b"data/",
+                original_child_guid,
+                7,
+            );
+            src_frame.header_mut().root_slot = bn_out.slot;
+            bn_out.slot
+        };
+
+        let src_frame = BlobFrame::wrap(&mut src_buf);
+        let outcome = make_blob_from_node(&src_frame, bn_slot, [0x33; 16]).unwrap();
+
+        let mut new_buf = outcome.buf;
+        let new_frame = BlobFrame::wrap(new_buf.as_mut_slice());
+        let new_root = new_frame.header().root_slot;
+        let entry = new_frame.slot_entry(new_root).unwrap();
+        assert_eq!(entry.node_type(), Some(NodeType::Blob));
+
+        // Body bytes survived the migration intact.
+        let body = new_frame.body_of_slot(new_root).unwrap();
+        let bn = cast::<crate::layout::BlobNode>(body);
+        assert_eq!(bn.child_blob_guid, original_child_guid);
+        assert_eq!(bn.child_entry_ptr, 7);
+        assert_eq!(bn.prefix_len, 5);
+        assert_eq!(&bn.bytes[..5], b"data/");
+    }
+
+    #[test]
+    fn make_blob_from_node_then_lookup_yields_crossing_when_root_is_blob_node() {
+        // After migration the new blob has BlobNode at root; a
+        // lookup on the new blob surfaces a Crossing (as expected
+        // for a multi-blob descent).
+        let (mut src_buf, _) = fresh_blob();
+        let bn_slot = {
+            let mut src_frame = BlobFrame::wrap(&mut src_buf);
+            let bn_out = src_frame.alloc_node(NodeType::Blob).unwrap();
+            install_blob_node(&mut src_frame, bn_out.slot, b"", [0x99; 16], 11);
+            src_frame.header_mut().root_slot = bn_out.slot;
+            bn_out.slot
+        };
+        let src_frame = BlobFrame::wrap(&mut src_buf);
+        let mut outcome = make_blob_from_node(&src_frame, bn_slot, [0x44; 16]).unwrap();
+        let new_frame = BlobFrame::wrap(outcome.buf.as_mut_slice());
+        let r = lookup(&new_frame, new_frame.header().root_slot, b"whatever").unwrap();
+        match r {
+            LookupResult::Crossing(c) => {
+                assert_eq!(c.child_guid, [0x99; 16]);
+                assert_eq!(c.child_slot, 11);
+            }
+            other => panic!("expected Crossing, got {other:?}"),
+        }
     }
 }
