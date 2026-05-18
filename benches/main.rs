@@ -134,6 +134,19 @@ fn make_artisan() -> Tree {
     Tree::open(cfg).expect("artisan open")
 }
 
+/// Persistent artisan on a temp dir. `flush_on_write = false` so
+/// each `put` lands in the BufferManager cache; the persistent
+/// backend only gets a `pwrite` at spillover or `checkpoint()`.
+/// Matches RocksDB's `WAL=on, sync=false` (per-op durable to OS
+/// page cache, not fsync'd).
+fn make_artisan_persistent() -> (Tree, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.flush_on_write = false;
+    let tree = Tree::open(cfg).expect("artisan persistent open");
+    (tree, dir)
+}
+
 fn make_rocksdb() -> (DB, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut opts = Options::default();
@@ -148,6 +161,16 @@ fn make_rocksdb() -> (DB, TempDir) {
 fn rocksdb_write_opts() -> WriteOptions {
     let mut wo = WriteOptions::default();
     wo.disable_wal(true);
+    wo.set_sync(false);
+    wo
+}
+
+/// Same as `rocksdb_write_opts` but with the WAL enabled — the
+/// per-op durability profile we compare artisan's persistent
+/// backend against (`WAL=on, sync=false`).
+fn rocksdb_write_opts_persistent() -> WriteOptions {
+    let mut wo = WriteOptions::default();
+    wo.disable_wal(false);
     wo.set_sync(false);
     wo
 }
@@ -275,19 +298,139 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
     }
 }
 
+// Persistent variant: both engines on disk with WAL/durability on
+// (RocksDB: WAL enabled, fsync off; artisan: PersistentBackend,
+// flush_on_write = false — each `put` stays in the BM cache,
+// only spillover + `checkpoint()` hit disk).
+fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
+    let key_count = pairs.len();
+
+    // ---- get ----
+    {
+        let mut group = c.benchmark_group(format!("{name}_persist_get"));
+        group.throughput(Throughput::Elements(1));
+
+        let (artisan, _dir) = make_artisan_persistent();
+        preload_artisan(&artisan, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 11);
+        group.bench_function("artisan", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, _) = &pairs[idx];
+                black_box(artisan.get(black_box(k)).unwrap());
+            });
+        });
+
+        let (db, _dir) = make_rocksdb();
+        let wo = rocksdb_write_opts_persistent();
+        for (k, v) in pairs {
+            db.put_opt(k, v, &wo).expect("rocksdb preload");
+        }
+        let mut rng = StdRng::seed_from_u64(SEED + 11);
+        group.bench_function("rocksdb", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, _) = &pairs[idx];
+                black_box(db.get(black_box(k)).unwrap());
+            });
+        });
+
+        group.finish();
+    }
+
+    // ---- put ----
+    {
+        let mut group = c.benchmark_group(format!("{name}_persist_put"));
+        group.throughput(Throughput::Elements(1));
+
+        let (artisan, _dir) = make_artisan_persistent();
+        preload_artisan(&artisan, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 12);
+        group.bench_function("artisan", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                black_box(artisan.put(black_box(k), black_box(v)).unwrap());
+            });
+        });
+
+        let (db, _dir) = make_rocksdb();
+        let wo = rocksdb_write_opts_persistent();
+        for (k, v) in pairs {
+            db.put_opt(k, v, &wo).expect("rocksdb preload");
+        }
+        let mut rng = StdRng::seed_from_u64(SEED + 12);
+        group.bench_function("rocksdb", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                black_box(db.put_opt(black_box(k), black_box(v), &wo).unwrap());
+            });
+        });
+
+        group.finish();
+    }
+
+    // ---- mixed ----
+    {
+        let mut group = c.benchmark_group(format!("{name}_persist_mixed"));
+        group.throughput(Throughput::Elements(1));
+
+        let (artisan, _dir) = make_artisan_persistent();
+        preload_artisan(&artisan, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 13);
+        group.bench_function("artisan", |b| {
+            b.iter(|| {
+                let r = rng.next_u32();
+                let idx = (r as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                if r & 1 == 0 {
+                    black_box(artisan.get(black_box(k)).unwrap());
+                } else {
+                    black_box(artisan.put(black_box(k), black_box(v)).unwrap());
+                }
+            });
+        });
+
+        let (db, _dir) = make_rocksdb();
+        let wo = rocksdb_write_opts_persistent();
+        for (k, v) in pairs {
+            db.put_opt(k, v, &wo).expect("rocksdb preload");
+        }
+        let mut rng = StdRng::seed_from_u64(SEED + 13);
+        group.bench_function("rocksdb", |b| {
+            b.iter(|| {
+                let r = rng.next_u32();
+                let idx = (r as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                if r & 1 == 0 {
+                    black_box(db.get(black_box(k)).unwrap());
+                } else {
+                    black_box(db.put_opt(black_box(k), black_box(v), &wo).unwrap());
+                }
+            });
+        });
+
+        group.finish();
+    }
+}
+
 fn kv_benches(c: &mut Criterion) {
     let pairs = gen_kv_dataset();
     bench_scenario(c, "kv", &pairs);
+    bench_scenario_persistent(c, "kv", &pairs);
 }
 
 fn objstore_benches(c: &mut Criterion) {
     let pairs = gen_objstore_dataset();
     bench_scenario(c, "objstore", &pairs);
+    bench_scenario_persistent(c, "objstore", &pairs);
 }
 
 fn fs_benches(c: &mut Criterion) {
     let pairs = gen_fs_dataset();
     bench_scenario(c, "fs", &pairs);
+    bench_scenario_persistent(c, "fs", &pairs);
 }
 
 criterion_group!(benches, kv_benches, objstore_benches, fs_benches);

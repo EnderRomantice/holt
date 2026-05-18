@@ -69,17 +69,21 @@ Done — algorithm core:
 - Zero-copy `Tree::put` / `delete` / `rename` via
   `BufferManager::pin` + `commit` (Stage 6 phase 2c) — mutations
   also operate in place against the BM-owned buffer; `Tree` no
-  longer keeps a separate `state.root_buf`. Writers serialise
-  through a single `Mutex<()>` until HybridLatch ships
+  longer keeps a separate `state.root_buf`
+- **`HybridLatch` wired into `CachedBlob`** (Stage 6 phase 2b) —
+  3-mode latch (optimistic / shared / exclusive) over an
+  `UnsafeCell<AlignedBlobBuf>`. `Tree::get`'s walker runs
+  **wait-free**: snapshot the latch version, walk, validate;
+  restart from the root on a torn read. `put` / `delete` no
+  longer take any Tree-wide lock — per-blob exclusive on the
+  root serialises them. `rename` keeps a small `rename_lock`
+  for its multi-step atomicity
 - Walker split into focused submodules under `engine/walker/`
   (types / readers / writers / lookup / insert / erase /
   spillover / migrate / tests) — ten files under ~700 LOC each
   rather than one ~3400-LOC blob
 
 Queued — see [ROADMAP.md](ROADMAP.md):
-
-- HybridLatch optimistic reads wired over the per-blob RwLock
-  (Stage 6 phase 2b) — removes the single writer mutex
 - WAL + crash recovery (Stage 5)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)

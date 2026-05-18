@@ -12,20 +12,23 @@
 //! ## Concurrency model
 //!
 //! Tree owns an `Arc<BufferManager>`. The BM keeps each cached
-//! blob behind its own `RwLock<AlignedBlobBuf>`, so:
+//! blob behind a `HybridLatch` (LeanStore-style 3-mode latch)
+//! wrapping an `UnsafeCell<AlignedBlobBuf>`:
 //!
-//! - **Reads** (`get`) pin the relevant blobs and walk the cached
-//!   buffer under shared read-guards. Lock-free against the writer
-//!   lock; readers on different blobs progress in parallel, and
-//!   readers on the *same* blob also progress in parallel.
-//! - **Writes** (`put` / `delete` / `rename`) serialise through
-//!   `write_lock` (a process-wide `Mutex<()>`) for the duration of
-//!   the walker pass. Inside, the walker pins each touched blob
-//!   for **exclusive** write access via the BM's `RwLock`.
-//!
-//! Per-blob `HybridLatch` (replacing the `Mutex<()>` write_lock
-//! with optimistic-concurrency reads + restart) lands in Stage 6
-//! phase 2b.
+//! - **Reads** (`get`) walk every blob in **optimistic** mode —
+//!   wait-free, no real lock taken. The walker snapshots the
+//!   latch version, reads the buffer, then validates; on a torn
+//!   read it restarts from the root. Readers never block writers
+//!   and writers never block readers.
+//! - **Writes** (`put` / `delete`) take **exclusive** mode on
+//!   each blob they touch (always starting with the root). This
+//!   serialises concurrent mutators on the same blob without any
+//!   Tree-wide writer mutex; mutations on disjoint child blobs
+//!   can proceed in parallel.
+//! - **`rename`** is multi-step (lookup probe + erase + insert)
+//!   and must be atomic across all three. It takes the
+//!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
+//!   prevent racing renames from interleaving.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,12 +56,12 @@ pub struct Tree {
     /// sentinel; multi-tenant trees (post-v0.1) will allocate
     /// per-tree root GUIDs from a manifest.
     root_guid: BlobGuid,
-    /// Serialises mutators (`put` / `delete` / `rename`) against
-    /// each other. Readers never take this lock — they coordinate
-    /// only with the per-blob `RwLock` inside the BM. Stage 6 phase
-    /// 2b replaces it with per-blob `HybridLatch` for fully
-    /// concurrent writers on disjoint subtrees.
-    write_lock: Arc<Mutex<()>>,
+    /// Serialises **only `rename`** — the multi-step
+    /// `lookup_multi(src)` + `erase_multi(src)` + `insert_multi(dst)`
+    /// must appear atomic to other writers. `put` / `delete` /
+    /// `get` never take this lock; they coordinate via the
+    /// per-blob `HybridLatch` inside the BM.
+    rename_lock: Arc<Mutex<()>>,
     /// Monotonically-increasing sequence stamped on every new
     /// leaf. Stage 5 ties this to the WAL record number.
     next_seq: Arc<AtomicU64>,
@@ -147,7 +150,7 @@ impl Tree {
             cfg,
             backend: bm,
             root_guid,
-            write_lock: Arc::new(Mutex::new(())),
+            rename_lock: Arc::new(Mutex::new(())),
             next_seq: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -190,7 +193,9 @@ impl Tree {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let _w = self.write_lock.lock().unwrap();
+        // Concurrent writers are serialised by the per-blob
+        // `HybridLatch` (root blob always taken exclusive); no
+        // Tree-wide writer mutex needed.
         let outcome = engine::insert_multi(
             &self.backend,
             self.root_guid,
@@ -215,7 +220,8 @@ impl Tree {
     /// [`BlobNode`]: crate::layout::BlobNode
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-        let _w = self.write_lock.lock().unwrap();
+        // No Tree-wide lock — per-blob `HybridLatch` exclusive on
+        // the root serialises concurrent `delete` / `put` calls.
         let outcome = engine::erase_multi(&self.backend, self.root_guid, &padded)?;
         if self.cfg.flush_on_write {
             self.backend.commit(self.root_guid)?;
@@ -231,16 +237,18 @@ impl Tree {
     /// - When `force` is `true`, any existing leaf at `dst` is
     ///   overwritten.
     ///
-    /// Atomic with respect to other writers (`write_lock` is held
-    /// for the whole sequence). Stage 5 (WAL) will swap for a
-    /// dedicated `RenameTxnOp` so the child-blob writes between
-    /// erase and insert commit as one journal record.
+    /// Atomic with respect to other renames (`rename_lock` is held
+    /// for the whole sequence). Concurrent `put`/`delete` on
+    /// disjoint subtrees are not blocked. Stage 5 (WAL) will swap
+    /// the multi-step path for a dedicated `RenameTxnOp` so the
+    /// child-blob writes between erase and insert commit as one
+    /// journal record.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
 
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let _w = self.write_lock.lock().unwrap();
+        let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
         let value = match engine::lookup_multi(&self.backend, self.root_guid, &src_padded)? {

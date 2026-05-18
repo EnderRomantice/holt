@@ -16,15 +16,21 @@
 //! with dirty tracking + a background checkpointer (Stage 6
 //! phase 3).
 //!
-//! ## Per-blob locking
+//! ## Per-blob locking — 3-mode `HybridLatch`
 //!
-//! Each cached blob has its own `RwLock<AlignedBlobBuf>`. Reads
-//! and writes on **different** blobs progress without
-//! coordinating — the only shared lock is on the cache's HashMap
-//! / LRU bookkeeping, which is held for very short windows.
-//! On the **same** blob, N readers can run concurrently while
-//! writers take exclusive. Full optimistic-concurrency reads via
-//! `HybridLatch` ship later in Stage 6 phase 2.
+//! Each cached blob lives behind a `HybridLatch` (LeanStore-style
+//! 3-mode latch) wrapping an `UnsafeCell<AlignedBlobBuf>`:
+//!
+//! - **Optimistic** — wait-free. Snapshot the latch version, read
+//!   the buffer without a real lock, then `validate()` afterwards.
+//!   If a writer lapped the snapshot, the read is discarded and
+//!   the caller restarts. Used by `Tree::get`'s walker.
+//! - **Shared** — N readers run concurrently, mutually exclusive
+//!   with writers. Used by `BufferManager::commit` (durable write-
+//!   through reads the cached image under shared).
+//! - **Exclusive** — single writer, mutually exclusive with all
+//!   readers. Used by every walker mutation hop (`insert_multi`
+//!   / `erase_multi` / spillover).
 //!
 //! ## Pin-and-operate
 //!
@@ -33,13 +39,16 @@
 //! `Arc<CachedBlob>` holding the buffer alive in cache. The
 //! `Arc`'s strong count keeps eviction at bay. From there:
 //!
-//! - [`CachedBlob::read`] → `RwLockReadGuard<AlignedBlobBuf>`,
-//!   wrap with `BlobFrameRef::wrap(guard.as_slice())` for zero-
-//!   copy traversal.
-//! - [`CachedBlob::write`] → `RwLockWriteGuard<AlignedBlobBuf>`,
-//!   wrap with `BlobFrame::wrap(guard.as_mut_slice())` for in-
-//!   place mutation. Don't forget to write-back via `write_blob`
-//!   afterwards so the inner backend sees the change.
+//! - [`CachedBlob::read_optimistic`] → wait-free [`OptimisticGuard`]
+//!   with `as_slice()` + `validate()`. Wrap with
+//!   `BlobFrameRef::wrap(guard.as_slice())` for zero-copy traversal.
+//! - [`CachedBlob::read`] → [`BlobReadGuard`] (shared). Same
+//!   `BlobFrameRef::wrap` shape, but blocks behind any active
+//!   writer.
+//! - [`CachedBlob::write`] → [`BlobWriteGuard`] (exclusive). Wrap
+//!   with `BlobFrame::wrap(guard.as_mut_slice())` for in-place
+//!   mutation. Drop the guard, then call
+//!   [`BufferManager::commit`] to flush the change to disk.
 //!
 //! ## Eviction
 //!
@@ -51,10 +60,13 @@
 //! temporarily exceed `capacity` while every entry is pinned;
 //! it shrinks back as readers drop their handles.
 
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
 
 use crate::api::errors::Result;
+use crate::concurrency::{Guard as LatchGuard, HybridLatch};
 use crate::layout::BlobGuid;
 
 use super::backend::{AlignedBlobBuf, Backend};
@@ -73,26 +85,140 @@ struct BufferManagerState {
 }
 
 /// A single cached blob. Callers obtain one via
-/// [`BufferManager::pin`] and then take a read/write guard on it
-/// to access the underlying 512 KB buffer with zero copies.
+/// [`BufferManager::pin`] and then take an optimistic / shared /
+/// exclusive guard on it to access the underlying 512 KB buffer
+/// with zero copies.
 ///
 /// Holding the `Arc<CachedBlob>` prevents the entry from being
 /// evicted, so traversals that pin a blob can borrow into it for
 /// as long as the pin is alive.
 pub struct CachedBlob {
-    buf: RwLock<AlignedBlobBuf>,
+    latch: HybridLatch,
+    buf: UnsafeCell<AlignedBlobBuf>,
 }
 
+// SAFETY: every access to `buf` is gated by `latch`, which provides
+// the standard reader-writer exclusion (plus an optimistic mode
+// whose reads are revalidated by the caller before being trusted).
+// The `UnsafeCell` only marks the interior-mutability; the actual
+// concurrency contract is enforced by `HybridLatch`.
+unsafe impl Sync for CachedBlob {}
+
 impl CachedBlob {
-    /// Shared read access to the underlying buffer. N concurrent
-    /// readers across different threads progress in parallel.
-    pub fn read(&self) -> RwLockReadGuard<'_, AlignedBlobBuf> {
-        self.buf.read().expect("CachedBlob RwLock poisoned")
+    fn new(buf: AlignedBlobBuf) -> Self {
+        Self {
+            latch: HybridLatch::new(),
+            buf: UnsafeCell::new(buf),
+        }
     }
 
-    /// Exclusive write access to the underlying buffer.
-    pub fn write(&self) -> RwLockWriteGuard<'_, AlignedBlobBuf> {
-        self.buf.write().expect("CachedBlob RwLock poisoned")
+    /// Wait-free read snapshot. No real lock taken — the caller
+    /// reads bytes through [`OptimisticGuard::as_slice`] and then
+    /// calls [`OptimisticGuard::validate`] to confirm no writer
+    /// lapped the snapshot. If validation fails the caller must
+    /// discard everything read and restart.
+    pub fn read_optimistic(&self) -> OptimisticGuard<'_> {
+        OptimisticGuard {
+            latch: LatchGuard::optimistic(&self.latch),
+            buf: &self.buf,
+        }
+    }
+
+    /// Shared read access — blocks while a writer holds the latch
+    /// exclusively, but N shared readers run concurrently.
+    pub fn read(&self) -> BlobReadGuard<'_> {
+        BlobReadGuard {
+            _latch: LatchGuard::shared(&self.latch),
+            buf: &self.buf,
+        }
+    }
+
+    /// Exclusive write access — blocks until idle, then runs
+    /// alone. Bumps the version on release so concurrent
+    /// optimistic readers detect the change and restart.
+    pub fn write(&self) -> BlobWriteGuard<'_> {
+        BlobWriteGuard {
+            _latch: LatchGuard::exclusive(&self.latch),
+            buf: &self.buf,
+        }
+    }
+}
+
+/// Wait-free guard returned by [`CachedBlob::read_optimistic`].
+///
+/// Reads from `as_slice()` may be **torn** (a concurrent writer
+/// could be mid-mutation). The caller must finish reading and
+/// call [`OptimisticGuard::validate`]; if `validate` returns
+/// `false`, every byte read through this guard is potentially
+/// stale and must be discarded.
+pub struct OptimisticGuard<'a> {
+    latch: LatchGuard<'a>,
+    buf: &'a UnsafeCell<AlignedBlobBuf>,
+}
+
+impl<'a> OptimisticGuard<'a> {
+    /// Pointer-style view of the 512 KB buffer. Bytes may be torn
+    /// — see the type-level docs.
+    #[must_use]
+    pub fn as_slice(&self) -> &'a [u8] {
+        // SAFETY: the optimistic guard holds the latch in
+        // `Optimistic` mode (no real lock); reads through this
+        // borrow may race with a writer. The walker treats any
+        // result derived from such a borrow as untrusted until
+        // `validate()` confirms it; corrupt bodies surface as
+        // `Error::NodeCorrupt` rather than panics because the
+        // layout decoders bounds-check every field.
+        unsafe { (&*self.buf.get()).as_slice() }
+    }
+
+    /// Returns `true` if no exclusive writer modified the buffer
+    /// between the snapshot and now.
+    #[must_use]
+    pub fn validate(&self) -> bool {
+        self.latch.validate()
+    }
+}
+
+/// Shared-mode read guard returned by [`CachedBlob::read`].
+///
+/// Derefs to `&AlignedBlobBuf`; call `.as_slice()` for byte-level
+/// access.
+pub struct BlobReadGuard<'a> {
+    _latch: LatchGuard<'a>,
+    buf: &'a UnsafeCell<AlignedBlobBuf>,
+}
+
+impl Deref for BlobReadGuard<'_> {
+    type Target = AlignedBlobBuf;
+    fn deref(&self) -> &AlignedBlobBuf {
+        // SAFETY: shared-mode latch excludes writers.
+        unsafe { &*self.buf.get() }
+    }
+}
+
+/// Exclusive-mode write guard returned by [`CachedBlob::write`].
+///
+/// Derefs to `&mut AlignedBlobBuf`; call `.as_mut_slice()` for
+/// byte-level access.
+pub struct BlobWriteGuard<'a> {
+    _latch: LatchGuard<'a>,
+    buf: &'a UnsafeCell<AlignedBlobBuf>,
+}
+
+impl Deref for BlobWriteGuard<'_> {
+    type Target = AlignedBlobBuf;
+    fn deref(&self) -> &AlignedBlobBuf {
+        // SAFETY: exclusive-mode latch excludes all other access.
+        unsafe { &*self.buf.get() }
+    }
+}
+
+impl DerefMut for BlobWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut AlignedBlobBuf {
+        // SAFETY: exclusive-mode latch excludes all other access,
+        // and `&mut self` ensures no other borrow of this guard
+        // exists.
+        unsafe { &mut *self.buf.get() }
     }
 }
 
@@ -162,12 +288,9 @@ impl BufferManager {
             state.lru.push_back(guid);
             return;
         }
-        let entry = Arc::new(CachedBlob {
-            buf: RwLock::new(contents.clone()),
-        });
+        let entry = Arc::new(CachedBlob::new(contents.clone()));
         state.cache.insert(guid, entry);
         state.lru.push_back(guid);
-        // Evict if over capacity.
         while state.cache.len() > self.capacity {
             if !Self::try_evict_lru(&mut state) {
                 break;
@@ -214,10 +337,11 @@ impl BufferManager {
     /// should hold pins only as long as they're actively traversing
     /// or mutating, so eviction can make progress under pressure.
     ///
-    /// From the returned handle, use [`CachedBlob::read`] for
-    /// shared access (compatible with `BlobFrameRef::wrap`) or
-    /// [`CachedBlob::write`] for exclusive access (compatible with
-    /// `BlobFrame::wrap`).
+    /// From the returned handle, use:
+    /// - [`CachedBlob::read_optimistic`] for wait-free reads
+    ///   (snapshot + validate; restart on failure).
+    /// - [`CachedBlob::read`] for blocking shared access.
+    /// - [`CachedBlob::write`] for exclusive write access.
     pub fn pin(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
         if let Some(entry) = self.get_cached(guid) {
             return Ok(entry);
@@ -235,9 +359,7 @@ impl BufferManager {
         }
         // Pathological: insert raced with eviction. Build an
         // entry directly from scratch and force-insert it.
-        let entry = Arc::new(CachedBlob {
-            buf: RwLock::new(scratch),
-        });
+        let entry = Arc::new(CachedBlob::new(scratch));
         let mut state = self.state.lock().unwrap();
         state.cache.insert(guid, entry.clone());
         if let Some(pos) = state.lru.iter().position(|g| *g == guid) {

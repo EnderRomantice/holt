@@ -41,47 +41,73 @@ pub fn lookup_at<'a>(
     descend(frame, start_slot, key, depth)
 }
 
-/// Multi-blob lookup — zero-copy.
+/// Multi-blob lookup — wait-free in the common case.
 ///
-/// Pins each blob in the `BufferManager` (root first, then each
-/// child crossing) under a shared read-guard and runs the walker
-/// directly against the cached buffer. No 512 KB memcpy per hop;
-/// concurrent readers on disjoint blobs never coordinate.
+/// Walks every blob via [`CachedBlob::read_optimistic`]: snapshot
+/// the latch version, read raw bytes, then `validate()` after the
+/// hop. If a writer lapped the snapshot mid-walk the hop is
+/// discarded and the entire lookup restarts from the root.
 ///
-/// Returns the value bytes on a match (cloned out so the pin can
-/// drop), or `None` if no leaf matches `key`.
+/// Why restart from the root: a writer who modifies any blob may
+/// also have moved the `BlobNode` crossing that pointed there, so
+/// the parent-side path is stale too. Restarting catches the
+/// new tree shape from the top.
+///
+/// On match the value bytes are cloned out so the pin / guard can
+/// drop; on `NotFound` returns `Ok(None)`.
 pub fn lookup_multi(
     bm: &BufferManager,
     root_guid: BlobGuid,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let root_pin = bm.pin(root_guid)?;
-    let crossing = {
-        let guard = root_pin.read();
-        let frame = BlobFrameRef::wrap(guard.as_slice());
-        let root_slot = frame.header().root_slot;
-        match lookup_at(frame, root_slot, key, 0)? {
-            LookupResult::Found(v) => return Ok(Some(v.to_vec())),
-            LookupResult::NotFound => return Ok(None),
-            LookupResult::Crossing(c) => c,
-        }
-    };
-    drop(root_pin);
+    // Outer loop: each iteration is one full attempt; we restart
+    // here when an optimistic snapshot is invalidated.
+    'restart: loop {
+        // Hop 0: the root blob.
+        let root_pin = bm.pin(root_guid)?;
+        let crossing = {
+            let guard = root_pin.read_optimistic();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let root_slot = frame.header().root_slot;
+            let result = lookup_at(frame, root_slot, key, 0);
 
-    let mut current_guid = crossing.child_guid;
-    let mut start_slot = crossing.child_slot;
-    let mut depth = crossing.child_depth;
-    loop {
-        let pin = bm.pin(current_guid)?;
-        let guard = pin.read();
-        let frame = BlobFrameRef::wrap(guard.as_slice());
-        match lookup_at(frame, start_slot, key, depth)? {
-            LookupResult::Found(v) => return Ok(Some(v.to_vec())),
-            LookupResult::NotFound => return Ok(None),
-            LookupResult::Crossing(c) => {
-                current_guid = c.child_guid;
-                start_slot = c.child_slot;
-                depth = c.child_depth;
+            // Validate AFTER consuming any borrowed data from the
+            // frame so a torn read can't escape past this point.
+            if !guard.validate() {
+                continue 'restart;
+            }
+            match result {
+                Err(e) => return Err(e),
+                Ok(LookupResult::Found(v)) => return Ok(Some(v.to_vec())),
+                Ok(LookupResult::NotFound) => return Ok(None),
+                Ok(LookupResult::Crossing(c)) => c,
+            }
+        };
+        drop(root_pin);
+
+        // Cross-blob hops. Same pattern; on a torn read we restart
+        // the whole walk from the root (the parent BlobNode that
+        // pointed us here may also have moved).
+        let mut current_guid = crossing.child_guid;
+        let mut start_slot = crossing.child_slot;
+        let mut depth = crossing.child_depth;
+        loop {
+            let pin = bm.pin(current_guid)?;
+            let guard = pin.read_optimistic();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let result = lookup_at(frame, start_slot, key, depth);
+            if !guard.validate() {
+                continue 'restart;
+            }
+            match result {
+                Err(e) => return Err(e),
+                Ok(LookupResult::Found(v)) => return Ok(Some(v.to_vec())),
+                Ok(LookupResult::NotFound) => return Ok(None),
+                Ok(LookupResult::Crossing(c)) => {
+                    current_guid = c.child_guid;
+                    start_slot = c.child_slot;
+                    depth = c.child_depth;
+                }
             }
         }
     }

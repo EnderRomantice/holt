@@ -650,3 +650,80 @@ fn tree_get_follows_blob_node_crossing_across_two_blobs() {
     // Missing keys still NotFound.
     assert!(tree.get(b"k99").unwrap().is_none());
 }
+
+#[test]
+fn optimistic_readers_dont_block_writers() {
+    // Stage 6 phase 2b: BufferManager's per-blob HybridLatch lets
+    // readers walk in optimistic mode (snapshot version → read →
+    // validate → restart on torn) while writers take exclusive.
+    // This test pounds the same tree from N readers + a writer
+    // concurrently and verifies (1) readers never see stale data
+    // that doesn't match the stable initial seed, and (2) the
+    // writer's monotonic counter ends at the expected value.
+    use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+    use std::thread;
+
+    let tree = Arc::new(Tree::open(TreeConfig::memory()).unwrap());
+    // Seed 100 stable keys that the readers will hammer.
+    let stable_value = b"stable-value".to_vec();
+    for i in 0..100u32 {
+        let k = format!("stable/{i:04}").into_bytes();
+        tree.put(&k, &stable_value).unwrap();
+    }
+
+    let wrong = Arc::new(AtomicU64::new(0));
+
+    // 4 reader threads × 500 random gets on the stable keys.
+    let reader_handles: Vec<_> = (0..4u32)
+        .map(|t| {
+            let tree = tree.clone();
+            let stable_value = stable_value.clone();
+            let wrong = wrong.clone();
+            thread::spawn(move || {
+                for r in 0..500u32 {
+                    let i = (t * 500 + r * 13) % 100;
+                    let k = format!("stable/{i:04}").into_bytes();
+                    match tree.get(&k).unwrap() {
+                        Some(v) if v == stable_value => {}
+                        other => {
+                            wrong.fetch_add(1, AOrdering::Relaxed);
+                            panic!(
+                                "reader saw torn / wrong value for {k:?}: {other:?}"
+                            );
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // 1 writer thread churns 200 keys disjoint from the stable ones.
+    let writer_handle = {
+        let tree = tree.clone();
+        thread::spawn(move || {
+            for i in 0..200u32 {
+                let k = format!("churn/{i:04}").into_bytes();
+                let v = format!("v-{i}").into_bytes();
+                tree.put(&k, &v).unwrap();
+            }
+        })
+    };
+
+    for h in reader_handles {
+        h.join().unwrap();
+    }
+    writer_handle.join().unwrap();
+
+    assert_eq!(wrong.load(AOrdering::Relaxed), 0);
+    // All churn writes landed.
+    for i in 0..200u32 {
+        let k = format!("churn/{i:04}").into_bytes();
+        let v = format!("v-{i}").into_bytes();
+        assert_eq!(tree.get(&k).unwrap().as_deref(), Some(&v[..]));
+    }
+    // Stable keys unchanged.
+    for i in 0..100u32 {
+        let k = format!("stable/{i:04}").into_bytes();
+        assert_eq!(tree.get(&k).unwrap().as_deref(), Some(&stable_value[..]));
+    }
+}

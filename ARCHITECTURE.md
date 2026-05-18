@@ -267,7 +267,7 @@ the packed-image size, well below `PAGE_SIZE - SPILLOVER_RESERVATION`.
   collapse always wraps the surviving child in `Prefix([byte])` to
   preserve depth invariants. Mild space waste, compact reclaims it.
 
-## 5b. BufferManager (Stage 6 phase 1 + 2a + 2c)
+## 5b. BufferManager (Stage 6 phase 1 + 2a + 2b + 2c)
 
 `BufferManager` sits between [`Tree`] and the underlying
 [`Backend`], caching recently-accessed blobs. It **itself
@@ -298,42 +298,70 @@ durability semantic without forcing callers to checkpoint.
 A later revision (Stage 6 phase 3) will add **write-back** mode
 with dirty tracking + a background checkpointer thread.
 
-### Per-blob locking — `RwLock<AlignedBlobBuf>`
+### Per-blob locking — `HybridLatch + UnsafeCell<AlignedBlobBuf>`
 
-Each cached blob lives behind its own `RwLock<AlignedBlobBuf>`.
-On **different** blobs, ops never contend; on the **same** blob,
-N readers run in parallel (only writers take exclusive). The
-cache's shared `HashMap`/LRU lock is held only for very short
+Each cached blob lives behind a LeanStore-style `HybridLatch`
+(3-mode latch) wrapping the 512 KB buffer in `UnsafeCell`:
+
+| Mode       | Cost                | Used by                          |
+|------------|---------------------|----------------------------------|
+| Optimistic | atomic load + check | `Tree::get` walker (wait-free)   |
+| Shared    | brief CAS spin loop | `BufferManager::commit`          |
+| Exclusive  | brief CAS spin loop | `Tree::put` / `delete` / spillover |
+
+On **different** blobs, ops never contend. On the **same** blob:
+- N optimistic readers don't block writers (each takes a version
+  snapshot + revalidates after the walk; on a torn read the
+  walker restarts from the root).
+- N shared readers run in parallel; writers wait.
+- A single writer runs alone and bumps the version on release so
+  in-flight optimistic readers detect the change.
+
+The cache's `HashMap`/LRU mutex is held only for very short
 windows (insertions, eviction, LRU touches).
 
-Full optimistic concurrency (read-only descent under a version
-snapshot that's validated post-hoc) wires `HybridLatch` over the
-RwLock in Stage 6 phase 2b.
-
-### Pin-and-operate (Stage 6 phase 2a + 2c)
+### Pin-and-operate (Stage 6 phase 2a + 2b + 2c)
 
 Every blob operated on by the walker — root **and** every
-cross-blob hop, for **both reads and writes** — is pinned in the
-BM via `BufferManager::pin(guid)`. The returned `Arc<CachedBlob>`
-keeps the entry alive (its `strong_count >= 2` skips LRU
-eviction); the walker borrows into the underlying buffer:
+cross-blob hop, for both reads and writes — is pinned in the BM
+via `BufferManager::pin(guid)`. The returned `Arc<CachedBlob>`
+keeps the entry alive (`strong_count >= 2` skips LRU eviction);
+the walker borrows into the underlying buffer via a typed guard:
 
-| Operation | Guard | Wrap as            |
-|-----------|-------|--------------------|
-| Read      | `read()` → `RwLockReadGuard` | `BlobFrameRef::wrap(&[u8])` |
-| Write     | `write()` → `RwLockWriteGuard` | `BlobFrame::wrap(&mut [u8])` |
+| Operation                    | Guard               | Wrap as                       |
+|------------------------------|---------------------|-------------------------------|
+| Wait-free read (Tree::get)   | `read_optimistic()` → `OptimisticGuard` | `BlobFrameRef::wrap(g.as_slice())`, then `g.validate()` |
+| Shared read (commit)         | `read()` → `BlobReadGuard` | derefs to `&AlignedBlobBuf`     |
+| Exclusive write              | `write()` → `BlobWriteGuard` | derefs to `&mut AlignedBlobBuf` |
 
-After a write the walker calls `BufferManager::commit(guid)` to
-durably write the cached buffer through to the inner backend. No
-second 512 KB memcpy: `commit` takes a shared read-guard on the
-pinned cache entry and writes its bytes directly.
+After an exclusive write the walker calls
+`BufferManager::commit(guid)` to durably write the cached buffer
+through to the inner backend. No second 512 KB memcpy: `commit`
+takes a shared read-guard on the pinned cache entry and writes
+its bytes directly.
 
-This means `Tree` no longer keeps its own `state.root_buf` — the
-canonical in-memory image of the root blob lives in the BM cache,
-and both readers and writers reach it the same way. The Tree's
-only remaining synchronisation primitive is a `Mutex<()>`
-`write_lock` that serialises mutators against each other; readers
-never take it.
+### Optimistic-read restart loop
+
+`Tree::get` (via `engine::lookup_multi`) walks each blob under an
+`OptimisticGuard` and validates AFTER consuming any borrowed
+data. If `validate()` returns false (an exclusive writer lapped
+the snapshot mid-walk), the lookup restarts from the root — the
+parent BlobNode that pointed at the just-torn child may also
+have moved, so the only safe re-entry point is the tree root.
+
+### No Tree-wide writer mutex
+
+`Tree::put` / `Tree::delete` no longer take any Tree-wide lock.
+Per-blob `HybridLatch` exclusive on the root serialises
+concurrent mutators (every write hits root); two writes on
+disjoint child subtrees can proceed in parallel after their root
+windows finish. `Tree::rename` keeps a `Mutex<()>` `rename_lock`
+because its `lookup_probe + erase + insert` sequence must appear
+atomic to other renames.
+
+`Tree` no longer keeps its own `state.root_buf` — the canonical
+in-memory image of the root blob lives in the BM cache, and both
+readers and writers reach it the same way.
 
 ### LRU eviction
 

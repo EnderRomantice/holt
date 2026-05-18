@@ -52,21 +52,21 @@ pub fn erase_multi(
     key: &[u8],
 ) -> Result<EraseOutcome> {
     let root_pin = bm.pin(root_guid)?;
+    // One continuous exclusive critical section — see
+    // `insert_multi` for why per-phase guard drops would race.
+    let mut guard = root_pin.write();
 
     let r = {
-        let mut guard = root_pin.write();
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
         let root_slot = frame.header().root_slot;
         erase_at(Some(bm), &mut frame, root_slot, key, 0)?
     };
     let new_root = {
-        let mut guard = root_pin.write();
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
         let root_slot = frame.header().root_slot;
         resolve_new_root_after_erase(&mut frame, root_slot, &r.signal)?
     };
     {
-        let mut guard = root_pin.write();
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
         frame.header_mut().root_slot = new_root;
     }

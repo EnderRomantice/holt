@@ -72,6 +72,14 @@ pub fn insert_multi(
     }
 
     let root_pin = bm.pin(root_guid)?;
+    // Hold the exclusive guard for the **entire** insert. Every
+    // observable mutation (walker descent, header.root_slot bump,
+    // spillover, compact) happens inside one continuous critical
+    // section — releasing between phases would let another writer
+    // observe an inconsistent intermediate state (e.g. freed
+    // EmptyRoot slot before header is bumped) and lose updates to
+    // the racy header rewrite.
+    let mut guard = root_pin.write();
 
     // Retry loop. On every `OutOfSpace`, run **spillover + compact
     // back-to-back**:
@@ -89,7 +97,6 @@ pub fn insert_multi(
     // `insert_at_blob_node`.
     for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
         let r = {
-            let mut guard = root_pin.write();
             let mut frame = BlobFrame::wrap(guard.as_mut_slice());
             let root_slot = frame.header().root_slot;
             insert_at(Some(bm), &mut frame, root_slot, key, value, 0, seq)
@@ -97,7 +104,6 @@ pub fn insert_multi(
         match r {
             Ok(out) => {
                 {
-                    let mut guard = root_pin.write();
                     let mut frame = BlobFrame::wrap(guard.as_mut_slice());
                     frame.header_mut().root_slot = out.slot_after;
                 }
@@ -108,14 +114,10 @@ pub fn insert_multi(
             }
             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
                 {
-                    let mut guard = root_pin.write();
                     let mut frame = BlobFrame::wrap(guard.as_mut_slice());
                     spillover_blob(bm, &mut frame)?;
                 }
-                {
-                    let mut guard = root_pin.write();
-                    compact_blob(&mut guard)?;
-                }
+                compact_blob(&mut guard)?;
             }
             Err(other) => return Err(other),
         }

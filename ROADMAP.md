@@ -99,27 +99,27 @@ Required for the v0.1 tag:
 
 ### Concurrency
 
-- [x] `HybridLatch` 3-mode primitive (used standalone in tests)
+- [x] `HybridLatch` 3-mode primitive (LeanStore-style: optimistic
+      / shared / exclusive)
 - [x] `BufferManager` — LRU-bounded cache wrapping any Backend.
-      Implements Backend itself (transparent drop-in). Per-blob
-      `RwLock<AlignedBlobBuf>` so concurrent ops on different
-      blobs progress in parallel, and N readers can share a single
-      blob's buffer with zero coordination.
+      Implements Backend itself (transparent drop-in).
 - [x] `BlobFrameRef<'a>` + `BufferManager::pin(guid)` —
       pin-and-operate read path. `Tree::get` walks each blob via
-      a shared read-guard with **no 512 KB memcpy per hop**; the
-      walker's lookup arms borrow into the pinned buffer (Stage 6
-      phase 2a).
+      a shared read-guard with **no 512 KB memcpy per hop**
+      (Stage 6 phase 2a).
 - [x] Walker insert/erase use `pin` + `BufferManager::commit`
       throughout — `Tree::state.root_buf` removed, root + every
       cross-blob hop operate in place against the BM-owned buffer
-      under exclusive `RwLock` write guards. Writers serialise
-      through a single `Mutex<()>` until per-blob HybridLatch
-      ships (Stage 6 phase 2c).
-- [ ] Wire HybridLatch into the walker — `pin_optimistic` returns
-      a version snapshot the walker validates after each hop;
-      escalates to shared (or restarts) on a torn read. Removes
-      the single writer mutex. Stage 6 phase 2b.
+      (Stage 6 phase 2c).
+- [x] **`HybridLatch` wired into `CachedBlob`** —
+      `RwLock<AlignedBlobBuf>` replaced by `HybridLatch +
+      UnsafeCell<AlignedBlobBuf>`. Three guards exposed:
+      `read_optimistic()` (wait-free snapshot+validate),
+      `read()` (shared), `write()` (exclusive).
+      `Tree::get`'s walker runs in optimistic mode and restarts
+      from the root on a torn read; `put` / `delete` never take
+      a Tree-wide mutex (per-blob exclusive on the root
+      serialises them) — Stage 6 phase 2b.
 - [ ] Cross-blob lock-coupling (`BlobNode` descent acquires the
       target blob's latch)
 - [x] MVCC seq counter bumped on writes (carried in Leaf body;
