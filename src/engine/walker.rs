@@ -204,7 +204,9 @@ pub fn insert_multi(
 /// a balanced split heuristic — both queued.
 const MAX_SPILLOVER_ATTEMPTS: u32 = 64;
 
-/// Erase `key` from the tree rooted at `root_slot`.
+/// Single-blob erase. Surfaces [`Error::NotYetImplemented`] if the
+/// descent reaches a [`NodeType::Blob`] crossing — Stage 2d
+/// callers wanting cross-blob erase should use [`erase_multi`].
 ///
 /// Returns the new root slot (caller updates `header.root_slot`)
 /// and the prior value if the key was present. If `key` was not in
@@ -214,22 +216,114 @@ pub fn erase(
     root_slot: u16,
     key: &[u8],
 ) -> Result<EraseOutcome> {
-    let r = erase_at(frame, root_slot, key, 0)?;
-    let new_root = match r.signal {
-        EraseSignal::Unchanged => root_slot,
-        EraseSignal::Replaced(s) => s,
+    let r = erase_at(None, frame, root_slot, key, 0)?;
+    let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
+    Ok(EraseOutcome {
+        new_root_slot: new_root,
+        previous: r.previous,
+    })
+}
+
+/// Multi-blob erase. Walks across [`NodeType::Blob`] crossings via
+/// `backend`, recursively running [`erase_at`] in each child
+/// blob's frame. When a child blob becomes empty as a result
+/// (signal = `SubtreeGone`) the parent's `BlobNode` is freed and
+/// the orphaned child blob is removed from the backend in the
+/// same step — no GC pass needed.
+///
+/// Inputs:
+/// - `backend`: where to load / write / delete child blobs.
+/// - `root_guid` + `root_buf`: the root blob's GUID and its
+///   in-memory image. `root_buf` is mutated in place; on return,
+///   `root_buf.header.root_slot` reflects the new entry slot. The
+///   caller writes `root_buf` back to the backend (typically
+///   `Tree::delete` does so via `flush_on_write`).
+pub fn erase_multi(
+    backend: &dyn Backend,
+    root_guid: BlobGuid,
+    root_buf: &mut AlignedBlobBuf,
+    key: &[u8],
+) -> Result<EraseOutcome> {
+    let _ = root_guid;
+    let r = {
+        let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+        let root_slot = frame.header().root_slot;
+        erase_at(Some(backend), &mut frame, root_slot, key, 0)?
+    };
+    let new_root = {
+        let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+        let root_slot = frame.header().root_slot;
+        resolve_new_root_after_erase(&mut frame, root_slot, &r.signal)?
+    };
+    let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+    frame.header_mut().root_slot = new_root;
+    Ok(EraseOutcome {
+        new_root_slot: new_root,
+        previous: r.previous,
+    })
+}
+
+fn resolve_new_root_after_erase(
+    frame: &mut BlobFrame<'_>,
+    root_slot: u16,
+    signal: &EraseSignal,
+) -> Result<u16> {
+    match signal {
+        EraseSignal::Unchanged => Ok(root_slot),
+        EraseSignal::Replaced(s) => Ok(*s),
         EraseSignal::SubtreeGone => {
             // The whole tree is empty — re-seed the EmptyRoot
             // sentinel so subsequent lookups return NotFound and
             // subsequent inserts replace the sentinel cleanly.
             let out = frame.alloc_node(NodeType::EmptyRoot)?;
-            out.slot
+            Ok(out.slot)
+        }
+    }
+}
+
+/// Multi-blob lookup. Same shape as [`insert_multi`] / [`erase_multi`]:
+/// caller passes the root blob's GUID + buffer + the backend, and
+/// the walker handles all cross-blob descent internally.
+///
+/// Returns the value bytes on a match, or `None` if no leaf
+/// matches `key` anywhere in the multi-blob tree.
+///
+/// Used by `Tree::get` (single-call lookup) and `Tree::rename`
+/// (which probes the source key before mutating).
+pub fn lookup_multi(
+    backend: &dyn Backend,
+    root_buf: &mut AlignedBlobBuf,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    // First-hop descent in the cached root buffer.
+    let crossing = {
+        let frame = BlobFrame::wrap(root_buf.as_mut_slice());
+        let root_slot = frame.header().root_slot;
+        match lookup_at(&frame, root_slot, key, 0)? {
+            LookupResult::Found(v) => return Ok(Some(v.to_vec())),
+            LookupResult::NotFound => return Ok(None),
+            LookupResult::Crossing(c) => c,
         }
     };
-    Ok(EraseOutcome {
-        new_root_slot: new_root,
-        previous: r.previous,
-    })
+
+    // Cross-blob loop — load each child blob from the backend.
+    let mut current_guid = crossing.child_guid;
+    let mut start_slot = crossing.child_slot;
+    let mut depth = crossing.child_depth;
+    loop {
+        let mut buf = AlignedBlobBuf::zeroed();
+        backend.read_blob(current_guid, &mut buf)?;
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        match lookup_at(&frame, start_slot, key, depth)? {
+            LookupResult::Found(v) => return Ok(Some(v.to_vec())),
+            LookupResult::NotFound => return Ok(None),
+            LookupResult::Crossing(c) => {
+                current_guid = c.child_guid;
+                start_slot = c.child_slot;
+                depth = c.child_depth;
+            }
+        }
+    }
 }
 
 // ---------- internal types ----------
@@ -1180,6 +1274,7 @@ struct EraseReturn {
 }
 
 fn erase_at(
+    backend: Option<&dyn Backend>,
     frame: &mut BlobFrame<'_>,
     slot: u16,
     key: &[u8],
@@ -1195,13 +1290,16 @@ fn erase_at(
             previous: None,
         }),
         NodeType::Leaf => erase_at_leaf(frame, slot, key),
-        NodeType::Prefix => erase_at_prefix(frame, slot, key, depth),
+        NodeType::Prefix => erase_at_prefix(backend, frame, slot, key, depth),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner(frame, slot, ntype, key, depth)
+            erase_at_inner(backend, frame, slot, ntype, key, depth)
         }
-        NodeType::Blob => Err(Error::NotYetImplemented(
-            "walker::erase_at: BlobNode crossing — Stage 2d",
-        )),
+        NodeType::Blob => match backend {
+            Some(b) => erase_at_blob_node(b, frame, slot, key, depth),
+            None => Err(Error::NotYetImplemented(
+                "walker::erase_at: BlobNode crossing requires Backend — use erase_multi",
+            )),
+        },
     }
 }
 
@@ -1225,6 +1323,7 @@ fn erase_at_leaf(
 }
 
 fn erase_at_prefix(
+    backend: Option<&dyn Backend>,
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
     key: &[u8],
@@ -1242,7 +1341,7 @@ fn erase_at_prefix(
         });
     }
 
-    let r = erase_at(frame, child_slot, key, depth + plen)?;
+    let r = erase_at(backend, frame, child_slot, key, depth + plen)?;
     match r.signal {
         EraseSignal::Unchanged => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
@@ -1271,6 +1370,7 @@ fn erase_at_prefix(
 }
 
 fn erase_at_inner(
+    backend: Option<&dyn Backend>,
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
     ntype: NodeType,
@@ -1294,7 +1394,7 @@ fn erase_at_inner(
         }
     };
 
-    let r = erase_at(frame, child, key, depth + 1)?;
+    let r = erase_at(backend, frame, child, key, depth + 1)?;
     match r.signal {
         EraseSignal::Unchanged => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
@@ -1614,6 +1714,110 @@ fn insert_at_blob_node(
         slot_after: bn_slot,
         previous: child_result.previous,
     })
+}
+
+// ---------- multi-blob erase (Stage 2d phase C) ----------
+
+/// Erase across a [`NodeType::Blob`] crossing.
+///
+/// Reads the BlobNode body, validates the inline prefix against
+/// `key[depth..]`, then loads the child blob via `backend` and
+/// recursively runs [`erase_at`] inside the child frame. Maps the
+/// child's [`EraseSignal`] back to the parent:
+///
+/// - `Unchanged`: write the child blob back (it may still have
+///   been mutated even though the erase target didn't affect the
+///   entry slot) and return `Unchanged` upward.
+/// - `Replaced(new_entry)`: the child's entry slot changed (e.g.,
+///   collapse-to-lone-child). Update the child blob's
+///   `header.root_slot`, patch the parent's `BlobNode.child_entry_ptr`,
+///   write the child back, return `Unchanged` upward (the parent's
+///   slot still hosts the same BlobNode).
+/// - `SubtreeGone`: the child blob is now empty. Free the parent's
+///   BlobNode slot, delete the orphaned child blob from the
+///   backend, and propagate `SubtreeGone` upward so the
+///   grandparent collapses too.
+fn erase_at_blob_node(
+    backend: &dyn Backend,
+    parent_frame: &mut BlobFrame<'_>,
+    bn_slot: u16,
+    key: &[u8],
+    depth: usize,
+) -> Result<EraseReturn> {
+    let bn = {
+        let body = parent_frame
+            .body_of_slot(bn_slot)
+            .ok_or(Error::NodeCorrupt {
+                context: "erase_at_blob_node: body resolution failed",
+            })?;
+        *cast::<BlobNode>(body)
+    };
+    let plen = bn.prefix_len as usize;
+    if plen > BLOB_MAX_INLINE {
+        return Err(Error::NodeCorrupt {
+            context: "erase_at_blob_node: prefix_len exceeds inline buffer",
+        });
+    }
+
+    // BlobNode prefix doesn't match the search key → key is not in
+    // this subtree. Erase is a no-op.
+    if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
+        return Ok(EraseReturn {
+            signal: EraseSignal::Unchanged,
+            previous: None,
+        });
+    }
+
+    let child_guid = bn.child_blob_guid;
+    let child_entry = bn.child_entry_ptr as u16;
+    let child_depth = depth + plen;
+
+    // Load child blob.
+    let mut child_buf = AlignedBlobBuf::zeroed();
+    backend.read_blob(child_guid, &mut child_buf)?;
+
+    // Recurse into the child frame.
+    let r = {
+        let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
+        erase_at(Some(backend), &mut cf, child_entry, key, child_depth)?
+    };
+
+    match r.signal {
+        EraseSignal::Unchanged => {
+            // Child may have been touched even if the entry slot
+            // didn't change — write back unconditionally.
+            backend.write_blob(child_guid, &child_buf)?;
+            Ok(EraseReturn {
+                signal: EraseSignal::Unchanged,
+                previous: r.previous,
+            })
+        }
+        EraseSignal::Replaced(new_entry) => {
+            // Child collapsed to a new entry slot.
+            {
+                let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
+                cf.header_mut().root_slot = new_entry;
+            }
+            let mut new_bn = bn;
+            new_bn.child_entry_ptr = u32::from(new_entry);
+            write_struct_to_slot(parent_frame, bn_slot, &new_bn)?;
+            backend.write_blob(child_guid, &child_buf)?;
+            Ok(EraseReturn {
+                signal: EraseSignal::Unchanged,
+                previous: r.previous,
+            })
+        }
+        EraseSignal::SubtreeGone => {
+            // Child blob is empty. Drop the parent's BlobNode slot
+            // and reclaim the orphaned child blob from the backend.
+            parent_frame.free_node(bn_slot)?;
+            backend.delete_blob(child_guid)?;
+            Ok(EraseReturn {
+                signal: EraseSignal::SubtreeGone,
+                previous: r.previous,
+            })
+        }
+    }
 }
 
 // ---------- spillover primitives ----------

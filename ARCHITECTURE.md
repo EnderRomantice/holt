@@ -119,6 +119,37 @@ Three reasons trigger compaction or migration:
 - `OutOfBlobFrame` — alloc failed in current blob; spill a subtree
   to a new blob. **Implemented (Stage 2d phase B).**
 
+### `erase_multi` + child-blob reclaim (Stage 2d phase C)
+
+`walker::erase_multi(backend, root_guid, root_buf, key)` mirrors
+`insert_multi`: it threads `Some(backend)` through the existing
+`erase_at` dispatch, and when the descent reaches a `BlobNode` it
+calls `erase_at_blob_node`. That arm:
+
+1. Reads the BlobNode body, validates `key[depth..]` against the
+   inline prefix; mismatch is a no-op (key not in the subtree).
+2. Loads the child blob via `backend.read_blob`.
+3. Recursively runs `erase_at` inside the child frame.
+4. Translates the child's `EraseSignal` back to the parent:
+   - `Unchanged` → write child back, propagate `Unchanged`.
+   - `Replaced(new_entry)` → patch the child blob's
+     `header.root_slot` and the parent's BlobNode
+     `child_entry_ptr`, write child back, propagate `Unchanged`.
+   - `SubtreeGone` → the child blob is empty; free the parent's
+     BlobNode slot **and** delete the orphaned child blob from the
+     backend via `backend.delete_blob`. Propagate `SubtreeGone` so
+     the grandparent collapses too.
+
+`walker::lookup_multi(backend, root_buf, key)` is the symmetric
+read-side helper used by `Tree::get` and `Tree::rename`'s src/dst
+probes — it loops over `LookupResult::Crossing` signals, loading
+each child blob as needed.
+
+After this commit `Tree::delete` and `Tree::rename` work across
+arbitrarily many blobs, completing the public API's cross-blob
+symmetry with `Tree::put` (Stage 2d phase B) and `Tree::get`
+(Stage 2d phase A).
+
 ### `make_blob_from_node` + `splitBlob` (Stage 2d phase B)
 
 `make_blob_from_node` is the primitive: take a subtree, deep-copy

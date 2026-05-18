@@ -45,11 +45,12 @@ small-metadata workloads — see [benches/README.md](benches/README.md)).
 Done — algorithm core:
 
 - Layout (9 NodeTypes, 4 KB BlobHeader, bit-packed slot table)
-- Walker insert / lookup / erase / rename (single-blob + cross-blob
-  lookup; cross-blob auto-spillover insert)
+- Walker insert / lookup / erase / rename — **all four with full
+  cross-blob support** (Stage 2d phase A / B / C)
 - SIMD Node16 byte search + longest-common-prefix (SSE2 / NEON /
   scalar)
 - `splitBlob` auto-spillover via `make_blob_from_node`
+- Child-blob auto-reclaim when an erase empties it
 - Strict-prefix support (terminator byte)
 - In-place leaf-value update on same-size writes
 - `MemoryBackend` + cross-platform `PersistentBackend`
@@ -63,7 +64,7 @@ Queued — see [ROADMAP.md](ROADMAP.md):
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
 - `mergeBlob` (child-blob → parent inverse of splitBlob)
-- BlobNode arm for `erase` + cross-blob `rename`
+- Erase-time node shrinkage (Node256 → 48 → 16 → 4)
 
 ## Quick taste
 

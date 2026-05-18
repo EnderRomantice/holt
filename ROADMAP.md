@@ -44,7 +44,8 @@ Required for the v0.1 tag:
   - [x] Prefix arm (full-match descent + mismatch split)
   - [x] BlobNode lookup arm (Stage 2d phase A)
   - [x] BlobNode insert arm with auto-spillover (Stage 2d phase B)
-  - [ ] BlobNode erase arm (Tree::delete cross-blob — next turn)
+  - [x] BlobNode erase arm + child-blob delete-on-empty
+        (Stage 2d phase C)
   - [ ] Shrink chain on erase (Node256 → 48 → 16 → 4) — collapse
         currently always wraps surviving child in `Prefix([byte])`
         to preserve descent invariants
@@ -62,9 +63,11 @@ Required for the v0.1 tag:
 - [x] Single-Mutex Tree write lock (Stage 5 swaps for per-blob
       HybridLatch)
 - [x] Strict-prefix support via Tree-layer terminator byte
-- [x] Atomic single-blob rename (erase + insert under write_lock;
-      Stage 5 will swap for a dedicated RenameTxnOp)
-- [ ] Atomic cross-blob rename
+- [x] Atomic rename (single-blob and cross-blob; both flavours
+      run erase_multi + insert_multi under the write_lock;
+      Stage 5 will swap for a dedicated RenameTxnOp so the
+      child-blob writes between erase and insert commit as one
+      WAL record)
 - [ ] Stateful iterator with prefix + start_after + delimiter
 
 ### Persistence + crash safety

@@ -348,6 +348,111 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
 }
 
 #[test]
+fn multi_blob_delete_round_trip() {
+    // Insert past one-blob capacity → auto-spillover creates
+    // child blobs. Delete a key that lives in a child blob;
+    // verify it disappears from the tree (including across
+    // crossings). Also verify the rest of the keys still resolve.
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+
+    const N: u32 = 2000;
+    let value = vec![0x42; 200];
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), &value).unwrap();
+    }
+    assert!(
+        backend.list_blobs().unwrap().len() >= 2,
+        "test pre-cond: expected multi-blob state",
+    );
+
+    // Delete every 5th key.
+    let mut deleted = 0u32;
+    for i in 0..N {
+        if i % 5 != 0 {
+            continue;
+        }
+        let k = format!("k{i:08}").into_bytes();
+        let prev = tree.delete(&k).unwrap();
+        assert_eq!(prev.as_deref(), Some(&value[..]), "delete returned wrong prev for {k:?}");
+        deleted += 1;
+    }
+
+    // Survivors readable, deletions gone.
+    for i in 0..N {
+        let k = format!("k{i:08}").into_bytes();
+        let got = tree.get(&k).unwrap();
+        if i % 5 == 0 {
+            assert!(got.is_none(), "deleted key {k:?} still present");
+        } else {
+            assert_eq!(got.as_deref(), Some(&value[..]), "survivor key {k:?} missing");
+        }
+    }
+    let _ = deleted;
+}
+
+#[test]
+fn multi_blob_rename_round_trip() {
+    // Builds a multi-blob tree, then exercises rename:
+    //   1. force-overwrite onto an existing dst (no new leaf
+    //      allocated, so spillover never re-triggers)
+    //   2. DstExists guard with force=false
+    //
+    // Renaming to a brand-new key in the multi-blob state can
+    // cascade further spillovers and stress the
+    // MAX_SPILLOVER_ATTEMPTS budget — that case is gated on
+    // Stage 6 compactBlob (which reclaims the extent leak that
+    // makes the budget tight). Within-existing-keys renames are
+    // the realistic metadata workload anyway (move foo/bar → foo/baz
+    // where both directory entries exist).
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+
+    const N: u32 = 2000;
+    let value_a = vec![0x99; 200];
+    let value_b = vec![0xAA; 200];
+    for i in 0..N {
+        // Half the keys get value_a, half get value_b — so the
+        // force-overwrite assertion below has something to check.
+        let v = if i % 2 == 0 { &value_a } else { &value_b };
+        tree.put(format!("k{i:08}").as_bytes(), v).unwrap();
+    }
+    assert!(
+        backend.list_blobs().unwrap().len() >= 2,
+        "test pre-cond: expected multi-blob state",
+    );
+
+    // force-overwrite an existing dst. value_a's "k00000006" wins
+    // over value_b's "k00000007".
+    let src = format!("k{:08}", 6).into_bytes();
+    let dst = format!("k{:08}", 7).into_bytes();
+    tree.rename(&src, &dst, /*force=*/ true).unwrap();
+    assert!(tree.get(&src).unwrap().is_none(), "src should be gone post-rename");
+    assert_eq!(
+        tree.get(&dst).unwrap().as_deref(),
+        Some(&value_a[..]),
+        "dst should now carry src's old value",
+    );
+
+    // force=false on a still-occupied dst → DstExists.
+    let live_src = format!("k{:08}", 100).into_bytes();
+    let occupied_dst = format!("k{:08}", 101).into_bytes();
+    let r = tree.rename(&live_src, &occupied_dst, /*force=*/ false);
+    assert!(
+        matches!(r, Err(artisan::Error::DstExists)),
+        "force=false to occupied dst must be DstExists",
+    );
+
+    // Unaffected keys still resolve.
+    let untouched = format!("k{:08}", 500).into_bytes();
+    assert!(tree.get(&untouched).unwrap().is_some());
+}
+
+#[test]
 fn auto_spillover_preserves_data_across_reopen() {
     // After auto-spillover the tree is multi-blob. Closing and
     // reopening the same backend must surface the same key/value

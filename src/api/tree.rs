@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
-use crate::engine::{self, LookupResult};
+use crate::engine;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
 use crate::store::BlobFrame;
@@ -157,40 +157,11 @@ impl Tree {
     /// span multiple blobs when the tree has been split by Stage 2d
     /// spillover. The root blob descent happens against the
     /// in-memory cache (no backend hit); subsequent crossings load
-    /// child blobs from the backend.
+    /// child blobs from the backend via [`engine::lookup_multi`].
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-
-        // 1) First-hop descent in the cached root blob.
-        let crossing = {
-            let mut state = self.state.lock().unwrap();
-            let frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
-            let root_slot = frame.header().root_slot;
-            match engine::lookup_at(&frame, root_slot, &padded, 0)? {
-                LookupResult::Found(v) => return Ok(Some(v.to_vec())),
-                LookupResult::NotFound => return Ok(None),
-                LookupResult::Crossing(c) => c,
-            }
-        };
-
-        // 2) Cross-blob loop — read each child blob from the backend.
-        let mut current_guid = crossing.child_guid;
-        let mut start_slot = crossing.child_slot;
-        let mut depth = crossing.child_depth;
-        loop {
-            let mut buf = AlignedBlobBuf::zeroed();
-            self.backend.read_blob(current_guid, &mut buf)?;
-            let frame = BlobFrame::wrap(buf.as_mut_slice());
-            match engine::lookup_at(&frame, start_slot, &padded, depth)? {
-                LookupResult::Found(v) => return Ok(Some(v.to_vec())),
-                LookupResult::NotFound => return Ok(None),
-                LookupResult::Crossing(c) => {
-                    current_guid = c.child_guid;
-                    start_slot = c.child_slot;
-                    depth = c.child_depth;
-                }
-            }
-        }
+        let mut state = self.state.lock().unwrap();
+        engine::lookup_multi(&*self.backend, &mut state.root_buf, &padded)
     }
 
     /// Insert or replace `(key, value)`. Returns the previous value
@@ -231,17 +202,22 @@ impl Tree {
 
     /// Remove `key`. Returns the value that was stored at `key`, or
     /// `None` if no leaf matched.
+    ///
+    /// Walks across [`BlobNode`] crossings (Stage 2d phase C). When
+    /// a child blob becomes empty as a result of the erase, its
+    /// parent's BlobNode is freed and the orphaned child blob is
+    /// deleted from the backend — no GC pass needed.
+    ///
+    /// [`BlobNode`]: crate::layout::BlobNode
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-
         let mut state = self.state.lock().unwrap();
-        let outcome;
-        {
-            let mut frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
-            let root_slot = frame.header().root_slot;
-            outcome = engine::walker::erase(&mut frame, root_slot, &padded)?;
-            frame.header_mut().root_slot = outcome.new_root_slot;
-        }
+        let outcome = engine::erase_multi(
+            &*self.backend,
+            self.root_guid,
+            &mut state.root_buf,
+            &padded,
+        )?;
         if self.cfg.flush_on_write {
             self.backend.write_blob(self.root_guid, &state.root_buf)?;
         }
@@ -255,60 +231,58 @@ impl Tree {
     ///   **and** `force` is `false`.
     /// - When `force` is `true`, any existing leaf at `dst` is
     ///   overwritten.
+    ///
+    /// Cross-blob rename is supported (Stage 2d phase C): probes
+    /// use [`engine::lookup_multi`], the erase + insert steps use
+    /// [`engine::erase_multi`] / [`engine::insert_multi`]. Atomic
+    /// with respect to other writers (the internal write lock is
+    /// held for the whole sequence). Stage 5 (WAL) will swap for a
+    /// dedicated `RenameTxnOp` so the child-blob writes between
+    /// erase and insert commit as one journal record.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
 
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let mut state = self.state.lock().unwrap();
-        {
-            let mut frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
-            let root_slot = frame.header().root_slot;
 
-            // Stage 2d phase A: cross-blob rename surfaces
-            // NotYetImplemented (insert + erase don't yet follow
-            // BlobNode crossings — that's phase B). Single-blob
-            // renames work the same as before.
-            let value: Vec<u8> = match engine::lookup(&frame, root_slot, &src_padded)? {
-                LookupResult::Found(v) => v.to_vec(),
-                LookupResult::NotFound => return Err(Error::NotFound),
-                LookupResult::Crossing(_) => {
-                    return Err(Error::NotYetImplemented(
-                        "Tree::rename across BlobNode — Stage 2d phase B",
-                    ));
-                }
-            };
+        // Probe src across all blobs.
+        let value = match engine::lookup_multi(&*self.backend, &mut state.root_buf, &src_padded)? {
+            Some(v) => v,
+            None => return Err(Error::NotFound),
+        };
 
-            // Same key? Treat as a no-op.
-            if src == dst {
-                return Ok(());
-            }
-
-            if !force {
-                let dst_exists = match engine::lookup(&frame, root_slot, &dst_padded)? {
-                    LookupResult::Found(_) => true,
-                    LookupResult::NotFound => false,
-                    LookupResult::Crossing(_) => {
-                        return Err(Error::NotYetImplemented(
-                            "Tree::rename dst probe across BlobNode — Stage 2d phase B",
-                        ));
-                    }
-                };
-                if dst_exists {
-                    return Err(Error::DstExists);
-                }
-            }
-
-            // erase(src)
-            let erase_out = engine::walker::erase(&mut frame, root_slot, &src_padded)?;
-            frame.header_mut().root_slot = erase_out.new_root_slot;
-
-            // insert(dst, value)
-            let new_root = frame.header().root_slot;
-            let insert_out =
-                engine::walker::insert(&mut frame, new_root, &dst_padded, &value, seq)?;
-            frame.header_mut().root_slot = insert_out.new_root_slot;
+        // Same key? No-op (seq is already bumped).
+        if src == dst {
+            return Ok(());
         }
+
+        // Probe dst across all blobs unless overwrite is allowed.
+        if !force
+            && engine::lookup_multi(&*self.backend, &mut state.root_buf, &dst_padded)?
+                .is_some()
+        {
+            return Err(Error::DstExists);
+        }
+
+        // erase(src) + insert(dst, value). Both are multi-blob:
+        // they walk through BlobNodes and write any touched child
+        // blobs back through the backend within this call.
+        engine::erase_multi(
+            &*self.backend,
+            self.root_guid,
+            &mut state.root_buf,
+            &src_padded,
+        )?;
+        engine::insert_multi(
+            &*self.backend,
+            self.root_guid,
+            &mut state.root_buf,
+            &dst_padded,
+            &value,
+            seq,
+        )?;
+
         if self.cfg.flush_on_write {
             self.backend.write_blob(self.root_guid, &state.root_buf)?;
         }
