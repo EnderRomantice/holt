@@ -1,0 +1,9 @@
+target/
+Cargo.lock
+*.profraw
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
+*~

@@ -1,0 +1,439 @@
+//! `BlobFrame` — typed view over one 512 KB blob.
+//!
+//! Provides:
+//!   - `init`: format a fresh buffer (writes header, seeds the
+//!     empty_root sentinel at slot 1)
+//!   - `alloc_node(ntype)`: try free-list first, else bump
+//!   - `free_node(slot)`: push onto per-NodeType LIFO
+//!   - `alloc_extent(size)`: raw bump for Leaf key/value bytes
+//!   - `body_of_slot(slot)`: resolve a slot to its body slice
+//!
+//! All operations enforce the on-disk invariants: 8-byte body
+//! alignment, MAX_SLOTS cap, and slot-entry bit-packing.
+
+use crate::layout::{
+    size_of_node, BlobGuid, BlobHeader, NodeType, SlotEntry, SlotEntryRaw,
+    DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
+};
+
+/// Errors from `alloc_node` / `alloc_extent`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllocError {
+    /// `num_slots` reached `MAX_SLOTS` — no more slot indices.
+    OutOfSlots,
+    /// Data area can't fit the requested size.
+    OutOfSpace {
+        /// Bytes the caller requested (8-byte aligned for extents).
+        need: u32,
+        /// Bytes actually free in the data area.
+        avail: u32,
+    },
+    /// `alloc_node(NodeType::Invalid)` or `alloc_extent(0)`.
+    InvalidRequest,
+}
+
+impl std::fmt::Display for AllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfSlots => write!(f, "blob slot table exhausted ({} slots)", MAX_SLOTS),
+            Self::OutOfSpace { need, avail } => {
+                write!(f, "blob data area exhausted (need {need} bytes, {avail} available)")
+            }
+            Self::InvalidRequest => write!(f, "invalid allocation request"),
+        }
+    }
+}
+impl std::error::Error for AllocError {}
+
+/// Errors from `free_node`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FreeError {
+    /// Slot index 0 or > `num_slots`.
+    InvalidSlot(u16),
+    /// Slot entry's tag doesn't decode to a valid NodeType.
+    TypeMismatch {
+        /// Which slot was attempted.
+        slot: u16,
+        /// The 15-bit tag we found instead of a NodeType.
+        tag: u16,
+    },
+}
+
+impl std::fmt::Display for FreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSlot(s) => write!(f, "free_node: invalid slot index {s}"),
+            Self::TypeMismatch { slot, tag } => {
+                write!(f, "free_node: slot {slot} has invalid type tag {tag}")
+            }
+        }
+    }
+}
+impl std::error::Error for FreeError {}
+
+/// Outcome of a node alloc — slot index + a *mutable view* of the
+/// body bytes via offset (callers write directly into the frame
+/// buffer using `body_of_slot_mut`).
+#[derive(Debug, Clone, Copy)]
+pub struct AllocOutcome {
+    /// 1-based slot index of the allocated body.
+    pub slot: u16,
+    /// Byte offset of the body within the blob buffer.
+    pub byte_offset: u32,
+    /// Body size in bytes.
+    pub size: u32,
+}
+
+/// Outcome of a raw-extent alloc (for Leaf key/value bytes).
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentAllocOutcome {
+    /// Byte offset of the extent within the blob.
+    pub byte_offset: u32,
+    /// Aligned size (always a multiple of 8).
+    pub aligned_size: u32,
+}
+
+/// Typed view over a 524288-byte buffer formatted as a BlobFrame.
+///
+/// `BlobFrame` does not own the buffer; the caller (BufferManager
+/// or a test) provides `&mut [u8]` of length `PAGE_SIZE`.
+pub struct BlobFrame<'a> {
+    /// Backing buffer (must be exactly `PAGE_SIZE` bytes).
+    buf: &'a mut [u8],
+}
+
+impl<'a> BlobFrame<'a> {
+    /// Wrap an existing buffer that's already been formatted.
+    ///
+    /// Caller asserts that `buf` was previously initialized via
+    /// `init` (or loaded from disk in the same format). No
+    /// validation is done — use `wrap_validated` to also run a
+    /// sanity check on the header.
+    pub fn wrap(buf: &'a mut [u8]) -> Self {
+        assert_eq!(buf.len(), PAGE_SIZE as usize, "BlobFrame requires PAGE_SIZE buffer");
+        Self { buf }
+    }
+
+    /// Initialize a fresh blob from a zeroed buffer.
+    ///
+    /// Writes the header, sets `space_used` to `DATA_AREA_START`,
+    /// allocates the empty-tree root sentinel (8-byte all-zero
+    /// node at slot 1), and stores its slot index in `root_slot`.
+    pub fn init(buf: &'a mut [u8], guid: BlobGuid) -> Result<Self, AllocError> {
+        assert_eq!(buf.len(), PAGE_SIZE as usize);
+        // Zero the buffer so all our atomic-by-construction
+        // invariants hold (header counters = 0, slot table empty,
+        // data area zeroed).
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        let mut frame = Self { buf };
+        // Seed the header.
+        {
+            let h = frame.header_mut();
+            h.blob_guid = guid;
+            h.space_used = DATA_AREA_START;
+        }
+        // Allocate the empty-tree root sentinel.
+        let out = frame.alloc_node(NodeType::EmptyRoot)?;
+        debug_assert_eq!(out.slot, 1);
+        // Body is already zero (we memset the whole buffer above);
+        // record it as the tree's root.
+        frame.header_mut().root_slot = out.slot;
+        Ok(frame)
+    }
+
+    /// Const reference to the header.
+    #[must_use]
+    pub fn header(&self) -> &BlobHeader {
+        // SAFETY: BlobFrame's buffer is PAGE_SIZE bytes and starts
+        // with a properly-aligned BlobHeader (header is 4096 B
+        // with natural u64 alignment requirements satisfied by
+        // PAGE_SIZE-aligned allocations; callers must provide an
+        // 8-byte aligned buffer).
+        unsafe { &*(self.buf.as_ptr() as *const BlobHeader) }
+    }
+
+    /// Mutable reference to the header.
+    #[must_use]
+    pub fn header_mut(&mut self) -> &mut BlobHeader {
+        // SAFETY: see `header`.
+        unsafe { &mut *(self.buf.as_mut_ptr() as *mut BlobHeader) }
+    }
+
+    /// Read the slot table entry for a 1-based slot index.
+    ///
+    /// Returns `None` if `slot` is 0 or beyond `num_slots`.
+    #[must_use]
+    pub fn slot_entry(&self, slot: u16) -> Option<SlotEntry> {
+        let h = self.header();
+        if slot == 0 || slot > h.num_slots {
+            return None;
+        }
+        let off = HEADER_SIZE as usize + (slot as usize - 1) * 4;
+        let raw_bytes = &self.buf[off..off + 4];
+        let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
+        Some(SlotEntryRaw(raw).decode())
+    }
+
+    /// Write a slot table entry. `slot` must be in 1..=num_slots.
+    fn write_slot_entry(&mut self, slot: u16, entry: SlotEntry) {
+        debug_assert!(slot >= 1);
+        debug_assert!(slot <= self.header().num_slots || slot == self.header().num_slots + 1);
+        let off = HEADER_SIZE as usize + (slot as usize - 1) * 4;
+        let raw = entry.raw().0;
+        self.buf[off..off + 4].copy_from_slice(&raw.to_le_bytes());
+    }
+
+    /// Resolve a slot to a const view of its body bytes.
+    #[must_use]
+    pub fn body_of_slot(&self, slot: u16) -> Option<&[u8]> {
+        let e = self.slot_entry(slot)?;
+        let ntype = e.node_type()?;
+        if ntype == NodeType::Invalid {
+            return None;
+        }
+        let off = e.byte_offset() as usize;
+        let size = size_of_node(ntype) as usize;
+        if off + size > self.buf.len() {
+            return None;
+        }
+        Some(&self.buf[off..off + size])
+    }
+
+    /// Mutable view of a slot's body bytes.
+    pub fn body_of_slot_mut(&mut self, slot: u16) -> Option<&mut [u8]> {
+        let e = self.slot_entry(slot)?;
+        let ntype = e.node_type()?;
+        if ntype == NodeType::Invalid {
+            return None;
+        }
+        let off = e.byte_offset() as usize;
+        let size = size_of_node(ntype) as usize;
+        if off + size > self.buf.len() {
+            return None;
+        }
+        Some(&mut self.buf[off..off + size])
+    }
+
+    /// Allocate a node of the given NodeType.
+    ///
+    /// Tries the per-NodeType free list first, then bump-allocates
+    /// from `space_used`. Returns `(slot, body_offset, size)` —
+    /// caller writes the body via `body_of_slot_mut(slot)`.
+    pub fn alloc_node(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
+        if ntype == NodeType::Invalid {
+            return Err(AllocError::InvalidRequest);
+        }
+        let size = size_of_node(ntype);
+        let ntype_idx = (ntype.as_u8() - 1) as usize;
+
+        // Try free list first.
+        let free_head = self.header().free_list_head[ntype_idx];
+        if free_head != 0 {
+            // Pop. The slot entry's high bits hold the next-free
+            // slot index; the low bits already hold the freed
+            // body's byte offset.
+            let e = self.slot_entry(free_head).ok_or(AllocError::InvalidRequest)?;
+            let next_free = e.next_free();
+            self.header_mut().free_list_head[ntype_idx] = next_free;
+
+            // Re-tag as live with the same offset.
+            let off = e.byte_offset();
+            self.write_slot_entry(free_head, SlotEntry::live(ntype, off));
+            self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
+            return Ok(AllocOutcome { slot: free_head, byte_offset: off, size });
+        }
+
+        // Bump-allocate.
+        let h = self.header();
+        if h.num_slots >= MAX_SLOTS as u16 {
+            return Err(AllocError::OutOfSlots);
+        }
+        let avail = PAGE_SIZE.saturating_sub(h.space_used);
+        if avail < size {
+            return Err(AllocError::OutOfSpace { need: size, avail });
+        }
+        let body_off = h.space_used;
+        debug_assert!(body_off >= DATA_AREA_START);
+        debug_assert!(body_off + size <= PAGE_SIZE);
+
+        let new_slot = h.num_slots + 1; // 1-based
+        // Write the slot table entry BEFORE bumping num_slots so
+        // the slot is visible at slot[new_slot] when we then bump
+        // num_slots in the header.
+        // (The `write_slot_entry` debug_assert checks
+        // `slot <= num_slots + 1` for exactly this case.)
+        self.write_slot_entry(new_slot, SlotEntry::live(ntype, body_off));
+        let h = self.header_mut();
+        h.num_slots += 1;
+        h.space_used += size;
+        h.gap_space = h.gap_space.wrapping_add(size);
+
+        Ok(AllocOutcome { slot: new_slot, byte_offset: body_off, size })
+    }
+
+    /// Push a slot onto its NodeType's free list. The body bytes
+    /// remain in place (they'll be overwritten on the next alloc
+    /// that reuses this slot).
+    pub fn free_node(&mut self, slot: u16) -> Result<(), FreeError> {
+        let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
+        let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
+            slot,
+            tag: e.ntype_or_next_free,
+        })?;
+        if ntype == NodeType::Invalid {
+            return Err(FreeError::TypeMismatch { slot, tag: e.ntype_or_next_free });
+        }
+        let ntype_idx = (ntype.as_u8() - 1) as usize;
+        let old_head = self.header().free_list_head[ntype_idx];
+        let off = e.byte_offset();
+        self.write_slot_entry(slot, SlotEntry::freed(old_head, off));
+        self.header_mut().free_list_head[ntype_idx] = slot;
+        Ok(())
+    }
+
+    /// Bump-allocate a raw byte extent (NOT a node — does not
+    /// touch the slot table). Used for Leaf key/value bytes.
+    /// Increments `space_used` by the 8-byte-aligned size.
+    pub fn alloc_extent(&mut self, size: u32) -> Result<ExtentAllocOutcome, AllocError> {
+        if size == 0 {
+            return Err(AllocError::InvalidRequest);
+        }
+        let aligned = (size + 7) & !7;
+        let h = self.header();
+        let avail = PAGE_SIZE.saturating_sub(h.space_used);
+        if avail < aligned {
+            return Err(AllocError::OutOfSpace { need: aligned, avail });
+        }
+        let off = h.space_used;
+        self.header_mut().space_used += aligned;
+        Ok(ExtentAllocOutcome { byte_offset: off, aligned_size: aligned })
+    }
+
+    /// View of the buffer's raw bytes.
+    #[must_use]
+    pub fn raw(&self) -> &[u8] {
+        self.buf
+    }
+
+    /// Raw byte view at an arbitrary offset.
+    ///
+    /// Used to read Leaf extents (key/value bytes) which live in
+    /// the data area but are not registered in the slot table.
+    /// Returns `None` if `offset + len` would run past `PAGE_SIZE`.
+    #[must_use]
+    pub fn bytes_at(&self, offset: u32, len: u32) -> Option<&[u8]> {
+        let o = offset as usize;
+        let l = len as usize;
+        let end = o.checked_add(l)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(&self.buf[o..end])
+    }
+
+    /// Mutable view at an arbitrary offset.
+    pub fn bytes_at_mut(&mut self, offset: u32, len: u32) -> Option<&mut [u8]> {
+        let o = offset as usize;
+        let l = len as usize;
+        let end = o.checked_add(l)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(&mut self.buf[o..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> Vec<u8> {
+        vec![0u8; PAGE_SIZE as usize]
+    }
+
+    #[test]
+    fn init_seeds_empty_root_sentinel() {
+        let mut buf = fresh();
+        let frame = BlobFrame::init(&mut buf, [0xAB; 16]).unwrap();
+        let h = frame.header();
+        assert_eq!(h.blob_guid, [0xAB; 16]);
+        assert_eq!(h.num_slots, 1);
+        assert_eq!(h.root_slot, 1);
+        // After allocating the 8-byte sentinel, space_used is
+        // DATA_AREA_START + 8.
+        assert_eq!(h.space_used, DATA_AREA_START + 8);
+
+        // The root slot is tagged empty_root and its body is all zero.
+        let e = frame.slot_entry(1).unwrap();
+        assert_eq!(e.node_type(), Some(NodeType::EmptyRoot));
+        let body = frame.body_of_slot(1).unwrap();
+        assert_eq!(body.len(), 8);
+        assert!(body.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn alloc_node_bumps_space_used() {
+        let mut buf = fresh();
+        let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
+        let space_before = frame.header().space_used;
+        let out = frame.alloc_node(NodeType::Node4).unwrap();
+        assert_eq!(out.slot, 2);
+        assert_eq!(out.size, 24);
+        assert_eq!(out.byte_offset, space_before);
+        assert_eq!(frame.header().space_used, space_before + 24);
+        assert_eq!(frame.header().num_slots, 2);
+
+        // The slot entry decodes back to Node4 with the right offset.
+        let e = frame.slot_entry(2).unwrap();
+        assert_eq!(e.node_type(), Some(NodeType::Node4));
+        assert_eq!(e.byte_offset(), space_before);
+    }
+
+    #[test]
+    fn free_then_realloc_reuses_slot() {
+        let mut buf = fresh();
+        let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
+        let a = frame.alloc_node(NodeType::Leaf).unwrap();
+        let b = frame.alloc_node(NodeType::Leaf).unwrap();
+        let c = frame.alloc_node(NodeType::Leaf).unwrap();
+        assert_eq!(a.slot, 2);
+        assert_eq!(b.slot, 3);
+        assert_eq!(c.slot, 4);
+
+        frame.free_node(b.slot).unwrap();
+        // Re-alloc — should pop slot 3 (LIFO).
+        let r = frame.alloc_node(NodeType::Leaf).unwrap();
+        assert_eq!(r.slot, 3);
+    }
+
+    #[test]
+    fn alloc_extent_does_not_touch_slot_table() {
+        let mut buf = fresh();
+        let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
+        let space_before = frame.header().space_used;
+        let slots_before = frame.header().num_slots;
+        let e = frame.alloc_extent(13).unwrap();
+        // 13 → padded to 16.
+        assert_eq!(e.aligned_size, 16);
+        assert_eq!(e.byte_offset, space_before);
+        assert_eq!(frame.header().space_used, space_before + 16);
+        // Slot table untouched.
+        assert_eq!(frame.header().num_slots, slots_before);
+    }
+
+    #[test]
+    fn out_of_space_at_data_area_boundary() {
+        let mut buf = fresh();
+        let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
+        // Drain the data area with one giant extent.
+        let remaining = PAGE_SIZE - frame.header().space_used;
+        frame.alloc_extent(remaining - 8).unwrap();
+        frame.alloc_extent(8).unwrap();
+        assert!(matches!(
+            frame.alloc_extent(8),
+            Err(AllocError::OutOfSpace { .. })
+        ));
+    }
+}
