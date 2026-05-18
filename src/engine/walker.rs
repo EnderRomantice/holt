@@ -409,10 +409,50 @@ fn insert_into_leaf(
     let (existing_key, existing_value) = read_leaf_kv(frame, leaf_slot)?;
 
     if existing_key == new_key {
-        // Update path: install a fresh leaf with bumped seq, free
-        // the old. Stage 6 (BufferManager + compactBlob) will
-        // reclaim the orphan extent; for now it's harmless dead
-        // space.
+        // Update path. Try in-place first: if the new value fits
+        // inside the existing extent's 8-byte-aligned footprint we
+        // overwrite the value bytes and bump the leaf's value_size
+        // + seq — zero allocator activity, zero extent leak.
+        let key_off = {
+            let body = frame.body_of_slot(leaf_slot).ok_or(Error::NodeCorrupt {
+                context: "insert_into_leaf: body resolution failed",
+            })?;
+            cast::<Leaf>(body).key_offset
+        };
+        let key_len_u32 = new_key.len() as u32;
+        let old_extent_size =
+            leaf_extent_size(key_len_u32, u32::from(existing_value.len() as u16));
+        let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
+
+        if new_extent_size <= old_extent_size {
+            // Value bytes live at: key_offset + 2 + key.len() ..
+            // .. key_offset + (old_extent_size - tail_padding).
+            // We blanket-write new_value over the available space
+            // (= old_extent_size - 2 - key_len) and zero the
+            // trailing padding so the on-disk image stays clean.
+            let value_offset = key_off + 2 + key_len_u32;
+            let value_room = old_extent_size - 2 - key_len_u32;
+            let region = frame
+                .bytes_at_mut(value_offset, value_room)
+                .ok_or(Error::NodeCorrupt {
+                    context: "insert_into_leaf: extent value range out of bounds",
+                })?;
+            region[..new_value.len()].copy_from_slice(new_value);
+            for b in region[new_value.len()..].iter_mut() {
+                *b = 0;
+            }
+            let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq);
+            write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+            return Ok(InsertReturn {
+                slot_after: leaf_slot,
+                previous: Some(existing_value),
+            });
+        }
+
+        // Value grew past the existing extent — fall back to
+        // alloc-fresh-and-free-old. The old extent bytes leak
+        // until Stage 6's compactBlob reclaims; the old leaf slot
+        // returns to its per-NodeType free list.
         let new_slot = write_leaf(frame, new_key, new_value, seq)?;
         frame.free_node(leaf_slot)?;
         return Ok(InsertReturn {

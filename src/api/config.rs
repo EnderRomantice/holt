@@ -42,6 +42,14 @@ pub struct TreeConfig {
     /// Bytes appended to the WAL before triggering an automatic
     /// checkpoint. Stage 5 wires this up. Default 16 MB.
     pub checkpoint_byte_interval: u64,
+    /// If `true` (the default), every `Tree::put` / `delete` /
+    /// `rename` synchronously writes the mutated root blob through
+    /// the backend. Set to `false` to keep mutations in the
+    /// in-memory cache only — the caller must then invoke
+    /// [`crate::Tree::checkpoint`] to make changes durable. Used by
+    /// benchmarks (matches the "no-WAL, batched flush" mode of
+    /// other embedded engines).
+    pub flush_on_write: bool,
 }
 
 impl TreeConfig {
@@ -55,6 +63,7 @@ impl TreeConfig {
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
             checkpoint_byte_interval: 16 * 1024 * 1024,
+            flush_on_write: true,
         }
     }
 
@@ -66,6 +75,7 @@ impl TreeConfig {
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
             checkpoint_byte_interval: 16 * 1024 * 1024,
+            flush_on_write: true,
         }
     }
 

@@ -23,6 +23,8 @@ io-uring = "0.7"
 [dev-dependencies]
 rand = "0.8"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+rocksdb = { version = "0.23", default-features = false }
 
 [features]
 default = []
@@ -39,3 +41,8 @@ inherits = "release"
 [[example]]
 name = "basic_kv"
 path = "examples/basic_kv.rs"
+
+[[bench]]
+name = "main"
+harness = false
+path = "benches/main.rs"

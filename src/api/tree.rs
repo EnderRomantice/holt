@@ -12,9 +12,19 @@
 //! guarantees the two keys diverge somewhere inside the radix
 //! tree (at the `\0` vs `'d'` byte in this example).
 //!
-//! The trade-off: a user-supplied key MUST NOT end with `\0`.
-//! Empty keys are fine — `b""` pads to `b"\0"` and round-trips
-//! cleanly.
+//! ## Cached root blob
+//!
+//! Tree keeps the root blob's 512 KB buffer pinned in memory in a
+//! `Mutex<TreeState>`. Every `get` / `put` / `delete` / `rename`
+//! operates on that cached buffer; mutations either flush-through
+//! to the backend immediately (`flush_on_write = true`, the
+//! default) or stay in cache until `checkpoint()` (`false`, useful
+//! for batch / benchmark workloads).
+//!
+//! Cross-blob descent (Stage 2d phase A) still reads child blobs
+//! from the backend per crossing — the cache is root-only for now.
+//! Stage 6 BufferManager will pin arbitrary child blobs and add a
+//! real LRU.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,8 +42,8 @@ use crate::store::backend::PersistentBackend;
 /// An `artisan` tree — your handle to one metadata store.
 ///
 /// Clone the handle to share the same backing store: the backend
-/// is held via `Arc` and writes serialise through a single
-/// internal mutex (Stage 5 will swap the mutex for per-blob
+/// is held via `Arc` and writes serialise through the internal
+/// `Mutex<TreeState>` (Stage 5 will swap the mutex for per-blob
 /// `HybridLatch`).
 #[derive(Clone)]
 pub struct Tree {
@@ -43,12 +53,22 @@ pub struct Tree {
     /// sentinel; multi-blob support (Stage 2d) introduces a per-tree
     /// root manifest.
     root_guid: BlobGuid,
-    /// Serialises mutations against the root blob. Stage 5
-    /// (BufferManager + HybridLatch) makes this per-blob.
-    write_lock: Arc<Mutex<()>>,
+    /// Cached root buffer + serialisation lock. Mutating ops hold
+    /// the mutex exclusively; read ops also hold it (because
+    /// `BlobFrame::wrap` needs `&mut [u8]`). Stage 6 will swap for
+    /// per-blob HybridLatch to allow concurrent optimistic reads.
+    state: Arc<Mutex<TreeState>>,
     /// Monotonically-increasing sequence stamped on every new
     /// leaf. Stage 5 ties this to the WAL record number.
     next_seq: Arc<AtomicU64>,
+}
+
+/// In-memory cache of the root blob. Construction reads it once
+/// from the backend; subsequent ops read/mutate this buffer
+/// directly. `Tree::checkpoint` (and `Tree::put`/`delete`/`rename`
+/// when `flush_on_write = true`) writes it back through the backend.
+struct TreeState {
+    root_buf: AlignedBlobBuf,
 }
 
 impl std::fmt::Debug for Tree {
@@ -108,22 +128,24 @@ impl Tree {
 
     /// Open a tree with a caller-supplied [`Backend`].
     ///
-    /// Use this when you want to plug in something other than the
-    /// built-in memory / persistent backends — e.g. a network-backed
-    /// store, an instrumented wrapper, or a fault-injection harness.
+    /// Reads the root blob into the in-memory cache. If the backend
+    /// doesn't yet contain a root blob, initialises an empty one
+    /// and writes it through, flushing before returning.
     pub fn open_with_backend(cfg: TreeConfig, backend: Arc<dyn Backend>) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
-        if !backend.has_blob(root_guid)? {
-            let mut buf = AlignedBlobBuf::zeroed();
-            BlobFrame::init(buf.as_mut_slice(), root_guid)?;
-            backend.write_blob(root_guid, &buf)?;
+        let mut root_buf = AlignedBlobBuf::zeroed();
+        if backend.has_blob(root_guid)? {
+            backend.read_blob(root_guid, &mut root_buf)?;
+        } else {
+            BlobFrame::init(root_buf.as_mut_slice(), root_guid)?;
+            backend.write_blob(root_guid, &root_buf)?;
             backend.flush()?;
         }
         Ok(Self {
             cfg,
             backend,
             root_guid,
-            write_lock: Arc::new(Mutex::new(())),
+            state: Arc::new(Mutex::new(TreeState { root_buf })),
             next_seq: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -133,32 +155,32 @@ impl Tree {
     ///
     /// Transparently follows `BlobNode` crossings — the lookup may
     /// span multiple blobs when the tree has been split by Stage 2d
-    /// spillover.
+    /// spillover. The root blob descent happens against the
+    /// in-memory cache (no backend hit); subsequent crossings load
+    /// child blobs from the backend.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
 
-        // Each iteration loads the current blob, does a single-blob
-        // descent, then either resolves (Found/NotFound) or hands
-        // off to the next blob via Crossing. Worst case is one
-        // backend read per blob on the descent path.
-        let mut current_guid = self.root_guid;
-        let mut start_slot: u16 = 0; // overwritten on iter 1 from header.root_slot
-        let mut depth: usize = 0;
-        let mut first_iter = true;
+        // 1) First-hop descent in the cached root blob.
+        let crossing = {
+            let mut state = self.state.lock().unwrap();
+            let frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
+            let root_slot = frame.header().root_slot;
+            match engine::lookup_at(&frame, root_slot, &padded, 0)? {
+                LookupResult::Found(v) => return Ok(Some(v.to_vec())),
+                LookupResult::NotFound => return Ok(None),
+                LookupResult::Crossing(c) => c,
+            }
+        };
 
+        // 2) Cross-blob loop — read each child blob from the backend.
+        let mut current_guid = crossing.child_guid;
+        let mut start_slot = crossing.child_slot;
+        let mut depth = crossing.child_depth;
         loop {
             let mut buf = AlignedBlobBuf::zeroed();
             self.backend.read_blob(current_guid, &mut buf)?;
             let frame = BlobFrame::wrap(buf.as_mut_slice());
-
-            // First iteration: start at this blob's header.root_slot.
-            // Subsequent iterations: start at the slot the Crossing
-            // pointed us at.
-            if first_iter {
-                start_slot = frame.header().root_slot;
-                first_iter = false;
-            }
-
             match engine::lookup_at(&frame, start_slot, &padded, depth)? {
                 LookupResult::Found(v) => return Ok(Some(v.to_vec())),
                 LookupResult::NotFound => return Ok(None),
@@ -166,7 +188,6 @@ impl Tree {
                     current_guid = c.child_guid;
                     start_slot = c.child_slot;
                     depth = c.child_depth;
-                    // Loop again — load the child blob.
                 }
             }
         }
@@ -174,23 +195,25 @@ impl Tree {
 
     /// Insert or replace `(key, value)`. Returns the previous value
     /// if the key already existed.
+    ///
+    /// Modifies the in-memory cached root blob; flushes to the
+    /// backend immediately when `TreeConfig::flush_on_write` is
+    /// `true` (the default).
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-        let _guard = self.write_lock.lock().unwrap();
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
-        let mut buf = AlignedBlobBuf::zeroed();
-        self.backend.read_blob(self.root_guid, &mut buf)?;
-
+        let mut state = self.state.lock().unwrap();
         let outcome;
         {
-            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            let mut frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
             let root_slot = frame.header().root_slot;
             outcome = engine::walker::insert(&mut frame, root_slot, &padded, value, seq)?;
             frame.header_mut().root_slot = outcome.new_root_slot;
         }
-
-        self.backend.write_blob(self.root_guid, &buf)?;
+        if self.cfg.flush_on_write {
+            self.backend.write_blob(self.root_guid, &state.root_buf)?;
+        }
         Ok(outcome.previous)
     }
 
@@ -198,23 +221,18 @@ impl Tree {
     /// `None` if no leaf matched.
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-        let _guard = self.write_lock.lock().unwrap();
 
-        let mut buf = AlignedBlobBuf::zeroed();
-        self.backend.read_blob(self.root_guid, &mut buf)?;
-
+        let mut state = self.state.lock().unwrap();
         let outcome;
         {
-            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            let mut frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
             let root_slot = frame.header().root_slot;
             outcome = engine::walker::erase(&mut frame, root_slot, &padded)?;
             frame.header_mut().root_slot = outcome.new_root_slot;
         }
-
-        // Even on NotFound we still rewrite — the frame is unchanged
-        // (idempotent), so this is a 512 KB no-op write. Stage 6
-        // BufferManager will skip the write when nothing was dirtied.
-        self.backend.write_blob(self.root_guid, &buf)?;
+        if self.cfg.flush_on_write {
+            self.backend.write_blob(self.root_guid, &state.root_buf)?;
+        }
         Ok(outcome.previous)
     }
 
@@ -225,49 +243,31 @@ impl Tree {
     ///   **and** `force` is `false`.
     /// - When `force` is `true`, any existing leaf at `dst` is
     ///   overwritten.
-    ///
-    /// Atomic with respect to other writers (the internal
-    /// `write_lock` is held for the whole erase-then-insert
-    /// sequence) and atomic on disk (the underlying blob is
-    /// rewritten exactly once at the end). Stage 5 will replace
-    /// the lock with per-blob `HybridLatch` + a single
-    /// `RenameObjectTxnOp` so observers can't see the intermediate
-    /// "src gone, dst not yet present" state across blobs.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
 
-        let _guard = self.write_lock.lock().unwrap();
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-
-        let mut buf = AlignedBlobBuf::zeroed();
-        self.backend.read_blob(self.root_guid, &mut buf)?;
-
+        let mut state = self.state.lock().unwrap();
         {
-            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            let mut frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
             let root_slot = frame.header().root_slot;
 
-            // Step 1: probe src to make sure it exists.
-            //         Probe dst to honour the !force guard.
-            //
             // Stage 2d phase A: cross-blob rename surfaces
             // NotYetImplemented (insert + erase don't yet follow
             // BlobNode crossings — that's phase B). Single-blob
             // renames work the same as before.
-            let value: Vec<u8> = {
-                match engine::lookup(&frame, root_slot, &src_padded)? {
-                    LookupResult::Found(v) => v.to_vec(),
-                    LookupResult::NotFound => return Err(Error::NotFound),
-                    LookupResult::Crossing(_) => {
-                        return Err(Error::NotYetImplemented(
-                            "Tree::rename across BlobNode — Stage 2d phase B",
-                        ));
-                    }
+            let value: Vec<u8> = match engine::lookup(&frame, root_slot, &src_padded)? {
+                LookupResult::Found(v) => v.to_vec(),
+                LookupResult::NotFound => return Err(Error::NotFound),
+                LookupResult::Crossing(_) => {
+                    return Err(Error::NotYetImplemented(
+                        "Tree::rename across BlobNode — Stage 2d phase B",
+                    ));
                 }
             };
 
-            // Same key? Treat as a no-op (no value-changing write,
-            // but bump seq for caller-visible ordering).
+            // Same key? Treat as a no-op.
             if src == dst {
                 return Ok(());
             }
@@ -287,33 +287,28 @@ impl Tree {
                 }
             }
 
-            // Step 2: erase src.
+            // erase(src)
             let erase_out = engine::walker::erase(&mut frame, root_slot, &src_padded)?;
             frame.header_mut().root_slot = erase_out.new_root_slot;
 
-            // Step 3: insert at dst — read root_slot fresh; erase
-            //         may have collapsed/reseeded it.
+            // insert(dst, value)
             let new_root = frame.header().root_slot;
-            let insert_out = engine::walker::insert(
-                &mut frame,
-                new_root,
-                &dst_padded,
-                &value,
-                seq,
-            )?;
+            let insert_out =
+                engine::walker::insert(&mut frame, new_root, &dst_padded, &value, seq)?;
             frame.header_mut().root_slot = insert_out.new_root_slot;
         }
-
-        self.backend.write_blob(self.root_guid, &buf)?;
+        if self.cfg.flush_on_write {
+            self.backend.write_blob(self.root_guid, &state.root_buf)?;
+        }
         Ok(())
     }
 
-    /// Flush every previously-returned write through the backend.
-    ///
-    /// On the persistent backend this issues `fdatasync` on the
-    /// underlying blobs file and rewrites the manifest. On the
-    /// memory backend this is a no-op.
+    /// Force-flush the cached root blob through the backend and
+    /// run the backend's own durability protocol
+    /// (`fdatasync` on persistent; no-op on memory).
     pub fn checkpoint(&self) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        self.backend.write_blob(self.root_guid, &state.root_buf)?;
         self.backend.flush()?;
         Ok(())
     }
