@@ -106,8 +106,8 @@ mod x86 {
     /// guarantees both pointers are at least 16 bytes valid.
     #[inline]
     pub(super) unsafe fn cmp_16_bytes_bitmask(a: *const u8, b: *const u8) -> u32 {
-        let va = unsafe { _mm_loadu_si128(a as *const __m128i) };
-        let vb = unsafe { _mm_loadu_si128(b as *const __m128i) };
+        let va = unsafe { _mm_loadu_si128(a.cast::<__m128i>()) };
+        let vb = unsafe { _mm_loadu_si128(b.cast::<__m128i>()) };
         let cmp = _mm_cmpeq_epi8(va, vb);
         _mm_movemask_epi8(cmp) as u32
     }
@@ -116,7 +116,7 @@ mod x86 {
     /// `None`. Caller guarantees `keys` is at least 16 bytes valid.
     #[inline]
     pub(super) unsafe fn find_byte_in_16(keys: *const u8, count: u8, byte: u8) -> Option<u8> {
-        let vec = unsafe { _mm_loadu_si128(keys as *const __m128i) };
+        let vec = unsafe { _mm_loadu_si128(keys.cast::<__m128i>()) };
         let needle = _mm_set1_epi8(byte as i8);
         let cmp = _mm_cmpeq_epi8(vec, needle);
         let mask = _mm_movemask_epi8(cmp) as u32;

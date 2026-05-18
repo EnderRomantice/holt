@@ -94,8 +94,7 @@ impl FileHeader {
     pub fn now(tree_id: u64) -> Self {
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         Self {
             tree_id,
             created_at,
