@@ -267,6 +267,52 @@ the packed-image size, well below `PAGE_SIZE - SPILLOVER_RESERVATION`.
   collapse always wraps the surviving child in `Prefix([byte])` to
   preserve depth invariants. Mild space waste, compact reclaims it.
 
+## 5b. BufferManager (Stage 6 phase 1)
+
+`BufferManager` sits between [`Tree`] and the underlying
+[`Backend`], caching recently-accessed blobs. It **itself
+implements `Backend`** — drop-in wrapper, no walker change.
+
+```
+Tree → Arc<dyn Backend>            ← BufferManager → Arc<dyn Backend>
+                                                       ↑
+                                              MemoryBackend or
+                                              PersistentBackend
+```
+
+`Tree::open_with_backend` wraps the user-supplied backend
+transparently; `TreeConfig::buffer_pool_size` (default 64) drives
+the cache capacity in blobs (= 32 MB resident).
+
+### Mode: write-through
+
+Writes go to **both** the cache **and** the inner backend in one
+call. Read I/O is what gets cached; write I/O latency is
+unchanged. This preserves the existing `flush_on_write`
+durability semantic without forcing callers to checkpoint.
+
+A later revision (Stage 6 phase 3) will add **write-back** mode
+with dirty tracking + a background checkpointer thread.
+
+### Per-blob locking
+
+Each cached blob lives behind its own `Mutex<AlignedBlobBuf>`.
+Concurrent ops on **different** blobs don't contend; the cache's
+shared `HashMap`/LRU lock is held only for very short windows
+(insertions, eviction, LRU touches).
+
+The Tree's `write_lock` still serialises mutations through the
+walker — full optimistic concurrency requires the
+`BlobFrameRef` + walker refactor in Stage 6 phase 2.
+
+### LRU eviction
+
+When the cache exceeds `capacity` blobs the oldest *evictable*
+entry is dropped. "Evictable" = `Arc::strong_count(entry) == 1`
+(no outstanding pin outside the cache). The current BM doesn't
+hand out long-lived pins — every `read_blob`/`write_blob`
+finishes before returning — so eviction always makes progress.
+
 ## 6. Persistence + crash safety
 
 WAL (write-ahead log) with 13+ physiological TxnOp variants:

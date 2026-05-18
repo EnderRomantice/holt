@@ -348,6 +348,55 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
 }
 
 #[test]
+fn concurrent_reads_across_multi_blob_tree_via_buffer_manager() {
+    // Builds a multi-blob tree (forces auto-spillover), then
+    // hammers `Tree::get` from N threads concurrently. The
+    // BufferManager between Tree and the inner backend keeps the
+    // child blobs cached after the first read; per-blob locks
+    // mean concurrent reads on *different* blobs don't fight for
+    // a single mutex.
+    use std::thread;
+
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let tree = Arc::new(
+        TreeBuilder::new("ignored")
+            .open_with_backend(backend.clone())
+            .unwrap(),
+    );
+
+    const N: u32 = 2000;
+    let value = vec![0x66; 200];
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), &value).unwrap();
+    }
+    // Multi-blob pre-cond.
+    assert!(
+        backend.list_blobs().unwrap().len() >= 2,
+        "test pre-cond: {} keys × 200 B values should overflow into multiple blobs",
+        N,
+    );
+
+    // 8 threads × 250 random gets each.
+    let handles: Vec<_> = (0..8u32)
+        .map(|t| {
+            let tree = tree.clone();
+            let value = value.clone();
+            thread::spawn(move || {
+                for r in 0..250u32 {
+                    let i = (t * 250 + r * 7) % N;
+                    let k = format!("k{i:08}").into_bytes();
+                    let got = tree.get(&k).unwrap();
+                    assert_eq!(got.as_deref(), Some(&value[..]));
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
 fn compact_then_insert_reclaims_extent_leak() {
     // Pure-mutation workload: insert N keys, delete half, insert
     // another N. Without compact reclaiming the deleted-leaf

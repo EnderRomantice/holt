@@ -67,3 +67,4 @@ pub use api::errors::{Error, Result};
 pub use api::tree::Tree;
 pub use api::builder::TreeBuilder;
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
+pub use store::BufferManager;

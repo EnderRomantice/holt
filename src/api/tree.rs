@@ -34,7 +34,7 @@ use super::errors::{Error, Result};
 use crate::engine;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
-use crate::store::BlobFrame;
+use crate::store::{BlobFrame, BufferManager};
 
 #[cfg(unix)]
 use crate::store::backend::PersistentBackend;
@@ -128,22 +128,36 @@ impl Tree {
 
     /// Open a tree with a caller-supplied [`Backend`].
     ///
-    /// Reads the root blob into the in-memory cache. If the backend
-    /// doesn't yet contain a root blob, initialises an empty one
-    /// and writes it through, flushing before returning.
+    /// The supplied backend is **transparently wrapped** with a
+    /// [`BufferManager`] of `cfg.buffer_pool_size` blobs. Cross-blob
+    /// reads benefit from the LRU cache; writes stay write-through
+    /// so durability and `flush_on_write` semantics are unchanged.
+    ///
+    /// Reads the root blob into the in-memory `state` cache. If
+    /// the backend doesn't yet contain a root blob, initialises an
+    /// empty one and writes it through, flushing before returning.
     pub fn open_with_backend(cfg: TreeConfig, backend: Arc<dyn Backend>) -> Result<Self> {
+        // Wrap the user's backend with a BufferManager. The wrap
+        // is transparent: read_blob hits the cache after the first
+        // load, write_blob still write-throughs to the underlying
+        // backend in the same call (so flush_on_write durability
+        // is preserved).
+        let cached: Arc<dyn Backend> = Arc::new(BufferManager::new(
+            backend,
+            cfg.buffer_pool_size,
+        ));
         let root_guid = ROOT_BLOB_GUID;
         let mut root_buf = AlignedBlobBuf::zeroed();
-        if backend.has_blob(root_guid)? {
-            backend.read_blob(root_guid, &mut root_buf)?;
+        if cached.has_blob(root_guid)? {
+            cached.read_blob(root_guid, &mut root_buf)?;
         } else {
             BlobFrame::init(root_buf.as_mut_slice(), root_guid)?;
-            backend.write_blob(root_guid, &root_buf)?;
-            backend.flush()?;
+            cached.write_blob(root_guid, &root_buf)?;
+            cached.flush()?;
         }
         Ok(Self {
             cfg,
-            backend,
+            backend: cached,
             root_guid,
             state: Arc::new(Mutex::new(TreeState { root_buf })),
             next_seq: Arc::new(AtomicU64::new(1)),

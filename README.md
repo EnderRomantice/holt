@@ -60,10 +60,14 @@ Done — algorithm core:
 - In-place leaf-value update on same-size writes
 - `MemoryBackend` + cross-platform `PersistentBackend`
   (Linux `O_DIRECT`, macOS `F_NOCACHE`)
+- `BufferManager` LRU cache wrapping any backend (Stage 6 phase 1)
+  — `TreeConfig::buffer_pool_size` drives capacity, per-blob
+  Mutex lets concurrent reads on different blobs progress
 
 Queued — see [ROADMAP.md](ROADMAP.md):
 
-- `BufferManager` + per-blob `HybridLatch` wiring (Stage 6 part 2)
+- BufferManager pin/operate API + walker refactor + HybridLatch
+  optimistic reads (Stage 6 phase 2)
 - WAL + crash recovery (Stage 5)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
