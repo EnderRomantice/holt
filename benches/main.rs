@@ -47,8 +47,8 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
-use holt::{Tree, TreeConfig};
-use rocksdb::{Options, WriteOptions, DB};
+use holt::{RangeEntry, Tree, TreeConfig};
+use rocksdb::{Direction, IteratorMode, Options, WriteOptions, DB};
 
 // ---------------------------------------------------------------
 // Workload configuration
@@ -574,22 +574,305 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
     }
 }
 
+// ---------------------------------------------------------------
+// LIST / range-scan benches
+// ---------------------------------------------------------------
+//
+// These are the load-bearing test for the metadata-engine claim:
+// `readdir(dir)` / S3 `LIST ?prefix=foo/&delimiter=/` is the
+// dominant access pattern beyond raw point lookup. holt's
+// `Tree::range` does an anchored descent + sequential leaf walk;
+// RocksDB uses a seek + prefix-bounded iterator; SQLite uses a
+// `WHERE k >= ? AND k < ?` range scan over the B-tree primary key.
+// `kv` (random keys) has no prefix structure, so list benches are
+// only meaningful for objstore + fs.
+
+/// Smallest byte-string strictly greater than every string with
+/// `prefix`. Used to bound SQLite range queries
+/// (`WHERE k >= prefix AND k < prefix_upper(prefix)`). Caller must
+/// guarantee the last byte of `prefix` is < `0xFF`.
+fn prefix_upper(prefix: &[u8]) -> Vec<u8> {
+    let mut u = prefix.to_vec();
+    let last = u.last_mut().expect("prefix must be non-empty");
+    *last = last
+        .checked_add(1)
+        .expect("prefix's last byte must be < 0xFF for this helper");
+    u
+}
+
+fn bench_list_plain(
+    c: &mut Criterion,
+    group_name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    prefix: &[u8],
+    take: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(take as u64));
+
+    let holt = make_holt();
+    preload_holt(&holt, pairs);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
+            for entry in holt.range().prefix(black_box(prefix)) {
+                match entry.unwrap() {
+                    RangeEntry::Key { key, value } => out.push((key, value)),
+                    RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
+                }
+                if out.len() >= take {
+                    break;
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    preload_rocksdb(&db, pairs);
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
+            for item in db.iterator(IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, v) = item.unwrap();
+                if !k.starts_with(prefix) {
+                    break;
+                }
+                out.push((k.to_vec(), v.to_vec()));
+                if out.len() >= take {
+                    break;
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    let conn = make_sqlite_memory();
+    preload_sqlite(&conn, pairs);
+    let upper = prefix_upper(prefix);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            let mut stmt = conn
+                .prepare_cached("SELECT k, v FROM kv WHERE k >= ? AND k < ? ORDER BY k LIMIT ?")
+                .unwrap();
+            let rows = stmt
+                .query_map(params![prefix, upper.as_slice(), take as i64], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap();
+            let out: Vec<(Vec<u8>, Vec<u8>)> = rows.collect::<Result<_, _>>().unwrap();
+            black_box(out);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_list_plain_persistent(
+    c: &mut Criterion,
+    group_name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    prefix: &[u8],
+    take: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(take as u64));
+
+    let (holt, _dir) = make_holt_persistent();
+    preload_holt(&holt, pairs);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
+            for entry in holt.range().prefix(black_box(prefix)) {
+                match entry.unwrap() {
+                    RangeEntry::Key { key, value } => out.push((key, value)),
+                    RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
+                }
+                if out.len() >= take {
+                    break;
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    let wo = rocksdb_write_opts_persistent();
+    for (k, v) in pairs {
+        db.put_opt(k, v, &wo).expect("rocksdb preload");
+    }
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
+            for item in db.iterator(IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, v) = item.unwrap();
+                if !k.starts_with(prefix) {
+                    break;
+                }
+                out.push((k.to_vec(), v.to_vec()));
+                if out.len() >= take {
+                    break;
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    let (conn, _dir) = make_sqlite_persistent();
+    preload_sqlite(&conn, pairs);
+    let upper = prefix_upper(prefix);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            let mut stmt = conn
+                .prepare_cached("SELECT k, v FROM kv WHERE k >= ? AND k < ? ORDER BY k LIMIT ?")
+                .unwrap();
+            let rows = stmt
+                .query_map(params![prefix, upper.as_slice(), take as i64], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap();
+            let out: Vec<(Vec<u8>, Vec<u8>)> = rows.collect::<Result<_, _>>().unwrap();
+            black_box(out);
+        });
+    });
+
+    group.finish();
+}
+
+/// S3-style `LIST` with delimiter rollup. holt has the dedup in
+/// the engine via `RangeEntry::CommonPrefix`; RocksDB and SQLite
+/// have to do app-level dedup over the raw range scan. None of
+/// the three currently fast-forward past a rolled-up subtree
+/// (holt v0.2 backlog item), so all three scan every leaf to find
+/// the next distinct rollup — this is fair, just slow.
+fn bench_list_delim(
+    c: &mut Criterion,
+    group_name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    prefix: &[u8],
+    delim: u8,
+    take: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(take as u64));
+
+    let holt = make_holt();
+    preload_holt(&holt, pairs);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            let mut out: Vec<RangeEntry> = Vec::with_capacity(take);
+            for entry in holt.range().prefix(black_box(prefix)).delimiter(delim) {
+                out.push(entry.unwrap());
+                if out.len() >= take {
+                    break;
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    preload_rocksdb(&db, pairs);
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(take);
+            let mut last_common: Option<Vec<u8>> = None;
+            for item in db.iterator(IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, _v) = item.unwrap();
+                if !k.starts_with(prefix) {
+                    break;
+                }
+                let rest = &k[prefix.len()..];
+                let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
+                    k[..=prefix.len() + idx].to_vec()
+                } else {
+                    k.to_vec()
+                };
+                if last_common.as_deref() != Some(emit.as_slice()) {
+                    last_common = Some(emit.clone());
+                    out.push(emit);
+                    if out.len() >= take {
+                        break;
+                    }
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    let conn = make_sqlite_memory();
+    preload_sqlite(&conn, pairs);
+    let upper = prefix_upper(prefix);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            let mut stmt = conn
+                .prepare_cached("SELECT k FROM kv WHERE k >= ? AND k < ? ORDER BY k")
+                .unwrap();
+            let rows = stmt
+                .query_map(params![prefix, upper.as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .unwrap();
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(take);
+            let mut last_common: Option<Vec<u8>> = None;
+            for row in rows {
+                let k = row.unwrap();
+                let rest = &k[prefix.len()..];
+                let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
+                    k[..=prefix.len() + idx].to_vec()
+                } else {
+                    k
+                };
+                if last_common.as_deref() != Some(emit.as_slice()) {
+                    last_common = Some(emit.clone());
+                    out.push(emit);
+                    if out.len() >= take {
+                        break;
+                    }
+                }
+            }
+            black_box(out);
+        });
+    });
+
+    group.finish();
+}
+
 fn kv_benches(c: &mut Criterion) {
     let pairs = gen_kv_dataset();
     bench_scenario(c, "kv", &pairs);
     bench_scenario_persistent(c, "kv", &pairs);
+    // kv has no prefix structure — no list benches.
 }
 
 fn objstore_benches(c: &mut Criterion) {
     let pairs = gen_objstore_dataset();
     bench_scenario(c, "objstore", &pairs);
     bench_scenario_persistent(c, "objstore", &pairs);
+    // Single-bucket listing: prefix narrows to ~625 files.
+    bench_list_plain(c, "objstore_list", &pairs, b"bucket-05/", 100);
+    bench_list_plain_persistent(c, "objstore_persist_list", &pairs, b"bucket-05/", 100);
+    // S3-style top-level dir rollup: prefix `bucket-` + delim `/`
+    // yields 32 distinct `bucket-NN/` common prefixes.
+    bench_list_delim(c, "objstore_list_dir", &pairs, b"bucket-", b'/', 8);
 }
 
 fn fs_benches(c: &mut Criterion) {
     let pairs = gen_fs_dataset();
     bench_scenario(c, "fs", &pairs);
     bench_scenario_persistent(c, "fs", &pairs);
+    // Single-dir listing: prefix narrows to ~1250 files.
+    bench_list_plain(c, "fs_list", &pairs, b"/usr/local/share/category-5/", 100);
+    bench_list_plain_persistent(
+        c,
+        "fs_persist_list",
+        &pairs,
+        b"/usr/local/share/category-5/",
+        100,
+    );
+    // Parent rollup: prefix `/usr/local/share/` + delim `/` yields
+    // 16 distinct `/usr/local/share/category-N/` common prefixes.
+    bench_list_delim(c, "fs_list_dir", &pairs, b"/usr/local/share/", b'/', 8);
 }
 
 criterion_group!(benches, kv_benches, objstore_benches, fs_benches);
