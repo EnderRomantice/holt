@@ -119,7 +119,7 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
     for h in handles {
         let hist = h.join().unwrap();
         // Skip the empty compactor histogram.
-        if hist.len() > 0 {
+        if !hist.is_empty() {
             merged.add(&hist).unwrap();
         }
     }

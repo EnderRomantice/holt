@@ -6,6 +6,192 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking — public API closure
+
+The v0.1 crate exposed `holt::layout`, `holt::journal`, `holt::store`
+as `pub mod`s. That leaked the on-disk struct layout, WAL record
+codec, `BufferManager`, allocator outcomes, and three `HybridLatch`
+guard types as part of the SemVer surface — any future change to
+those (and there will be many) would break downstream users.
+
+The supported, SemVer-stable user surface is now narrow:
+
+```text
+holt::Tree                holt::Storage             holt::TreeStats
+holt::TreeBuilder         holt::CheckpointConfig    holt::BlobStats
+holt::TreeConfig          holt::CheckpointerStats   holt::TxnBatch
+holt::Error               holt::RangeBuilder
+holt::Result              holt::RangeEntry
+                          holt::RangeIter
+
+holt::Backend             holt::AlignedBlobBuf      holt::BlobGuid
+holt::MemoryBackend       holt::PersistentBackend
+```
+
+`metrics::render_prometheus` is gated behind the `metrics` feature
+and is part of that feature's surface.
+
+What changed:
+
+- **`layout`, `journal`, `store` are now `pub(crate)`.** Their
+  contents (`BlobHeader`, `SlotEntry`, `Node{4,16,48,256}`, the WAL
+  codec, `BufferManager`, `BlobFrame`, `*Guard` types) are crate-
+  internal. Users who reached into them (chiefly tools that
+  introspected on-disk frames) need to either pin to v0.1.* or open
+  an issue describing the use case — most can be served by stable
+  helpers added to the public surface.
+- **`pub use holt::BufferManager` removed.** It was never part of
+  what users should be touching.
+- **`BlobGuid` re-exported at the crate root.** Custom `Backend`
+  implementations need to name blobs; `holt::BlobGuid` is the
+  supported path.
+- **`RangeBuilder::new(bm, root_guid)` is `pub(crate)`.** It was
+  always an internal constructor; the user surface is
+  `Tree::range()` / `Tree::scan_prefix()`. The signature also
+  references `BufferManager`, which is no longer public.
+- **`TreeConfig::checkpoint_byte_interval` field and
+  `TreeBuilder::checkpoint_byte_interval(bytes)` builder method
+  removed.** The field was marked `Reserved` and never read
+  anywhere in the engine — a classic "experimental that escaped".
+  Configure the WAL drain cadence via `CheckpointConfig`
+  (background) or by calling `Tree::checkpoint()` explicitly.
+- **`AllocOutcome` shrunk to `{ slot }`**; the `byte_offset` /
+  `size` fields were dead.
+- **`ExtentAllocOutcome` shrunk to `{ byte_offset }`**; the
+  `aligned_size` field was dead.
+- **`encode_record` returns `()` instead of `Result<()>`** — it
+  has no fallible step (purely buffer append + CRC). Callers
+  drop the `?` / `.unwrap()`.
+- **`BufferManager::capacity()` and `BufferManager::clear()`
+  removed.** Both were dead code; `BufferManager` itself is no
+  longer public anyway.
+
+### Breaking
+
+- **`TreeConfig::flush_on_write` renamed to
+  `memory_flush_on_write`** — the field is meaningless under the
+  persistent backend (the WAL+BufferManager dirty-set pair already
+  decides when bytes hit the backend); leaving the v0.1 name in
+  place made it look like a per-write fsync knob it never was.
+  Callers using `TreeBuilder::flush_on_write(b)` switch to
+  `TreeBuilder::memory_flush_on_write(b)`; the field is a no-op
+  on persistent trees.
+- **`Error::NodeCorrupt` carries optional `blob_guid` + `slot`
+  fields** — construct via `Error::node_corrupt(ctx)` and enrich
+  via `.with_blob_guid(g)` / `.with_slot(s)`. Pattern-matching
+  call sites must spread the new fields (`NodeCorrupt { context,
+  .. }`); the buffer manager + walker cross-blob arms attach the
+  GUID automatically.
+
+### Added — errors
+
+- **`Error::Internal(&'static str)`** — new variant for
+  invariant-violation paths that were previously surfacing as
+  `Error::NotYetImplemented` (now reserved for genuine
+  walker-arm feature gaps like degenerate inline-prefix
+  `BlobNode` splits). Five defensive guards in
+  `checkpoint::round` migrated. Non-breaking thanks to
+  `Error`'s `#[non_exhaustive]` marker.
+
+### Fixed — durability (W2D-strict)
+
+- **Writer ↔ background-checkpoint W2D race** (`round.rs`) — the
+  pending-delete snapshot now happens inside the same `wal.lock`
+  critical section as `snapshot_dirty` and `wal.flush`. Previously
+  a writer could land a fresh blob into `dirty` between
+  `snapshot_dirty` and `snapshot_pending_deletes`, then the round
+  would observe a pending-delete for that blob without seeing
+  its WAL record, opening a tiny W2D inversion window.
+- **Checkpoint error paths no longer drop drained state.** Both
+  `Tree::checkpoint` and the background round now restore every
+  snapshot they drained on every error return:
+  - WAL flush failure under `wal.lock` restores both `dirty` and
+    `pending` (previously `Tree::checkpoint`'s `w.flush()?`
+    propagated without restore, so the next round saw
+    `dirty == 0 && pending == 0` and could truncate the WAL,
+    losing the cache mutations the failed flush had just
+    drained).
+  - I/O worker channel-closed / pre-delete Sync failure in the
+    bg round now restores `pending` on every early-return path
+    (previously these returns drained `pending` and never
+    restored it, losing unlink intent).
+- **Abort-on-dirty-failure gate before pending-delete.** When any
+  `write_through` at phase 2 fails, the round still runs the
+  pre-delete `backend.flush` to fsync the writes that *did*
+  succeed, but skips phase 5 entirely and restores the whole
+  pending snapshot. Previously the round flushed the partial
+  parent write, then applied the dependent child's manifest
+  delete — a crash there would leave the on-disk parent
+  referencing a slot that was no longer in the manifest, so
+  WAL replay's walker descent through the `BlobNode` crossing
+  would fail. The new gate keeps parent + child consistent
+  across the failure window: the next round retries the parent
+  write and only then processes its child's deletion.
+- **`scan.rs::refresh_blob_node_pointers` inline `bm.commit`** —
+  replaced with `bm.mark_dirty(parent_guid, STRUCTURAL_SEQ)` so
+  the post-compact pointer repair stages through the unified
+  dirty-set protocol. The previous inline commit pushed the cache
+  image (possibly containing unflushed user-write effects on the
+  parent) straight to backend, re-opening the W2D hole that
+  `Tree::compact` phase 1/2 had just closed.
+- **`Tree::compact` is documented `NOT online-safe`** — running
+  concurrently with reads or writes can torn-read across
+  `BlobNode` crossings. Pause user traffic before calling. The
+  v0.3 maintenance latch will lift this restriction.
+
+### Added — metrics export
+
+- **`metrics` feature flag** (off by default, zero-cost when off).
+  Enables `holt::metrics::render_prometheus(&stats) -> String`
+  which emits Prometheus text format covering blob / space /
+  dirty / pending-delete / cache hit-miss / optimistic-restart /
+  checkpointer counters. Pure Rust, no extra deps. Gauge / counter
+  naming follows Prometheus conventions — gauges drop the
+  `_total` suffix (`holt_slots`, `holt_tombstones`,
+  `holt_compactions`), counters keep it.
+
+### Added — diagnostics
+
+- **`Tree::scan_prefix(p)`** — one-line wrapper for
+  `tree.range().prefix(p)`.
+- **Range-iter tombstone fix** — `RangeIter::next_inner` now
+  skips tombstone leaves in the same `advance_to_next_leaf` loop
+  rather than emitting them and relying on the caller to filter.
+  Caught by the new tombstone property test.
+
+### Added — benchmarks
+
+- **Group B — scale curve** (`kv_scale_get` / `kv_scale_put`).
+  Criterion-parameterized over `{ 20 000, 100 000, 500 000 }`
+  keys. The 500 k tier (~48 MB payload) exceeds the default
+  32 MB buffer pool so real cache-miss + cross-blob descent
+  becomes visible. Bench results: holt still ~2× faster than
+  RocksDB / SQLite on `get` at every tier; on `put`, RocksDB's
+  LSM amortizes flat (~1 500 ns), holt grows 2.4× (365 → 867 ns)
+  but stays ahead.
+- **Group C — p95/p99 latency under maintenance interference**
+  (`tests/bench_contention_p95.rs`, `#[ignore]`). Uses
+  `hdrhistogram` to track every `put`'s latency under 4 writer
+  threads + a 5 ms-cadence background checkpointer + concurrent
+  `tree.compact()` calls. Reports mean / p50 / p95 / p99 / p99.9
+  / max + sustained throughput. Sample result on M3 Pro: 307 k
+  ops/s sustained, p50 = 2 µs, p99 = 108 µs, max = 30 ms
+  (compact-call worst case).
+- **Removed Group A** (`*_durable_put` with
+  `wal_sync_on_commit = true`) — each engine's "sync=true" knob
+  maps to a different macOS syscall (`F_FULLFSYNC` vs
+  `F_BARRIERFSYNC` vs lazy fsync), so the numbers measured
+  drive-cache flush latency for some engines and OS-page-cache
+  flushes for others. Not apples-to-apples; removed.
+
+### Polish
+
+- **PGO build profile docs** (`PGO.md`) — two-stage
+  `cargo pgo build` → `cargo pgo optimize build` walkthrough,
+  plus the workload-shape table for when PGO helps vs when it
+  doesn't (helps on CPU-bound point lookup; rounding error on
+  WAL-fsync-bound or blob-memcpy-bound workloads).
+
 ### Performance
 
 - **SIMD Node48 / Node256 range-iter scans** — two new primitives
@@ -26,6 +212,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   back to slice-by-16 on older / non-x86 cores. Drops per-record
   CRC cost from ~110 ns to ~20 ns on supported hardware. v0.1's
   256-entry table + byte-at-a-time loop is gone.
+- **Cached `Tree.root_pin`** (commit `a6f5c78`) — every
+  `get` / `put` / `delete` keeps the root pinned via
+  `Arc<CachedBlob>` and skips the BM `Mutex<HashMap>` lookup on the
+  root hop. ≈300 ns / op on the hot path.
+- **`RangeIter` delimiter fast-forward** (commit `861dba9`) — after
+  emitting a `CommonPrefix(C)`, ascend the descent stack past `C`'s
+  subtree instead of scanning every leaf under it to dedup.
+  `*_list_dir` is now `O(distinct_rollups)`.
 
 ### Changed — concurrency
 
@@ -57,8 +251,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   who don't enable the feature pay zero runtime cost.
 
 - **`Tree::stats` extended** with bg-checkpointer + dirty-set
-  counters:
+  + cache + concurrency counters:
   - `TreeStats::bm_dirty_count` — current count of unflushed blobs
+  - `TreeStats::bm_pending_delete_count` — pending backend deletes
+    queued by `delete_blob`
+  - `TreeStats::bm_cache_hits` / `bm_cache_misses` — cumulative
+    counts since `Tree::open`
+  - `TreeStats::bm_optimistic_restarts` — count of optimistic-read
+    walker restarts (load-bearing signal for latch contention)
   - `TreeStats::checkpointer: Option<CheckpointerStats>` — when bg
     is running, returns cumulative `rounds_attempted` /
     `rounds_succeeded` / `blobs_flushed` / `merges_total` /
@@ -66,6 +266,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
   `CheckpointerStats` is re-exported at the crate root for
   convenience.
+
+- **Silent observability reads** — `BufferManager::pin_silent` /
+  `get_cached_silent` and `walker::scan::collect_blob_guids_silent`
+  do not bump `cache_hits` / `cache_misses` and do not refresh
+  the LRU `last_touched` tick. `Tree::stats` uses them so a
+  metrics scrape doesn't pollute the counters it's about to
+  report (observer effect).
 
 ### Added — I/O backend
 
@@ -129,17 +336,6 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - `engine::walker::types::CompactStats` — `compact_blob` now returns
   `Result<()>`. Test sites that read the stats counters read
   `space_used` straight off the frame header instead.
-
-### Performance
-
-- **Cached `Tree.root_pin`** (commit `a6f5c78`) — every
-  `get` / `put` / `delete` keeps the root pinned via
-  `Arc<CachedBlob>` and skips the BM `Mutex<HashMap>` lookup on the
-  root hop. ≈300 ns / op on the hot path.
-- **`RangeIter` delimiter fast-forward** (commit `861dba9`) — after
-  emitting a `CommonPrefix(C)`, ascend the descent stack past `C`'s
-  subtree instead of scanning every leaf under it to dedup.
-  `*_list_dir` is now `O(distinct_rollups)`.
 
 ### Internal
 

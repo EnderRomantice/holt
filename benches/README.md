@@ -29,28 +29,51 @@ workloads (`readdir`, S3 `ListObjects`):
   RocksDB + SQLite get the same logic done at the bench's app
   layer, since neither has a native `?delimiter=` API)
 
-`N_KEYS = 20 000` — large enough that the data spreads across
-**multiple holt blobs** (~6–8 × 512 KB), so the bench exercises
-`BlobNode` crossings + cross-blob spillover/compact retries, not
-just single-blob descent.
+`N_KEYS = 20 000` for the baseline scenarios — large enough that
+the data spreads across **multiple holt blobs** (~6–8 × 512 KB),
+so the bench exercises `BlobNode` crossings + cross-blob
+spillover/compact retries, not just single-blob descent.
+
+A second group — **scale curve** (`kv_scale_get` / `kv_scale_put`)
+— parameterizes over `{ 20 000, 100 000, 500 000 }` keys. The
+500 k tier (~48 MB payload) exceeds the default 32 MB buffer
+pool, so it forces real eviction + cross-blob descent on every
+miss instead of measuring the "fully resident in L2 cache" path
+that the 20 k baseline implicitly does.
+
+A third group — **p95/p99 latency under maintenance interference**
+— lives in `tests/bench_contention_p95.rs` (not criterion;
+criterion measures means, not percentiles). Run via
+`cargo test --release --test bench_contention_p95 -- --ignored --nocapture`.
+It spins 4 writer threads + a 5 ms-cadence background
+checkpointer + concurrent `Tree::compact()` calls and tracks
+every `put` latency via `hdrhistogram`.
 
 ## Running
 
 ```sh
-# Full sweep (~7 minutes — 24 bench groups × 3 engines × ~5s/measure):
+# Full criterion sweep (~5 min on M3 Pro):
 cargo bench --bench main
 
 # Quick smoke pass (~1 minute):
 cargo bench --bench main -- --quick --noplot
+
+# Scale curve only (Group B):
+cargo bench --bench main -- kv_scale
 
 # A single scenario:
 cargo bench --bench main -- kv_get
 
 # Just the range scans (the load-bearing metadata-engine test):
 cargo bench --bench main -- _list
+
+# p95/p99 under bg checkpoint + compact interference (Group C):
+cargo test --release --test bench_contention_p95 \
+    -- --ignored --nocapture
 ```
 
-HTML reports land in `target/criterion/`.
+HTML criterion reports land in `target/criterion/`. The
+percentile bench prints its histogram table to stdout.
 
 ## Methodology — apples-to-apples
 
@@ -61,8 +84,8 @@ same durability profile:
 
 Engine algorithm cost only — durability disabled across the board:
 
-- **holt**: `TreeConfig::memory()` with `flush_on_write = false`.
-  Mutations stay in the BufferManager-pinned blobs.
+- **holt**: `TreeConfig::memory()` with `memory_flush_on_write =
+  false`. Mutations stay in the BufferManager-pinned blobs.
 - **RocksDB**: temp-dir DB, `disable_wal = true`, `sync = false`,
   64 MB memtable, compression disabled.
 - **SQLite**: `:memory:` DB, `journal_mode=MEMORY`,
@@ -107,8 +130,11 @@ hierarchical, prefix-rich keys; if your keys are random bytes
 
 ### Sample numbers — Apple M-series, `cargo bench --quick`
 
-These are local-laptop numbers; re-run on your hardware before
-quoting them. The **relative ordering** is what's load-bearing.
+These are rough `--quick` numbers for orientation; **full-suite
+results — including the scale curve and the p95/p99 contention
+bench — live in [`RESULTS.md`](RESULTS.md)**, which is what to
+quote. Either way, re-run on your hardware before quoting; the
+**relative ordering** is what's load-bearing.
 
 **Point lookup (memory mode), 32-byte key, 64-byte value, N=20 000:**
 
@@ -148,10 +174,14 @@ to single µs.
 
 ## Caveats
 
-1. **Single-threaded.** Per-blob `HybridLatch` makes reads
-   wait-free; concurrent-read throughput scales with cores, but
-   this bench measures single-thread latency. A multi-reader
-   stress is on the bench backlog.
+1. **Single-threaded latency, not throughput.** Per-blob
+   `HybridLatch` makes reads wait-free; concurrent-read
+   throughput scales with cores, but the criterion bench measures
+   single-thread latency. For concurrent-read throughput see
+   `tests/bench_multi_reader.rs` (sample numbers on M-series:
+   1 → 5.67 M ops/s, 4 → 14.73 M ops/s, 16 → 19.06 M ops/s). For
+   tail-latency under maintenance interference see
+   `tests/bench_contention_p95.rs`.
 2. **No fsync.** Both modes set `sync=off`-equivalent — durable
    to OS page cache only. A real `fsync`-per-op workload is
    fsync-bound (~1–3 ms on consumer SSD) and overwhelms every
