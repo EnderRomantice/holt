@@ -56,6 +56,9 @@ rocksdb = { version = "0.24", default-features = false }
 # across machines.
 rusqlite = { version = "0.39", features = ["bundled"] }
 proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
+# Lock-free histogram for the contention p95/p99 bench
+# (`tests/bench_contention_p95.rs`). Pure Rust, no native deps.
+hdrhistogram = { version = "7", default-features = false }
 
 [features]
 default = []
