@@ -73,7 +73,7 @@ impl AlignedBlobBuf {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), PAGE_SIZE as usize) }
     }
 
-    /// Length in bytes — always [`PAGE_SIZE`].
+    /// Length in bytes — always `PAGE_SIZE` (512 KB).
     #[must_use]
     pub const fn len(&self) -> usize {
         PAGE_SIZE as usize

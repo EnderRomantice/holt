@@ -7,7 +7,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
-## [Unreleased] — v0.2 close-out
+## [0.2.0] — 2026-05-20
 
 ### Breaking
 

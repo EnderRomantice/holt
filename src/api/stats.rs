@@ -1,7 +1,7 @@
 //! Per-blob and tree-wide counter snapshots returned by
 //! [`Tree::stats`](crate::Tree::stats).
 //!
-//! These mirror the [`BlobHeader`](crate::layout::BlobHeader)
+//! These mirror the `BlobHeader`
 //! counter fields and are read in a single shared-guard pass
 //! per blob, so a snapshot of any one blob is internally
 //! consistent but the cross-blob aggregate is not linearised
@@ -11,7 +11,7 @@ use crate::layout::BlobGuid;
 
 /// Per-blob counters captured by [`Tree::stats`](crate::Tree::stats).
 ///
-/// Each field mirrors a [`BlobHeader`](crate::layout::BlobHeader)
+/// Each field mirrors a `BlobHeader`
 /// counter and is read in a single shared-guard pass over the blob.
 #[derive(Debug, Clone, Copy)]
 pub struct BlobStats {

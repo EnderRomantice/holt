@@ -50,7 +50,7 @@ use super::txn::{BatchOp, TxnBatch};
 /// An `holt` tree — your handle to one metadata store.
 ///
 /// Clone the handle to share the same backing store: the
-/// [`BufferManager`] is held via `Arc`.
+/// internal `BufferManager` is held via `Arc`.
 ///
 /// ## Concurrency
 ///
@@ -158,7 +158,7 @@ impl Tree {
     /// `Storage::Persistent` config.
     ///
     /// The supplied backend is **transparently wrapped** with a
-    /// [`BufferManager`] of `cfg.buffer_pool_size` blobs.
+    /// `BufferManager` of `cfg.buffer_pool_size` blobs.
     /// `BufferManager` owns the in-memory blob cache; the walker
     /// pins blobs from it for both reads and writes — no separate
     /// root buffer in `Tree`.
@@ -238,7 +238,7 @@ impl Tree {
     /// matches.
     ///
     /// **Zero-copy and lock-free against the writer lock**: pins
-    /// each blob via the [`BufferManager`] and walks the cached
+    /// each blob via the `BufferManager` and walks the cached
     /// buffer under a shared `RwLock` read guard. N readers on
     /// different blobs progress in parallel; readers on the same
     /// blob also progress in parallel via the read-half.
@@ -254,7 +254,7 @@ impl Tree {
     /// Insert or replace `(key, value)`. Returns the previous value
     /// if the key already existed.
     ///
-    /// Walks across [`BlobNode`] crossings. When any blob hits
+    /// Walks across `BlobNode` crossings. When any blob hits
     /// `AllocError::OutOfSpace`, the walker automatically migrates
     /// a subtree out via `splitBlob` and retries — so trees may
     /// grow well past the 512 KB single-blob limit without caller
@@ -270,7 +270,6 @@ impl Tree {
     /// Per-op `memory_flush_on_write` mode drains the dirty set inline
     /// after the WAL append.
     ///
-    /// [`BlobNode`]: crate::layout::BlobNode
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
@@ -335,7 +334,7 @@ impl Tree {
     /// Remove `key`. Returns the value that was stored at `key`, or
     /// `None` if no leaf matched.
     ///
-    /// Walks across [`BlobNode`] crossings. When a child blob
+    /// Walks across `BlobNode` crossings. When a child blob
     /// becomes empty as a result of the erase, its parent's
     /// `BlobNode` is freed and the orphaned child blob is queued
     /// for deferred deletion via the BM — the actual
@@ -343,7 +342,6 @@ impl Tree {
     /// after the WAL record covering this erase is durable
     /// (invariant W2D).
     ///
-    /// [`BlobNode`]: crate::layout::BlobNode
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
         // Pre-allocate the seq before the walker descends so any
@@ -1043,7 +1041,7 @@ impl Tree {
     ///    mostly-empty collapses back toward a single root blob.
     ///
     /// Both phases stage their changes via `mark_dirty` /
-    /// `mark_for_delete` on the [`crate::store::BufferManager`]
+    /// `mark_for_delete` on the internal `BufferManager`
     /// rather than writing through to backend inline. This keeps
     /// compact compatible with invariant **W2D**: a naive
     /// `bm.commit(*guid)` per touched blob would push the cache

@@ -1,9 +1,9 @@
-//! Prometheus text-format renderer for [`TreeStats`].
+//! Prometheus text-format renderer for [`TreeStats`](crate::TreeStats).
 //!
 //! Enabled via the `metrics` feature flag. Pure Rust — no
 //! `prometheus` / `metrics` crate dependency. The caller hosts
 //! its own HTTP `/metrics` endpoint (axum, hyper, warp, …) and
-//! invokes [`render_prometheus`] inside the handler.
+//! invokes [`render_prometheus`](crate::metrics::render_prometheus) inside the handler.
 //!
 //! ```ignore
 //! use holt::{Tree, TreeConfig};
