@@ -29,7 +29,7 @@ use super::MAX_SPILLOVER_ATTEMPTS;
 /// the new root slot (caller updates `header.root_slot`) and the
 /// prior value if the key already existed.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn insert(
+pub(super) fn insert(
     frame: &mut BlobFrame<'_>,
     root_slot: u16,
     key: &[u8],

@@ -63,19 +63,18 @@ pub struct TreeConfig {
     /// calling `Tree::checkpoint` to truncate the on-disk log.
     /// Default 16 MB.
     pub checkpoint_byte_interval: u64,
-    /// Memory-backend BM-commit toggle.
+    /// **Memory-only** BM-commit toggle (no effect on
+    /// persistent trees — the WAL + `Tree::checkpoint` is the
+    /// durability path there; see [`Self::wal_sync_on_commit`]).
     ///
-    /// For **memory** trees: `true` (the default) writes the
-    /// BM-cached root blob through the (memory-backed) `Backend`
-    /// after every `put` / `delete` / `rename`. Useful with
-    /// custom backends that want to mirror state out per op;
-    /// benchmarks set this to `false` to skip the redundant
-    /// memcpy.
-    ///
-    /// For **persistent** trees this flag has no effect — the
-    /// WAL is the per-op durability path and the blob image only
-    /// flushes at `Tree::checkpoint`. See [`Self::wal_sync_on_commit`].
-    pub flush_on_write: bool,
+    /// For memory trees: `true` (the default) drains the BM
+    /// dirty set into the backing `Backend` after every `put` /
+    /// `delete` / `rename`, so custom backends supplied via
+    /// [`crate::Tree::open_with_backend`] see state mirrored
+    /// per op. `false` defers all writes to an explicit
+    /// `Tree::checkpoint` call — useful in benches where the
+    /// memcpy through `MemoryBackend` is uninteresting.
+    pub memory_flush_on_write: bool,
     /// Background checkpointer policy. Default disabled —
     /// callers drive [`crate::Tree::checkpoint`] synchronously.
     /// Enable via [`CheckpointConfig::enabled`] or
@@ -94,7 +93,7 @@ impl TreeConfig {
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
             checkpoint_byte_interval: 16 * 1024 * 1024,
-            flush_on_write: true,
+            memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
         }
     }
@@ -107,7 +106,7 @@ impl TreeConfig {
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
             checkpoint_byte_interval: 16 * 1024 * 1024,
-            flush_on_write: true,
+            memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
         }
     }

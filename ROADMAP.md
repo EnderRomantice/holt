@@ -2,31 +2,35 @@
 
 ## Where things stand
 
-The algorithm core (Stage 2), the storage cache (Stage 6
-phase 1+2a+2b+2c), and the WAL record codec (Stage 5a) are all
-done. The tree walks insert / lookup / erase / rename across
-arbitrarily many 512 KB blobs, auto-splits when any blob fills,
-has SIMD-accelerated Node16 byte search, and ships a criterion
-bench that runs **~3.5–5× faster than RocksDB** on small-metadata
-workloads (both `memory` and `persistent` variants).
+The algorithm core, the storage cache, and the WAL record codec
+are all done. The tree walks insert / lookup / erase / rename
+across arbitrarily many 512 KB blobs, auto-splits when any blob
+fills, has SIMD-accelerated Node16 byte search and Node48 /
+Node256 range scans, runs an asynchronous 3-thread background
+checkpointer (planner + I/O worker + cold-blob eviction) under
+a W2D-strict protocol, and exports its observability via
+`Tree::stats` + the `holt::metrics` Prometheus renderer (behind
+the `metrics` feature flag).
 
-Concurrency model is settled: per-blob `HybridLatch` (LeanStore
-3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 202 tests (including a
-property-based suite and a 4-readers × 1-writer optimistic-read
-stress) all green; zero clippy / rustdoc warnings under
-`-D warnings`; CI matrix (ubuntu + macOS) wired.
+Concurrency model: per-blob `HybridLatch` (LeanStore 3-mode)
+gives wait-free optimistic reads. Persistent-tree writers
+serialise on `wal.lock` — the same lock the checkpoint round
+takes when it snapshots dirty + pending-delete and flushes WAL,
+which is the load-bearing piece of the W2D-strict ordering.
+No Tree-wide writer mutex. 240+ tests (including a property-based
+suite, multi-reader stress bench, failpoint-driven checkpoint
+round tests, and crash-and-replay coverage) all green; zero
+clippy / rustdoc warnings under `-D warnings`; CI matrix
+(ubuntu + macOS) plus a `cargo deny check` supply-chain job.
 
-The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
-— writer/replay/integration) and **shrink-on-erase + tombstone
-GC**. The sections below are the live status — see
+The sections below are the per-feature live status — see
 [ARCHITECTURE.md](ARCHITECTURE.md) for design and `git log` for
 what changed when.
 
-The goal is **v0.1: a usable embedded library** for path-shaped
-metadata, single-node + persistent + crash-safe. After that we
-extend (background checkpointer, async backends, MVCC snapshots,
-etc.).
+The goal of v0.1 + v0.2 was **a usable embedded library** for
+path-shaped metadata, single-node + persistent + crash-safe.
+v0.3 extends concurrency primitives (per-node latch, cross-blob
+lock-coupling), MVCC snapshots, and online compaction.
 
 ## v0.1 — Usable embedded library
 

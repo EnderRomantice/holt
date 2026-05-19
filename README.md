@@ -57,16 +57,21 @@ without coordinating.
 
 ## Project status
 
-**v0.1 in active development.** The algorithm core (insert / lookup /
-erase / rename / range / txn / compact + multi-blob crossings),
-persistent backend, physiological WAL with batched transactions,
-and the stateful `Tree::range` iterator (prefix anchoring +
-`start_after` + S3 delimiter) are all landed. 202 tests (unit +
-property-based + crash-and-replay) pass on Ubuntu + macOS CI.
+**Pre-1.0, actively maintained.** The algorithm core (insert /
+lookup / erase / rename / range / txn / compact + multi-blob
+crossings), persistent backend with `O_DIRECT` + optional
+`io_uring` fast path, physiological WAL with batched
+transactions, sharded buffer manager + 3-thread background
+checkpointer enforcing WAL-before-data, SIMD CRC32 + node
+scans, and the stateful `Tree::range` iterator (prefix
+anchoring + `start_after` + S3 delimiter) are all landed.
+240+ tests (unit + property-based + crash-and-replay +
+failpoint-injected) pass on Ubuntu + macOS CI.
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature breakdown
-and [`ROADMAP.md`](ROADMAP.md) for what's queued (io_uring backend,
-background checkpointer, SIMD CRC32, MVCC snapshots).
+See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature
+breakdown and [`ROADMAP.md`](ROADMAP.md) for what's queued
+(per-node `HybridLatch`, cross-blob lock-coupling, MVCC
+snapshots, online compaction).
 
 `cargo bench --bench main` runs a side-by-side comparison with
 RocksDB and SQLite across three metadata workload shapes — see

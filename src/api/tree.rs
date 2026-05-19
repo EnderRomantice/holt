@@ -50,8 +50,27 @@ use super::txn::{BatchOp, TxnBatch};
 /// An `holt` tree — your handle to one metadata store.
 ///
 /// Clone the handle to share the same backing store: the
-/// `BufferManager` is held via `Arc`. Reads run lock-free against
-/// the writer mutex; writers serialise through `write_lock`.
+/// [`BufferManager`] is held via `Arc`.
+///
+/// ## Concurrency
+///
+/// - **Reads** (`get`, `range`, `scan_prefix`) run wait-free
+///   against `HybridLatch::read_optimistic` — they capture each
+///   blob's latch version, read the bytes, then `validate()`.
+///   Restarts from the root on a torn read. Never blocks
+///   writers and never block each other.
+/// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
+///   exclusively for the blobs they touch (always the root,
+///   plus any cross-blob descent target). For persistent trees
+///   the whole walker + `mark_dirty` + `wal.append` sequence
+///   runs inside one `wal.lock` critical section — see the
+///   `Tree::put` body for the W2D-strict protocol. There is
+///   **no** Tree-wide writer mutex; concurrent writers on
+///   disjoint blobs do not serialize on each other.
+/// - **`rename`** holds `rename_lock` (a `Mutex<()>` scoped to
+///   rename only) so its multi-step
+///   `lookup → erase → insert` appears atomic to other writers.
+///   `put` / `delete` / `get` never take `rename_lock`.
 #[derive(Clone)]
 pub struct Tree {
     cfg: TreeConfig,
@@ -167,7 +186,7 @@ impl Tree {
         // image before exposing the tree to callers: the on-disk
         // blob lags the WAL between the last `Tree::checkpoint`
         // and now, so the WAL is the source of truth for any op
-        // committed via `flush_on_write = true`.
+        // committed via `memory_flush_on_write = true`.
         let (wal, next_seq) = if attach_wal {
             match cfg.wal_path() {
                 None => (None, 1u64),
@@ -248,7 +267,7 @@ impl Tree {
     /// write to the inner backend happens when the WAL record
     /// covering this op is on disk — driven either by the
     /// background checkpoint round or by [`Tree::checkpoint`].
-    /// Per-op `flush_on_write` mode drains the dirty set inline
+    /// Per-op `memory_flush_on_write` mode drains the dirty set inline
     /// after the WAL append.
     ///
     /// [`BlobNode`]: crate::layout::BlobNode
@@ -294,7 +313,7 @@ impl Tree {
             outcome
         } else {
             // No WAL — no checkpoint round to race with on the
-            // wal-lock axis. `flush_on_write` (if set) flushes
+            // wal-lock axis. `memory_flush_on_write` (if set) flushes
             // dirty + pending-delete sets inline before returning.
             let outcome = engine::insert_multi(
                 &self.backend,
@@ -304,7 +323,7 @@ impl Tree {
                 seq,
             )?;
             self.backend.mark_dirty(self.root_guid, seq);
-            if self.cfg.flush_on_write {
+            if self.cfg.memory_flush_on_write {
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
             }
@@ -362,7 +381,7 @@ impl Tree {
             if outcome.previous.is_some() {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            if self.cfg.flush_on_write {
+            if self.cfg.memory_flush_on_write {
                 // Flush every blob the walker touched (root + any
                 // children) — no WAL means this is the sole durability
                 // path. snapshot_dirty drains all entries; we commit
@@ -435,7 +454,7 @@ impl Tree {
             engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq)?;
             engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
             self.backend.mark_dirty(self.root_guid, seq);
-            if self.cfg.flush_on_write {
+            if self.cfg.memory_flush_on_write {
                 // Walker may have dirtied child blobs across the
                 // erase + insert sequence — drain the full set.
                 // The erase half can also queue SubtreeGone deletes.
@@ -559,7 +578,7 @@ impl Tree {
                     }
                 }
             }
-            if self.cfg.flush_on_write {
+            if self.cfg.memory_flush_on_write {
                 // Every inner op may have dirtied root + cross-blob
                 // children — drain the whole set rather than just
                 // the root. Inner deletes/renames may also have
@@ -607,7 +626,7 @@ impl Tree {
     /// to the inner backend via `write_through` (CAS-on-seq).
     ///
     /// Used by:
-    /// - The no-WAL `flush_on_write` path, where every op must
+    /// - The no-WAL `memory_flush_on_write` path, where every op must
     ///   reach backend before returning (no checkpointer to defer
     ///   to).
     /// - `Tree::checkpoint`, where the user explicitly asks for
@@ -766,7 +785,7 @@ impl Tree {
     ///    re-marked something between our snapshot and now; their
     ///    entry must keep the WAL alive until a future flush).
     ///
-    /// `flush_on_write = false` callers rely on this to make
+    /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
         use std::collections::HashMap;

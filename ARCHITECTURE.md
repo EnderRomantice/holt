@@ -118,9 +118,9 @@ Three reasons trigger compaction or migration:
   earlier orphans) exceeds a threshold; compact in place.
   _Not yet wired_ — see "leaked extents" caveat below.
 - `OutOfBlobFrame` — alloc failed in current blob; spill a subtree
-  to a new blob. **Implemented (Stage 2d phase B).**
+  to a new blob. **Implemented.**
 
-### `erase_multi` + child-blob reclaim (Stage 2d phase C)
+### `erase_multi` + child-blob reclaim
 
 `walker::erase_multi(backend, root_guid, root_buf, key)` mirrors
 `insert_multi`: it threads `Some(backend)` through the existing
@@ -148,10 +148,10 @@ each child blob as needed.
 
 After this commit `Tree::delete` and `Tree::rename` work across
 arbitrarily many blobs, completing the public API's cross-blob
-symmetry with `Tree::put` (Stage 2d phase B) and `Tree::get`
-(Stage 2d phase A).
+symmetry with `Tree::put` and `Tree::get`
+.
 
-### `make_blob_from_node` + `splitBlob` (Stage 2d phase B)
+### `make_blob_from_node` + `splitBlob`
 
 `make_blob_from_node` is the primitive: take a subtree, deep-copy
 it into a fresh blob (recursive walk through every NodeType,
@@ -203,7 +203,7 @@ vice versa. Each spillover's `free_subtree` typically frees one or
 more `Prefix` nodes, so the next `BlobNode` install reuses one of
 those bodies for free.
 
-### `compactBlob` — in-place extent reclaim (Stage 6 part 1)
+### `compactBlob` — in-place extent reclaim
 
 `compact_blob(buf)` deep-clones the live tree out of `buf` into a
 scratch [`AlignedBlobBuf`] (via the same [`clone_subtree`] used by
@@ -270,7 +270,7 @@ the packed-image size, well below `PAGE_SIZE - SPILLOVER_RESERVATION`.
   collapse still applies once a node has emptied to a single
   child.
 
-## 5b. BufferManager (Stage 6 phase 1 + 2a + 2b + 2c)
+## 5b. BufferManager
 
 `BufferManager` sits between [`Tree`] and the underlying
 [`Backend`], caching recently-accessed blobs. It **itself
@@ -293,13 +293,31 @@ the cache capacity in blobs (= 32 MB resident).
 
 ### Mode: write-through
 
-Writes go to **both** the cache **and** the inner backend in one
-call. Read I/O is what gets cached; write I/O latency is
-unchanged. This preserves the existing `flush_on_write`
-durability semantic without forcing callers to checkpoint.
+The walker mutates blobs via `CachedBlob::write` guards; those
+edits stay in cache (write-back) until something flushes them
+to backend. The `BufferManager` tracks the "newer than backend"
+state in two parallel sets:
 
-A later revision (Stage 6 phase 3) will add **write-back** mode
-with dirty tracking + a background checkpointer thread.
+- `dirty: Mutex<HashMap<BlobGuid, u64>>` — guid → lowest
+  unflushed WAL seq. An entry exists iff the cached image is
+  newer than backend (invariant **I1**).
+- `pending_deletes: Mutex<HashMap<BlobGuid, u64>>` — blobs the
+  erase walker's `SubtreeGone` path unlinked from their parent
+  in cache, queued for `backend.delete_blob` at the next
+  checkpoint round (so the manifest mutation can't race ahead
+  of the WAL record covering the unlink — invariant **W2D**).
+
+Two flush paths drain these sets:
+
+- **`Tree::checkpoint`** — synchronous, caller-driven. Snapshots
+  both sets under `wal.lock`, `wal.flush`-es, then runs
+  `write_through(expected_seq)` per dirty blob, `backend.flush`
+  the data file, applies pending deletes, re-`backend.flush` to
+  persist the manifest deletions, then truncates the WAL when
+  both sets are empty.
+- **Background checkpoint round** — same eight-step protocol
+  but driven by the
+  [`Checkpointer`](src/checkpoint/mod.rs) thread group.
 
 ### Per-blob locking — `HybridLatch + UnsafeCell<AlignedBlobBuf>`
 
@@ -323,7 +341,7 @@ On **different** blobs, ops never contend. On the **same** blob:
 The cache's `HashMap`/LRU mutex is held only for very short
 windows (insertions, eviction, LRU touches).
 
-### Pin-and-operate (Stage 6 phase 2a + 2b + 2c)
+### Pin-and-operate
 
 Every blob operated on by the walker — root **and** every
 cross-blob hop, for both reads and writes — is pinned in the BM
@@ -333,15 +351,22 @@ the walker borrows into the underlying buffer via a typed guard:
 
 | Operation                    | Guard               | Wrap as                       |
 |------------------------------|---------------------|-------------------------------|
-| Wait-free read (Tree::get)   | `read_optimistic()` → `OptimisticGuard` | `BlobFrameRef::wrap(g.as_slice())`, then `g.validate()` |
-| Shared read (commit)         | `read()` → `BlobReadGuard` | derefs to `&AlignedBlobBuf`     |
+| Wait-free read (`Tree::get`) | `read_optimistic()` → `OptimisticGuard` | `BlobFrameRef::wrap(g.as_slice())`, then `g.validate()` |
+| Shared read (checkpoint snapshot bytes) | `read()` → `BlobReadGuard` | derefs to `&AlignedBlobBuf`     |
 | Exclusive write              | `write()` → `BlobWriteGuard` | derefs to `&mut AlignedBlobBuf` |
 
-After an exclusive write the walker calls
-`BufferManager::commit(guid)` to durably write the cached buffer
-through to the inner backend. No second 512 KB memcpy: `commit`
-takes a shared read-guard on the pinned cache entry and writes
-its bytes directly.
+After an exclusive write the walker tags the touched blob via
+`bm.mark_dirty(guid, seq)`; the cache image stays put until a
+checkpoint flushes it. Erase ops that empty a child blob queue
+the unlink via `bm.mark_for_delete(child_guid, seq)` so the
+manifest mutation can't race ahead of the WAL record covering
+the unlink (invariant **W2D**).
+
+Observability paths (`Tree::stats`, metrics scrapes) take the
+silent variants `pin_silent` / `get_cached_silent` so they
+don't bump cache hit/miss counters or refresh the LRU
+`last_touched` tick — a scrape must not inflate the very
+counters it's about to report.
 
 ### Optimistic-read restart loop
 
@@ -352,19 +377,39 @@ the snapshot mid-walk), the lookup restarts from the root — the
 parent BlobNode that pointed at the just-torn child may also
 have moved, so the only safe re-entry point is the tree root.
 
-### No Tree-wide writer mutex
+### Writer synchronisation — `wal.lock` is the per-op barrier
 
-`Tree::put` / `Tree::delete` no longer take any Tree-wide lock.
-Per-blob `HybridLatch` exclusive on the root serialises
-concurrent mutators (every write hits root); two writes on
-disjoint child subtrees can proceed in parallel after their root
-windows finish. `Tree::rename` keeps a `Mutex<()>` `rename_lock`
-because its `lookup_probe + erase + insert` sequence must appear
-atomic to other renames.
+`Tree::put` / `Tree::delete` for persistent trees take
+`wal.lock()` (the `Mutex<WalWriter>` guarding the journal
+writer) **once** at the top of each op and hold it across:
 
-`Tree` no longer keeps its own `state.root_buf` — the canonical
-in-memory image of the root blob lives in the BM cache, and both
-readers and writers reach it the same way.
+1. `engine::insert_multi` / `erase_multi` (walker descent,
+   including all cross-blob hops, spillover, and compact retries
+   — these grab the per-blob `HybridLatch` exclusive as
+   needed),
+2. `bm.mark_dirty(root_guid, seq)` (plus any
+   `mark_dirty(child_guid, seq)` / `mark_for_delete(...)` the
+   walker already issued internally),
+3. `wal.append_*` for the op's record,
+4. optional `wal.flush()` if `wal_sync_on_commit` is set.
+
+The wal-lock-around-the-whole-op shape is **load-bearing**: it
+guarantees that any dirty / pending-delete entry visible to a
+checkpoint round has its corresponding WAL record already
+buffered in the writer (W2D-strict). The background checkpoint
+round and `Tree::checkpoint` snapshot both sets under the same
+`wal.lock`, so they can't catch an entry whose WAL record
+hasn't been appended yet.
+
+Concurrent writers serialise on `wal.lock`. That's the
+intentional barrier. (Cross-blob lock-coupling — letting
+writers on disjoint child blobs release the root early — is
+queued for v0.3; see ROADMAP.)
+
+`Tree::rename` keeps a separate `Mutex<()>` `rename_lock`
+around its multi-step `lookup → erase → insert` so other
+renames see it atomically. `put` / `delete` / `get` never
+take `rename_lock`.
 
 ### LRU eviction
 
@@ -395,9 +440,15 @@ Checkpointer periodically:
    can be reclaimed).
 4. Evicts cold blobs from the buffer pool.
 
-v0.1 ships with a **synchronous** checkpointer (caller decides
-when to call `tree.checkpoint()`). v0.2+ adds an asynchronous
-3-thread checkpointer.
+Both flavours coexist:
+
+- **Synchronous** — `Tree::checkpoint()` walks the same eight
+  steps inline on the caller's thread. Useful for tests + apps
+  that want full control over checkpoint cadence.
+- **Asynchronous** — a 3-thread background `Checkpointer`
+  (planner + I/O worker + eviction sweep) parks on
+  `idle_interval` and runs rounds in the background. Opt-in via
+  [`CheckpointConfig::enabled`](src/checkpoint/mod.rs).
 
 ## 7. Iterators
 
@@ -416,23 +467,37 @@ in-blob descent also crosses `BlobNode` boundaries).
 
 ```rust
 pub trait Backend: Send + Sync {
-    fn read_blob(&self, guid: BlobGuid, into: &mut [u8]) -> Result<()>;
-    fn write_blob(&self, guid: BlobGuid, from: &[u8]) -> Result<()>;
-    fn list_blobs(&self) -> Result<Vec<BlobGuid>>;
+    fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
+    fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()>;
     fn delete_blob(&self, guid: BlobGuid) -> Result<()>;
+    fn list_blobs(&self) -> Result<Vec<BlobGuid>>;
+    fn flush(&self) -> Result<()>;
+    fn has_blob(&self, guid: BlobGuid) -> Result<bool>;
 }
 ```
 
+`AlignedBlobBuf` is the 4 KB-aligned 512 KB buffer the trait
+hands around, so `O_DIRECT` / `io_uring` paths can submit it
+without copying. `flush()` is `fdatasync` on the data file +
+manifest persist (atomic-rename tmp file).
+
 Implementations:
-- `MemoryBackend` — `HashMap<BlobGuid, Vec<u8>>`, for tests +
-  ephemeral use cases.
-- `FileBackend` — one file per blob; uses POSIX `pread` / `pwrite`.
-- `MmapBackend` — mmap-backed, faster reads, more complex flush
-  semantics. Optional feature.
-- (Future) `IoUringBackend` — Linux-only, behind `tokio-uring`
-  or `glommio`. v0.2+.
-- (Future) `RemoteBackend` — talks to a remote blob store via gRPC.
-  For distributed deployments.
+
+- **`MemoryBackend`** — `RwLock<HashMap<BlobGuid,
+  AlignedBlobBuf>>`. For tests, micro-benches, and ephemeral
+  workloads.
+- **`PersistentBackend`** — single packed `blobs.dat` (blob N at
+  byte offset `N × PAGE_SIZE`) + atomic-rename `manifest.bin`.
+  Opens with `O_DIRECT` on Linux, `F_NOCACHE` (`fcntl`) on
+  macOS. Available on every Unix.
+- **`io_uring` fast path** — `cfg(target_os = "linux")` plus
+  `feature = "io-uring"`. `PersistentBackend` routes reads /
+  writes through a per-backend `IoUring` (depth 8) instead of
+  `pread` / `pwrite`. Non-Linux builds with the feature on
+  still get the syscall path.
+
+Future: a remote object-store backend (S3-shaped) is on the
+v0.3+ track.
 
 ## 9. Threading model
 

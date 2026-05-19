@@ -35,6 +35,15 @@ pub enum Error {
     /// inline-prefix `BlobNode` splits). The static string names
     /// the unimplemented case for diagnostics.
     NotYetImplemented(&'static str),
+    /// An internal invariant the engine relies on was observed
+    /// to be violated — typically a background thread closing a
+    /// channel it shouldn't have closed, or a completion sender
+    /// disappearing without producing a result. Distinct from
+    /// [`Self::NotYetImplemented`] (genuine feature gap) and
+    /// from [`Self::NodeCorrupt`] (on-disk / cache layout
+    /// problem). The static string names the specific invariant
+    /// for triage.
+    Internal(&'static str),
     /// A blob's slot table or header is corrupt — recovery
     /// should bail out rather than silently misbehave.
     ///
@@ -130,6 +139,7 @@ impl std::fmt::Display for Error {
                 write!(f, "value too long ({len} bytes; max {})", u16::MAX)
             }
             Self::NotYetImplemented(where_) => write!(f, "not yet implemented: {where_}"),
+            Self::Internal(what) => write!(f, "internal invariant violated: {what}"),
             Self::NodeCorrupt {
                 context,
                 blob_guid,

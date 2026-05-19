@@ -30,7 +30,7 @@ use super::writers::{
 /// and the prior value if the key was present. If `key` was not in
 /// the tree, `previous` is `None` and `new_root_slot == root_slot`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
+pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
     // Single-blob path passes `None` for `bm`, which rejects the
     // BlobNode arm — so the `seq` argument is dead. Pass `0`.
     let r = erase_at(None, frame, root_slot, key, 0, 0)?;

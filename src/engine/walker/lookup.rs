@@ -24,7 +24,7 @@ use super::types::{BlobNodeCrossing, LookupResult};
 /// copies. Returned borrows are tied to the lifetime of that
 /// underlying buffer.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn lookup<'a>(
+pub(super) fn lookup<'a>(
     frame: BlobFrameRef<'a>,
     start_slot: u16,
     key: &[u8],
@@ -35,8 +35,7 @@ pub fn lookup<'a>(
 /// Continue a lookup at `start_slot` with a non-zero `depth` — used
 /// by callers driving cross-blob descent through
 /// [`LookupResult::Crossing`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn lookup_at<'a>(
+pub(super) fn lookup_at<'a>(
     frame: BlobFrameRef<'a>,
     start_slot: u16,
     key: &[u8],

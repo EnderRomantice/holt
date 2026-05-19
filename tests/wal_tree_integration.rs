@@ -262,7 +262,7 @@ fn default_mode_loses_writes_without_checkpoint_or_fsync() {
 fn batched_mode_loses_writes_without_checkpoint() {
     let dir = tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -293,7 +293,7 @@ fn batched_mode_loses_writes_without_checkpoint() {
 fn batched_mode_with_checkpoint_persists_everything() {
     let dir = tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -575,10 +575,10 @@ fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
 
     // `open_with_backend` skips the WAL and the bg checkpointer
     // (default `CheckpointConfig::disabled`). Disable
-    // `flush_on_write` too so the test can observe the dirty-set
+    // `memory_flush_on_write` too so the test can observe the dirty-set
     // state between ops and the explicit `checkpoint` call.
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
     let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
 
     // Inner backend starts with only the seeded root.
@@ -686,7 +686,7 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
     let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
 
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false; // no implicit per-op flush
+    cfg.memory_flush_on_write = false; // no implicit per-op flush
     let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
 
     let initial = inner.list_blobs().unwrap();
@@ -750,7 +750,7 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
 
     let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
     let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
 
     // Inner backend starts with only the seeded root.

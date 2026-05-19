@@ -130,7 +130,7 @@ fn setup_with_pending_delete() -> (Arc<dyn Backend>, Arc<FailpointBackend>, Tree
     let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
     let fp_dyn: Arc<dyn Backend> = fp.clone();
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
     let tree = Tree::open_with_backend(cfg, fp_dyn).unwrap();
 
     // Stuff enough data to force at least one spillover, then
@@ -260,7 +260,7 @@ fn dirty_write_failure_is_retried_next_round() {
     let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
     let fp_clone: Arc<dyn Backend> = fp.clone();
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
     let tree = Tree::open_with_backend(cfg, fp_clone).unwrap();
 
     tree.put(b"k1", b"v1").unwrap();
@@ -304,7 +304,7 @@ fn bg_checkpointer_recovers_from_transient_failure() {
     let _ = dir; // we use open_with_backend (no WAL), so dir unused
 
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false;
+    cfg.memory_flush_on_write = false;
     cfg.checkpoint = CheckpointConfig {
         enabled: true,
         idle_interval: Duration::from_millis(10),

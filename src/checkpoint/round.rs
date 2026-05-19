@@ -164,8 +164,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                 failed.entry(*g).or_insert(*t);
             }
             shared.bm.restore_dirty(failed);
-            return Err(Error::NotYetImplemented(
-                "checkpoint: I/O worker channel closed mid-round",
+            return Err(Error::Internal("checkpoint: I/O worker channel closed mid-round",
             ));
         }
         completions.push((*guid, *txn_id, rx));
@@ -203,8 +202,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         .send(IoTask::Sync { on_done: sync_tx })
         .is_err()
     {
-        return Err(Error::NotYetImplemented(
-            "checkpoint: I/O worker channel closed before Sync",
+        return Err(Error::Internal("checkpoint: I/O worker channel closed before Sync",
         ));
     }
     match sync_rx.recv() {
@@ -214,8 +212,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             return Err(e);
         }
         Err(_) => {
-            return Err(Error::NotYetImplemented(
-                "checkpoint: I/O worker dropped Sync completion",
+            return Err(Error::Internal("checkpoint: I/O worker dropped Sync completion",
             ));
         }
     }
@@ -268,8 +265,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             .is_err()
         {
             shared.bm.restore_pending_deletes(restore_applied());
-            return Err(Error::NotYetImplemented(
-                "checkpoint: I/O worker channel closed before Sync (deletes)",
+            return Err(Error::Internal("checkpoint: I/O worker channel closed before Sync (deletes)",
             ));
         }
         match sync_rx2.recv() {
@@ -281,8 +277,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             }
             Err(_) => {
                 shared.bm.restore_pending_deletes(restore_applied());
-                return Err(Error::NotYetImplemented(
-                    "checkpoint: I/O worker dropped Sync (deletes) completion",
+                return Err(Error::Internal("checkpoint: I/O worker dropped Sync (deletes) completion",
                 ));
             }
         }

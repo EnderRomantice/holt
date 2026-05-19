@@ -31,8 +31,8 @@
 //!
 //! | Mode       | holt                                        | RocksDB                              | SQLite                                              |
 //! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|
-//! | memory     | `TreeConfig::memory()`, `flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` |
-//! | persistent | `TreeConfig::new(dir)`, `flush_on_write=false` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=NORMAL`, file-backed |
+//! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` |
+//! | persistent | `TreeConfig::new(dir)`, `memory_flush_on_write=false` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=NORMAL`, file-backed |
 //!
 //! ## Running
 //!
@@ -134,19 +134,18 @@ fn gen_fs_dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
 
 fn make_holt() -> Tree {
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false; // batched flushes; matches RocksDB / SQLite no-WAL mode
+    cfg.memory_flush_on_write = false; // batched flushes; matches RocksDB / SQLite no-WAL mode
     Tree::open(cfg).expect("holt open")
 }
 
-/// Persistent holt on a temp dir. `flush_on_write = false` so
-/// each `put` lands in the BufferManager cache; the persistent
+/// Persistent holt on a temp dir. Each `put` lands in the WAL
+/// writer's buffer + BufferManager cache; the persistent
 /// backend only gets a `pwrite` at spillover or `checkpoint()`.
 /// Matches RocksDB's `WAL=on, sync=false` (per-op durable to OS
 /// page cache, not fsync'd) and SQLite's `WAL + synchronous=NORMAL`.
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
-    let mut cfg = TreeConfig::new(dir.path());
-    cfg.flush_on_write = false;
+    let cfg = TreeConfig::new(dir.path());
     let tree = Tree::open(cfg).expect("holt persistent open");
     (tree, dir)
 }

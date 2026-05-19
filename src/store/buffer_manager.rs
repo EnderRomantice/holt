@@ -14,7 +14,7 @@
 //!
 //! - **Synchronous** [`BufferManager::commit`] — drives one blob
 //!   per call from [`crate::Tree::checkpoint`] or per-op
-//!   `flush_on_write` mode. Writes the cache image to backend
+//!   `memory_flush_on_write` mode. Writes the cache image to backend
 //!   and atomically clears the blob's dirty entry on success.
 //! - **Background checkpointer** — drives a round-based flush of
 //!   the entire dirty set; see [`BufferManager::snapshot_dirty`]

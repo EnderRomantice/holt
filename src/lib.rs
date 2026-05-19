@@ -20,13 +20,15 @@
 //! ## Quick taste
 //!
 //! ```ignore
-//! use holt::TreeBuilder;
+//! use holt::{RangeEntry, TreeBuilder};
 //!
 //! let tree = TreeBuilder::new("/var/lib/myapp/meta.holt").open()?;
 //! tree.put(b"img/01.jpg", b"rgb_data")?;
-//! let v = tree.get(b"img/01.jpg")?.unwrap();
-//! for entry in tree.range(b"img/").take(10) {
-//!     println!("{} -> {}", entry.key_str(), entry.value_str());
+//! let v: Vec<u8> = tree.get(b"img/01.jpg")?.unwrap();
+//! for entry in tree.scan_prefix(b"img/").into_iter().take(10) {
+//!     if let RangeEntry::Key { key, value } = entry? {
+//!         println!("{key:?} -> {value:?}");
+//!     }
 //! }
 //! # Ok::<(), holt::Error>(())
 //! ```
