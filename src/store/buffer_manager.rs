@@ -93,6 +93,7 @@
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::api::errors::Result;
@@ -112,6 +113,16 @@ pub struct BufferManager {
     /// [`BufferManager::snapshot_dirty`] so checkpoint rounds and
     /// concurrent writers don't step on each other.
     dirty: Mutex<HashMap<BlobGuid, u64>>,
+    /// Monotonic logical clock used by the v0.2 eviction thread to
+    /// classify cache entries as cold. Every `pin` / `get_cached`
+    /// stamps the touched entry's `last_touched` with
+    /// `clock.fetch_add(1)`; the eviction thread compares the
+    /// current clock to each entry's stamp to find candidates that
+    /// haven't been used in the last N ticks.
+    ///
+    /// Uses `Relaxed` ordering throughout — strict happens-before
+    /// isn't required, only "more recent stamps look more recent".
+    clock: AtomicU64,
 }
 
 struct BufferManagerState {
@@ -131,6 +142,11 @@ struct BufferManagerState {
 pub struct CachedBlob {
     latch: HybridLatch,
     buf: UnsafeCell<AlignedBlobBuf>,
+    /// Stamp set by `BufferManager` on every `pin` / `get_cached`.
+    /// Read by the v0.2 eviction thread to decide if this entry is
+    /// cold enough to drop. Relaxed reads/writes — see
+    /// [`BufferManager::clock`].
+    last_touched: AtomicU64,
 }
 
 // SAFETY: every access to `buf` is gated by `latch`, which provides
@@ -145,7 +161,15 @@ impl CachedBlob {
         Self {
             latch: HybridLatch::new(),
             buf: UnsafeCell::new(buf),
+            last_touched: AtomicU64::new(0),
         }
+    }
+
+    /// Logical tick at which this entry was last looked up. Used
+    /// by the v0.2 eviction thread to classify the entry as cold.
+    #[must_use]
+    pub(crate) fn last_touched(&self) -> u64 {
+        self.last_touched.load(Ordering::Relaxed)
     }
 
     /// Wait-free read snapshot. No real lock taken — the caller
@@ -272,7 +296,59 @@ impl BufferManager {
                 lru: VecDeque::new(),
             }),
             dirty: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(1),
         }
+    }
+
+    /// Current logical clock value. Read by the v0.2 eviction
+    /// thread to compare against each entry's `last_touched`. The
+    /// returned tick is `Relaxed` — fine for "how cold is this
+    /// entry" decisions, not for cross-thread synchronisation.
+    pub(crate) fn clock_tick(&self) -> u64 {
+        self.clock.load(Ordering::Relaxed)
+    }
+
+    /// Iterate cached `(guid, entry)` pairs under a brief BM-state
+    /// lock — the eviction thread snapshots this list, releases the
+    /// lock, then makes its keep/drop decisions. The clone of the
+    /// `Arc<CachedBlob>` bumps its strong count so `try_evict`
+    /// won't fire on it mid-decision.
+    pub(crate) fn snapshot_entries(&self) -> Vec<(BlobGuid, Arc<CachedBlob>)> {
+        let state = self.state.lock().unwrap();
+        state
+            .cache
+            .iter()
+            .map(|(g, e)| (*g, Arc::clone(e)))
+            .collect()
+    }
+
+    /// Drop the cache entry for `guid` if (a) it's still cached,
+    /// (b) we hold the only outside reference (caller's `Arc` was
+    /// dropped before calling), and (c) nothing in the dirty map
+    /// references it.
+    ///
+    /// Returns `true` if an entry was actually evicted.
+    pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
+        let dirty_guard = self.dirty.lock().unwrap();
+        if dirty_guard.contains_key(&guid) {
+            return false;
+        }
+        drop(dirty_guard);
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.cache.get(&guid) {
+            // strong_count == 1 means only the cache holds the Arc.
+            // The eviction-thread snapshot already dropped its
+            // clone before calling this.
+            if Arc::strong_count(entry) > 1 {
+                return false;
+            }
+            state.cache.remove(&guid);
+            if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
+                state.lru.remove(pos);
+            }
+            return true;
+        }
+        false
     }
 
     /// Maximum number of blobs the cache will retain before
@@ -299,7 +375,9 @@ impl BufferManager {
     }
 
     /// Internal: look up `guid` in the cache. On a hit, touches
-    /// the LRU (moves to back) and returns the entry.
+    /// the LRU (moves to back) **and** stamps the entry's
+    /// `last_touched` with the current clock tick (so the v0.2
+    /// eviction thread treats this hit as fresh).
     fn get_cached(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
         let mut state = self.state.lock().unwrap();
         if let Some(entry) = state.cache.get(&guid).cloned() {
@@ -308,6 +386,9 @@ impl BufferManager {
                 state.lru.remove(pos);
             }
             state.lru.push_back(guid);
+            drop(state);
+            let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+            entry.last_touched.store(tick, Ordering::Relaxed);
             Some(entry)
         } else {
             None
@@ -315,7 +396,9 @@ impl BufferManager {
     }
 
     /// Internal: insert a freshly-loaded blob into the cache.
-    /// Idempotent under concurrent inserts.
+    /// Idempotent under concurrent inserts. Stamps the new entry's
+    /// `last_touched` so it doesn't look cold to the eviction
+    /// thread on its very next sweep.
     fn insert_into_cache(&self, guid: BlobGuid, contents: &AlignedBlobBuf) {
         let mut state = self.state.lock().unwrap();
         if state.cache.contains_key(&guid) {
@@ -328,6 +411,8 @@ impl BufferManager {
             return;
         }
         let entry = Arc::new(CachedBlob::new(contents.clone()));
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        entry.last_touched.store(tick, Ordering::Relaxed);
         state.cache.insert(guid, entry);
         state.lru.push_back(guid);
         while state.cache.len() > self.capacity {
@@ -533,6 +618,46 @@ impl BufferManager {
     #[must_use]
     pub fn dirty_count(&self) -> usize {
         self.dirty.lock().unwrap().len()
+    }
+
+    /// Snapshot the cached bytes for `guid` into a freshly allocated
+    /// `AlignedBlobBuf`. Returns `None` if the blob isn't cached.
+    ///
+    /// Used by the v0.2 background checkpointer to hand off bytes to
+    /// the I/O worker thread without keeping the shared read guard
+    /// open across the actual `backend.write_blob` call. The read
+    /// guard is held only for the duration of the 512 KB memcpy, so
+    /// writers don't block on long-running (especially io_uring)
+    /// I/O.
+    pub(crate) fn snapshot_bytes(&self, guid: BlobGuid) -> Option<AlignedBlobBuf> {
+        let entry = self.get_cached(guid)?;
+        let buf = entry.read();
+        Some(buf.clone())
+    }
+
+    /// Push pre-snapshotted bytes for `guid` directly to the inner
+    /// backend, bypassing the cache. Used by the v0.2 I/O worker
+    /// thread, which receives bytes that were snapshotted by the
+    /// orchestrator under a shared read guard.
+    ///
+    /// On success, clears the dirty entry for `guid` (the backend
+    /// image now matches the snapshot). On failure, leaves the
+    /// dirty entry intact so the next round retries.
+    pub(crate) fn write_through(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) -> Result<()> {
+        self.backend.write_blob(guid, bytes)?;
+        // Snapshot-time bytes are now durable in backend. Any
+        // concurrent writer that mutated cache after our snapshot
+        // already called `mark_dirty` with a newer entry; that
+        // entry survives this clear because we only `remove` the
+        // map slot if it's still present (see commit's pattern).
+        self.dirty.lock().unwrap().remove(&guid);
+        Ok(())
+    }
+
+    /// Forward `flush` to the inner backend without touching the
+    /// cache. Used by the v0.2 I/O worker for `IoTask::Sync`.
+    pub(crate) fn backend_flush(&self) -> Result<()> {
+        self.backend.flush()
     }
 }
 

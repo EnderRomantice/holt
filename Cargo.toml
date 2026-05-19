@@ -16,6 +16,10 @@ categories = ["database-implementations", "data-structures", "filesystem"]
 # v0.1 deps. PersistentBackend is available on every Unix; io_uring
 # is the Linux fast path (Stage 7).
 [dependencies]
+# Bounded MPSC + `select!` between a timer and a stop-channel —
+# used by the v0.2 background checkpointer threads (planner / I/O /
+# eviction). Std's `mpsc` lacks bounded sends and `select!`.
+crossbeam-channel = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -438,6 +438,7 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
                 idle_interval: Duration::from_millis(25),
                 dirty_blob_threshold: 1,
                 auto_merge: true,
+                ..CheckpointConfig::default()
             })
             .open()
             .unwrap();
