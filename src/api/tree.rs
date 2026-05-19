@@ -240,6 +240,12 @@ impl Tree {
         // `HybridLatch` (root blob always taken exclusive); no
         // Tree-wide writer mutex needed.
         let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
+        // Root blob's cached image is now ahead of the backend
+        // image. Tag it for the (foreground or background)
+        // checkpoint round; the `flush_on_write` branch below
+        // drains the entry inline, the WAL branch defers to the
+        // checkpointer.
+        self.backend.mark_dirty(self.root_guid, seq);
 
         // Durability model: the WAL flush is the **per-op
         // boundary**. The BM-cached blob image stays in memory
@@ -289,6 +295,10 @@ impl Tree {
         if let Some(wal) = &self.wal {
             if let Some(prev) = &outcome.previous {
                 let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+                // Only mark dirty on an actual erase — a no-op
+                // delete (key absent) leaves the cached image
+                // byte-identical to the backend.
+                self.backend.mark_dirty(self.root_guid, seq);
                 let mut w = wal.lock().unwrap();
                 // Fast-path: skips the `TxnOp::Erase` enum's
                 // two `Vec` clones (key, value).
@@ -299,6 +309,10 @@ impl Tree {
             }
             // No-op delete (key wasn't there) is not logged.
         } else if self.cfg.flush_on_write {
+            if outcome.previous.is_some() {
+                let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+                self.backend.mark_dirty(self.root_guid, seq);
+            }
             self.backend.commit(self.root_guid)?;
         }
         Ok(outcome.previous)
@@ -344,6 +358,8 @@ impl Tree {
         // `BlobNode` crossings and commit any touched child blobs.
         engine::erase_multi(&self.backend, &self.root_pin, &src_padded)?;
         engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
+        // Both walker calls mutated the root blob's cached image.
+        self.backend.mark_dirty(self.root_guid, seq);
 
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
@@ -487,6 +503,7 @@ impl Tree {
     fn apply_put_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<TxnOp> {
         let padded = pad_key(key);
         let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
+        self.backend.mark_dirty(self.root_guid, seq);
         Ok(TxnOp::Insert {
             tree_id: 0,
             seq,
@@ -499,6 +516,11 @@ impl Tree {
     fn apply_delete_inner(&self, key: &[u8], seq: u64) -> Result<Option<TxnOp>> {
         let padded = pad_key(key);
         let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded)?;
+        if outcome.previous.is_some() {
+            // Only an actual erase mutated bytes; the no-op path
+            // leaves the cached image byte-identical to backend.
+            self.backend.mark_dirty(self.root_guid, seq);
+        }
         Ok(outcome.previous.map(|prev| TxnOp::Erase {
             tree_id: 0,
             seq,
@@ -520,6 +542,7 @@ impl Tree {
             }
             engine::erase_multi(&self.backend, &self.root_pin, &src_padded)?;
             engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
+            self.backend.mark_dirty(self.root_guid, seq);
         }
         Ok(TxnOp::RenameObject {
             tree_id: 0,
