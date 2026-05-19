@@ -33,3 +33,11 @@ updates:
     commit-message:
       prefix: "chore(ci)"
       include: "scope"
+    ignore:
+      # `dtolnay/rust-toolchain@1.82` is NOT a regular action version
+      # bump — the tag IS our MSRV. The MSRV CI job must keep
+      # pinning to whatever version Cargo.toml's `rust-version`
+      # says (currently 1.82). Bumping it would silently invalidate
+      # the MSRV claim. MSRV changes go through a deliberate
+      # Cargo.toml + dependabot.yml + this tag bump in one PR.
+      - dependency-name: "dtolnay/rust-toolchain"
