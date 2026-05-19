@@ -54,15 +54,15 @@ mod uring;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};

@@ -445,11 +445,8 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
 
         // Produce a WAL of non-trivial size.
         for i in 0..500u32 {
-            tree.put(
-                format!("bg/{i:04}").as_bytes(),
-                format!("v-{i}").as_bytes(),
-            )
-            .unwrap();
+            tree.put(format!("bg/{i:04}").as_bytes(), format!("v-{i}").as_bytes())
+                .unwrap();
         }
 
         // Wait until the background thread shrinks the WAL back

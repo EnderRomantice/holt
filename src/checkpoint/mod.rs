@@ -327,9 +327,7 @@ impl Checkpointer {
 impl Drop for Checkpointer {
     fn drop(&mut self) {
         // 1. Stop the planner so no new rounds start.
-        self.shared
-            .checkpoint_stop
-            .store(true, Ordering::SeqCst);
+        self.shared.checkpoint_stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.checkpoint_handle.take() {
             h.thread().unpark();
             let _ = h.join();
@@ -350,9 +348,7 @@ impl Drop for Checkpointer {
         }
 
         // 4. Stop the eviction thread.
-        self.shared
-            .eviction_stop
-            .store(true, Ordering::SeqCst);
+        self.shared.eviction_stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.eviction_handle.take() {
             h.thread().unpark();
             let _ = h.join();
@@ -413,8 +409,7 @@ mod tests {
     #[test]
     fn spawn_and_drop_is_leak_free() {
         let bm = make_bm();
-        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, no_merge_cfg())
-            .expect("spawn");
+        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, no_merge_cfg()).expect("spawn");
         // Give threads a tick to actually park.
         thread::sleep(Duration::from_millis(50));
         drop(ck);
@@ -455,8 +450,7 @@ mod tests {
         let bm = make_bm();
         let mut cfg = no_merge_cfg();
         cfg.idle_interval = Duration::from_secs(10);
-        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, cfg)
-            .expect("spawn");
+        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, cfg).expect("spawn");
 
         // Need a cached blob so snapshot_bytes finds it.
         let scratch = crate::store::backend::AlignedBlobBuf::zeroed();
@@ -502,8 +496,7 @@ mod tests {
             eviction_idle_ticks: 1, // immediately stale after one tick advance
             ..no_merge_cfg()
         };
-        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, cfg)
-            .expect("spawn");
+        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, cfg).expect("spawn");
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

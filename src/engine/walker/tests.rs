@@ -959,7 +959,6 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
     }
 }
 
-
 /// Synthetic two-blob tree: build a normal tree, deep-clone its
 /// subtree into a fresh child blob, then rewrite the root blob's
 /// `header.root_slot` to point at a freshly-allocated `BlobNode`

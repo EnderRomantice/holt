@@ -62,9 +62,7 @@ fn pretty_bytes(b: u64) -> String {
 }
 
 fn print_results(results: &[Run]) {
-    println!(
-        "\n=== Background checkpointer impact ({KEYS} keys × 64 B value, persistent) ===\n"
-    );
+    println!("\n=== Background checkpointer impact ({KEYS} keys × 64 B value, persistent) ===\n");
     println!(
         "{:<22}  {:>11}  {:>10}  {:>10}  {:>11}  {:>9}",
         "config", "write_total", "peak_wal", "final_wal", "data_file", "reopen"
@@ -226,9 +224,7 @@ fn bg_checkpointer_bounds_wal_under_paced_writes() {
         drop(dir);
     }
 
-    println!(
-        "\n=== Paced workload ({KEYS} keys × 64 B, 100 ms pause every 500) ===\n"
-    );
+    println!("\n=== Paced workload ({KEYS} keys × 64 B, 100 ms pause every 500) ===\n");
     println!(
         "{:<22}  {:>11}  {:>10}  {:>10}  {:>9}",
         "config", "write_total", "peak_wal", "final_wal", "reopen"
@@ -274,7 +270,11 @@ fn bg_checkpointer_keeps_wal_bounded_and_speeds_reopen() {
     {
         let dir = TempDir::new().unwrap();
         let cfg = TreeConfig::new(dir.path());
-        results.push(run_workload("bg disabled (default)", dir.path().into(), cfg));
+        results.push(run_workload(
+            "bg disabled (default)",
+            dir.path().into(),
+            cfg,
+        ));
         drop(dir);
     }
 
@@ -283,11 +283,7 @@ fn bg_checkpointer_keeps_wal_bounded_and_speeds_reopen() {
         let dir = TempDir::new().unwrap();
         let mut cfg = TreeConfig::new(dir.path());
         cfg.checkpoint = CheckpointConfig::enabled();
-        results.push(run_workload(
-            "bg enabled (default)",
-            dir.path().into(),
-            cfg,
-        ));
+        results.push(run_workload("bg enabled (default)", dir.path().into(), cfg));
         drop(dir);
     }
 

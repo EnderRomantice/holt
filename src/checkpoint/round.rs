@@ -79,9 +79,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // 1. Snapshot dirty.
     let snap = shared.bm.snapshot_dirty();
     let snap_count = snap.len();
-    shared
-        .last_dirty_count
-        .store(snap_count, Ordering::Relaxed);
+    shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
 
     if snap.is_empty() && merged == 0 {
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -156,7 +154,11 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // 5. Sync the backend so every Flush above is on stable
     //    storage before we drop WAL records.
     let (sync_tx, sync_rx) = bounded(1);
-    if shared.io_tx.send(IoTask::Sync { on_done: sync_tx }).is_err() {
+    if shared
+        .io_tx
+        .send(IoTask::Sync { on_done: sync_tx })
+        .is_err()
+    {
         return Err(Error::NotYetImplemented(
             "checkpoint: I/O worker channel closed before Sync",
         ));
