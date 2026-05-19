@@ -1,16 +1,23 @@
-//! ART walker — descent / insert / erase / scan / rename / compact.
+//! ART engine — descent, mutation, range-scan, and the
+//! per-blob hot-path primitives the walker is built from.
 //!
-//! Stage 2a–2c: single-blob lookup + insert + erase land.
-//! Stage 2d: multi-blob descent (BlobNode crossing + splitBlob).
-//! Stage 6 phase 2a (current): read paths take [`BlobFrameRef`]
-//! and run zero-copy against `BufferManager::pin`-ed buffers.
+//! Submodules:
 //!
-//! [`simd`] hosts SIMD hot paths the walker calls into (Node16
-//! byte search, longest-common-prefix).
+//! - [`walker`] — the recursive walker, split into focused
+//!   files: `lookup` / `insert` / `erase` / `range` / `merge`
+//!   / `scan` (read-side walkers + tree-wide passes),
+//!   `spillover` / `migrate` (write-side restructuring), and
+//!   the internal `readers` / `writers` / `types` primitives
+//!   they share.
+//! - [`simd`] — SIMD hot paths the walker calls into:
+//!   `Node16` byte search and longest-common-prefix
+//!   (SSE2 / NEON / scalar fallback).
 //!
-//! [`BlobFrameRef`]: crate::store::BlobFrameRef
+//! Read paths take [`crate::store::BlobFrameRef`] and run
+//! zero-copy against `BufferManager`-pinned buffers; writes
+//! take an exclusive `HybridLatch` for the duration of the
+//! mutation. See `concurrency` for the latch contract.
 
-pub mod compact;
 pub mod simd;
 pub mod walker;
 

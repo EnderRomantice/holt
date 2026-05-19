@@ -3,6 +3,21 @@
 //! Each variant carries the minimal info needed to replay the
 //! operation deterministically during WAL recovery.
 
+/// Reason a `compactBlob` (or `splitBlob`-triggered compact)
+/// fired. Encoded into the WAL as the `reason` body of
+/// [`TxnOp::Compact`]. Stable on-disk tag values are assigned
+/// in [`super::codec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactReason {
+    /// Too many tombstone leaves; rebuild dropping them.
+    SplitTombstone,
+    /// Bump-allocator wasted space exceeds threshold; rebuild
+    /// compactly.
+    SplitGapSpace,
+    /// Alloc failed in the current blob; spill a subtree out.
+    OutOfBlobFrame,
+}
+
 /// 11 transaction-op variants emitted by the walker.
 ///
 /// Variant tags are stable on-disk constants — see the `TY_*`
@@ -58,7 +73,7 @@ pub enum TxnOp {
         /// Compacted blob's GUID.
         blob: [u8; 16],
         /// Why we compacted.
-        reason: super::super::engine::compact::CompactReason,
+        reason: CompactReason,
     },
     /// Atomic in-tree rename.
     RenameObject {

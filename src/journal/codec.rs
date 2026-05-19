@@ -32,8 +32,9 @@
 //! followed by raw bytes.
 
 use crate::api::errors::{Error, Result};
-use crate::engine::compact::CompactReason;
 use crate::layout::BlobGuid;
+
+use super::txn_op::CompactReason;
 
 use super::txn_op::TxnOp;
 
