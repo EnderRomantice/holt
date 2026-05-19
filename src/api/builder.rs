@@ -23,6 +23,7 @@ use crate::store::backend::Backend;
 ///     .open()?;
 /// ```
 #[derive(Debug, Clone)]
+#[must_use = "TreeBuilder is consumed by `.open()` / `.open_with_backend()`; chained setters return a fresh builder you must use"]
 pub struct TreeBuilder {
     cfg: TreeConfig,
 }
@@ -30,7 +31,6 @@ pub struct TreeBuilder {
 impl TreeBuilder {
     /// Start a builder targeting `data_dir` in persistent mode
     /// (the default).
-    #[must_use]
     pub fn new<P: Into<PathBuf>>(data_dir: P) -> Self {
         Self {
             cfg: TreeConfig::new(data_dir),
@@ -39,28 +39,24 @@ impl TreeBuilder {
 
     /// Flip the builder to **in-memory** mode. The supplied
     /// `data_dir` becomes informational only.
-    #[must_use]
     pub fn memory(mut self) -> Self {
         self.cfg.storage = Storage::Memory;
         self
     }
 
     /// Set buffer pool size (in number of 512 KB blob frames).
-    #[must_use]
     pub fn buffer_pool_size(mut self, n: usize) -> Self {
         self.cfg.buffer_pool_size = n;
         self
     }
 
     /// fsync the WAL on every commit (slow + durable) vs batched.
-    #[must_use]
     pub fn wal_sync_on_commit(mut self, on: bool) -> Self {
         self.cfg.wal_sync_on_commit = on;
         self
     }
 
     /// Bytes appended to the WAL before triggering a checkpoint.
-    #[must_use]
     pub fn checkpoint_byte_interval(mut self, bytes: u64) -> Self {
         self.cfg.checkpoint_byte_interval = bytes;
         self

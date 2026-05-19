@@ -13,7 +13,11 @@ use std::path::PathBuf;
 ///
 /// `Persistent` is the production target. `Memory` is for tests,
 /// scratch use, and platforms without a usable file-backed backend.
+///
+/// `#[non_exhaustive]` so adding new storage variants (e.g., a
+/// future `RemoteObjectStore`) is a non-breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Storage {
     /// File-backed durable storage at `dir`. On Linux the
     /// [`crate::PersistentBackend`] opens the underlying file with

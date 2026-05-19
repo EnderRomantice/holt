@@ -619,6 +619,7 @@ fn bench_list_plain(
                 match entry.unwrap() {
                     RangeEntry::Key { key, value } => out.push((key, value)),
                     RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
+                    _ => unreachable!("RangeEntry got a new variant"),
                 }
                 if out.len() >= take {
                     break;
@@ -687,6 +688,7 @@ fn bench_list_plain_persistent(
                 match entry.unwrap() {
                     RangeEntry::Key { key, value } => out.push((key, value)),
                     RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
+                    _ => unreachable!("RangeEntry got a new variant"),
                 }
                 if out.len() >= take {
                     break;

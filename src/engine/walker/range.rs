@@ -35,7 +35,11 @@ use super::readers::{
 };
 
 /// An entry yielded by [`RangeIter`].
+///
+/// `#[non_exhaustive]` so adding new emission types (e.g., a
+/// future tombstone-marker variant) is a non-breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RangeEntry {
     /// A leaf — user key + value (engine terminator already stripped).
     Key {
@@ -56,6 +60,7 @@ pub enum RangeEntry {
 ///
 /// The builder is consumed by [`RangeBuilder::into_iter`] into a
 /// [`RangeIter`] yielding [`RangeEntry`] items in lex order.
+#[must_use = "RangeBuilder is lazy — call `.into_iter()` or use it in a `for` loop"]
 pub struct RangeBuilder {
     bm: Arc<BufferManager>,
     root_guid: BlobGuid,
@@ -67,7 +72,6 @@ pub struct RangeBuilder {
 impl RangeBuilder {
     /// Construct a builder anchored at `root_guid` of the BM-backed
     /// tree. Public surface: [`crate::Tree::range`].
-    #[must_use]
     pub fn new(bm: Arc<BufferManager>, root_guid: BlobGuid) -> Self {
         Self {
             bm,
@@ -80,7 +84,6 @@ impl RangeBuilder {
 
     /// Restrict the scan to keys starting with `prefix`. Default:
     /// empty (the whole tree).
-    #[must_use]
     pub fn prefix(mut self, prefix: &[u8]) -> Self {
         self.prefix = prefix.to_vec();
         self
@@ -88,7 +91,6 @@ impl RangeBuilder {
 
     /// Strict-greater-than lower bound. Default: none (start at
     /// the first matching leaf).
-    #[must_use]
     pub fn start_after(mut self, key: &[u8]) -> Self {
         self.start_after = Some(key.to_vec());
         self
@@ -99,7 +101,6 @@ impl RangeBuilder {
     /// [`RangeEntry::CommonPrefix`] emission per distinct common
     /// prefix. Default: no delimiter (every leaf yielded as
     /// [`RangeEntry::Key`]).
-    #[must_use]
     pub fn delimiter(mut self, byte: u8) -> Self {
         self.delimiter = Some(byte);
         self

@@ -5,13 +5,15 @@ adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning will follow [Semantic Versioning](https://semver.org/) once
 v0.1.0 ships.
 
-## [Unreleased] — v0.1.0-dev
+## [0.1.0] — 2026-05-19
 
-The v0.1 cycle is "build the engine end-to-end." All algorithmic +
-API surfaces are landed: ART core, multi-blob `splitBlob` /
-`mergeBlob` / `compactBlob`, persistent backend, physiological WAL
-with batched transactions, S3-style range iteration. See
-[`ROADMAP.md`](ROADMAP.md) for the live list.
+First crates.io release. The v0.1 cycle was "build the engine
+end-to-end" — all algorithmic + API surfaces below are landed:
+ART core, multi-blob `splitBlob` / `mergeBlob` / `compactBlob`,
+persistent backend (Linux `O_DIRECT` + macOS `F_NOCACHE`),
+physiological WAL with batched transactions, S3-style range
+iteration with delimiter rollup. 203 tests on Ubuntu + macOS
+CI. See [`ROADMAP.md`](ROADMAP.md) for what's queued for v0.2.
 
 ### Added — algorithm core
 

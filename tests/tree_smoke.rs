@@ -1090,6 +1090,7 @@ fn collect_keys(iter: impl IntoIterator<Item = Result<RangeEntry, holt::Error>>)
         .map(|r| match r.unwrap() {
             RangeEntry::Key { key, .. } => key,
             RangeEntry::CommonPrefix(p) => p,
+            _ => panic!("RangeEntry got a new variant"),
         })
         .collect()
 }
@@ -1119,6 +1120,7 @@ fn range_no_filter_walks_all_keys_in_lex_order() {
         .map(|r| match r.unwrap() {
             RangeEntry::Key { key, value } => (key, value),
             RangeEntry::CommonPrefix(_) => panic!("no delimiter set"),
+            _ => panic!("RangeEntry got a new variant"),
         })
         .collect();
     assert_eq!(
@@ -1195,6 +1197,7 @@ fn range_delimiter_rolls_up_common_prefixes_with_dedup() {
         match r.unwrap() {
             RangeEntry::Key { key, .. } => keys_seen.push(key),
             RangeEntry::CommonPrefix(p) => prefixes_seen.push(p),
+            _ => panic!("RangeEntry got a new variant"),
         }
     }
     // Lex order over leaves under img/:

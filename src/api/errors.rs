@@ -6,7 +6,12 @@ use crate::store::{AllocError, FreeError};
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Top-level error type covering the union of every failure mode.
+///
+/// Marked `#[non_exhaustive]` — new variants may be added in
+/// minor releases without breaking SemVer. Callers should always
+/// match with a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Backend I/O failure.
     BackendIo(std::io::Error),
