@@ -82,19 +82,42 @@
 //!
 //! ## Eviction
 //!
-//! When the cache exceeds `capacity` blobs, the oldest unpinned
-//! entry is dropped (LRU policy). "Unpinned" means no outstanding
-//! `Arc<CachedBlob>` references outside the cache itself —
-//! `Arc::strong_count(entry) == 1` — so eviction skips entries
-//! currently being walked under a `pin()`. The cache may
-//! temporarily exceed `capacity` while every entry is pinned;
-//! it shrinks back as readers drop their handles.
+//! Two paths drop cold cache entries:
+//!
+//! - **Inline overflow** ([`Self::try_evict_lru`]) — fires inside
+//!   [`Self::insert_into_cache`] when the new entry pushes the
+//!   cache past `capacity`. Picks the entry with the oldest
+//!   `last_touched` tick whose `Arc::strong_count == 1` (no
+//!   outside pin). O(n) walk over the cache, called only on the
+//!   overflow path; the bg eviction thread (below) handles
+//!   steady-state reclaim cheaply.
+//! - **Background sweep** (v0.2 [`crate::checkpoint`] eviction
+//!   thread) — periodic walk based on the same `last_touched`
+//!   tick + `eviction_idle_ticks` threshold. Snapshots the cache
+//!   under shard locks, then drops the snapshot's Arc clones
+//!   before calling `try_evict_cold` so the BM's `strong_count`
+//!   check sees only the shard's own reference.
+//!
+//! The cache may temporarily exceed `capacity` while every entry
+//! is pinned; it shrinks back as readers drop their handles or
+//! the bg sweep catches up.
+//!
+//! ## Concurrent sharding
+//!
+//! The cache is a [`DashMap`] (sharded concurrent `HashMap`) so
+//! `pin` / `get_cached` calls on different blobs hit different
+//! shards — no single global mutex on the hot read path. v0.1's
+//! `Mutex<HashMap>` + `VecDeque<BlobGuid>` inline LRU was the
+//! per-blob bottleneck for multi-threaded workloads; v0.2's
+//! sharded cache + tick-based eviction removes it.
 
 use std::cell::UnsafeCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use dashmap::DashMap;
 
 use crate::api::errors::Result;
 use crate::concurrency::{Guard as LatchGuard, HybridLatch};
@@ -106,7 +129,14 @@ use super::backend::{AlignedBlobBuf, Backend};
 pub struct BufferManager {
     backend: Arc<dyn Backend>,
     capacity: usize,
-    state: Mutex<BufferManagerState>,
+    /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
+    /// concurrent `pin` / `get_cached` on different blobs hit
+    /// different shards — no single global mutex on the hot read
+    /// path. Replaces v0.1's `Mutex<HashMap>` + `VecDeque<BlobGuid>`
+    /// inline LRU; the v0.2 background eviction thread + each
+    /// entry's `last_touched` tick give "approximate LRU" without
+    /// needing an O(n) front-of-deque touch on every hit.
+    cache: DashMap<BlobGuid, Arc<CachedBlob>>,
     /// Per-blob lowest unflushed WAL seq. An entry exists ⟺ the
     /// cached image of that blob is newer than the backend image
     /// (invariant **I1**; see module docs). Drained atomically by
@@ -118,17 +148,12 @@ pub struct BufferManager {
     /// stamps the touched entry's `last_touched` with
     /// `clock.fetch_add(1)`; the eviction thread compares the
     /// current clock to each entry's stamp to find candidates that
-    /// haven't been used in the last N ticks.
+    /// haven't been used in the last N ticks. The same field also
+    /// drives inline overflow eviction (`try_evict_lru`).
     ///
     /// Uses `Relaxed` ordering throughout — strict happens-before
     /// isn't required, only "more recent stamps look more recent".
     clock: AtomicU64,
-}
-
-struct BufferManagerState {
-    cache: HashMap<BlobGuid, Arc<CachedBlob>>,
-    /// LRU list. Back = most recently used; front = oldest.
-    lru: VecDeque<BlobGuid>,
 }
 
 /// A single cached blob. Callers obtain one via
@@ -291,10 +316,7 @@ impl BufferManager {
         Self {
             backend,
             capacity: capacity.max(1),
-            state: Mutex::new(BufferManagerState {
-                cache: HashMap::new(),
-                lru: VecDeque::new(),
-            }),
+            cache: DashMap::new(),
             dirty: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(1),
         }
@@ -314,11 +336,9 @@ impl BufferManager {
     /// `Arc<CachedBlob>` bumps its strong count so `try_evict`
     /// won't fire on it mid-decision.
     pub(crate) fn snapshot_entries(&self) -> Vec<(BlobGuid, Arc<CachedBlob>)> {
-        let state = self.state.lock().unwrap();
-        state
-            .cache
+        self.cache
             .iter()
-            .map(|(g, e)| (*g, Arc::clone(e)))
+            .map(|kv| (*kv.key(), Arc::clone(kv.value())))
             .collect()
     }
 
@@ -329,26 +349,19 @@ impl BufferManager {
     ///
     /// Returns `true` if an entry was actually evicted.
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
-        let dirty_guard = self.dirty.lock().unwrap();
-        if dirty_guard.contains_key(&guid) {
-            return false;
-        }
-        drop(dirty_guard);
-        let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.cache.get(&guid) {
-            // strong_count == 1 means only the cache holds the Arc.
-            // The eviction-thread snapshot already dropped its
-            // clone before calling this.
-            if Arc::strong_count(entry) > 1 {
+        {
+            let dirty_guard = self.dirty.lock().unwrap();
+            if dirty_guard.contains_key(&guid) {
                 return false;
             }
-            state.cache.remove(&guid);
-            if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
-                state.lru.remove(pos);
-            }
-            return true;
         }
-        false
+        // `DashMap::remove_if` checks the predicate under the
+        // shard lock. `strong_count == 1` means only the shard's
+        // slot holds the `Arc` (the snapshot's clone was dropped
+        // by the caller; see `eviction::run_scan`).
+        self.cache
+            .remove_if(&guid, |_, entry| Arc::strong_count(entry) == 1)
+            .is_some()
     }
 
     /// Maximum number of blobs the cache will retain before
@@ -361,38 +374,29 @@ impl BufferManager {
     /// Current number of cached blobs.
     #[must_use]
     pub fn cached_count(&self) -> usize {
-        self.state.lock().unwrap().cache.len()
+        self.cache.len()
     }
 
     /// Drop every cached entry. The inner backend is untouched.
     /// Useful for tests and to release memory under pressure.
     pub fn clear(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.cache.clear();
-        state.lru.clear();
-        drop(state);
+        self.cache.clear();
         self.dirty.lock().unwrap().clear();
     }
 
-    /// Internal: look up `guid` in the cache. On a hit, touches
-    /// the LRU (moves to back) **and** stamps the entry's
-    /// `last_touched` with the current clock tick (so the v0.2
-    /// eviction thread treats this hit as fresh).
+    /// Internal: look up `guid` in the cache. On a hit, stamps
+    /// the entry's `last_touched` with the current clock tick so
+    /// the v0.2 eviction thread treats this hit as fresh.
     fn get_cached(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
-        let mut state = self.state.lock().unwrap();
-        if let Some(entry) = state.cache.get(&guid).cloned() {
-            // Move to back of LRU.
-            if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
-                state.lru.remove(pos);
-            }
-            state.lru.push_back(guid);
-            drop(state);
-            let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-            entry.last_touched.store(tick, Ordering::Relaxed);
-            Some(entry)
-        } else {
-            None
-        }
+        let entry = self.cache.get(&guid)?;
+        let arc = Arc::clone(entry.value());
+        // Drop the shard read guard before touching the atomic —
+        // not strictly required (the atomic is independent) but
+        // keeps shard occupancy short.
+        drop(entry);
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        arc.last_touched.store(tick, Ordering::Relaxed);
+        Some(arc)
     }
 
     /// Internal: insert a freshly-loaded blob into the cache.
@@ -400,48 +404,65 @@ impl BufferManager {
     /// `last_touched` so it doesn't look cold to the eviction
     /// thread on its very next sweep.
     fn insert_into_cache(&self, guid: BlobGuid, contents: &AlignedBlobBuf) {
-        let mut state = self.state.lock().unwrap();
-        if state.cache.contains_key(&guid) {
-            // Another thread populated the cache between our miss
-            // and now; touch the LRU and bail.
-            if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
-                state.lru.remove(pos);
-            }
-            state.lru.push_back(guid);
-            return;
-        }
-        let entry = Arc::new(CachedBlob::new(contents.clone()));
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        entry.last_touched.store(tick, Ordering::Relaxed);
-        state.cache.insert(guid, entry);
-        state.lru.push_back(guid);
-        while state.cache.len() > self.capacity {
-            if !Self::try_evict_lru(&mut state) {
+        let inserted = self.cache.entry(guid).or_insert_with(|| {
+            let entry = Arc::new(CachedBlob::new(contents.clone()));
+            entry.last_touched.store(tick, Ordering::Relaxed);
+            entry
+        });
+        // Re-stamp even on existing entries — a concurrent thread
+        // may have populated the slot while we read from backend;
+        // either way "just observed" is "freshly touched".
+        inserted.value().last_touched.store(tick, Ordering::Relaxed);
+        drop(inserted);
+
+        // Inline overflow eviction. With the v0.2 background
+        // eviction thread, capacity overflow is a rare burst
+        // event — the bg sweep keeps it well below capacity in
+        // steady state. The loop bounds itself by the number of
+        // entries we walk (so it always terminates).
+        let mut spins = self.cache.len();
+        while self.cache.len() > self.capacity && spins > 0 {
+            if !self.try_evict_lru() {
                 break;
             }
+            spins -= 1;
         }
     }
 
-    /// Internal: drop the LRU-most cache entry if it's evictable
-    /// (no outstanding `Arc` references outside the cache itself).
-    /// Returns `true` if an entry was dropped.
-    fn try_evict_lru(state: &mut BufferManagerState) -> bool {
-        let mut victim_idx = None;
-        for (i, guid) in state.lru.iter().enumerate() {
-            if let Some(entry) = state.cache.get(guid) {
-                if Arc::strong_count(entry) <= 1 {
-                    victim_idx = Some((i, *guid));
-                    break;
+    /// Internal: walk the cache for the entry with the oldest
+    /// `last_touched` tick whose `Arc::strong_count == 1` (i.e.
+    /// no outside pin) and evict it. Returns `true` if an entry
+    /// was dropped.
+    ///
+    /// O(n) in the cache size, but called only on insert overflow
+    /// — the background eviction thread handles steady-state
+    /// reclaim with its own tick-driven cadence.
+    fn try_evict_lru(&self) -> bool {
+        let mut victim: Option<(BlobGuid, u64)> = None;
+        for kv in &self.cache {
+            if Arc::strong_count(kv.value()) > 1 {
+                continue;
+            }
+            let tick = kv.value().last_touched.load(Ordering::Relaxed);
+            match victim {
+                None => victim = Some((*kv.key(), tick)),
+                Some((_, vmin)) if tick < vmin => {
+                    victim = Some((*kv.key(), tick));
                 }
+                _ => {}
             }
         }
-        if let Some((idx, guid)) = victim_idx {
-            state.lru.remove(idx);
-            state.cache.remove(&guid);
-            true
-        } else {
-            false
+        if let Some((guid, _)) = victim {
+            // `remove_if` re-checks strong_count under the shard
+            // lock — guards against a pin acquired between our
+            // scan and the remove.
+            return self
+                .cache
+                .remove_if(&guid, |_, e| Arc::strong_count(e) == 1)
+                .is_some();
         }
+        false
     }
 
     /// Internal: drop `guid` from cache (no-op if not cached) and
@@ -450,12 +471,7 @@ impl BufferManager {
     /// any pending dirty write would race with the delete in the
     /// backend.
     fn evict_from_cache(&self, guid: BlobGuid) {
-        let mut state = self.state.lock().unwrap();
-        state.cache.remove(&guid);
-        if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
-            state.lru.remove(pos);
-        }
-        drop(state);
+        self.cache.remove(&guid);
         self.dirty.lock().unwrap().remove(&guid);
     }
 
@@ -490,12 +506,9 @@ impl BufferManager {
         // Pathological: insert raced with eviction. Build an
         // entry directly from scratch and force-insert it.
         let entry = Arc::new(CachedBlob::new(scratch));
-        let mut state = self.state.lock().unwrap();
-        state.cache.insert(guid, entry.clone());
-        if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
-            state.lru.remove(pos);
-        }
-        state.lru.push_back(guid);
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        entry.last_touched.store(tick, Ordering::Relaxed);
+        self.cache.insert(guid, Arc::clone(&entry));
         Ok(entry)
     }
 
@@ -706,12 +719,10 @@ impl Backend for BufferManager {
     }
 
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
-        // Fast path: check cache without locking the inner backend.
-        {
-            let state = self.state.lock().unwrap();
-            if state.cache.contains_key(&guid) {
-                return Ok(true);
-            }
+        // Fast path: shard-local check without consulting the
+        // inner backend.
+        if self.cache.contains_key(&guid) {
+            return Ok(true);
         }
         self.backend.has_blob(guid)
     }
@@ -770,13 +781,12 @@ mod tests {
         );
 
         // The most-recently-loaded GUIDs should be the survivors.
-        let state = bm.state.lock().unwrap();
         let mut g_last = [0u8; 16];
         g_last[0] = 9;
         let mut g_first = [0u8; 16];
         g_first[0] = 0;
-        assert!(state.cache.contains_key(&g_last));
-        assert!(!state.cache.contains_key(&g_first));
+        assert!(bm.cache.contains_key(&g_last));
+        assert!(!bm.cache.contains_key(&g_first));
     }
 
     #[test]

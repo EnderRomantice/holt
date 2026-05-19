@@ -20,6 +20,11 @@ categories = ["database-implementations", "data-structures", "filesystem"]
 # used by the v0.2 background checkpointer threads (planner / I/O /
 # eviction). Std's `mpsc` lacks bounded sends and `select!`.
 crossbeam-channel = "0.5"
+# Sharded concurrent HashMap — backs the BufferManager's blob
+# cache. Replaces v0.1's `Mutex<HashMap>` so concurrent pins on
+# different blobs hit different shards (no single global lock on
+# the hot read path).
+dashmap = "6"
 # Structured event emission on `spillover` / `merge_blob` /
 # `compact_blob` / WAL flush / checkpoint round. Optional so
 # users who don't run a `tracing` subscriber don't pay any

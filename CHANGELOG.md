@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — concurrency
+
+- **Sharded `BufferManager` cache** — v0.1's
+  `Mutex<HashMap<BlobGuid, _>>` + `VecDeque<BlobGuid>` inline LRU
+  is replaced by `DashMap<BlobGuid, Arc<CachedBlob>>`. `pin` /
+  `get_cached` on different blobs hit different shards instead of
+  contending on a single mutex.
+- **Tick-based inline overflow eviction** — `try_evict_lru` walks
+  the cache for the entry with the lowest `last_touched` tick
+  whose `Arc::strong_count == 1` instead of using the
+  front-of-deque order. Same primitive as the bg eviction sweep.
+
 ### Added — observability
 
 - **`tracing` feature flag** (off by default). When enabled,

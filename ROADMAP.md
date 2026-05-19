@@ -325,9 +325,14 @@ by `~leaves_per_rollup` once fast-forward lands.
       descent stack past `C`'s subtree instead of scanning every
       leaf under it to dedup. `*_list_dir` is now
       `O(distinct_rollups)` instead of `O(leaves_under_prefix)`.
-- [ ] **Sharded `BufferManager` state** — replace the single
-      `Mutex<BMState>` with sharded buckets (DashMap-style) so
-      concurrent pins on different blobs don't contend.
+- [x] **Sharded `BufferManager` state** — the v0.1
+      `Mutex<HashMap<BlobGuid, _>>` + `VecDeque<BlobGuid>` LRU is
+      replaced by `DashMap<BlobGuid, Arc<CachedBlob>>`.
+      Concurrent `pin` / `get_cached` on different blobs hit
+      different shards instead of contending on a single mutex.
+      Inline overflow eviction (`try_evict_lru`) now picks the
+      oldest `last_touched` tick whose `Arc::strong_count == 1`,
+      using the same clock that drives the bg eviction sweep.
 
 ### Concurrency primitive upgrades
 
@@ -368,15 +373,13 @@ by `~leaves_per_rollup` once fast-forward lands.
       The original ancestor has a backoff path
       (`free_list is {} sleep 10ms retry={}`); adding it would
       buy resilience under stress.
-- [~] **Adaptive buffer-pool eviction** — partial. Background
-      eviction thread (v0.2 C1) drops cold entries against a
-      `clock_tick` / `last_touched` tick threshold instead of
-      strict LRU. Inline `try_evict_lru` on capacity overflow
-      still walks the `VecDeque<BlobGuid>` though; for the
-      common case where the bg eviction thread keeps the pool
-      below capacity, this never fires. Strict-LRU removal
-      will go when `buffer_pool_size > 128` becomes the typical
-      configuration.
+- [x] **Adaptive buffer-pool eviction** — both paths (inline
+      overflow + bg sweep) are driven by the same
+      `clock_tick` / `last_touched` tick mechanism. Inline
+      overflow walks the `DashMap` for the entry with the oldest
+      tick whose `Arc::strong_count == 1`; bg sweep uses the
+      configurable `eviction_idle_ticks` threshold. The v0.1
+      `VecDeque<BlobGuid>` is gone.
 
 ### Observability
 
