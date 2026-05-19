@@ -129,6 +129,88 @@ jobs:
         run: cargo clippy --lib --tests --features "io-uring tracing" --locked -- -D warnings
 
   # --------------------------------------------------------------
+  # Criterion microbenches — run on both Tier-1 Unix targets so
+  # we can read the perf delta between the default
+  # `pread`/`pwrite` backend (macOS + Linux without feature) and
+  # the `--features io-uring` Linux build. Numbers go to the job
+  # summary as a Markdown table; no failure thresholds — variance
+  # on hosted runners is too high for hard SLOs, but eyeballing
+  # the deltas tells us if a commit massively regressed
+  # something. Measurement window is short (`--warm-up-time 1
+  # --measurement-time 2`) so a full CI run stays under ~5 min.
+  # --------------------------------------------------------------
+  bench:
+    name: bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install LLVM (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Filter to holt-only persist scenarios so the run stays
+      # focused (the full matrix also benches rocksdb / sqlite for
+      # the apples-to-apples comparison — those numbers belong in
+      # a separate "compare" job, not the regression gate).
+      - name: cargo bench (default backend)
+        run: |
+          set -o pipefail
+          cargo bench --bench main --locked -- \
+            --warm-up-time 1 --measurement-time 2 \
+            "persist_put/holt|persist_get/holt|persist_mixed/holt" \
+            2>&1 | tee bench-default.txt
+
+      - name: cargo bench (io-uring backend, Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          cargo bench --bench main --features io-uring --locked -- \
+            --warm-up-time 1 --measurement-time 2 \
+            "persist_put/holt|persist_get/holt|persist_mixed/holt" \
+            2>&1 | tee bench-uring.txt
+
+      - name: Post results to job summary
+        if: always()
+        run: |
+          {
+            echo "## holt bench results — ${{ matrix.os }}"
+            echo ""
+            echo "### Default backend (\`pread\`/\`pwrite\`)"
+            echo '```'
+            grep -E "time:|thrpt:" bench-default.txt || echo "(no measurements captured)"
+            echo '```'
+            if [ -f bench-uring.txt ]; then
+              echo ""
+              echo "### \`--features io-uring\` backend"
+              echo '```'
+              grep -E "time:|thrpt:" bench-uring.txt || echo "(no measurements captured)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw bench logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench-*.txt
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------
   # `cargo doc` — fails on broken intra-doc links / missing docs
   # so the rendered docs.rs page stays clean.
   # --------------------------------------------------------------
