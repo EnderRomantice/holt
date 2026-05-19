@@ -12,7 +12,7 @@ workloads (both `memory` and `persistent` variants).
 
 Concurrency model is settled: per-blob `HybridLatch` (LeanStore
 3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 176 tests (including a
+writes with **no Tree-wide writer mutex**. 202 tests (including a
 property-based suite and a 4-readers × 1-writer optimistic-read
 stress) all green; zero clippy / rustdoc warnings under
 `-D warnings`; CI matrix (ubuntu + macOS) wired.
@@ -256,9 +256,10 @@ Required for the v0.1 tag:
       both memory and persistent (drop-without-checkpoint +
       reopen via WAL replay) modes
 - [x] Criterion benchmarks: KV / objstore-metadata / fs-metadata
-      shapes × get / put / mixed × memory / persistent. See
-      [benches/README.md](benches/README.md) and the project-level
-      writeup at [docs/benchmarks.md](docs/benchmarks.md).
+      shapes × get / put / mixed × memory / persistent, comparing
+      against RocksDB **and** SQLite. See
+      [benches/README.md](benches/README.md) for methodology +
+      how-to-read-the-numbers.
 
 ### Docs + examples
 
@@ -269,9 +270,10 @@ Required for the v0.1 tag:
 - [x] `examples/s3_metadata.rs` — holt as an S3-compatible object
       metadata backend
 - [x] `cargo doc` renders with zero warnings under `-D warnings`
-- [x] `docs/benchmarks.md` — project-level rollup of the criterion
-      numbers vs RocksDB. LMDB / Sled comparisons queued (Sled is
-      largely unmaintained; LMDB needs a separate dev-dep wiring).
+- [x] `benches/README.md` rollup of the criterion methodology +
+      how-to-read (kv = ART anti-pattern; objstore / fs = design
+      target). LMDB comparison queued (needs a separate dev-dep
+      wiring); Sled skipped (largely unmaintained).
 
 ### Polish
 

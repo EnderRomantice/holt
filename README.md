@@ -7,117 +7,58 @@ keys** — file paths, S3 object names, multi-tenant namespaces,
 time-bucketed identifiers — with sub-microsecond lookups, per-blob
 concurrency, and crash-safe persistence.
 
-It is **not** a general-purpose KV store. It targets the workloads
-where:
+It targets workloads where:
 
 - Keys are **hierarchical / path-shaped** (so prefix compression pays).
-- The dominant access pattern is **point lookup + prefix range scan**.
+- The dominant access is **point lookup + prefix range scan**.
 - Concurrency is **high** (many readers + writers across disjoint
   subtrees).
 - Latency is **micro-critical** — no LSM compaction stalls, no
   single-writer locks.
 
-If you need full-text search or vector similarity, use a different
-tool. If you need exactly this shape, holt should beat
-LMDB / RocksDB / SQLite on its target workload.
+It is **not** a general-purpose KV store; if you need full-text or
+vector similarity, reach for the right tool. For this shape, holt
+should beat LMDB / RocksDB / SQLite on its target workload.
 
 ## When to reach for holt
 
-| Engine          | Data structure | Persistence       | Concurrency        | Notes                                                       |
-|-----------------|----------------|-------------------|--------------------|-------------------------------------------------------------|
-| LMDB            | B+tree         | mmap              | Single-writer MVCC | Battle-tested; cross-page chasing for short hot keys.       |
-| RocksDB         | LSM            | SST + WAL         | MVCC               | Compaction stalls; large hot dataset is RAM-heavy.          |
-| SQLite          | B-tree         | File              | Single writer      | Convenient, but writer is the bottleneck under load.        |
-| Sled            | Hybrid LSM     | Log-structured    | Lock-free          | Rust-native, but largely unmaintained.                      |
-| **holt**     | **Adaptive Radix Tree** | **512 KB blobs** | **Per-blob 3-mode latch** | **Path compression + lookup is O(key.len)**     |
+| Engine        | Data structure        | Persistence       | Concurrency        | Notes                                                |
+|---------------|-----------------------|-------------------|--------------------|------------------------------------------------------|
+| LMDB          | B+tree                | mmap              | Single-writer MVCC | Battle-tested; page chasing for short hot keys.      |
+| RocksDB       | LSM                   | SST + WAL         | MVCC               | Compaction stalls; large hot dataset is RAM-heavy.   |
+| SQLite        | B-tree                | File              | Single writer      | Convenient, but writer is the bottleneck under load. |
+| Sled          | Hybrid LSM            | Log-structured    | Lock-free          | Rust-native, largely unmaintained.                   |
+| **holt**      | **Adaptive Radix Tree** | **512 KB blobs** | **Per-blob 3-mode latch** | **Path compression + lookup is O(key.len)** |
 
 ART's lookup cost is `O(key.len)`, not `O(log N)`. For short hot keys
-(say, < 64 bytes), that's faster than any tree-based competitor. The
-per-blob HybridLatch lets N readers traverse different subtrees in
-parallel without coordinating with each other.
+(< 64 bytes), that beats any tree-based competitor. The per-blob
+HybridLatch lets N readers traverse disjoint subtrees in parallel
+without coordinating.
 
 ## Project status
 
-**v0.1 in active development.** 176 tests pass (incl. property-based +
-crash-and-replay) and CI is green on ubuntu + macOS;
-`cargo bench --bench main`
-runs a side-by-side comparison with RocksDB (memory + persistent
-variants, both showing holt **~3.5–5× faster** on small-metadata
-workloads — see [benches/README.md](benches/README.md)).
+**v0.1 in active development.** The algorithm core (insert / lookup /
+erase / rename / range / txn / compact + multi-blob crossings),
+persistent backend, physiological WAL with batched transactions,
+and the stateful `Tree::range` iterator (prefix anchoring +
+`start_after` + S3 delimiter) are all landed. 202 tests (unit +
+property-based + crash-and-replay) pass on Ubuntu + macOS CI.
 
-Done — algorithm core:
+See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature breakdown
+and [`ROADMAP.md`](ROADMAP.md) for what's queued (io_uring backend,
+background checkpointer, SIMD CRC32, MVCC snapshots).
 
-- Layout (9 NodeTypes, 4 KB BlobHeader, bit-packed slot table)
-- Walker insert / lookup / erase / rename — **all four with full
-  cross-blob support** (Stage 2d phase A / B / C)
-- SIMD Node16 byte search + longest-common-prefix (SSE2 / NEON /
-  scalar)
-- `splitBlob` auto-spillover via `make_blob_from_node`
-- `compactBlob` — in-place extent reclaim, paired with splitBlob
-  on every OOM so churn workloads (insert + delete + reinsert)
-  stay in fewer blobs
-- 128-byte bump-area reservation so spillover always has room to
-  install its emergency BlobNode
-- Child-blob auto-reclaim when an erase empties it
-- Strict-prefix support (terminator byte)
-- In-place leaf-value update on same-size writes
-- `MemoryBackend` + Unix-only `PersistentBackend`
-  (Linux `O_DIRECT`, macOS `F_NOCACHE`). The crate `compile_error!`s
-  on Windows — see [`ROADMAP.md`](ROADMAP.md).
-- `BufferManager` LRU cache wrapping any backend (Stage 6 phase 1)
-  — `TreeConfig::buffer_pool_size` drives capacity, per-blob
-  `RwLock` lets N readers share a single blob in parallel
-- Zero-copy `Tree::get` via `BufferManager::pin` + `BlobFrameRef`
-  (Stage 6 phase 2a) — read paths walk the cached buffer in place,
-  no 512 KB memcpy per cross-blob hop
-- Zero-copy `Tree::put` / `delete` / `rename` via
-  `BufferManager::pin` + `commit` (Stage 6 phase 2c) — mutations
-  also operate in place against the BM-owned buffer; `Tree` no
-  longer keeps a separate `state.root_buf`
-- **`HybridLatch` wired into `CachedBlob`** (Stage 6 phase 2b) —
-  3-mode latch (optimistic / shared / exclusive) over an
-  `UnsafeCell<AlignedBlobBuf>`. `Tree::get`'s walker runs
-  **wait-free**: snapshot the latch version, walk, validate;
-  restart from the root on a torn read. `put` / `delete` no
-  longer take any Tree-wide lock — per-blob exclusive on the
-  root serialises them. `rename` keeps a small `rename_lock`
-  for its multi-step atomicity
-- Walker split into focused submodules under `engine/walker/`
-  (types / readers / writers / lookup / insert / erase /
-  spillover / migrate / tests) — ten files under ~700 LOC each
-  rather than one ~3400-LOC blob
-- **WAL record codec** (Stage 5a) — binary `TxnOp` format with
-  CRC32 `sanity_info`. 10 variants encode / decode round-trip;
-  4 corruption catch-cases (CRC, magic, truncation, unknown tag)
-  surface as `Error::ReplaySanityFailed`. See
-  [`src/journal/codec.rs`](src/journal/codec.rs).
-- **WAL writer + replay scanner** (Stage 5b) —
-  [`WalWriter`](src/journal/writer.rs) is append-only with explicit
-  `flush()`-for-durability (`sync_data`); [`replay()`](src/journal/reader.rs)
-  is a forward scanner that handles a torn tail gracefully and
-  patches in the byte offset when reporting mid-file corruption.
-- **WAL ↔ Tree integration** (Stage 5c) — every `put` / `delete` /
-  `rename` emits a `TxnOp`; the WAL flush is the per-op
-  durability boundary. `Tree::open` replays the durable WAL onto
-  the BM-cached blob and resumes `next_seq` past every replayed
-  record. `Tree::checkpoint` writes the BM root through, flushes,
-  then atomically truncates the WAL.
-
-- **Erase-time node shrink** (Node256→48→16→4 at thresholds 37 /
-  12 / 3, with hysteresis vs the grow thresholds 48 / 16 / 4) —
-  the inner-node body shrinks to the smallest variant that fits
-  after every erase. The terminal `Node4 → Prefix([byte])`
-  lone-child collapse is unchanged.
-
-Queued — see [ROADMAP.md](ROADMAP.md):
-- io_uring submission on the persistent backend (Stage 7)
+`cargo bench --bench main` runs a side-by-side comparison with
+RocksDB and SQLite across three metadata workload shapes — see
+[`benches/README.md`](benches/README.md) for the methodology and
+headline numbers.
 
 ## Quick taste
 
 ```rust
-use holt::{Tree, TreeBuilder, TreeConfig};
+use holt::{Tree, TreeBuilder, TreeConfig, RangeEntry};
 
-// Persistent (default).
+// Persistent (default), Unix-only.
 let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
     .buffer_pool_size(128)
     .open()?;
@@ -128,79 +69,62 @@ let tree = Tree::open(TreeConfig::memory())?;
 tree.put(b"img/01.jpg", b"rgb_data_blob_id_abc")?;
 let value = tree.get(b"img/01.jpg")?.unwrap();
 tree.delete(b"img/01.jpg")?;
+tree.rename(b"old/path", b"new/path", false)?; // atomic
 
-// Atomic rename (force=true overwrites dst).
-tree.rename(b"old/path", b"new/path", false)?;
+// Batched, crash-atomic transaction (one WAL record).
+tree.txn(|batch| {
+    batch.put(b"a", b"1");
+    batch.put(b"b", b"2");
+    batch.delete(b"c");
+})?;
 
-tree.checkpoint()?;   // flush root blob + manifest
+// S3-style listing with prefix + delimiter rollup.
+for entry in tree.range().prefix(b"img/").delimiter(b'/') {
+    match entry? {
+        RangeEntry::Key { key, .. } => println!("leaf {key:?}"),
+        RangeEntry::CommonPrefix(p) => println!("dir  {p:?}"),
+    }
+}
+
+tree.checkpoint()?;   // flush WAL + write through + truncate
 ```
 
-## Architecture at a glance
+## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Public API: Tree, Iter, Txn, TreeBuilder                    │
-├────────────────────────────────────────────────────────────┤
-│ Engine: insert / lookup / erase / scan / rename / compact   │
-├────────────────────────────────────────────────────────────┤
-│ Concurrency: HybridLatch (3-mode) + lock-coupling           │
-├────────────────────────────────────────────────────────────┤
-│ Journal: physiological WAL + replay + checkpoint            │
-├────────────────────────────────────────────────────────────┤
-│ Store: BufferManager + BlobFrame (512 KB, bump alloc)       │
-├────────────────────────────────────────────────────────────┤
-│ Layout: NodeType variants + SlotEntry + BlobHeader          │
-├────────────────────────────────────────────────────────────┤
-│ Backend: file / mmap / memory (pluggable trait)             │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Public API: Tree, TreeBuilder, TxnBatch, RangeIter           │
+├──────────────────────────────────────────────────────────────┤
+│ Engine: insert / lookup / erase / range / merge / migrate    │
+├──────────────────────────────────────────────────────────────┤
+│ Concurrency: HybridLatch (3-mode optimistic / shared / excl) │
+├──────────────────────────────────────────────────────────────┤
+│ Journal: physiological WAL (11 TxnOp variants) + replay      │
+├──────────────────────────────────────────────────────────────┤
+│ Store: BufferManager (LRU pin/commit) + BlobFrame (512 KB)   │
+├──────────────────────────────────────────────────────────────┤
+│ Layout: 9 NodeType variants + bit-packed SlotEntry + Header  │
+├──────────────────────────────────────────────────────────────┤
+│ Backend: MemoryBackend + PersistentBackend (O_DIRECT / NOCACHE) │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the deep dive.
+The design draws on Leis et al.'s ART paper (ICDE 2013) for the
+four-node-size scheme and LeanStore (ICDE 2018) for the HybridLatch
+contract.
 
-## Design notes
+## Not on the roadmap
 
-- **Adaptive Radix Tree** core: four internal node sizes
-  (4 / 16 / 48 / 256 children) chosen at runtime to keep the tree
-  dense. Lookup walks one byte of the key per level.
-- **Path compression** via a dedicated `Prefix` node variant — long
-  shared paths cost one node, not one per byte.
-- **Multi-blob via in-tree crossings**: when a 512 KB blob fills,
-  a subtree is migrated to a fresh blob and a `BlobNode` crossing is
-  written into the parent. Trees grow to arbitrary size in 512 KB
-  increments.
-- **Per-blob `HybridLatch`** (LeanStore-style 3-mode lock):
-  optimistic readers take a version snapshot and validate; shared
-  readers take a reader counter; writers take exclusive. Reader
-  fast path is wait-free under no contention.
-- **Crash safety** via a physiological WAL with 10 TxnOp variants
-  and a synchronous (or eventually asynchronous) checkpointer.
-- **Per-blob free-list** lets recycled slot indices feed back into
-  the bump allocator with zero overhead.
+holt is single-node + Unix-only by design. Out of scope:
 
-The design is informed by:
-
-- Leis et al., "The Adaptive Radix Tree: ARTful Indexing for
-  Main-Memory Databases" (ICDE 2013) — the four-node-size scheme.
-- Leis et al., "LeanStore: In-Memory Data Management Beyond Main
-  Memory" (ICDE 2018) — the HybridLatch contract.
-
-## What this is NOT
-
-To avoid surprise:
-
-- **Not a SQL database.** No joins, no aggregates, no query planner.
-- **Not a vector DB.** No kNN, no embeddings, no similarity search.
-- **Not a full-text index.** No tokenization, no inverted index.
-- **Not a replication / consensus layer.** The library is single-node
-  + persistent. Replication is a layer above this.
-- **Not a network server.** This is a library you embed; bring your
-  own RPC.
-
-For these, combine holt with a domain-appropriate engine:
-
-- holt + FAISS / Qdrant / pgvector → AI workspace metadata + vectors
-- holt + Tantivy → FS metadata + full-text
-- holt + custom Raft → distributed deployments
+- **Windows** — `compile_error!`s the crate (Unix `O_DIRECT` /
+  `F_NOCACHE` has no Windows analog worth carrying).
+- **SQL / vector / full-text** — combine with a domain-appropriate
+  engine (`+ FAISS` for vectors, `+ Tantivy` for full-text).
+- **Replication / consensus** — build above; we'll expose hooks
+  (change feed, snapshot transfer) but won't ship Raft.
+- **Network server** — this is a library; wrap it in your own RPC.
 
 ## License
 

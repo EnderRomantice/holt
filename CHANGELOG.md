@@ -159,7 +159,7 @@ with batched transactions, S3-style range iteration. See
 
 ### Added — tests / benches / examples
 
-- **176 tests**: 114 unit + 30 tree_smoke + 15 wal_round_trip + 10
+- **202 tests**: 117 unit + 51 tree_smoke + 15 wal_round_trip + 12
   wal_tree_integration + 2 property-based + 5 layout-invariants.
 - **Property-based tests** (`proptest`) — random put / delete /
   rename traces cross-checked against a `HashMap` oracle in memory

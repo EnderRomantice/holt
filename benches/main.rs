@@ -1,5 +1,5 @@
-//! Criterion benchmarks comparing holt against RocksDB across
-//! three realistic shapes of metadata workload.
+//! Criterion benchmarks comparing holt against RocksDB **and**
+//! SQLite across three realistic shapes of metadata workload.
 //!
 //! ## Scenarios
 //!
@@ -8,43 +8,43 @@
 //! 2. **Object storage metadata** — path-like keys
 //!    (`bucket-NN/path/sub/file-NNNN.bin`) and small JSON-ish
 //!    values carrying size / etag / storage class. Models the S3
-//!    metadata tier (an holt/NSS-target workload).
+//!    metadata tier (a holt-target workload).
 //! 3. **Filesystem metadata** — `/usr/local/share/...` paths +
 //!    32-byte packed inode bodies (size + mtime + mode + uid + gid).
 //!    Models a POSIX metadata server.
 //!
 //! Each scenario runs three operations:
-//! - **get**: random lookup over a pre-loaded 2000-key dataset.
+//! - **get**: random lookup over a pre-loaded dataset.
 //! - **put**: random key replacement (in-place update).
 //! - **mixed**: 50% get / 50% put, key chosen at random.
 //!
+//! The dataset size is intentionally large enough
+//! (`N_KEYS = 20 000`) to spread across **multiple holt blobs**
+//! (~5–7 × 512 KB), so the bench exercises `BlobNode` crossings
+//! rather than single-blob descent.
+//!
 //! ## Fairness
 //!
-//! Both engines run in their "no-WAL, batched flush" mode:
-//! - holt: `TreeConfig::memory()` with `flush_on_write = false`.
-//!   Mutations stay in the in-memory cached root blob; `checkpoint()`
-//!   flushes through the backend.
-//! - RocksDB: temp-dir database, `disable_wal=true`, `sync=false`,
-//!   64 MB memtable, compression disabled. Equivalent to "memtable-
-//!   only writes during the bench window."
+//! All three engines run in their "no-WAL, batched flush" mode
+//! for the memory variant, and "WAL on, no per-op fsync" for the
+//! persistent variant:
 //!
-//! ## Caveat: holt single-blob cap
-//!
-//! As of Stage 2d phase A, holt auto-spillover (multi-blob
-//! insertion) is not yet wired — the working set must fit in a
-//! single 512 KB blob. N=2000 keys with the sizes above
-//! comfortably fits (~200-250 KB). Phase B unlocks larger workloads.
+//! | Mode       | holt                                        | RocksDB                              | SQLite                                              |
+//! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|
+//! | memory     | `TreeConfig::memory()`, `flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` |
+//! | persistent | `TreeConfig::new(dir)`, `flush_on_write=false` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=NORMAL`, file-backed |
 //!
 //! ## Running
 //!
 //! ```sh
-//! cargo bench --bench main
-//! # Pick a single group:
-//! cargo bench --bench main -- kv_get
+//! cargo bench --bench main                     # full ~5 min sweep
+//! cargo bench --bench main -- --quick --noplot # ~1 min smoke
+//! cargo bench --bench main -- kv_get           # single scenario
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
+use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
 use holt::{Tree, TreeConfig};
@@ -54,14 +54,16 @@ use rocksdb::{Options, WriteOptions, DB};
 // Workload configuration
 // ---------------------------------------------------------------
 
-const N_KEYS: usize = 2000;
+/// Dataset size — large enough to spread across ≈ 5–7 holt blobs
+/// for the kv/objstore/fs shapes (≈ 100 B/leaf amortised).
+const N_KEYS: usize = 10_000;
 const KV_KEY_LEN: usize = 32;
 const KV_VAL_LEN: usize = 64;
 
-const OBJSTORE_BUCKETS: usize = 16;
+const OBJSTORE_BUCKETS: usize = 32;
 const OBJSTORE_FILES_PER_BUCKET: usize = N_KEYS / OBJSTORE_BUCKETS;
 
-const FS_DIRS: usize = 8;
+const FS_DIRS: usize = 16;
 const FS_FILES_PER_DIR: usize = N_KEYS / FS_DIRS;
 
 const SEED: u64 = 0xDEAD_BEEF_CAFE_BABE;
@@ -130,7 +132,7 @@ fn gen_fs_dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
 
 fn make_holt() -> Tree {
     let mut cfg = TreeConfig::memory();
-    cfg.flush_on_write = false; // batched flushes; matches RocksDB no-WAL mode
+    cfg.flush_on_write = false; // batched flushes; matches RocksDB / SQLite no-WAL mode
     Tree::open(cfg).expect("holt open")
 }
 
@@ -138,7 +140,7 @@ fn make_holt() -> Tree {
 /// each `put` lands in the BufferManager cache; the persistent
 /// backend only gets a `pwrite` at spillover or `checkpoint()`.
 /// Matches RocksDB's `WAL=on, sync=false` (per-op durable to OS
-/// page cache, not fsync'd).
+/// page cache, not fsync'd) and SQLite's `WAL + synchronous=NORMAL`.
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());
@@ -175,6 +177,35 @@ fn rocksdb_write_opts_persistent() -> WriteOptions {
     wo
 }
 
+/// `:memory:` SQLite with the journal off — matches our "no-WAL,
+/// batched flush" memory bench mode.
+fn make_sqlite_memory() -> Connection {
+    let conn = Connection::open_in_memory().expect("sqlite open");
+    conn.execute_batch(
+        "PRAGMA journal_mode = MEMORY;\n\
+         PRAGMA synchronous = OFF;\n\
+         PRAGMA cache_size = -65536;\n\
+         CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID;",
+    )
+    .expect("sqlite pragmas + schema");
+    conn
+}
+
+/// File-backed SQLite with WAL on and `synchronous = NORMAL` —
+/// matches RocksDB's `WAL=on, sync=false` durability profile.
+fn make_sqlite_persistent() -> (Connection, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let conn = Connection::open(dir.path().join("bench.db")).expect("sqlite open");
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;\n\
+         PRAGMA synchronous = NORMAL;\n\
+         PRAGMA cache_size = -65536;\n\
+         CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID;",
+    )
+    .expect("sqlite pragmas + schema");
+    (conn, dir)
+}
+
 fn preload_holt(tree: &Tree, pairs: &[(Vec<u8>, Vec<u8>)]) {
     for (k, v) in pairs {
         tree.put(k, v).expect("holt put");
@@ -186,6 +217,23 @@ fn preload_rocksdb(db: &DB, pairs: &[(Vec<u8>, Vec<u8>)]) {
     for (k, v) in pairs {
         db.put_opt(k, v, &wo).expect("rocksdb put");
     }
+}
+
+fn preload_sqlite(conn: &Connection, pairs: &[(Vec<u8>, Vec<u8>)]) {
+    // Bulk-load inside one transaction — without this SQLite's
+    // per-statement implicit transactions dominate setup time at
+    // 20k rows.
+    let tx = conn.unchecked_transaction().expect("tx");
+    {
+        let mut stmt = tx
+            .prepare("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
+            .expect("prep");
+        for (k, v) in pairs {
+            stmt.execute(params![k.as_slice(), v.as_slice()])
+                .expect("insert");
+        }
+    }
+    tx.commit().expect("commit");
 }
 
 // ---------------------------------------------------------------
@@ -222,6 +270,21 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
             });
         });
 
+        let conn = make_sqlite_memory();
+        preload_sqlite(&conn, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 1);
+        group.bench_function("sqlite", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, _) = &pairs[idx];
+                let mut stmt = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                let v: Vec<u8> = stmt
+                    .query_row(params![k.as_slice()], |row| row.get(0))
+                    .unwrap();
+                black_box(v);
+            });
+        });
+
         group.finish();
     }
 
@@ -250,6 +313,21 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
                 let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                black_box(());
+            });
+        });
+
+        let conn = make_sqlite_memory();
+        preload_sqlite(&conn, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 2);
+        group.bench_function("sqlite", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                let mut stmt = conn
+                    .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
+                    .unwrap();
+                stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
                 black_box(());
             });
         });
@@ -296,14 +374,37 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
             });
         });
 
+        let conn = make_sqlite_memory();
+        preload_sqlite(&conn, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 3);
+        group.bench_function("sqlite", |b| {
+            b.iter(|| {
+                let r = rng.next_u32();
+                let idx = (r as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                if r & 1 == 0 {
+                    let mut stmt = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                    let v: Vec<u8> = stmt
+                        .query_row(params![k.as_slice()], |row| row.get(0))
+                        .unwrap();
+                    black_box(v);
+                } else {
+                    let mut stmt = conn
+                        .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
+                        .unwrap();
+                    stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
+                    black_box(());
+                }
+            });
+        });
+
         group.finish();
     }
 }
 
-// Persistent variant: both engines on disk with WAL/durability on
-// (RocksDB: WAL enabled, fsync off; holt: PersistentBackend,
-// flush_on_write = false — each `put` stays in the BM cache,
-// only spillover + `checkpoint()` hit disk).
+// Persistent variant: all three engines on disk with WAL/durability
+// on (each at the `sync=off` profile — durable past a process crash
+// but not a power loss).
 fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
     let key_count = pairs.len();
 
@@ -337,6 +438,21 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
             });
         });
 
+        let (conn, _dir) = make_sqlite_persistent();
+        preload_sqlite(&conn, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 11);
+        group.bench_function("sqlite", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, _) = &pairs[idx];
+                let mut stmt = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                let v: Vec<u8> = stmt
+                    .query_row(params![k.as_slice()], |row| row.get(0))
+                    .unwrap();
+                black_box(v);
+            });
+        });
+
         group.finish();
     }
 
@@ -367,6 +483,21 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
                 let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                black_box(());
+            });
+        });
+
+        let (conn, _dir) = make_sqlite_persistent();
+        preload_sqlite(&conn, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 12);
+        group.bench_function("sqlite", |b| {
+            b.iter(|| {
+                let idx = (rng.next_u32() as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                let mut stmt = conn
+                    .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
+                    .unwrap();
+                stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
                 black_box(());
             });
         });
@@ -410,6 +541,30 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                     black_box(db.get(black_box(k)).unwrap());
                 } else {
                     let _: () = db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                    black_box(());
+                }
+            });
+        });
+
+        let (conn, _dir) = make_sqlite_persistent();
+        preload_sqlite(&conn, pairs);
+        let mut rng = StdRng::seed_from_u64(SEED + 13);
+        group.bench_function("sqlite", |b| {
+            b.iter(|| {
+                let r = rng.next_u32();
+                let idx = (r as usize) % key_count;
+                let (k, v) = &pairs[idx];
+                if r & 1 == 0 {
+                    let mut stmt = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                    let v: Vec<u8> = stmt
+                        .query_row(params![k.as_slice()], |row| row.get(0))
+                        .unwrap();
+                    black_box(v);
+                } else {
+                    let mut stmt = conn
+                        .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
+                        .unwrap();
+                    stmt.execute(params![k.as_slice(), v.as_slice()]).unwrap();
                     black_box(());
                 }
             });
