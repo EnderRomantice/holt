@@ -182,16 +182,34 @@ fn insert_into_leaf(
     let (existing_key, existing_value) = read_leaf_kv(frame.as_ref(), leaf_slot)?;
 
     if existing_key == new_key {
-        // Update path. Try in-place first: if the new value fits
-        // inside the existing extent's 8-byte-aligned footprint we
-        // overwrite the value bytes and bump the leaf's value_size
-        // + seq — zero allocator activity, zero extent leak.
-        let key_off = {
+        // Same-key update path (covers two semantic cases via the
+        // same alloc machinery):
+        //
+        // 1. **Resurrect**: the existing leaf is tombstoned — the
+        //    user just put the key back after deleting it. From
+        //    the user's view this is a fresh insert (`previous`
+        //    is `None`) and the blob's `tombstone_leaf_cnt` drops
+        //    by one because the slot leaves the tombstone state.
+        // 2. **Update**: the existing leaf is live — return the
+        //    prior value and overwrite (in place when extents fit;
+        //    fall back to alloc-fresh + free-old when the value
+        //    grew past the existing extent).
+        //
+        // `Leaf::live` always pins `tombstone = 0` so both write
+        // paths naturally clear the bit in the new leaf body.
+        let existing_leaf = {
             let body = frame.body_of_slot(leaf_slot).ok_or(Error::NodeCorrupt {
                 context: "insert_into_leaf: body resolution failed",
             })?;
-            cast::<Leaf>(body).key_offset
+            *cast::<Leaf>(body)
         };
+        let was_tombstoned = existing_leaf.tombstone != 0;
+        let prev = if was_tombstoned {
+            None
+        } else {
+            Some(existing_value.clone())
+        };
+        let key_off = existing_leaf.key_offset;
         let key_len_u32 = new_key.len() as u32;
         let old_extent_size = leaf_extent_size(key_len_u32, u32::from(existing_value.len() as u16));
         let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
@@ -211,9 +229,13 @@ fn insert_into_leaf(
             }
             let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq);
             write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+            if was_tombstoned {
+                let h = frame.header_mut();
+                h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
+            }
             return Ok(InsertReturn {
                 slot_after: leaf_slot,
-                previous: Some(existing_value),
+                previous: prev,
             });
         }
 
@@ -223,9 +245,13 @@ fn insert_into_leaf(
         // per-NodeType free list.
         let new_slot = write_leaf(frame, new_key, new_value, seq)?;
         frame.free_node(leaf_slot)?;
+        if was_tombstoned {
+            let h = frame.header_mut();
+            h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
+        }
         return Ok(InsertReturn {
             slot_after: new_slot,
-            previous: Some(existing_value),
+            previous: prev,
         });
     }
 

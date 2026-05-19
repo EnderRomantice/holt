@@ -35,6 +35,20 @@ fn get(frame: &BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Run filter-mode compaction on a Vec-backed test blob in place.
+///
+/// Erase only flips the leaf's `tombstone` byte and bumps the
+/// blob's `tombstone_leaf_cnt`; the structural collapse — lone-child
+/// `Prefix` wrap, `Node256→48→16→4` downshift, `EmptyRoot` reseat
+/// — runs inside `compact_blob`. Tests that assert post-erase shape
+/// drop their `BlobFrame` view, call this, and re-wrap.
+fn compact_in_place(buf: &mut [u8]) {
+    let mut ab = AlignedBlobBuf::zeroed();
+    ab.as_mut_slice().copy_from_slice(buf);
+    compact_blob(&mut ab).unwrap();
+    buf.copy_from_slice(ab.as_slice());
+}
+
 #[test]
 fn single_insert_then_lookup() {
     let (mut buf, _) = fresh_blob();
@@ -213,13 +227,22 @@ fn del(frame: &mut BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
 #[test]
 fn erase_only_leaf_returns_value_and_empties_tree() {
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    put(&mut frame, b"k", b"v", 1);
-    assert_eq!(del(&mut frame, b"k").as_deref(), Some(&b"v"[..]));
-    assert_eq!(get(&frame, b"k"), None);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        put(&mut frame, b"k", b"v", 1);
+        assert_eq!(del(&mut frame, b"k").as_deref(), Some(&b"v"[..]));
+        assert_eq!(get(&frame, b"k"), None);
+        // Erase tombstones; the root is still a (tombstoned) leaf
+        // until compact rebuilds.
+        assert_eq!(frame.header().tombstone_leaf_cnt, 1);
+    }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     let root_slot = frame.header().root_slot;
     let e = frame.slot_entry(root_slot).unwrap();
     assert_eq!(e.node_type(), Some(NodeType::EmptyRoot));
+    assert_eq!(frame.header().tombstone_leaf_cnt, 0);
+    assert_eq!(frame.header().compact_times, 1);
 }
 
 #[test]
@@ -234,10 +257,14 @@ fn erase_missing_key_is_noop_returns_none() {
 #[test]
 fn erase_one_of_two_node4_collapses_to_prefix_over_lone_leaf() {
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    put(&mut frame, b"a", b"1", 1);
-    put(&mut frame, b"b", b"2", 2);
-    del(&mut frame, b"a");
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        put(&mut frame, b"a", b"1", 1);
+        put(&mut frame, b"b", b"2", 2);
+        del(&mut frame, b"a");
+    }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     let root_slot = frame.header().root_slot;
     let e = frame.slot_entry(root_slot).unwrap();
     assert_eq!(e.node_type(), Some(NodeType::Prefix));
@@ -315,33 +342,46 @@ fn inner_node_slot(frame: &BlobFrame<'_>) -> u16 {
 
 #[test]
 fn shrink_node16_to_node4_at_three_remaining() {
-    // 5 children → grows to Node16. Erase down to 3 children →
-    // shrinks to Node4. (Threshold is `count <= 3`.)
+    // 5 children → grows to Node16. Erase down to 3 live children
+    // + compact → shrinks to Node4. (The `pack_inner_node` arm
+    // picks Node4 for survivor counts in `2..=4`.)
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    for i in 0..5u8 {
-        let k = [b'k', b'0' + i];
-        put(&mut frame, &k, &[i], i as u64 + 1);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        for i in 0..5u8 {
+            let k = [b'k', b'0' + i];
+            put(&mut frame, &k, &[i], i as u64 + 1);
+        }
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node16),
+        );
+        // Erase two so 3 children remain live.
+        del(&mut frame, b"k0");
+        del(&mut frame, &[b'k', b'0' + 1]);
+        // Inner node is still Node16 until compaction filters the
+        // tombstones and rebuilds.
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node16),
+        );
     }
-    assert_eq!(
-        frame
-            .slot_entry(inner_node_slot(&frame))
-            .unwrap()
-            .node_type(),
-        Some(NodeType::Node16),
-    );
-    // Erase two so 3 children remain.
-    del(&mut frame, b"k0");
-    del(&mut frame, &[b'k', b'0' + 1]);
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         frame
             .slot_entry(inner_node_slot(&frame))
             .unwrap()
             .node_type(),
         Some(NodeType::Node4),
-        "Node16 with 3 remaining children should shrink to Node4",
+        "Node16 with 3 live children should compact to Node4",
     );
-    // All survivors readable.
     for i in 2..5u8 {
         let k = [b'k', b'0' + i];
         assert_eq!(get(&frame, &k).as_deref(), Some(&[i][..]));
@@ -351,33 +391,38 @@ fn shrink_node16_to_node4_at_three_remaining() {
 #[test]
 fn shrink_node48_to_node16_at_twelve_remaining() {
     // 20 children → grows through Node16 → Node48. Erase down to
-    // 12 children → shrinks to Node16. Threshold `count <= 12`.
+    // 12 live children + compact → shrinks to Node16. The
+    // `pack_inner_node` arm picks Node16 for survivor counts in
+    // `5..=16`.
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    for i in 0..20u8 {
-        let k = [b'p', i];
-        put(&mut frame, &k, &[i], i as u64 + 1);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        for i in 0..20u8 {
+            let k = [b'p', i];
+            put(&mut frame, &k, &[i], i as u64 + 1);
+        }
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node48),
+        );
+        // Erase 8 so 12 live children remain.
+        for i in 0..8u8 {
+            let k = [b'p', i];
+            del(&mut frame, &k);
+        }
     }
-    assert_eq!(
-        frame
-            .slot_entry(inner_node_slot(&frame))
-            .unwrap()
-            .node_type(),
-        Some(NodeType::Node48),
-    );
-    // Erase 8 so 12 children remain (still above the Node16
-    // shrink-to-Node4 threshold of 3).
-    for i in 0..8u8 {
-        let k = [b'p', i];
-        del(&mut frame, &k);
-    }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         frame
             .slot_entry(inner_node_slot(&frame))
             .unwrap()
             .node_type(),
         Some(NodeType::Node16),
-        "Node48 with 12 remaining children should shrink to Node16",
+        "Node48 with 12 live children should compact to Node16",
     );
     for i in 8..20u8 {
         let k = [b'p', i];
@@ -388,32 +433,38 @@ fn shrink_node48_to_node16_at_twelve_remaining() {
 #[test]
 fn shrink_node256_to_node48_at_thirty_seven_remaining() {
     // 60 children → grows through Node48 → Node256. Erase down to
-    // 37 children → shrinks to Node48. Threshold `count <= 37`.
+    // 37 live children + compact → shrinks to Node48. The
+    // `pack_inner_node` arm picks Node48 for survivor counts in
+    // `17..=48`.
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    for i in 0..60u8 {
-        let k = [b'q', i];
-        put(&mut frame, &k, &[i, i ^ 0xFF], i as u64 + 1);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        for i in 0..60u8 {
+            let k = [b'q', i];
+            put(&mut frame, &k, &[i, i ^ 0xFF], i as u64 + 1);
+        }
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node256),
+        );
+        // Erase 23 so 37 live children remain.
+        for i in 0..23u8 {
+            let k = [b'q', i];
+            del(&mut frame, &k);
+        }
     }
-    assert_eq!(
-        frame
-            .slot_entry(inner_node_slot(&frame))
-            .unwrap()
-            .node_type(),
-        Some(NodeType::Node256),
-    );
-    // Erase 23 so 37 children remain.
-    for i in 0..23u8 {
-        let k = [b'q', i];
-        del(&mut frame, &k);
-    }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         frame
             .slot_entry(inner_node_slot(&frame))
             .unwrap()
             .node_type(),
         Some(NodeType::Node48),
-        "Node256 with 37 remaining children should shrink to Node48",
+        "Node256 with 37 live children should compact to Node48",
     );
     for i in 23..60u8 {
         let k = [b'q', i];
@@ -424,51 +475,71 @@ fn shrink_node256_to_node48_at_thirty_seven_remaining() {
 
 #[test]
 fn shrink_chain_node256_node48_node16_node4() {
-    // One sustained churn: grow up through Node256, then erase
-    // back down past every shrink threshold in order. Confirms
-    // the shrink rules compose end-to-end.
+    // One sustained churn: grow up through Node256, then erase +
+    // compact past every `pack_inner_node` boundary in order.
+    // Confirms the survivor-driven downshift composes end-to-end:
+    // 60 → 37 → 12 → 3 live children pulls the inner node through
+    // Node256 → Node48 → Node16 → Node4.
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    for i in 0..60u8 {
-        let k = [b'q', i];
-        put(&mut frame, &k, &[i], i as u64 + 1);
-    }
-    assert_eq!(
-        frame
-            .slot_entry(inner_node_slot(&frame))
-            .unwrap()
-            .node_type(),
-        Some(NodeType::Node256),
-    );
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        for i in 0..60u8 {
+            let k = [b'q', i];
+            put(&mut frame, &k, &[i], i as u64 + 1);
+        }
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node256),
+        );
 
-    // Erase 23 → Node48.
-    for i in 0..23u8 {
-        del(&mut frame, &[b'q', i]);
+        // Erase 23 so 37 live children remain.
+        for i in 0..23u8 {
+            del(&mut frame, &[b'q', i]);
+        }
     }
-    assert_eq!(
-        frame
-            .slot_entry(inner_node_slot(&frame))
-            .unwrap()
-            .node_type(),
-        Some(NodeType::Node48),
-    );
+    compact_in_place(&mut buf);
+    {
+        let frame = BlobFrame::wrap(&mut buf);
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node48),
+        );
+    }
 
-    // Erase another 25 (total 48) so 12 children remain → Node16.
-    for i in 23..48u8 {
-        del(&mut frame, &[b'q', i]);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        // Erase another 25 (total 48 erased) so 12 live remain.
+        for i in 23..48u8 {
+            del(&mut frame, &[b'q', i]);
+        }
     }
-    assert_eq!(
-        frame
-            .slot_entry(inner_node_slot(&frame))
-            .unwrap()
-            .node_type(),
-        Some(NodeType::Node16),
-    );
+    compact_in_place(&mut buf);
+    {
+        let frame = BlobFrame::wrap(&mut buf);
+        assert_eq!(
+            frame
+                .slot_entry(inner_node_slot(&frame))
+                .unwrap()
+                .node_type(),
+            Some(NodeType::Node16),
+        );
+    }
 
-    // Erase another 9 (total 57) so 3 children remain → Node4.
-    for i in 48..57u8 {
-        del(&mut frame, &[b'q', i]);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        // Erase another 9 (total 57 erased) so 3 live remain.
+        for i in 48..57u8 {
+            del(&mut frame, &[b'q', i]);
+        }
     }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         frame
             .slot_entry(inner_node_slot(&frame))
@@ -482,28 +553,37 @@ fn shrink_chain_node256_node48_node16_node4() {
         let k = [b'q', i];
         assert_eq!(get(&frame, &k).as_deref(), Some(&[i][..]));
     }
+    // Three compactions ran; nothing tombstoned in the survivor.
+    assert_eq!(frame.header().compact_times, 3);
+    assert_eq!(frame.header().tombstone_leaf_cnt, 0);
 }
 
 #[test]
 fn erase_all_returns_to_empty_root() {
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
     let pairs = [
         (&b"alpha"[..], &b"A"[..]),
         (&b"beta"[..], &b"B"[..]),
         (&b"gamma"[..], &b"G"[..]),
     ];
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        put(&mut frame, k, v, i as u64 + 1);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            put(&mut frame, k, v, i as u64 + 1);
+        }
+        for (k, v) in &pairs {
+            assert_eq!(del(&mut frame, k).as_deref(), Some(*v));
+        }
+        assert_eq!(frame.header().tombstone_leaf_cnt as usize, pairs.len());
     }
-    for (k, v) in &pairs {
-        assert_eq!(del(&mut frame, k).as_deref(), Some(*v));
-    }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     let root_slot = frame.header().root_slot;
     assert_eq!(
         frame.slot_entry(root_slot).unwrap().node_type(),
         Some(NodeType::EmptyRoot)
     );
+    assert_eq!(frame.header().tombstone_leaf_cnt, 0);
 }
 
 #[test]
@@ -532,7 +612,6 @@ fn insert_after_erase_reinstates_key() {
 #[test]
 fn churn_100_keys_inserted_then_all_erased() {
     let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
         .map(|i| {
             (
@@ -541,15 +620,20 @@ fn churn_100_keys_inserted_then_all_erased() {
             )
         })
         .collect();
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        put(&mut frame, k, v, i as u64 + 1);
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            put(&mut frame, k, v, i as u64 + 1);
+        }
+        for (k, v) in &pairs {
+            assert_eq!(del(&mut frame, k).as_deref(), Some(&v[..]));
+        }
+        for (k, _) in &pairs {
+            assert_eq!(get(&frame, k), None);
+        }
     }
-    for (k, v) in &pairs {
-        assert_eq!(del(&mut frame, k).as_deref(), Some(&v[..]));
-    }
-    for (k, _) in &pairs {
-        assert_eq!(get(&frame, k), None);
-    }
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
     let root_slot = frame.header().root_slot;
     assert_eq!(
         frame.slot_entry(root_slot).unwrap().node_type(),

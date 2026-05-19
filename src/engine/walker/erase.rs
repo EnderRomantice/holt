@@ -3,7 +3,7 @@
 //! + `erase_at_blob_node` cross-blob arm.
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{BlobGuid, BlobNode, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use crate::store::backend::Backend;
 use crate::store::{BlobFrame, BufferManager};
 
@@ -118,6 +118,19 @@ pub(super) fn erase_at(
     }
 }
 
+/// Soft-delete a leaf in place: flip its `tombstone` byte and bump
+/// the blob's `tombstone_leaf_cnt`. The leaf body stays in its slot
+/// (so the parent never sees the deletion) and the extent bytes
+/// stay allocated until [`super::compact_blob`] rebuilds the blob.
+///
+/// Returns `EraseSignal::Unchanged` so descending callers do not
+/// rewire parents — structural collapse is now a compaction-time
+/// responsibility.
+///
+/// Replaying an erase against an already-tombstoned leaf is a
+/// no-op: `previous` returns `None` (the prior value was not
+/// visible to readers when this erase fired the second time) and
+/// the counter is not double-bumped.
 fn erase_at_leaf(frame: &mut BlobFrame<'_>, leaf_slot: u16, key: &[u8]) -> Result<EraseReturn> {
     let (existing_key, existing_value) = read_leaf_kv(frame.as_ref(), leaf_slot)?;
     if existing_key != key {
@@ -126,9 +139,26 @@ fn erase_at_leaf(frame: &mut BlobFrame<'_>, leaf_slot: u16, key: &[u8]) -> Resul
             previous: None,
         });
     }
-    frame.free_node(leaf_slot)?;
+    let leaf = {
+        let body = frame.body_of_slot(leaf_slot).ok_or(Error::NodeCorrupt {
+            context: "erase_at_leaf: body resolution failed",
+        })?;
+        *cast::<Leaf>(body)
+    };
+    if leaf.tombstone != 0 {
+        // Already soft-deleted — replay-idempotent.
+        return Ok(EraseReturn {
+            signal: EraseSignal::Unchanged,
+            previous: None,
+        });
+    }
+    let mut new_leaf = leaf;
+    new_leaf.tombstone = 1;
+    write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+    let h = frame.header_mut();
+    h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_add(1);
     Ok(EraseReturn {
-        signal: EraseSignal::SubtreeGone,
+        signal: EraseSignal::Unchanged,
         previous: Some(existing_value),
     })
 }

@@ -823,6 +823,104 @@ fn compact_after_writes_preserves_data_and_bumps_count() {
 }
 
 #[test]
+fn erase_tombstones_leaf_without_freeing_and_bumps_counter() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"alpha", b"A").unwrap();
+    let before = tree.stats().unwrap();
+    assert_eq!(before.total_tombstones, 0);
+    tree.delete(b"alpha").unwrap();
+    let after = tree.stats().unwrap();
+    assert_eq!(after.total_tombstones, 1, "delete should mark a tombstone");
+    // The blob still holds the tombstoned slot — space_used has
+    // **not** shrunk (no immediate reclaim).
+    assert_eq!(after.total_space_used, before.total_space_used);
+    // Lookup returns None because the read path skips tombstones.
+    assert!(tree.get(b"alpha").unwrap().is_none());
+}
+
+#[test]
+fn reinsert_at_tombstoned_key_resurrects_and_decrements_counter() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"k", b"v1").unwrap();
+    tree.delete(b"k").unwrap();
+    assert_eq!(tree.stats().unwrap().total_tombstones, 1);
+    // Re-insert at the same key should resurrect the leaf in place:
+    // the prior value isn't visible (it was deleted), so `put`
+    // returns None as the previous value, and the tombstone counter
+    // drops back to zero.
+    let prev = tree.put(b"k", b"v2").unwrap();
+    assert_eq!(prev, None, "resurrected leaf has no observable prior value");
+    let stats = tree.stats().unwrap();
+    assert_eq!(stats.total_tombstones, 0);
+    assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+}
+
+#[test]
+fn compact_drops_tombstoned_leaves_and_resets_counter() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    // 16 keys, delete half. compact should drop them.
+    for i in 0..16u32 {
+        tree.put(format!("k{i:04}").as_bytes(), b"value-bytes")
+            .unwrap();
+    }
+    for i in 0..8u32 {
+        tree.delete(format!("k{i:04}").as_bytes()).unwrap();
+    }
+    let before = tree.stats().unwrap();
+    assert_eq!(before.total_tombstones, 8);
+    let bytes_before_compact = before.total_space_used;
+
+    tree.compact().unwrap();
+
+    let after = tree.stats().unwrap();
+    assert_eq!(
+        after.total_tombstones, 0,
+        "compact must reset tombstone_leaf_cnt"
+    );
+    assert!(
+        after.total_space_used < bytes_before_compact,
+        "compact must reclaim bytes from the 8 dropped leaves: \
+         before={bytes_before_compact}, after={}",
+        after.total_space_used
+    );
+    assert_eq!(after.total_compactions, 1);
+    // Survivors still readable.
+    for i in 8..16u32 {
+        let v = tree.get(format!("k{i:04}").as_bytes()).unwrap();
+        assert_eq!(v.as_deref(), Some(&b"value-bytes"[..]));
+    }
+    // Dropped keys still gone (their tombstones were swept).
+    for i in 0..8u32 {
+        assert!(tree.get(format!("k{i:04}").as_bytes()).unwrap().is_none());
+    }
+}
+
+#[test]
+fn compact_collapses_all_tombstoned_tree_to_empty_root() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..8u32 {
+        tree.put(format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    for i in 0..8u32 {
+        tree.delete(format!("k{i}").as_bytes()).unwrap();
+    }
+    let pre = tree.stats().unwrap();
+    assert_eq!(pre.total_tombstones, 8);
+
+    tree.compact().unwrap();
+
+    let post = tree.stats().unwrap();
+    assert_eq!(post.total_tombstones, 0);
+    // No live keys anywhere.
+    for i in 0..8u32 {
+        assert!(tree.get(format!("k{i}").as_bytes()).unwrap().is_none());
+    }
+    // Subsequent puts work on the post-compact EmptyRoot.
+    tree.put(b"fresh", b"data").unwrap();
+    assert_eq!(tree.get(b"fresh").unwrap().as_deref(), Some(&b"data"[..]));
+}
+
+#[test]
 fn stats_aggregates_across_multi_blob_tree() {
     // Force the tree across blob boundaries with large values.
     let tree = TreeBuilder::new("ignored")
