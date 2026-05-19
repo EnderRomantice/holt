@@ -255,29 +255,35 @@ impl Tree {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        // Concurrent writers are serialised by the per-blob
-        // `HybridLatch` (root blob always taken exclusive); no
-        // Tree-wide writer mutex needed.
-        let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
-        // Root blob's cached image is now ahead of the backend
-        // image. Tag it for the (foreground or background)
-        // checkpoint round; the `flush_on_write` branch below
-        // drains the entry inline, the WAL branch defers to the
-        // checkpointer.
-        self.backend.mark_dirty(self.root_guid, seq);
 
-        // Durability model: the WAL flush is the **per-op
-        // boundary**. The BM-cached blob image stays in memory
-        // until `Tree::checkpoint`. A crash recovers by replaying
-        // every record past the last checkpoint onto the blob
-        // image that was durable at checkpoint time.
+        // W2D-strict protocol (WAL mode):
         //
-        // The previous "commit BM per op" design double-counted
-        // durability and made replay non-idempotent for `rename`
-        // (the WAL re-inserted the source key on top of an
-        // already-renamed blob).
-        if let Some(wal) = &self.wal {
+        // The walker mutation, `mark_dirty` calls (both walker-
+        // internal `mark_dirty(child, seq)` and the caller-side
+        // `mark_dirty(root, seq)`), and `wal.append` all happen
+        // inside one `wal.lock` critical section. The checkpoint
+        // round's `snapshot_dirty` is also taken under `wal.lock`,
+        // so any dirty entry it observes is guaranteed to have
+        // its WAL record already appended to the writer's buffer
+        // (and the trailing `wal.flush` makes it durable). This
+        // closes the race where a checkpointer could otherwise
+        // snapshot a dirty entry whose WAL record hadn't been
+        // appended yet, write the bytes to backend, and on
+        // crash leave the backend ahead of the WAL.
+        //
+        // Concurrent writers serialise on `wal.lock`. That is the
+        // intentional barrier — without it, the BM dirty set is
+        // not a safe input to the checkpoint round.
+        let outcome = if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
+            let outcome = engine::insert_multi(
+                &self.backend,
+                &self.root_pin,
+                &padded,
+                value,
+                seq,
+            )?;
+            self.backend.mark_dirty(self.root_guid, seq);
             // Fast-path: append the Insert record directly from
             // borrowed refs — skips the `TxnOp::Insert` enum's
             // three `Vec` clones (key, value, prev_value).
@@ -285,16 +291,25 @@ impl Tree {
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
-        } else if self.cfg.flush_on_write {
-            // No WAL (memory mode, or backend supplied by user).
-            // `flush_on_write` still pushes the BM through its
-            // `Backend`'s write-through path so callers that want
-            // per-op durability against a custom backend keep
-            // getting it. The walker may have dirtied child blobs
-            // too (spillover, cross-blob descent), so drain the
-            // full dirty set rather than just the root.
-            self.flush_dirty_inline()?;
-        }
+            outcome
+        } else {
+            // No WAL — no checkpoint round to race with on the
+            // wal-lock axis. `flush_on_write` (if set) flushes
+            // dirty + pending-delete sets inline before returning.
+            let outcome = engine::insert_multi(
+                &self.backend,
+                &self.root_pin,
+                &padded,
+                value,
+                seq,
+            )?;
+            self.backend.mark_dirty(self.root_guid, seq);
+            if self.cfg.flush_on_write {
+                self.flush_dirty_inline()?;
+                self.flush_pending_deletes_inline()?;
+            }
+            outcome
+        };
         Ok(outcome.previous)
     }
 
@@ -320,16 +335,19 @@ impl Tree {
         // fine — `next_seq` is monotonic and the unused seq doesn't
         // appear in any WAL record or dirty entry.
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded, seq)?;
 
-        if let Some(wal) = &self.wal {
+        // W2D-strict protocol: walker + mark_dirty + wal.append
+        // all under one wal.lock critical section — see `Tree::put`
+        // for the rationale.
+        let outcome = if let Some(wal) = &self.wal {
+            let mut w = wal.lock().unwrap();
+            let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded, seq)?;
             if let Some(prev) = &outcome.previous {
                 // Only mark the **root** dirty on an actual erase
                 // — a no-op delete (key absent) leaves the root
                 // image byte-identical to the backend, and the
                 // walker already mark_dirty'd any child it touched.
                 self.backend.mark_dirty(self.root_guid, seq);
-                let mut w = wal.lock().unwrap();
                 // Fast-path: skips the `TxnOp::Erase` enum's
                 // two `Vec` clones (key, value).
                 w.append_erase(seq, 0, key, prev)?;
@@ -338,21 +356,26 @@ impl Tree {
                 }
             }
             // No-op delete (key wasn't there) is not logged.
-        } else if self.cfg.flush_on_write {
+            outcome
+        } else {
+            let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded, seq)?;
             if outcome.previous.is_some() {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            // Flush every blob the walker touched (root + any
-            // children) — no WAL means this is the sole durability
-            // path. snapshot_dirty drains all entries; we commit
-            // each through the backend.
-            self.flush_dirty_inline()?;
-            // Plus drain any deferred deletes the SubtreeGone path
-            // queued — the cache image of those children is gone,
-            // but the backend slot is still alive until we apply
-            // `backend.delete_blob`.
-            self.flush_pending_deletes_inline()?;
-        }
+            if self.cfg.flush_on_write {
+                // Flush every blob the walker touched (root + any
+                // children) — no WAL means this is the sole durability
+                // path. snapshot_dirty drains all entries; we commit
+                // each through the backend.
+                self.flush_dirty_inline()?;
+                // Plus drain any deferred deletes the SubtreeGone
+                // path queued — the cache image of those children
+                // is gone, but the backend slot is still alive
+                // until we apply `backend.delete_blob`.
+                self.flush_pending_deletes_inline()?;
+            }
+            outcome
+        };
         Ok(outcome.previous)
     }
 
@@ -391,33 +414,34 @@ impl Tree {
             return Err(Error::DstExists);
         }
 
-        // erase(src) + insert(dst, value). Both walk through
-        // `BlobNode` crossings; any child blob the walker mutates
-        // gets `mark_dirty(child_guid, seq)` so the checkpoint
-        // round flushes them under invariant W2D (WAL-before-data).
-        // Sharing one `seq` across both phases keeps the rename
-        // atomic from the dirty-tracking perspective — failing
-        // halfway leaves a coherent partial-dirty set rather than
-        // two separately-staged ops.
-        engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq)?;
-        engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
-        // Both walker calls mutated the root blob's cached image.
-        self.backend.mark_dirty(self.root_guid, seq);
-
+        // W2D-strict protocol: walker + mark_dirty + wal.append
+        // all under one wal.lock critical section. Sharing one
+        // `seq` across both erase + insert phases keeps the
+        // rename atomic from the dirty-tracking perspective —
+        // failing halfway leaves a coherent partial-dirty set
+        // rather than two separately-staged ops.
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
+            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq)?;
+            engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
+            self.backend.mark_dirty(self.root_guid, seq);
             // Fast-path: skips the `TxnOp::RenameObject` enum's
             // two `Vec` clones (src_key, dst_key).
             w.append_rename_object(seq, 0, src, dst, force)?;
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
-        } else if self.cfg.flush_on_write {
-            // Walker may have dirtied child blobs across the
-            // erase + insert sequence — drain the full set.
-            // The erase half can also queue SubtreeGone deletes.
-            self.flush_dirty_inline()?;
-            self.flush_pending_deletes_inline()?;
+        } else {
+            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq)?;
+            engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
+            self.backend.mark_dirty(self.root_guid, seq);
+            if self.cfg.flush_on_write {
+                // Walker may have dirtied child blobs across the
+                // erase + insert sequence — drain the full set.
+                // The erase half can also queue SubtreeGone deletes.
+                self.flush_dirty_inline()?;
+                self.flush_pending_deletes_inline()?;
+            }
         }
         Ok(())
     }
@@ -486,31 +510,32 @@ impl Tree {
         // `base + index` and replay can derive it without storing
         // per-inner seqs in the body.
         let base_seq = self.next_seq.fetch_add(count, Ordering::SeqCst);
-        let mut wal_ops: Vec<TxnOp> = Vec::with_capacity(pending.len());
 
-        for (i, op) in pending.into_iter().enumerate() {
-            let seq = base_seq + i as u64;
-            match op {
-                BatchOp::Put { key, value } => {
-                    let entry = self.apply_put_inner(&key, &value, seq)?;
-                    wal_ops.push(entry);
-                }
-                BatchOp::Delete { key } => {
-                    if let Some(entry) = self.apply_delete_inner(&key, seq)? {
-                        wal_ops.push(entry);
-                    }
-                    // Pure no-op deletes (key absent) leave no WAL
-                    // record, matching `Tree::delete`'s contract.
-                }
-                BatchOp::Rename { src, dst, force } => {
-                    let entry = self.apply_rename_inner(&src, &dst, force, seq)?;
-                    wal_ops.push(entry);
-                }
-            }
-        }
-
+        // W2D-strict protocol: all inner ops' walker mutations +
+        // `mark_dirty` calls, plus the single envelope WAL append,
+        // happen under one wal.lock critical section — see
+        // `Tree::put` for the rationale.
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
+            let mut wal_ops: Vec<TxnOp> = Vec::with_capacity(pending.len());
+            for (i, op) in pending.into_iter().enumerate() {
+                let seq = base_seq + i as u64;
+                match op {
+                    BatchOp::Put { key, value } => {
+                        wal_ops.push(self.apply_put_inner(&key, &value, seq)?);
+                    }
+                    BatchOp::Delete { key } => {
+                        if let Some(entry) = self.apply_delete_inner(&key, seq)? {
+                            wal_ops.push(entry);
+                        }
+                        // Pure no-op deletes leave no WAL record,
+                        // matching `Tree::delete`'s contract.
+                    }
+                    BatchOp::Rename { src, dst, force } => {
+                        wal_ops.push(self.apply_rename_inner(&src, &dst, force, seq)?);
+                    }
+                }
+            }
             let envelope = TxnOp::Batch {
                 tree_id: 0,
                 ops: wal_ops,
@@ -519,13 +544,29 @@ impl Tree {
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
-        } else if self.cfg.flush_on_write {
-            // Every inner op may have dirtied root + cross-blob
-            // children — drain the whole set rather than just the
-            // root. Inner deletes/renames may also have queued
-            // SubtreeGone deferred deletes.
-            self.flush_dirty_inline()?;
-            self.flush_pending_deletes_inline()?;
+        } else {
+            for (i, op) in pending.into_iter().enumerate() {
+                let seq = base_seq + i as u64;
+                match op {
+                    BatchOp::Put { key, value } => {
+                        let _ = self.apply_put_inner(&key, &value, seq)?;
+                    }
+                    BatchOp::Delete { key } => {
+                        let _ = self.apply_delete_inner(&key, seq)?;
+                    }
+                    BatchOp::Rename { src, dst, force } => {
+                        let _ = self.apply_rename_inner(&src, &dst, force, seq)?;
+                    }
+                }
+            }
+            if self.cfg.flush_on_write {
+                // Every inner op may have dirtied root + cross-blob
+                // children — drain the whole set rather than just
+                // the root. Inner deletes/renames may also have
+                // queued SubtreeGone deferred deletes.
+                self.flush_dirty_inline()?;
+                self.flush_pending_deletes_inline()?;
+            }
         }
         Ok(())
     }
@@ -552,25 +593,50 @@ impl Tree {
         RangeBuilder::new(Arc::clone(&self.backend), self.root_guid)
     }
 
-    /// Drain the BM dirty map and synchronously commit each entry
-    /// through the inner backend.
+    /// Drain the BM dirty map and synchronously push each entry
+    /// to the inner backend via `write_through` (CAS-on-seq).
     ///
     /// Used by:
     /// - The no-WAL `flush_on_write` path, where every op must
     ///   reach backend before returning (no checkpointer to defer
     ///   to).
-    /// - `Tree::checkpoint`, where the user explicitly asks for a
-    ///   full-tree durability barrier.
+    /// - `Tree::checkpoint`, where the user explicitly asks for
+    ///   a full-tree durability barrier.
     ///
     /// `snapshot_dirty` atomically drains the map; concurrent
     /// `mark_dirty` calls land in the fresh empty map and stay
-    /// tracked for the next round. `BufferManager::commit` writes
-    /// the cached image through and clears the dirty entry on
-    /// success (or restores it on failure so a future flush retries).
+    /// tracked for the next round. `write_through(expected_seq)`
+    /// matches the checkpoint round's protocol: the dirty entry
+    /// is retired only when no racing writer has bumped its seq
+    /// in the meantime (snapshot 的 expected_seq 反映了我们抓到的
+    /// 那个 entry；之后 racing writer 写的 newer-seq 留给下一次
+    /// flush).
     fn flush_dirty_inline(&self) -> Result<()> {
         let snap = self.backend.snapshot_dirty();
-        for guid in snap.into_keys() {
-            self.backend.commit(guid)?;
+        let mut failed: std::collections::HashMap<BlobGuid, u64> =
+            std::collections::HashMap::new();
+        let mut first_err: Option<Error> = None;
+        for (guid, expected_seq) in snap {
+            // `snapshot_bytes` clones the cached image under a
+            // brief shared read guard so we hand owned bytes to
+            // `write_through`. `None` means the blob was evicted
+            // between snapshot_dirty and snapshot_bytes — drop
+            // the dirty entry on the floor; the eviction path
+            // already cleared `dirty` for it.
+            if let Some(bytes) = self.backend.snapshot_bytes(guid) {
+                if let Err(e) = self.backend.write_through(guid, &bytes, expected_seq) {
+                    failed.insert(guid, expected_seq);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if !failed.is_empty() {
+            self.backend.restore_dirty(failed);
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(())
     }
@@ -667,37 +733,123 @@ impl Tree {
     /// Make every previously-applied mutation durable and trim
     /// the WAL.
     ///
-    /// Sequence:
-    /// 1. Flush every buffered WAL record (`sync_data` on the log)
-    ///    — invariant W2D: WAL must be durable before any byte
-    ///    that mirrors a record reaches the data file.
-    /// 2. Drain the BM dirty set and write each entry through to
-    ///    the inner backend. Covers both the root and any
-    ///    cross-blob children the walker has touched since the
-    ///    last checkpoint.
-    /// 3. Drain the BM pending-delete set and apply each
-    ///    `backend.delete_blob` (manifest mutation, in-memory).
-    ///    Must follow step 2 so any final bytes for a soon-deleted
-    ///    blob are NOT written through (the slot is about to be
-    ///    released).
-    /// 4. `flush` the backend (`fdatasync` on persistent; no-op on
-    ///    memory). Persists the manifest's delete entries in the
-    ///    same syscall as the dirty bytes.
-    /// 5. Truncate the WAL — its records are now redundant with
-    ///    the freshly-durable blob images + manifest, so the next
-    ///    replay starts from an empty log.
+    /// Mirrors the background checkpoint round's protocol so a
+    /// manual checkpoint is just as concurrency-safe against
+    /// in-flight writers as the background path:
+    ///
+    /// 1. Under `wal.lock`: snapshot the BM dirty + pending-delete
+    ///    sets, then `wal.flush` so every WAL record covering a
+    ///    snapshotted dirty entry is durable before any data byte
+    ///    or manifest mutation reaches backend (invariant **W2D**).
+    /// 2. `write_through(guid, bytes, expected_seq)` per snapshot
+    ///    dirty entry — the CAS-on-seq retires the entry only if
+    ///    no racing writer bumped it. Failed writes are restored
+    ///    so the next checkpoint retries.
+    /// 3. `backend.flush` (`sync_data` on the data file + persist
+    ///    the manifest) so step 2's writes hit stable storage.
+    /// 4. Execute each `backend.delete_blob` from the pending-
+    ///    delete snapshot — mutates manifest in-memory.
+    /// 5. Re-`backend.flush` if any delete actually applied, so
+    ///    the manifest's delete entries reach disk too.
+    /// 6. Truncate the WAL — only if `dirty_count == 0` and
+    ///    `pending_delete_count == 0` (a racing writer may have
+    ///    re-marked something between our snapshot and now; their
+    ///    entry must keep the WAL alive until a future flush).
     ///
     /// `flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
-        if let Some(wal) = &self.wal {
-            wal.lock().unwrap().flush()?;
+        use std::collections::HashMap;
+
+        // 1. Snapshot under wal.lock so racing writers can't slip
+        //    in a not-yet-WAL-durable dirty entry past us.
+        let (snap_dirty, snap_pending) = if let Some(wal) = &self.wal {
+            let mut w = wal.lock().unwrap();
+            let snap_dirty = self.backend.snapshot_dirty();
+            let snap_pending = self.backend.snapshot_pending_deletes();
+            w.flush()?;
+            (snap_dirty, snap_pending)
+        } else {
+            (
+                self.backend.snapshot_dirty(),
+                self.backend.snapshot_pending_deletes(),
+            )
+        };
+
+        // 2. Write each dirty blob through the inner backend with
+        //    CAS-on-seq.
+        let mut dirty_failed: HashMap<BlobGuid, u64> = HashMap::new();
+        let mut first_err: Option<Error> = None;
+        for (guid, expected_seq) in &snap_dirty {
+            if let Some(bytes) = self.backend.snapshot_bytes(*guid) {
+                if let Err(e) = self.backend.write_through(*guid, &bytes, *expected_seq) {
+                    dirty_failed.insert(*guid, *expected_seq);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
         }
-        self.flush_dirty_inline()?;
-        self.flush_pending_deletes_inline()?;
-        self.backend.flush()?;
+        if !dirty_failed.is_empty() {
+            self.backend.restore_dirty(dirty_failed);
+        }
+
+        // 3. Sync data file + manifest snapshot.
+        if let Err(e) = self.backend.flush() {
+            // The pending-delete snapshot hasn't been applied
+            // yet — restore it so the next checkpoint retries.
+            self.backend.restore_pending_deletes(snap_pending);
+            return Err(e);
+        }
+
+        // 4. Apply pending deletes (manifest mutation).
+        let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
+        for (guid, seq) in &snap_pending {
+            if let Err(e) = self.backend.execute_pending_delete(*guid) {
+                pending_failed.insert(*guid, *seq);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if !pending_failed.is_empty() {
+            self.backend.restore_pending_deletes(pending_failed.clone());
+        }
+
+        // 5. Re-sync iff any delete actually applied. On failure
+        //    restore the already-applied entries to pending so
+        //    the next checkpoint retries the Sync — re-executing
+        //    `delete_blob` is idempotent (HashMap::remove on a
+        //    missing key is a noop).
+        let applied_deletes = snap_pending.len() - pending_failed.len();
+        if applied_deletes > 0 {
+            if let Err(e) = self.backend.flush() {
+                let restore_applied: HashMap<BlobGuid, u64> = snap_pending
+                    .iter()
+                    .filter(|(g, _)| !pending_failed.contains_key(*g))
+                    .map(|(g, s)| (*g, *s))
+                    .collect();
+                self.backend.restore_pending_deletes(restore_applied);
+                return Err(e);
+            }
+        }
+
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+
+        // 6. Conditional truncate. A writer that landed a
+        //    mark_dirty between our snapshot and here has its
+        //    entry still in `dirty` (write_through's CAS won't
+        //    retire newer-seq entries, and snapshot only drained
+        //    what we observed at step 1); leave the WAL alone so
+        //    that entry's WAL record stays recoverable. Same
+        //    logic for pending_delete_count.
         if let Some(wal) = &self.wal {
-            wal.lock().unwrap().truncate()?;
+            let mut w = wal.lock().unwrap();
+            if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
+                w.truncate()?;
+            }
         }
         Ok(())
     }
@@ -743,6 +895,7 @@ impl Tree {
             blobs.push(s);
         }
         let bm_dirty_count = self.backend.dirty_count();
+        let bm_pending_delete_count = self.backend.pending_delete_count();
         let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
             rounds_attempted: ck.rounds_attempted(),
             rounds_succeeded: ck.rounds_succeeded(),
@@ -760,6 +913,7 @@ impl Tree {
             total_tombstones,
             blobs,
             bm_dirty_count,
+            bm_pending_delete_count,
             checkpointer,
         })
     }

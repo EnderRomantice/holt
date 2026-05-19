@@ -65,6 +65,12 @@ pub struct TreeStats {
     /// checkpoint cadence; without it, it tracks the user's
     /// explicit `Tree::checkpoint` schedule.
     pub bm_dirty_count: usize,
+    /// Number of blobs queued for deferred backend deletion —
+    /// children unlinked by an erase walker's `SubtreeGone` path
+    /// or by a merge pass, waiting for the next checkpoint round
+    /// (or `Tree::checkpoint`) to issue the actual
+    /// `backend.delete_blob` + manifest re-sync.
+    pub bm_pending_delete_count: usize,
     /// Background checkpointer telemetry, or `None` if the bg
     /// thread group isn't running (the default; opt in via
     /// [`crate::CheckpointConfig::enabled`]).

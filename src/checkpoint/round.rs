@@ -76,8 +76,30 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     };
     shared.merges_total.fetch_add(merged, Ordering::Relaxed);
 
-    // 1. Snapshot dirty.
-    let snap = shared.bm.snapshot_dirty();
+    #[cfg(feature = "tracing")]
+    let round_start = std::time::Instant::now();
+
+    // 1+2. Snapshot dirty + flush WAL, both under the same wal
+    // lock so the dirty set we drain is closed against in-flight
+    // writers (W2D-strict). The writer-side protocol holds
+    // wal.lock for the duration of walker.mutate + mark_dirty +
+    // wal.append, so any dirty entry visible here has its WAL
+    // record already buffered in the writer — the trailing
+    // `wal.flush` makes it durable before we touch backend.
+    //
+    // No-WAL trees (memory mode, user-supplied backend) skip the
+    // lock; concurrency safety there is the user's contract.
+    let snap = if let Some(wal) = &shared.wal {
+        let mut w = wal.lock().unwrap();
+        let snap = shared.bm.snapshot_dirty();
+        if let Err(e) = w.flush() {
+            shared.bm.restore_dirty(snap);
+            return Err(e);
+        }
+        snap
+    } else {
+        shared.bm.snapshot_dirty()
+    };
     let snap_count = snap.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
 
@@ -92,17 +114,6 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");
         return Ok(());
-    }
-
-    #[cfg(feature = "tracing")]
-    let round_start = std::time::Instant::now();
-
-    // 2. WAL flush.
-    if let Some(wal) = &shared.wal {
-        if let Err(e) = wal.lock().unwrap().flush() {
-            shared.bm.restore_dirty(snap);
-            return Err(e);
-        }
     }
 
     // 3. Snapshot bytes + submit Flush tasks.

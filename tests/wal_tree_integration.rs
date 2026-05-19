@@ -933,3 +933,258 @@ fn cross_blob_writes_replay_correctly_through_wal_without_checkpoint() {
         }
     }
 }
+
+// ============================================================
+// Concurrent writer durability — regression for the W2D-strict
+// protocol that puts walker.mutate + mark_dirty + wal.append
+// inside one wal.lock and pulls the checkpoint round's
+// snapshot_dirty + wal.flush inside the same lock.
+//
+// The pre-fix race: a writer marked a blob dirty + then released
+// before appending WAL; a checkpoint round in between could
+// snapshot the dirty entry, flush a stale WAL (no record yet),
+// write the cache image to backend, sync — and the writer's
+// WAL append then landed AFTER backend was already past it. On
+// crash the WAL truncate point + backend image disagreed.
+//
+// These tests aren't deterministic race triggers (they can't
+// reliably interleave writer/checkpointer threads at a single
+// instruction). They're stress-with-invariant regressions:
+// every `put` that returns Ok is acknowledged, so the
+// post-reopen tree must contain every acknowledged key.
+// ============================================================
+
+#[test]
+fn concurrent_writers_and_bg_checkpoint_preserve_acked_ops() {
+    use holt::{CheckpointConfig, TreeBuilder};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    const WRITERS: usize = 4;
+    const OPS_PER_WRITER: u32 = 250;
+    const PAYLOAD_LEN: usize = 256;
+
+    let dir = tempdir().unwrap();
+    let payload = vec![b'y'; PAYLOAD_LEN];
+
+    {
+        let tree = Arc::new(
+            TreeBuilder::new(dir.path())
+                .wal_sync_on_commit(true) // per-op durable
+                .checkpoint(CheckpointConfig {
+                    enabled: true,
+                    idle_interval: Duration::from_millis(5),
+                    dirty_blob_threshold: 1,
+                    auto_merge: false,
+                    ..CheckpointConfig::default()
+                })
+                .open()
+                .unwrap(),
+        );
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|writer_id| {
+                let tree = Arc::clone(&tree);
+                let payload = payload.clone();
+                thread::spawn(move || {
+                    for i in 0..OPS_PER_WRITER {
+                        let key = format!("w{writer_id:02}/k{i:05}");
+                        tree.put(key.as_bytes(), &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Give the background checkpointer time to drain the
+        // tail of the dirty set before drop.
+        thread::sleep(Duration::from_millis(100));
+    } // drop → final synchronous round + thread join.
+
+    // Reopen — every acknowledged put must be visible.
+    {
+        let tree = Tree::open(TreeConfig::new(dir.path())).unwrap();
+        for writer_id in 0..WRITERS {
+            for i in 0..OPS_PER_WRITER {
+                let key = format!("w{writer_id:02}/k{i:05}");
+                assert_eq!(
+                    tree.get(key.as_bytes()).unwrap().as_deref(),
+                    Some(payload.as_slice()),
+                    "key {key} lost after concurrent put + bg checkpoint + reopen",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_writers_and_manual_checkpoints_preserve_acked_ops() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    const WRITERS: usize = 4;
+    const OPS_PER_WRITER: u32 = 200;
+    const PAYLOAD_LEN: usize = 256;
+
+    let dir = tempdir().unwrap();
+    let payload = vec![b'y'; PAYLOAD_LEN];
+
+    {
+        let cfg = durable_cfg(dir.path()); // wal_sync_on_commit = true
+        let tree = Arc::new(Tree::open(cfg).unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Background "checkpointer" — periodic manual
+        // Tree::checkpoint() while writers churn. This is the
+        // path P0 #2 fixed: snapshot under wal.lock,
+        // write_through with expected_seq, conditional
+        // truncate.
+        let ck_tree = Arc::clone(&tree);
+        let ck_done = Arc::clone(&done);
+        let ck_handle = thread::spawn(move || {
+            while !ck_done.load(Ordering::Relaxed) {
+                let _ = ck_tree.checkpoint();
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let writer_handles: Vec<_> = (0..WRITERS)
+            .map(|writer_id| {
+                let tree = Arc::clone(&tree);
+                let payload = payload.clone();
+                thread::spawn(move || {
+                    for i in 0..OPS_PER_WRITER {
+                        let key = format!("w{writer_id:02}/k{i:05}");
+                        tree.put(key.as_bytes(), &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        ck_handle.join().unwrap();
+
+        // One final checkpoint to make backend the source of
+        // truth before drop (we'll re-open with the same WAL
+        // path and don't want replay to mask a missed write).
+        tree.checkpoint().unwrap();
+    }
+
+    {
+        let tree = Tree::open(durable_cfg(dir.path())).unwrap();
+        for writer_id in 0..WRITERS {
+            for i in 0..OPS_PER_WRITER {
+                let key = format!("w{writer_id:02}/k{i:05}");
+                assert_eq!(
+                    tree.get(key.as_bytes()).unwrap().as_deref(),
+                    Some(payload.as_slice()),
+                    "key {key} lost after concurrent put + manual checkpoint + reopen",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_writers_with_deletes_and_bg_checkpoint() {
+    // Adds the deferred-delete path to the concurrent stress:
+    // half the writers put unique keys, the others delete keys
+    // a prior round inserted. Cross-blob erase that hits
+    // SubtreeGone queues pending deletes; the round + drop +
+    // reopen sequence must still leave the tree consistent.
+    use holt::{CheckpointConfig, TreeBuilder};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    const PUT_WRITERS: usize = 3;
+    const OPS: u32 = 200;
+    const PAYLOAD_LEN: usize = 512;
+
+    let dir = tempdir().unwrap();
+    let payload = vec![b'z'; PAYLOAD_LEN];
+
+    {
+        let tree = Arc::new(
+            TreeBuilder::new(dir.path())
+                .wal_sync_on_commit(true)
+                .checkpoint(CheckpointConfig {
+                    enabled: true,
+                    idle_interval: Duration::from_millis(5),
+                    dirty_blob_threshold: 1,
+                    auto_merge: true,
+                    ..CheckpointConfig::default()
+                })
+                .open()
+                .unwrap(),
+        );
+
+        // Phase 1: prefill keys "p<n>/k<i>" for n in 0..PUT_WRITERS.
+        for writer_id in 0..PUT_WRITERS {
+            for i in 0..OPS {
+                let k = format!("p{writer_id:02}/k{i:05}");
+                tree.put(k.as_bytes(), &payload).unwrap();
+            }
+        }
+
+        // Phase 2: concurrent put (different namespace) + delete
+        // (drains the prefilled keys, exercising SubtreeGone).
+        let putters: Vec<_> = (0..PUT_WRITERS)
+            .map(|writer_id| {
+                let tree = Arc::clone(&tree);
+                let payload = payload.clone();
+                thread::spawn(move || {
+                    for i in 0..OPS {
+                        let k = format!("q{writer_id:02}/k{i:05}");
+                        tree.put(k.as_bytes(), &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let deleter_tree = Arc::clone(&tree);
+        let deleter = thread::spawn(move || {
+            for writer_id in 0..PUT_WRITERS {
+                for i in 0..OPS {
+                    let k = format!("p{writer_id:02}/k{i:05}");
+                    let _ = deleter_tree.delete(k.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        for h in putters {
+            h.join().unwrap();
+        }
+        deleter.join().unwrap();
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    // Reopen: all `q*` keys present, all `p*` keys gone.
+    {
+        let tree = Tree::open(TreeConfig::new(dir.path())).unwrap();
+        for writer_id in 0..PUT_WRITERS {
+            for i in 0..OPS {
+                let kq = format!("q{writer_id:02}/k{i:05}");
+                assert_eq!(
+                    tree.get(kq.as_bytes()).unwrap().as_deref(),
+                    Some(payload.as_slice()),
+                    "{kq} (put) lost",
+                );
+                let kp = format!("p{writer_id:02}/k{i:05}");
+                assert!(
+                    tree.get(kp.as_bytes()).unwrap().is_none(),
+                    "{kp} (deleted) resurrected",
+                );
+            }
+        }
+    }
+}
