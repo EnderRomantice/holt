@@ -1292,3 +1292,53 @@ fn random_kv_insert_after_child_blob_compact_stays_consistent() {
         assert_eq!(tree.get(k).unwrap().as_deref(), Some(v.as_slice()));
     }
 }
+
+#[test]
+fn range_delim_fast_forward_yields_every_distinct_common_prefix() {
+    // Regression for v0.2 fast-forward in `Tree::range` delim mode.
+    //
+    // Builds an objstore-shaped tree with 32 distinct rollup buckets
+    // (`bucket-00/...` through `bucket-31/...`), each holding 50
+    // leaves. Without fast-forward the iterator dedup-scanned every
+    // leaf to find 32 rollups (1600 leaf walks). With fast-forward
+    // we ascend past each emitted rollup so the next descent
+    // visits the next bucket's first leaf directly.
+    //
+    // Either way the **emitted set** must be exactly the 32
+    // distinct `CommonPrefix` entries; this test fails (over-skip)
+    // if the ascent over-pops past a Prefix node whose bytes span
+    // the delimiter and re-anchors at a parent inner whose cursor
+    // points past the byte that would have led to a still-unseen
+    // bucket.
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for b in 0..32u32 {
+        for f in 0..50u32 {
+            let key = format!("bucket-{b:02}/path/sub/file-{f:04}.bin").into_bytes();
+            tree.put(&key, b"v").unwrap();
+        }
+    }
+
+    let mut rollups: Vec<Vec<u8>> = Vec::new();
+    for entry in tree.range().prefix(b"bucket-").delimiter(b'/') {
+        match entry.unwrap() {
+            RangeEntry::CommonPrefix(p) => rollups.push(p),
+            RangeEntry::Key { key, .. } => panic!(
+                "expected only CommonPrefix entries, got Key({:?})",
+                String::from_utf8_lossy(&key)
+            ),
+            _ => panic!("RangeEntry got a new variant"),
+        }
+    }
+
+    assert_eq!(
+        rollups.len(),
+        32,
+        "fast-forward must emit exactly one rollup per distinct bucket; \
+         got {} of 32 (over-skip from a Prefix-spans-delimiter ascent)",
+        rollups.len()
+    );
+    let expected: Vec<Vec<u8>> = (0..32u32)
+        .map(|b| format!("bucket-{b:02}/").into_bytes())
+        .collect();
+    assert_eq!(rollups, expected, "rollups must come back in lex order");
+}

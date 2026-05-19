@@ -126,25 +126,25 @@ quoting them. The **relative ordering** is what's load-bearing.
 | `fs_list` (`/usr/local/share/category-5/`, ~1250 leaves) | ~10.7 µs | ~18.9 µs | ~13.4 µs | **~1.25× faster** |
 
 **S3-style delim rollup (memory mode), `take(8)` distinct
-`CommonPrefix` entries — naive O(N) scan in all three engines
-(no fast-forward; on the v0.2 backlog):**
+`CommonPrefix` entries:**
 
-| Scenario | holt | RocksDB | SQLite | Notes |
+| Scenario | holt | RocksDB | SQLite | holt vs best other |
 |---|---|---|---|---|
-| `objstore_list_dir` (8 of 32 buckets) | ~579 µs | ~673 µs | **~463 µs** | SQLite wins on raw scan throughput; holt mid-pack |
-| `fs_list_dir` (8 of 16 dirs) | ~1.18 ms | ~1.33 ms | **~940 µs** | Same shape — SQLite's tight B-tree scan beats holt's leaf walk |
+| `objstore_list_dir` (8 of 32 buckets) | **~2.5 µs** | ~623 µs | ~440 µs | **~177× faster** |
+| `fs_list_dir` (8 of 16 dirs) | **~2.85 µs** | ~1.31 ms | ~928 µs | **~326× faster** |
 
 **Reading the LIST numbers:** plain prefix scans (`*_list`) are
 the bread-and-butter metadata workload — `readdir`, `ListObjects`
 with deep prefix — and holt wins those cleanly. The delimiter
-rollup (`*_list_dir`) is a fairness check: every engine has to
-scan all leaves under the prefix to dedup the rollups (none of
-the three fast-forwards past a rolled-up subtree). holt's per-leaf
-overhead from `BlobFrameRef` allocation + `RangeEntry::Key { ... }`
-materialisation costs it the win here; SQLite's tight C-loop wins
-on raw scan throughput. holt's qualitative advantage — built-in
-`CommonPrefix` semantics so callers don't reimplement dedup —
-isn't captured by the bench numbers.
+rollup (`*_list_dir`) is the load-bearing test for S3-style
+listings: holt's `Tree::range` does engine-level `CommonPrefix`
+dedup **and** fast-forwards past a rolled-up subtree once it's
+emitted, so the cost is `O(distinct_rollups)` rather than
+`O(leaves_under_prefix)`. RocksDB and SQLite have no equivalent
+API, so the bench rolls dedup at the app layer; even with a
+tight inner loop they still pay the full leaf-scan cost. v0.2
+fast-forward dropped `*_list_dir` from ~600 µs / ~1.3 ms down
+to single µs.
 
 ## Caveats
 
@@ -156,13 +156,13 @@ isn't captured by the bench numbers.
    to OS page cache only. A real `fsync`-per-op workload is
    fsync-bound (~1–3 ms on consumer SSD) and overwhelms every
    engine's algorithm cost.
-3. **Delim rollup is currently O(all leaves under prefix)** in
-   all three engines. holt v0.2 has fast-forward (skip past a
-   rolled-up subtree after emitting the `CommonPrefix`) on the
-   backlog; the same trick is available to RocksDB/SQLite via
-   `seek(common_prefix + 0xff)` but the bench's app-layer dedup
-   doesn't implement it either. Once holt gets fast-forward,
-   `*_list_dir` should drop by a factor of `leaves_per_rollup`.
+3. **Delim rollup uses fast-forward in holt only.** Holt's
+   `Tree::range` ascends the descent stack past a rolled-up
+   subtree after emitting its `CommonPrefix`, so the cost is
+   `O(distinct_rollups)`. RocksDB and SQLite still do the naive
+   `O(leaves_under_prefix)` scan with app-side dedup; both
+   could implement an equivalent `seek(common_prefix + 0xff)`
+   skip, but the bench's app-layer dedup doesn't.
 4. **Bench numbers are machine-dependent.** Don't take any
    absolute throughput claim from this README at face value —
    re-run on your hardware. The relative ordering (holt wins on

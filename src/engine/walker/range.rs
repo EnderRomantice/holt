@@ -228,11 +228,34 @@ impl Iterator for RangeIter {
                         if let Some(idx) = rest.iter().position(|b| *b == d) {
                             let common: Vec<u8> = user_key[..=self.prefix.len() + idx].to_vec();
                             if self.last_common_prefix.as_deref() == Some(common.as_slice()) {
-                                // Dedup: same common prefix already
-                                // emitted; just skip this leaf.
+                                // Defensive dedup: fast-forward below
+                                // skips most repeats, but a `Prefix`
+                                // node whose bytes span the delimiter
+                                // can over-pop the ascent and re-enter
+                                // the same rollup. The dedup catches
+                                // those.
                                 continue;
                             }
                             self.last_common_prefix = Some(common.clone());
+                            // Fast-forward past `common`'s subtree.
+                            // Ascend the descent stack while
+                            // `curr_key` still extends into the
+                            // rolled-up region; each pop trims its
+                            // `pushed_bytes`. The top frame's cursor
+                            // is already positioned past the byte
+                            // that led into `common` (descend always
+                            // advances the parent cursor before
+                            // pushing a child), so the natural
+                            // advance loop on the next `next()` call
+                            // picks the next sibling and skips the
+                            // whole subtree — `O(leaves_under_rollup)`
+                            // dedup-scans collapse to `O(stack_pops)`.
+                            let common_len = common.len();
+                            while self.curr_key.len() > common_len
+                                && self.stack.len() > self.anchor_depth
+                            {
+                                self.pop_frame();
+                            }
                             return Some(Ok(RangeEntry::CommonPrefix(common)));
                         }
                         // No delimiter in `rest` — emit as key and
