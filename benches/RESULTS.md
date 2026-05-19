@@ -48,6 +48,11 @@ short codepaths) to **467×** (`fs_list_dir` S3-style rollup
 vs RocksDB — fast-forward over `BlobNode` crossings beats
 seek-iterator-per-leaf hands down).
 
+Plus the scale curve (Group B below) running across `{20 k,
+100 k, 500 k, 2 M}` keys: **holt wins every cell at every
+tier**, with the lead vs RocksDB on get widening to **5.6× at
+2 M** as the LSM's read-amplification finally bites.
+
 ## KV workload (short random keys + short values)
 
 | Bench               | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
@@ -119,13 +124,14 @@ semantics.
   + SQLite both scan every leaf and dedupe in the host loop,
   which is what the 100–500× gap measures.
 
-## Group B — Scale curve (20 k → 100 k → 500 k keys)
+## Group B — Scale curve (20 k → 100 k → 500 k → 2 M keys)
 
-Parameterized `kv_get` and `kv_put` over three dataset sizes
-so the comparison is not biased by the "everything fits in L2
-cache" effect at 20 k. The 500 k tier ≈ 48 MB of payload, which
-**exceeds holt's default 32 MB (64-blob) buffer pool** — so we
-see real eviction churn + cross-blob descent on every miss.
+Parameterized `kv_get` and `kv_put` over four dataset sizes so
+the comparison is not biased by the "everything fits in L2 cache"
+effect at 20 k. The 500 k tier (~48 MB) already exceeds holt's
+default 32 MB (64-blob) buffer pool; the **2 M tier (~192 MB) is
+6× the pool**, so every miss pays the full `read_blob` + descent
+cost.
 
 ```bash
 cargo bench --bench main -- kv_scale --output-format bencher
@@ -135,34 +141,45 @@ cargo bench --bench main -- kv_scale --output-format bencher
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **190** |          722 |         586 |       3.8× |      3.1× |
-| **100 k** |   **428** |        1 123 |         912 |       2.6× |      2.1× |
-| **500 k** |   **687** |        1 814 |       1 349 |       2.6× |      2.0× |
+|  **20 k** |   **172** |          609 |         557 |       3.5× |      3.2× |
+| **100 k** |   **336** |          938 |         812 |       2.8× |      2.4× |
+| **500 k** |   **645** |        1 598 |       1 156 |       2.5× |      1.8× |
+|  **2 M**  | **1 030** |    **5 771** |       1 425 |   **5.6×** |      1.4× |
 
 ### `kv_scale_put` (random point upsert)
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **365** |        1 546 |         589 |       4.2× |      1.6× |
-| **100 k** |   **717** |        1 448 |         974 |       2.0× |      1.4× |
-| **500 k** |   **867** |        1 328 |       1 156 |       1.5× |      1.3× |
+|  **20 k** |   **323** |        1 170 |         589 |       3.6× |      1.8× |
+| **100 k** |   **578** |        1 312 |         879 |       2.3× |      1.5× |
+| **500 k** |   **971** |        1 665 |       1 278 |       1.7× |      1.3× |
+|  **2 M**  | **1 435** |        1 607 |       1 549 |       1.1× |      1.1× |
 
 ### Observations
 
-- **Holt's get latency** grows 3.6× across 25× data growth
-  (190 → 687 ns). RocksDB grows 2.5× (722 → 1 814 ns). SQLite
-  grows 2.3× (586 → 1 349 ns).
-- The relative gap narrows at scale because at 500 k holt
-  starts paying real cache-miss + spillover costs while RocksDB
-  / SQLite have always been paying them. Even so, holt still
-  wins by ~2× at every tier.
-- **Holt's put latency** grows 2.4× (365 → 867 ns); RocksDB is
-  *flat* (1.5× ≈ noise — its LSM write path is bounded by WAL
-  append, not key count). SQLite grows 2× similar to holt.
-- At 500 k, holt put is 1.3 – 1.5× the comparators — the
-  closest the put gap gets in any tier. Still a win, but the
-  takeaway is that LSM amortizes writes across compaction so
-  point-write latency is mostly constant.
+- **Holt still wins every cell at 2 M.** No regression on the
+  largest tier we test.
+- **Get-latency spikes for RocksDB at 2 M** (1 598 → 5 771 ns,
+  3.6× jump from 500 k). That's the LSM read-amplification cost
+  finally showing up — at 2 M the bloom filters miss more often
+  and the read has to descend multiple SST levels. Holt only
+  grows 1.6× (645 → 1 030 ns) over the same 4× data growth
+  because its descent depth scales with `log(N)` of distinct
+  prefixes, not with SST level count. Result: holt's **lead vs
+  RocksDB on get widens to 5.6× at 2 M** (up from 2.5× at 500 k).
+- **SQLite get tightens to 1.4×** at 2 M (from 1.8× at 500 k).
+  Its B-tree handles cache pressure gracefully — bounded fan-out
+  + 64 MB page cache means lookup depth is dominated by index
+  height, which grows slowly.
+- **Holt put gap narrows to ~1.1× over both** at 2 M. Holt grows
+  4.4× across 100× data growth (323 → 1 435 ns) — pure
+  eviction-churn cost on cross-blob descent. RocksDB grows just
+  1.4× (1 170 → 1 607 ns) because the LSM write path is bounded
+  by WAL append + memtable insert, not by key count or working
+  set. SQLite grows 2.6× (589 → 1 549 ns). The takeaway: at
+  cache-busting working-set sizes, LSM-style amortization
+  catches up; holt is still ahead, but the lead is the closest
+  it gets at any tier.
 
 ## Group C — p95 / p99 latency under maintenance interference
 

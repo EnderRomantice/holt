@@ -587,10 +587,14 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
 // fully-resident microbench.
 //
 // One representative workload per scale to keep total runtime
-// under ~5 minutes (Criterion's default 100 samples × 5 s
-// warm-up over 3 sizes × 3 engines × 2 ops = 18 sub-benches).
+// bounded (Criterion's default 100 samples × 5 s warm-up over 4
+// sizes × 3 engines × 2 ops = 24 sub-benches).
+//
+// At 2M the dataset is ~192 MB — 6× the default buffer pool —
+// so every miss pays the full read_blob + descent cost, and the
+// numbers reflect a working set the cache cannot hold.
 
-const SCALE_SIZES: &[usize] = &[20_000, 100_000, 500_000];
+const SCALE_SIZES: &[usize] = &[20_000, 100_000, 500_000, 2_000_000];
 
 fn gen_kv_dataset_sized(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rng = StdRng::seed_from_u64(SEED);
