@@ -40,6 +40,13 @@
 //!   scan / rename / compact).
 //! - [`journal`] — WAL + replay + checkpoint.
 //! - [`api`] — high-level `Tree` / `Txn` / `Iter` surface.
+//!
+//! ## Platform support
+//!
+//! holt is **Unix-only by design**: Linux (`O_DIRECT` fast path,
+//! `io_uring` on the persistent backend) and macOS (`F_NOCACHE`).
+//! Windows is out of scope and the crate refuses to compile there
+//! — see the platform stance in `ROADMAP.md`.
 
 #![doc(html_no_source)]
 #![deny(missing_docs)]
@@ -88,6 +95,16 @@
     // it forces hoisting of locally-scoped const helpers.
     clippy::items_after_statements
 )]
+
+// Hard scope gate — see the "Platform support" section in the
+// module docs. Building holt for Windows is intentionally
+// unsupported; the persistent backend's `O_DIRECT` / `F_NOCACHE`
+// path has no Windows analog worth maintaining for this project.
+#[cfg(not(unix))]
+compile_error!(
+    "holt is Unix-only — Linux and macOS are supported. Windows is out of scope; \
+     see ROADMAP.md."
+);
 
 pub mod api;
 pub mod concurrency;

@@ -237,9 +237,6 @@ Required for the v0.1 tag:
       `#![allow]` block in `src/lib.rs` documents the categories
       where `clippy::pedantic` fires for intentional design
       choices.
-- [ ] Windows tier-1 (persistent backend currently Unix-only;
-      `Tree::open` returns `NotYetImplemented` on Windows for the
-      persistent path)
 - [x] **MSRV policy** — Rust 1.82, gated by the `msrv` CI job
       (library-only build; dev-dependencies routinely require a
       newer toolchain than the library surface itself does)
@@ -271,7 +268,8 @@ Required for the v0.1 tag:
 ## v1.0 — Production-ready
 
 - Comprehensive feature set covered.
-- Multi-platform stability (Linux + macOS + Windows + BSDs).
+- Multi-platform stability across the supported Unix targets
+  (Linux + macOS, optional BSDs).
 - Real production deployments + case studies.
 - Long-term API stability commitment.
 
@@ -279,6 +277,10 @@ Required for the v0.1 tag:
 
 The library deliberately stays single-node. Things outside scope:
 
+- **Windows support**: holt is Unix-only by design — the persistent
+  backend rides `O_DIRECT` on Linux and `F_NOCACHE` on macOS, and
+  there is no Windows analog this project wants to maintain. The
+  crate `compile_error!`s on Windows targets.
 - **Replication / consensus**: build it above this. We expose hooks
   (change feed, snapshot transfer) but don't implement Raft.
 - **Network server**: this is a library. Wrap it in your gRPC /

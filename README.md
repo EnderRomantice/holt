@@ -61,8 +61,9 @@ Done — algorithm core:
 - Child-blob auto-reclaim when an erase empties it
 - Strict-prefix support (terminator byte)
 - In-place leaf-value update on same-size writes
-- `MemoryBackend` + cross-platform `PersistentBackend`
-  (Linux `O_DIRECT`, macOS `F_NOCACHE`)
+- `MemoryBackend` + Unix-only `PersistentBackend`
+  (Linux `O_DIRECT`, macOS `F_NOCACHE`). The crate `compile_error!`s
+  on Windows — see [`ROADMAP.md`](ROADMAP.md).
 - `BufferManager` LRU cache wrapping any backend (Stage 6 phase 1)
   — `TreeConfig::buffer_pool_size` drives capacity, per-blob
   `RwLock` lets N readers share a single blob in parallel

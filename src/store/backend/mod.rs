@@ -2,10 +2,13 @@
 //!
 //! Only two backends exist in holt and only two ever will:
 //!
-//! | Backend | Purpose | Where it works |
-//! |---|---|---|
-//! | [`MemoryBackend`]     | Tests, ephemeral trees, in-memory KV | All platforms |
-//! | [`PersistentBackend`] | File-backed durable storage; Linux fast path uses `O_DIRECT` + `io_uring` | All Unix |
+//! | Backend | Purpose |
+//! |---|---|
+//! | [`MemoryBackend`]     | Tests, ephemeral trees, in-memory KV |
+//! | [`PersistentBackend`] | File-backed durable storage; `O_DIRECT` on Linux, `F_NOCACHE` on macOS |
+//!
+//! Both run on every supported platform — holt is **Unix-only**
+//! (Linux + macOS); the crate refuses to compile on Windows.
 //!
 //! The trait surface ([`Backend`]) is blob-granular: read / write a
 //! full `PAGE_SIZE` ([`crate::layout::PAGE_SIZE`]) frame, list, delete,
@@ -18,14 +21,10 @@
 
 pub mod aligned;
 pub mod memory;
-
-#[cfg(unix)]
 pub mod persistent;
 
 pub use aligned::{AlignedBlobBuf, BUF_ALIGN};
 pub use memory::MemoryBackend;
-
-#[cfg(unix)]
 pub use persistent::PersistentBackend;
 
 use crate::api::errors::Result;

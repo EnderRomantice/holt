@@ -40,11 +40,8 @@ use crate::journal::reader::replay;
 use crate::journal::txn_op::TxnOp;
 use crate::journal::writer::WalWriter;
 use crate::layout::{BlobGuid, PAGE_SIZE};
-use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
+use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
-
-#[cfg(unix)]
-use crate::store::backend::PersistentBackend;
 
 /// An `holt` tree — your handle to one metadata store.
 ///
@@ -157,27 +154,14 @@ impl Tree {
     /// `"/path"` (the default). `TreeConfig::memory()` opens an
     /// in-memory tree.
     ///
-    /// On non-Unix platforms, persistent mode is unavailable;
-    /// passing a `Storage::Persistent` config there returns
-    /// [`Error::NotYetImplemented`] — fall back to
-    /// `TreeConfig::memory()` or supply your own [`Backend`] via
-    /// [`Tree::open_with_backend`].
+    /// holt is Unix-only — the persistent backend uses `O_DIRECT`
+    /// on Linux and `F_NOCACHE` on macOS. Building the crate on
+    /// Windows fails at compile time (see the platform stance in
+    /// `ROADMAP.md`).
     pub fn open(cfg: TreeConfig) -> Result<Self> {
         let backend: Arc<dyn Backend> = match &cfg.storage {
             Storage::Memory => Arc::new(MemoryBackend::new()),
-            Storage::Persistent { dir } => {
-                #[cfg(unix)]
-                {
-                    Arc::new(PersistentBackend::open(dir)?)
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = dir;
-                    return Err(Error::NotYetImplemented(
-                        "PersistentBackend is Unix-only; use TreeConfig::memory() or supply a Backend via Tree::open_with_backend",
-                    ));
-                }
-            }
+            Storage::Persistent { dir } => Arc::new(PersistentBackend::open(dir)?),
         };
         // The auto-managed backend earns automatic WAL coverage.
         Self::open_inner(cfg, backend, /*attach_wal=*/ true)

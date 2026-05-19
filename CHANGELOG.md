@@ -131,6 +131,10 @@ v0.1 items are higher-level API surface (`Tree::range`, `Tree::txn`,
 - **GitHub Actions CI** — matrix of ubuntu + macOS × build / test /
   doctest + lint (`cargo fmt --check`, `cargo clippy -D warnings`)
   + docs (`cargo doc -D warnings`) + MSRV (1.82) build.
+- **Platform scope locked**: holt is Unix-only by design. Building
+  on Windows fires a top-of-crate `compile_error!`; the persistent
+  backend's `O_DIRECT` (Linux) / `F_NOCACHE` (macOS) fast path has
+  no Windows analog worth carrying.
 - **Zero clippy / rustdoc warnings** under `-D warnings`. The
   curated `#![allow]` block in `src/lib.rs` lists the
   `clippy::pedantic` lints we've reviewed and judged either
