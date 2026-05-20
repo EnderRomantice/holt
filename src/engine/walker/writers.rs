@@ -27,13 +27,7 @@ pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &
             std::slice::from_raw_parts(std::ptr::from_ref::<T>(v).cast::<u8>(), size_of::<T>())
         };
         body.copy_from_slice(bytes);
-    } // ← drop the `body` mutable borrow of `frame.buf` before bumping
-      // Bump after the body write so observers performing an
-      // `Acquire`-load on the slot version followed by a body read
-      // either see (old body + old version) or (new body + new
-      // version), never a mix. No-op when the frame was constructed
-      // without version tracking (init / local-buf paths).
-    frame.bump_slot_version(slot);
+    }
     Ok(())
 }
 

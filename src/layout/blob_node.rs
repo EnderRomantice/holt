@@ -3,8 +3,7 @@
 //! A first-class node-type variant used when a tree spans
 //! multiple 512 KB blob frames. The walker hits one, swaps to
 //! the target blob, and continues at the child blob's
-//! authoritative `header.root_slot`; `child_entry_ptr` is kept as
-//! an on-disk compatibility/debug hint.
+//! authoritative `header.root_slot`.
 
 use std::mem::{offset_of, size_of};
 
@@ -12,7 +11,7 @@ use super::NodeType;
 
 /// Maximum inline path-compressed prefix bytes a Blob node holds.
 /// Longer prefixes chain through Prefix→Blob.
-pub const BLOB_MAX_INLINE: usize = 96;
+pub const BLOB_MAX_INLINE: usize = 104;
 
 /// 128-byte in-tree blob crossing.
 #[repr(C)]
@@ -28,10 +27,6 @@ pub struct BlobNode {
     _pad_6: u16,
     /// 128-bit identifier of the blob to walk into.
     pub child_blob_guid: [u8; 16],
-    /// Slot hint inside the child blob where the walk resumes.
-    /// The child blob's `header.root_slot` is authoritative.
-    pub child_entry_ptr: u32,
-    _pad_28: u32,
     /// Inline path-compressed prefix bytes (only first
     /// `prefix_len` are valid).
     pub bytes: [u8; BLOB_MAX_INLINE],
@@ -39,14 +34,13 @@ pub struct BlobNode {
 
 const _: () = assert!(size_of::<BlobNode>() == 128);
 const _: () = assert!(offset_of!(BlobNode, child_blob_guid) == 8);
-const _: () = assert!(offset_of!(BlobNode, child_entry_ptr) == 24);
-const _: () = assert!(offset_of!(BlobNode, bytes) == 32);
+const _: () = assert!(offset_of!(BlobNode, bytes) == 24);
 
 impl BlobNode {
-    /// Build a Blob crossing pointing at `(guid, entry_slot)`,
-    /// optionally with a path-compressed prefix.
+    /// Build a Blob crossing pointing at `child_guid`, optionally
+    /// with a path-compressed prefix.
     #[must_use]
-    pub fn new(prefix_bytes: &[u8], child_guid: [u8; 16], child_entry_slot: u32) -> Self {
+    pub fn new(prefix_bytes: &[u8], child_guid: [u8; 16]) -> Self {
         assert!(prefix_bytes.len() <= BLOB_MAX_INLINE);
         let mut b = Self {
             count: 1,
@@ -55,8 +49,6 @@ impl BlobNode {
             prefix_len: prefix_bytes.len() as u16,
             _pad_6: 0,
             child_blob_guid: child_guid,
-            child_entry_ptr: child_entry_slot,
-            _pad_28: 0,
             bytes: [0; BLOB_MAX_INLINE],
         };
         b.bytes[..prefix_bytes.len()].copy_from_slice(prefix_bytes);

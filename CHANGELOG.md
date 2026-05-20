@@ -125,49 +125,34 @@ same change applied inside the batch-path rename arm of
 - `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
   Tree helpers folded into the new `apply_batch_walker_inline`.
 
-### Infrastructure — slot-version counters and cross-blob latch coupling
+### Breaking — BlobNode format + cross-blob latch coupling
 
 Implements the first real concurrency cut for split metadata
-trees. `put` / `insert` and `delete` / `remove` no longer hold a
-root or ancestor blob's exclusive latch while mutating a
-descendant blob on the key path. The walker now acquires the
-child blob while the parent is still latched, releases the parent,
-and repeats that handoff recursively for every deeper `BlobNode`.
+trees and makes the on-disk `BlobNode` contract smaller. `put` /
+`insert` and `delete` / `remove` no longer hold a root or
+ancestor blob's exclusive latch while mutating a descendant blob
+on the key path. The walker reads the `BlobNode`, pins the child
+blob, releases the parent, and repeats that handoff recursively
+for every deeper `BlobNode`.
 
 The correctness boundary also changes: parent
-`BlobNode.child_entry_ptr` is now a compatibility / debug hint.
-The child blob's own `header.root_slot` is authoritative, so
-child-local splits, collapses, and post-compact root-slot changes
+`BlobNode.child_entry_ptr` is removed. The child blob's own
+`header.root_slot` is the only cross-blob entry. Child-local
+splits, collapses, and post-compact root-slot changes therefore
 do not require re-acquiring and rewriting the parent `BlobNode`.
 
 Concretely:
 
-- `CachedBlob` gains a `slot_versions: Box<[AtomicU64; MAX_SLOTS]>`
-  field — one `AtomicU64` per 1-based slot index. 10240 × 8 bytes
-  = **~80 KB per blob**; with the default 64-blob buffer pool
-  that's +5.2 MB resident, +10.4 MB at the 128-blob default
-  upper end. Acceptable for the concurrency gains the counters
-  unlock.
-- New `BlobFrame::wrap_versioned(buf, slot_versions)` constructor
-  + private `bump_slot_version(slot)` helper. The existing
-  `BlobFrame::wrap(buf)` keeps its no-version semantics for init /
-  local-buf / test paths.
-- `BlobWriteGuard::frame()` is the writer-side convenience that
-  pairs `as_mut_slice()` with the owning `CachedBlob`'s
-  `slot_versions` in one call.
-- Walker write paths migrate from
-  `BlobFrame::wrap(guard.as_mut_slice())` to `guard.frame()` —
-  ~20 call sites across `insert.rs` / `erase.rs` / `migrate.rs` /
-  `scan.rs`.
-- `BlobFrame::alloc_node` / `free_node` and walker
-  `write_struct_to_slot` bump the relevant slot's counter
-  (Release ordering) after every body mutation. Counters start
-  at 0; bumps are monotonic across the blob's lifetime in the
-  cache.
-- New `BlobFrame::slot_version(slot)` reader — `Acquire`-load
-  pair to `BlobFrame::bump_slot_version`'s `Release` store.
-  Returns 0 for unversioned frames (init / local-buf / test
-  paths) or out-of-range slot indices.
+- `BlobNode` stays 128 bytes, but the removed child-entry field
+  is reclaimed for inline prefix payload. `BLOB_MAX_INLINE`
+  grows from 96 to 104 bytes.
+- This is an on-disk format break for multi-blob trees written by
+  earlier v0.3 draft binaries. Rebuild from checkpointed data or
+  export/import before moving existing draft data onto this
+  layout.
+- `BlobWriteGuard::frame()` remains the writer-side convenience
+  for in-place mutation, but it now returns a plain
+  `BlobFrame::wrap(...)`; there is no per-slot version sidecar.
 - `walker::insert::insert_multi` first tries the recursive
   lock-coupled path. If the root blob is full, `spillover_blob`
   + `compact_blob` run as before, then the walker re-checks the
@@ -176,16 +161,14 @@ Concretely:
   the root latch across child mutation.
 - `walker::erase::erase_multi` mirrors the same recursive
   handoff. The lock-coupled delete path leaves an emptied child
-  blob reachable with an `EmptyRoot` sentinel rather than
-  unlinking the parent immediately; conservative parent-unlink
-  remains in the fallback and maintenance paths.
+  blob reachable with an `EmptyRoot` sentinel; structural pruning
+  remains a maintenance concern rather than a foreground delete
+  latch chain.
 - `walker::lookup`, `range`, and merge paths follow
-  `child.header.root_slot` when crossing blobs, so stale parent
-  hints cannot misroute reads after child compaction.
-- The older `insert_at_blob_node` / `erase_at_blob_node`
-  fallback arms keep debug-only slot-version assertions while
-  holding the parent latch. They are compatibility / conservative
-  paths, not the hot cross-blob writer path.
+  `child.header.root_slot` when crossing blobs, so parent
+  BlobNodes never need child-entry repair after child compaction.
+- The old recursive `insert_at_blob_node` /
+  `erase_at_blob_node` parent-held fallback arms are removed.
 
 ### Breaking — API redesign (split returning from blind)
 
@@ -379,11 +362,10 @@ competitive). Full table in [benches/RESULTS.md](benches/RESULTS.md).
   snapshot now drains inside the same `wal.lock` critical section
   as `snapshot_dirty` + `wal.flush`, closing the inversion window
   where a writer could land a fresh blob between the two drains.
-- **`scan.rs::refresh_blob_node_pointers` inline `bm.commit`**
-  replaced with `bm.mark_dirty(parent_guid, STRUCTURAL_SEQ)` so
-  the post-compact pointer repair stages through the unified
-  dirty-set protocol instead of pushing cache state straight to
-  backend.
+- **Parent-side BlobNode pointer repair removed.** Compact keeps
+  each child blob self-describing through `header.root_slot`; the
+  parent no longer stores a child entry slot and therefore no
+  post-compact repair pass is needed.
 - **`Tree::compact` documented `NOT online-safe`** — running
   concurrently with reads or writes can torn-read across
   `BlobNode` crossings. Future online-maintenance work needs

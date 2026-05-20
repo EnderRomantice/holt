@@ -56,7 +56,7 @@ mod tests {
         assert_eq!(MAX_SLOTS, 10_240);
         assert_eq!(DATA_AREA_START, 0xB000);
         assert_eq!(PREFIX_MAX_INLINE, 112);
-        assert_eq!(BLOB_MAX_INLINE, 96);
+        assert_eq!(BLOB_MAX_INLINE, 104);
     }
 
     #[test]

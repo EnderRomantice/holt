@@ -1206,14 +1206,13 @@ impl Tree {
     /// The caller must guarantee no other thread is calling
     /// `Tree::{put, get, delete, rename, txn, range, scan_prefix}`
     /// for the duration of `compact()`. Phase 1 rebuilds each
-    /// blob in place. Cross-blob readers use the child blob's own
-    /// `header.root_slot` as the authoritative entry, so stale
-    /// parent `BlobNode.child_entry_ptr` hints no longer break
-    /// descent. The remaining unsafe part is broader: `compact`
-    /// still collects and rewrites blobs without a tree-wide
-    /// maintenance latch, so concurrent structural writers can
-    /// race the maintenance pass. Schedule `compact()` during a
-    /// quiescent window until that latch lands.
+    /// blob in place. Cross-blob readers and writers use the child
+    /// blob's own `header.root_slot` as the authoritative entry.
+    /// The remaining unsafe part is broader: `compact` still
+    /// collects and rewrites blobs without a tree-wide maintenance
+    /// latch, so concurrent structural writers can race the
+    /// maintenance pass. Schedule `compact()` during a quiescent
+    /// window until that latch lands.
     ///
     /// ## Two phases:
     ///
@@ -1268,13 +1267,6 @@ impl Tree {
             self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
         }
 
-        // Phase 1.5 — refresh the parent-stored child-entry hint.
-        // Cross-blob walkers treat child.header.root_slot as
-        // authoritative, so this is no longer required for lookup
-        // correctness; keeping the hint fresh preserves older
-        // inspection/debug tooling and keeps the on-disk shape tidy.
-        engine::refresh_blob_node_pointers(&self.backend, self.root_guid)?;
-
         // Phase 2 — tree-wide merge pass. Walk parents in BFS order
         // from the root; each parent's `try_merge_children` collapses
         // any direct `BlobNode` child whose blob is small enough to
@@ -1290,7 +1282,7 @@ impl Tree {
             let pin = self.backend.pin(guid)?;
             let merged = {
                 let mut guard = pin.write();
-                let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+                let mut frame = guard.frame();
                 engine::try_merge_children(&self.backend, &mut frame, STRUCTURAL_SEQ)?
             };
             drop(pin);
@@ -1420,9 +1412,8 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             // Honour the walker's caller-side `mark_dirty(root,
             // seq)` contract — see the module doc above. The
             // walker itself only marks cross-blob children dirty
-            // (via `mark_dirty(child_guid, seq)` inside
-            // `insert_at_blob_node` / `erase_at_blob_node`); the
-            // root is always the caller's job.
+            // while lock-coupling into descendants; the root is
+            // always the caller's job.
             bm.mark_dirty(root_guid, seq);
         }
         Ok(())

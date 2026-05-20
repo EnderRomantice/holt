@@ -53,10 +53,10 @@ fn compact_in_place(buf: &mut [u8]) {
     buf.copy_from_slice(ab.as_slice());
 }
 
-fn replace_root_with_stale_blob_node(buf: &mut AlignedBlobBuf, child_guid: BlobGuid) {
+fn replace_root_with_blob_node(buf: &mut AlignedBlobBuf, child_guid: BlobGuid) {
     let mut frame = BlobFrame::wrap(buf.as_mut_slice());
     let bn_out = frame.alloc_node(NodeType::Blob).unwrap();
-    let bn = BlobNode::new(b"", child_guid, 1);
+    let bn = BlobNode::new(b"", child_guid);
     write_struct_to_slot(&mut frame, bn_out.slot, &bn).unwrap();
     frame.header_mut().root_slot = bn_out.slot;
 }
@@ -657,14 +657,8 @@ fn churn_100_keys_inserted_then_all_erased() {
 // Multi-blob lookup + `make_blob_from_node`
 // ============================================================
 
-fn install_blob_node(
-    frame: &mut BlobFrame<'_>,
-    slot: u16,
-    prefix: &[u8],
-    child_guid: BlobGuid,
-    entry: u32,
-) {
-    let bn = crate::layout::BlobNode::new(prefix, child_guid, entry);
+fn install_blob_node(frame: &mut BlobFrame<'_>, slot: u16, prefix: &[u8], child_guid: BlobGuid) {
+    let bn = crate::layout::BlobNode::new(prefix, child_guid);
     write_struct_to_slot(frame, slot, &bn).unwrap();
 }
 
@@ -674,14 +668,13 @@ fn lookup_blob_node_emits_crossing_on_match() {
     let mut frame = BlobFrame::wrap(&mut buf);
     let out = frame.alloc_node(NodeType::Blob).unwrap();
     let child_guid: BlobGuid = [0xAA; 16];
-    install_blob_node(&mut frame, out.slot, b"img/", child_guid, 42);
+    install_blob_node(&mut frame, out.slot, b"img/", child_guid);
     frame.header_mut().root_slot = out.slot;
 
     let r = lookup(frame.as_ref(), out.slot, b"img/01.jpg").unwrap();
     match r {
         LookupResult::Crossing(c) => {
             assert_eq!(c.child_guid, child_guid);
-            assert_eq!(c.child_slot, 42);
             assert_eq!(c.child_depth, 4);
         }
         other => panic!("expected Crossing, got {other:?}"),
@@ -693,7 +686,7 @@ fn lookup_blob_node_returns_not_found_when_prefix_diverges() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
     let out = frame.alloc_node(NodeType::Blob).unwrap();
-    install_blob_node(&mut frame, out.slot, b"img/", [0xAA; 16], 1);
+    install_blob_node(&mut frame, out.slot, b"img/", [0xAA; 16]);
     frame.header_mut().root_slot = out.slot;
 
     let r = lookup(frame.as_ref(), out.slot, b"doc/page1.txt").unwrap();
@@ -741,7 +734,7 @@ fn make_blob_from_node_round_trips_single_leaf() {
     );
 
     let new_frame = BlobFrame::wrap(outcome.buf.as_mut_slice());
-    assert_eq!(new_frame.header().root_slot, outcome.entry_slot);
+    assert_ne!(new_frame.header().root_slot, 0);
     assert_eq!(new_frame.header().blob_guid, new_guid);
 }
 
@@ -795,13 +788,7 @@ fn make_blob_from_node_preserves_existing_blob_node_crossings() {
     let bn_slot = {
         let mut src_frame = BlobFrame::wrap(&mut src_buf);
         let bn_out = src_frame.alloc_node(NodeType::Blob).unwrap();
-        install_blob_node(
-            &mut src_frame,
-            bn_out.slot,
-            b"data/",
-            original_child_guid,
-            7,
-        );
+        install_blob_node(&mut src_frame, bn_out.slot, b"data/", original_child_guid);
         src_frame.header_mut().root_slot = bn_out.slot;
         bn_out.slot
     };
@@ -820,7 +807,6 @@ fn make_blob_from_node_preserves_existing_blob_node_crossings() {
     let body = new_frame.body_of_slot(new_root).unwrap();
     let bn = cast::<crate::layout::BlobNode>(body);
     assert_eq!(bn.child_blob_guid, original_child_guid);
-    assert_eq!(bn.child_entry_ptr, 7);
     assert_eq!(bn.prefix_len, 5);
     assert_eq!(&bn.bytes[..5], b"data/");
 }
@@ -831,7 +817,7 @@ fn make_blob_from_node_then_lookup_yields_crossing_when_root_is_blob_node() {
     let bn_slot = {
         let mut src_frame = BlobFrame::wrap(&mut src_buf);
         let bn_out = src_frame.alloc_node(NodeType::Blob).unwrap();
-        install_blob_node(&mut src_frame, bn_out.slot, b"", [0x99; 16], 11);
+        install_blob_node(&mut src_frame, bn_out.slot, b"", [0x99; 16]);
         src_frame.header_mut().root_slot = bn_out.slot;
         bn_out.slot
     };
@@ -847,7 +833,6 @@ fn make_blob_from_node_then_lookup_yields_crossing_when_root_is_blob_node() {
     match r {
         LookupResult::Crossing(c) => {
             assert_eq!(c.child_guid, [0x99; 16]);
-            assert_eq!(c.child_slot, 11);
         }
         other => panic!("expected Crossing, got {other:?}"),
     }
@@ -974,7 +959,7 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
 /// `header.root_slot` to point at a freshly-allocated `BlobNode`
 /// referencing the child. Verifies `Tree::get` follows the
 /// crossing even when it was built outside the spillover path and
-/// the parent-stored child-entry hint is stale.
+/// the only child entry is the child blob's own `header.root_slot`.
 ///
 /// Lives here (not in `tests/tree_smoke.rs`) because it needs
 /// `engine::walker::*` internals (`make_blob_from_node`) that
@@ -1007,20 +992,24 @@ fn tree_get_and_put_follow_child_header_root_across_blob_node() {
     let mut root_buf = AlignedBlobBuf::zeroed();
     backend.read_blob(root_guid, &mut root_buf).unwrap();
 
-    let (saved_root_slot, child_outcome) = {
+    let (saved_root_slot, mut child_outcome) = {
         let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
         let saved_root = root_frame.header().root_slot;
         let outcome = make_blob_from_node(&root_frame, saved_root, child_guid).unwrap();
         (saved_root, outcome)
     };
 
+    let child_root_slot = {
+        let child_frame = BlobFrame::wrap(child_outcome.buf.as_mut_slice());
+        child_frame.header().root_slot
+    };
+    assert_ne!(
+        child_root_slot, 1,
+        "test needs child header root to differ from the default slot"
+    );
     backend.write_blob(child_guid, &child_outcome.buf).unwrap();
 
-    assert_ne!(
-        child_outcome.entry_slot, 1,
-        "test needs a stale child_entry_ptr that differs from child root"
-    );
-    replace_root_with_stale_blob_node(&mut root_buf, child_guid);
+    replace_root_with_blob_node(&mut root_buf, child_guid);
     let _ = saved_root_slot;
     backend.write_blob(root_guid, &root_buf).unwrap();
 
@@ -1056,7 +1045,7 @@ fn tree_get_and_put_follow_child_header_root_across_blob_node() {
     assert!(tree.get(b"k99").unwrap().is_none());
 }
 
-/// Same stale-hint setup as the one-level test above, but with
+/// Same synthetic setup as the one-level test above, but with
 /// two consecutive BlobNode crossings. This exercises the
 /// recursive lock-coupled writer path, not just the root→child
 /// fast path.
@@ -1085,17 +1074,21 @@ fn tree_put_and_delete_follow_nested_child_header_roots() {
     let mut root_buf = AlignedBlobBuf::zeroed();
     backend.read_blob(root_guid, &mut root_buf).unwrap();
 
-    let child_outcome = {
+    let mut child_outcome = {
         let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
         make_blob_from_node(&root_frame, root_frame.header().root_slot, child_guid).unwrap()
     };
+    let child_root_slot = {
+        let child_frame = BlobFrame::wrap(child_outcome.buf.as_mut_slice());
+        child_frame.header().root_slot
+    };
     assert_ne!(
-        child_outcome.entry_slot, 1,
-        "test needs root's stale child_entry_ptr to differ from child root"
+        child_root_slot, 1,
+        "test needs child header root to differ from the default slot"
     );
 
     let mut child_buf = child_outcome.buf.clone();
-    let grandchild_outcome = {
+    let mut grandchild_outcome = {
         let child_frame = BlobFrame::wrap(child_buf.as_mut_slice());
         make_blob_from_node(
             &child_frame,
@@ -1104,17 +1097,21 @@ fn tree_put_and_delete_follow_nested_child_header_roots() {
         )
         .unwrap()
     };
+    let grandchild_root_slot = {
+        let grandchild_frame = BlobFrame::wrap(grandchild_outcome.buf.as_mut_slice());
+        grandchild_frame.header().root_slot
+    };
     assert_ne!(
-        grandchild_outcome.entry_slot, 1,
-        "test needs child's stale child_entry_ptr to differ from grandchild root"
+        grandchild_root_slot, 1,
+        "test needs grandchild header root to differ from the default slot"
     );
 
     backend
         .write_blob(grandchild_guid, &grandchild_outcome.buf)
         .unwrap();
-    replace_root_with_stale_blob_node(&mut child_buf, grandchild_guid);
+    replace_root_with_blob_node(&mut child_buf, grandchild_guid);
     backend.write_blob(child_guid, &child_buf).unwrap();
-    replace_root_with_stale_blob_node(&mut root_buf, child_guid);
+    replace_root_with_blob_node(&mut root_buf, child_guid);
     backend.write_blob(root_guid, &root_buf).unwrap();
 
     let tree = TreeBuilder::new("ignored")

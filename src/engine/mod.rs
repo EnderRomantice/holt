@@ -26,6 +26,5 @@ pub mod walker;
 // hidden behind `mod walker;`.
 pub use walker::{
     collect_blob_guids, collect_blob_guids_silent, compact_blob, erase_multi, insert_multi,
-    lookup_multi_with, refresh_blob_node_pointers, try_merge_children, EraseOutcome, RangeBuilder,
-    RangeEntry, RangeIter,
+    lookup_multi_with, try_merge_children, EraseOutcome, RangeBuilder, RangeEntry, RangeIter,
 };

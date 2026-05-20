@@ -18,8 +18,8 @@ use super::readers::{ntype_of, read_node16, read_node256, read_node4, read_node4
 use super::types::{Victim, VictimEdgeKind};
 use super::writers::{inner_update_child, set_prefix_child, write_struct_to_slot};
 
-// Re-export `compact_blob` so `insert_multi` / `insert_at_blob_node`
-// can reach it via `super::spillover::compact_blob`.
+// Re-export `compact_blob` so `insert_multi` can reach it via
+// `super::spillover::compact_blob`.
 pub(super) use super::migrate::compact_blob;
 
 /// Trigger spillover on `frame`: migrate a subtree out to a fresh
@@ -70,9 +70,10 @@ pub(super) fn spillover_blob(
     // Free the migrated subtree's slots in the source blob.
     free_subtree(frame, victim.victim_slot)?;
 
-    // Allocate a BlobNode pointing at (new_guid, entry_slot).
+    // Allocate a BlobNode pointing at the child blob. The child
+    // blob's own header.root_slot is the only entry slot.
     let bn_alloc = frame.alloc_node(NodeType::Blob)?;
-    let bn = BlobNode::new(&[], new_guid, u32::from(outcome.entry_slot));
+    let bn = BlobNode::new(&[], new_guid);
     write_struct_to_slot(frame, bn_alloc.slot, &bn)?;
 
     // Wire the parent of the migrated subtree to point at the new

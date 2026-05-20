@@ -6,10 +6,10 @@
 //!
 //! 0. **Merge pass** (optional, controlled by
 //!    `CheckpointConfig::auto_merge`) — walks every reachable blob
-//!    and folds any mergeable child back into its parent. Inline
-//!    `bm.commit` per merge so the manifest deletion + parent's
-//!    new bytes both reach the backend before the round's `Sync`
-//!    at step 5.
+//!    and folds any mergeable child back into its parent. Merge
+//!    mutations are staged through the same dirty /
+//!    pending-delete sets as foreground writes, then flushed by
+//!    this round after the WAL sync.
 //! 1. **Snapshot dirty** — atomically drain the BM dirty map.
 //!    Concurrent writers' new `mark_dirty` lands in a fresh empty
 //!    map and gets picked up by the next round.
@@ -47,7 +47,6 @@ use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
 use crate::store::backend::Backend;
-use crate::store::BlobFrame;
 
 use super::io::IoTask;
 use super::Shared;
@@ -404,7 +403,7 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
         let pin = shared.bm.pin(guid)?;
         let stats = {
             let mut guard = pin.write();
-            let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+            let mut frame = guard.frame();
             engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)?
         };
         drop(pin);

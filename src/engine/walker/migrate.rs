@@ -60,20 +60,20 @@ pub fn make_blob_from_node(
     new_guid: BlobGuid,
 ) -> Result<MakeBlobOutcome> {
     let mut buf = AlignedBlobBuf::zeroed();
-    let entry_slot;
+    let cloned_root_slot;
     {
         let mut new_frame = BlobFrame::init(buf.as_mut_slice(), new_guid)?;
-        entry_slot = clone_subtree(src_frame, &mut new_frame, src_slot, false)?
+        cloned_root_slot = clone_subtree(src_frame, &mut new_frame, src_slot, false)?
             .expect("preserve mode never returns None");
 
         // Release the EmptyRoot sentinel that `BlobFrame::init`
         // seeded at slot 1; it's unreachable now.
-        if new_frame.header().root_slot == 1 && entry_slot != 1 {
+        if new_frame.header().root_slot == 1 && cloned_root_slot != 1 {
             new_frame.free_node(1)?;
         }
-        new_frame.header_mut().root_slot = entry_slot;
+        new_frame.header_mut().root_slot = cloned_root_slot;
     }
-    Ok(MakeBlobOutcome { buf, entry_slot })
+    Ok(MakeBlobOutcome { buf })
 }
 
 /// Repack `buf` in place, discarding all unreachable bytes plus
@@ -536,11 +536,7 @@ fn clone_node256(
 fn clone_blob_node(src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<Option<u16>> {
     let src_b = *cast::<BlobNode>(src_body);
     let plen = (src_b.prefix_len as usize).min(BLOB_MAX_INLINE);
-    let new_b = BlobNode::new(
-        &src_b.bytes[..plen],
-        src_b.child_blob_guid,
-        src_b.child_entry_ptr,
-    );
+    let new_b = BlobNode::new(&src_b.bytes[..plen], src_b.child_blob_guid);
     let out = dst.alloc_node(NodeType::Blob)?;
     write_struct_to_slot(dst, out.slot, &new_b)?;
     Ok(Some(out.slot))

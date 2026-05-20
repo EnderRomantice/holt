@@ -1,6 +1,5 @@
 //! Erase path — `erase` / `erase_multi` + recursive `erase_at`
-//! dispatch + per-NodeType arms + collapse-on-lone-child rewiring
-//! + `erase_at_blob_node` cross-blob arm.
+//! dispatch + per-NodeType arms + collapse-on-lone-child rewiring.
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
@@ -32,11 +31,9 @@ use super::writers::{
 /// the tree, `previous` is `None` and `new_root_slot == root_slot`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
-    // Single-blob path passes `None` for `bm`, which rejects the
-    // BlobNode arm — so the `seq` argument is dead. Pass `0`.
     // Single-blob `erase` is test-only today and always returns
     // the prior value — preserves the existing test surface.
-    let r = erase_at(None, frame, root_slot, key, 0, 0, true)?;
+    let r = erase_at(frame, root_slot, key, 0, true)?;
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
     Ok(EraseOutcome {
         new_root_slot: new_root,
@@ -48,9 +45,7 @@ pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Re
 /// Multi-blob erase. Pins the root via the [`BufferManager`] and
 /// walks across [`NodeType::Blob`] crossings. The lock-coupled
 /// child path keeps parent BlobNodes stable and records child root
-/// changes in the child blob's own header. The conservative
-/// `erase_at_blob_node` arm remains for internal single-frame
-/// callers, but `erase_multi` itself uses the latch-coupled path.
+/// changes in the child blob's own header.
 ///
 /// `wants_prev` mirrors `insert_multi`'s flag — `true` for
 /// [`crate::Tree::remove`] (returning API) and `false` for
@@ -90,12 +85,6 @@ struct EraseBlobCrossing {
     child_depth: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EraseCrossMode {
-    Conservative,
-    LockCoupled,
-}
-
 enum EraseStep {
     Done(EraseReturn),
     Crossing(EraseBlobCrossing),
@@ -116,17 +105,8 @@ fn lock_coupled_erase_in_blob(
     let step = {
         let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
-        erase_at_step(
-            Some(bm),
-            &mut frame,
-            root_slot,
-            key,
-            depth,
-            seq,
-            wants_prev,
-            EraseCrossMode::LockCoupled,
-        )
-        .map_err(|e| e.with_blob_guid(current_guid))?
+        erase_at_step(&mut frame, root_slot, key, depth, wants_prev, true)
+            .map_err(|e| e.with_blob_guid(current_guid))?
     };
 
     let r = match step {
@@ -201,41 +181,28 @@ fn resolve_new_root_after_erase(
 
 #[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 pub(super) fn erase_at(
-    bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
     slot: u16,
     key: &[u8],
     depth: usize,
-    seq: u64,
     wants_prev: bool,
 ) -> Result<EraseReturn> {
-    match erase_at_step(
-        bm,
-        frame,
-        slot,
-        key,
-        depth,
-        seq,
-        wants_prev,
-        EraseCrossMode::Conservative,
-    )? {
+    match erase_at_step(frame, slot, key, depth, wants_prev, false)? {
         EraseStep::Done(r) => Ok(r),
-        EraseStep::Crossing(_) => Err(Error::node_corrupt(
-            "walker::erase_at: conservative mode returned a BlobNode crossing",
+        EraseStep::Crossing(_) => Err(Error::NotYetImplemented(
+            "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
         )),
     }
 }
 
 #[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 fn erase_at_step(
-    bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
     slot: u16,
     key: &[u8],
     depth: usize,
-    seq: u64,
     wants_prev: bool,
-    cross_mode: EraseCrossMode,
+    allow_crossing: bool,
 ) -> Result<EraseStep> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
@@ -249,22 +216,20 @@ fn erase_at_step(
         })),
         NodeType::Leaf => erase_at_leaf(frame, slot, key, wants_prev).map(EraseStep::Done),
         NodeType::Prefix => {
-            erase_at_prefix_step(bm, frame, slot, key, depth, seq, wants_prev, cross_mode)
+            erase_at_prefix_step(frame, slot, key, depth, wants_prev, allow_crossing)
         }
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner_step(
-                bm, frame, slot, ntype, key, depth, seq, wants_prev, cross_mode,
-            )
+            erase_at_inner_step(frame, slot, ntype, key, depth, wants_prev, allow_crossing)
         }
-        NodeType::Blob => match (bm, cross_mode) {
-            (Some(_), EraseCrossMode::LockCoupled) => blob_node_erase_step(frame, slot, key, depth),
-            (Some(b), EraseCrossMode::Conservative) => {
-                erase_at_blob_node(b, frame, slot, key, depth, seq, wants_prev).map(EraseStep::Done)
+        NodeType::Blob => {
+            if allow_crossing {
+                blob_node_erase_step(frame, slot, key, depth)
+            } else {
+                Err(Error::NotYetImplemented(
+                    "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
+                ))
             }
-            (None, _) => Err(Error::NotYetImplemented(
-                "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
-            )),
-        },
+        }
     }
 }
 
@@ -360,14 +325,12 @@ fn erase_at_leaf(
 
 #[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn erase_at_prefix_step(
-    bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
     key: &[u8],
     depth: usize,
-    seq: u64,
     wants_prev: bool,
-    cross_mode: EraseCrossMode,
+    allow_crossing: bool,
 ) -> Result<EraseStep> {
     // `Prefix` is `Copy` — `p` is owned on the stack, so we can
     // hold `&p.bytes[..plen]` across the `frame.*` mutations
@@ -387,14 +350,12 @@ fn erase_at_prefix_step(
     }
 
     let r = erase_at_step(
-        bm,
         frame,
         child_slot,
         key,
         depth + plen,
-        seq,
         wants_prev,
-        cross_mode,
+        allow_crossing,
     )?;
     let EraseStep::Done(r) = r else {
         return Ok(r);
@@ -426,15 +387,13 @@ fn erase_at_prefix_step(
 
 #[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn erase_at_inner_step(
-    bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
     ntype: NodeType,
     key: &[u8],
     depth: usize,
-    seq: u64,
     wants_prev: bool,
-    cross_mode: EraseCrossMode,
+    allow_crossing: bool,
 ) -> Result<EraseStep> {
     if depth >= key.len() {
         return Ok(EraseStep::Done(EraseReturn {
@@ -452,16 +411,7 @@ fn erase_at_inner_step(
         }));
     };
 
-    let r = erase_at_step(
-        bm,
-        frame,
-        child,
-        key,
-        depth + 1,
-        seq,
-        wants_prev,
-        cross_mode,
-    )?;
+    let r = erase_at_step(frame, child, key, depth + 1, wants_prev, allow_crossing)?;
     let EraseStep::Done(r) = r else {
         return Ok(r);
     };
@@ -647,164 +597,5 @@ fn inner_remove_child_and_collapse(
         _ => Err(Error::node_corrupt(
             "inner_remove_child_and_collapse: not an inner node",
         )),
-    }
-}
-
-// ---------- multi-blob arm ----------
-
-/// Erase across a [`NodeType::Blob`] crossing.
-///
-/// Pins the child blob, runs the recursive erase in place, then
-/// maps the child's [`EraseSignal`] back to the parent:
-///
-/// - `Unchanged`: mark the child dirty when it was touched and
-///   return `Unchanged` upward.
-/// - `Replaced(new_entry)`: the child's entry slot changed (e.g.
-///   collapse-to-lone-child). Update the child blob's
-///   `header.root_slot`, mark the child dirty, and return
-///   `Unchanged` upward. The parent `BlobNode.child_entry_ptr`
-///   is only a compatibility hint; child `header.root_slot` is
-///   authoritative.
-/// - `SubtreeGone`: the child blob is now empty. Free the parent's
-///   BlobNode slot, drop the orphaned child blob from cache + disk,
-///   propagate `SubtreeGone` upward so the grandparent collapses
-///   too.
-#[allow(clippy::too_many_arguments)] // wants_prev added by API split
-fn erase_at_blob_node(
-    bm: &BufferManager,
-    parent_frame: &mut BlobFrame<'_>,
-    bn_slot: u16,
-    key: &[u8],
-    depth: usize,
-    seq: u64,
-    wants_prev: bool,
-) -> Result<EraseReturn> {
-    let bn = {
-        let body = parent_frame
-            .body_of_slot(bn_slot)
-            .ok_or(Error::node_corrupt(
-                "erase_at_blob_node: body resolution failed",
-            ))?;
-        *cast::<BlobNode>(body)
-    };
-    // Compatibility fallback: normal `erase_multi` reaches child
-    // blobs through `lock_coupled_erase_in_blob`, which releases
-    // ancestors before descendant mutation. This recursive arm is
-    // still kept for conservative single-frame paths that need to
-    // update / unlink the parent. While it holds the parent latch,
-    // this version check must never drift.
-    let parent_bn_version_at_descent = parent_frame.slot_version(bn_slot);
-    let plen = bn.prefix_len as usize;
-    if plen > BLOB_MAX_INLINE {
-        return Err(Error::node_corrupt(
-            "erase_at_blob_node: prefix_len exceeds inline buffer",
-        ));
-    }
-
-    if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
-        return Ok(EraseReturn {
-            signal: EraseSignal::Unchanged,
-            mutated: false,
-            previous: None,
-        });
-    }
-
-    let child_guid = bn.child_blob_guid;
-    let child_depth = depth + plen;
-
-    let child_pin = bm.pin(child_guid)?;
-
-    let r = {
-        let mut guard = child_pin.write();
-        let mut cf = guard.frame();
-        let child_entry = cf.header().root_slot;
-        // Errors propagating up are about something the recursive
-        // descent found inside `child_guid`'s frame; tag them so
-        // logs / panics carry actionable blob context.
-        erase_at(
-            Some(bm),
-            &mut cf,
-            child_entry,
-            key,
-            child_depth,
-            seq,
-            wants_prev,
-        )
-        .map_err(|e| e.with_blob_guid(child_guid))?
-    };
-
-    // Mark the child blob dirty when the descent actually mutated
-    // its cached image. The bg checkpointer / `Tree::checkpoint`
-    // will flush the bytes to backend **after** the WAL record
-    // for this op is on disk (invariant W2D — see `BufferManager`
-    // module docs). An inline `bm.commit(child_guid)` here would
-    // let child bytes reach backend before the WAL record,
-    // breaking the invariant.
-    //
-    // `r.mutated` is the authoritative "the child blob's bytes
-    // changed" signal — it tracks the actual tombstone bump
-    // regardless of whether the caller asked for the prev value.
-    // The Replaced arm is structural (slot pointer rewrite, no
-    // necessarily-a-tombstone) so it's tracked separately.
-    let child_touched = matches!(r.signal, EraseSignal::Replaced(_)) || r.mutated;
-
-    // Parent latch is held in this fallback, so drift is
-    // impossible unless the slot-version bump invariant broke.
-    debug_assert_eq!(
-        parent_frame.slot_version(bn_slot),
-        parent_bn_version_at_descent,
-        "erase_at_blob_node: parent BlobNode slot {bn_slot} version drifted from \
-         {parent_bn_version_at_descent} to {} during child work — invariant \
-         violation (parent latch was supposed to be held throughout)",
-        parent_frame.slot_version(bn_slot),
-    );
-
-    match r.signal {
-        EraseSignal::Unchanged => {
-            drop(child_pin);
-            if child_touched {
-                bm.mark_dirty(child_guid, seq);
-            }
-            Ok(EraseReturn {
-                signal: EraseSignal::Unchanged,
-                mutated: r.mutated,
-                previous: r.previous,
-            })
-        }
-        EraseSignal::Replaced(new_entry) => {
-            {
-                let mut guard = child_pin.write();
-                let mut cf = guard.frame();
-                cf.header_mut().root_slot = new_entry;
-            }
-            drop(child_pin);
-            bm.mark_dirty(child_guid, seq);
-            Ok(EraseReturn {
-                signal: EraseSignal::Unchanged,
-                mutated: r.mutated,
-                previous: r.previous,
-            })
-        }
-        EraseSignal::SubtreeGone => {
-            parent_frame.free_node(bn_slot)?;
-            drop(child_pin);
-            // Hand the child blob to the deferred-delete protocol
-            // — the actual `backend.delete_blob` runs from the
-            // checkpoint round after the WAL record for this op
-            // is durable (invariant W2D). An inline
-            // `bm.delete_blob(child_guid)` here would drop the
-            // manifest's child entry to in-memory before the
-            // user's WAL append; a racing `backend.flush` from
-            // any other op could then persist that manifest view
-            // while the user's erase record was still unflushed,
-            // and on crash + reopen the root's `BlobNode` would
-            // point at a slot the manifest no longer recognises.
-            bm.mark_for_delete(child_guid, seq);
-            Ok(EraseReturn {
-                signal: EraseSignal::SubtreeGone,
-                mutated: r.mutated,
-                previous: r.previous,
-            })
-        }
     }
 }

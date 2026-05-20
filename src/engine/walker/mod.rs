@@ -12,11 +12,11 @@
 //!   and single-blob descent arms. Zero-copy: walks against
 //!   `BlobFrameRef` so it's safe to run under a `BufferManager`
 //!   shared read-guard.
-//! - `insert` — [`insert`] / [`insert_multi`] + `insert_at`
-//!   dispatch + `insert_at_blob_node` cross-blob arm.
-//! - `erase` — [`erase`] / [`erase_multi`] + `erase_at` dispatch +
-//!   `erase_at_blob_node` cross-blob arm + lone-child collapse
-//!   rewiring.
+//! - `insert` — [`insert`] / [`insert_multi`] + single-descent
+//!   lock-coupled cross-blob mutation.
+//! - `erase` — [`erase`] / [`erase_multi`] + single-descent
+//!   lock-coupled cross-blob mutation + lone-child collapse
+//!   rewiring for single-blob callers.
 //! - `spillover` — when a blob fills, pick a victim subtree,
 //!   migrate it via [`make_blob_from_node`], free the source slots,
 //!   install a `BlobNode` placeholder.
@@ -61,14 +61,14 @@ pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;
 pub use migrate::compact_blob;
 pub use range::{RangeBuilder, RangeEntry, RangeIter};
-pub use scan::{collect_blob_guids, collect_blob_guids_silent, refresh_blob_node_pointers};
+pub use scan::{collect_blob_guids, collect_blob_guids_silent};
 pub use types::EraseOutcome;
 
 // ---------- shared internals ----------
 
-/// Cap on the spillover-retry loop inside `insert_multi` /
-/// `insert_at_blob_node`. Each spillover migrates the largest non-
-/// Blob subtree out of the current blob.
+/// Cap on the spillover-retry loop inside `insert_multi`. Each
+/// spillover migrates the largest non-Blob subtree out of the
+/// current blob.
 ///
 /// With the current heuristic (pick-largest, skip BlobNodes, cross-
 /// type Prefix↔Blob free-list fallback) one spillover frees roughly

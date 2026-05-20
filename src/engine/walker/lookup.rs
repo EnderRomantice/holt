@@ -174,7 +174,6 @@ fn blob_descend<'a>(body: &[u8], key: &[u8], depth: usize) -> Result<LookupResul
     }
     Ok(LookupResult::Crossing(BlobNodeCrossing {
         child_guid: b.child_blob_guid,
-        child_slot: b.child_entry_ptr as u16,
         child_depth: depth + plen,
     }))
 }
