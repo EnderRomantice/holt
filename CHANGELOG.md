@@ -7,11 +7,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
-## [Unreleased] — v0.3.1 follow-up
+## [Unreleased] — v0.3 (in progress)
 
-Three breaking-but-surgical optimizations on top of v0.3.0. Each
-fixes a real cost the v0.3.0 bench narrative identified, with no
-algorithmic change.
+Continuing work that's queued for the v0.3 release. The v0.3.0
+release commit (51764a9) shipped the API split + walker hot-path
+optimizations + WAL format v2; everything below extends that
+into the full v0.3 milestone and will ship as part of the final
+v0.3 tag (which may be cut as a single v0.3.0 amend or as
+v0.3.1, depending on release-time choice).
+
+The three breaking-but-surgical wins below land first; the
+multi-phase per-node-latch milestone (#27) builds on them.
 
 ### Breaking — WAL format v3 (drops dead audit fields)
 
