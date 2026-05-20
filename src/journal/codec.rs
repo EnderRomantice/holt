@@ -22,8 +22,8 @@
 //!   and to resume `next_seq` after restart.
 //! - `TY` = one-byte variant tag (stable on disk; see the
 //!   `TY_*` constants).
-//! - `BODY` = variant-specific bytes; see `encode_body` /
-//!   `decode_body` for the exact layout per variant.
+//! - `BODY` = variant-specific bytes; see the per-variant encoder
+//!   functions and `decode_body` for the exact layout per variant.
 //! - `CRC32` (IEEE 802.3 polynomial `0xEDB8_8320`) detects torn
 //!   writes and silent disk corruption.
 //!
@@ -192,17 +192,12 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 // ---------- encode ----------
 
-/// Append the binary record for `op` (sequence `seq`) to `out`.
+/// Test-only generic encoder for structural `TxnOp` variants.
 ///
-/// On return, `out` has grown by exactly
-/// `RECORD_HEADER_SIZE + body_len + RECORD_FOOTER_SIZE` bytes.
-/// `body_len` is variant-dependent — see `encode_body`.
-///
-/// Hot mutation paths in `Tree` use the per-variant
-/// [`encode_insert_record`] / [`encode_erase_record`] /
-/// [`encode_rename_object_record`] entry points instead — those
-/// skip the `TxnOp` enum construction and the `Vec` clones it
-/// forces on the caller.
+/// Production hot paths use the per-variant encoders below. Keeping
+/// this generic enum path out of release builds prevents it from
+/// becoming a second supported mutation surface.
+#[cfg(test)]
 pub fn encode_record(op: &TxnOp, seq: u64, out: &mut Vec<u8>) {
     write_record(out, seq, variant_tag(op), |buf| encode_body(op, buf));
 }
@@ -401,6 +396,7 @@ impl Drop for BatchEncoder<'_> {
     }
 }
 
+#[cfg(test)]
 fn variant_tag(op: &TxnOp) -> u8 {
     match op {
         TxnOp::Insert { .. } => TY_INSERT,
@@ -417,6 +413,7 @@ fn variant_tag(op: &TxnOp) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
     match op {
         TxnOp::Insert {
@@ -514,6 +511,7 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
     }
 }
 
+#[cfg(test)]
 fn encode_reason(r: CompactReason) -> u8 {
     match r {
         CompactReason::SplitTombstone => REASON_SPLIT_TOMBSTONE,

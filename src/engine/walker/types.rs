@@ -32,13 +32,6 @@ pub struct BlobNodeCrossing {
 /// Outcome of an [`super::insert::insert`] / [`super::insert::insert_multi`].
 #[derive(Debug)]
 pub struct InsertOutcome {
-    /// The slot the tree's `root_slot` should now point at — may
-    /// differ from the caller's input when a split promotes a new
-    /// node above the existing root. Only consumed by single-blob
-    /// test drivers; the multi-blob path updates `root_slot` in
-    /// place under the BM's write guard.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub new_root_slot: u16,
     /// `true` iff the root blob's cached bytes changed. Cross-
     /// blob updates usually mutate only a child blob; the walker
     /// marks those children dirty itself, and the `Tree` caller
@@ -51,14 +44,6 @@ pub struct InsertOutcome {
 /// Outcome of an [`super::erase::erase`] / [`super::erase::erase_multi`].
 #[derive(Debug)]
 pub struct EraseOutcome {
-    /// The slot the tree's `root_slot` should now point at — may
-    /// differ from the caller's input when the root collapses
-    /// (e.g. last leaf removed → fresh EmptyRoot sentinel; Node4
-    /// shrinks to its lone child and that child is promoted). Only
-    /// consumed by single-blob test drivers; the multi-blob path
-    /// updates `root_slot` in place under the BM's write guard.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub new_root_slot: u16,
     /// `true` iff the root blob's cached bytes changed. Cross-
     /// blob erases usually mutate only a child blob; the walker
     /// marks those children dirty itself, and the `Tree` caller

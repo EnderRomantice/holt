@@ -26,18 +26,18 @@ use super::writers::{
 /// descent reaches a [`NodeType::Blob`] crossing — callers wanting
 /// cross-blob erase should use [`erase_multi`].
 ///
-/// Returns the new root slot (caller updates `header.root_slot`)
-/// and the prior value if the key was present. If `key` was not in
-/// the tree, `previous` is `None` and `new_root_slot == root_slot`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Updates `header.root_slot` in place and returns the prior value
+/// if the key was present. If `key` was not in the tree,
+/// `previous` is `None` and the root slot is unchanged.
+#[cfg(test)]
 pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
     // Single-blob `erase` is test-only today and always returns
     // the prior value — preserves the existing test surface.
     let r = erase_at(frame, root_slot, key, 0, true)?;
     let root_dirty = r.mutated || !matches!(r.signal, EraseSignal::Unchanged);
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
+    frame.header_mut().root_slot = new_root;
     Ok(EraseOutcome {
-        new_root_slot: new_root,
         root_dirty,
         mutated: r.mutated,
         previous: r.previous,
@@ -72,9 +72,9 @@ pub fn erase_multi(
     // `bm.mark_dirty(child_guid, seq)` so the checkpoint round
     // flushes WAL **before** the child bytes reach the backend.
     let mut guard = root_pin.write();
-    let (root_guid, root_slot) = {
+    let root_guid = {
         let frame = guard.frame();
-        (frame.header().blob_guid, frame.header().root_slot)
+        frame.header().blob_guid
     };
     let mut blob_hops = 0u64;
     let mut max_cross_blob_depth = 0usize;
@@ -82,7 +82,6 @@ pub fn erase_multi(
         bm,
         guard,
         root_guid,
-        root_slot,
         true,
         key,
         seq,
@@ -113,7 +112,6 @@ fn lock_coupled_erase_in_blob(
     bm: &BufferManager,
     mut guard: BlobWriteGuard<'_>,
     current_guid: crate::layout::BlobGuid,
-    top_root_slot: u16,
     is_top_blob: bool,
     key: &[u8],
     seq: u64,
@@ -142,7 +140,6 @@ fn lock_coupled_erase_in_blob(
                 bm,
                 child_guard,
                 crossing.child_guid,
-                top_root_slot,
                 false,
                 key,
                 seq,
@@ -156,7 +153,7 @@ fn lock_coupled_erase_in_blob(
         }
     };
 
-    let (child_touched, current_root_after) = {
+    let child_touched = {
         let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
         let child_touched = !matches!(r.signal, EraseSignal::Unchanged) || r.mutated;
@@ -164,7 +161,7 @@ fn lock_coupled_erase_in_blob(
             let new_root = resolve_new_root_after_erase(&mut frame, root_slot, &r.signal)?;
             frame.header_mut().root_slot = new_root;
         }
-        (child_touched, frame.header().root_slot)
+        child_touched
     };
 
     drop(guard);
@@ -173,11 +170,6 @@ fn lock_coupled_erase_in_blob(
     }
 
     Ok(EraseOutcome {
-        new_root_slot: if is_top_blob {
-            current_root_after
-        } else {
-            top_root_slot
-        },
         root_dirty: is_top_blob && child_touched,
         mutated: r.mutated,
         previous: r.previous,
@@ -204,6 +196,7 @@ fn resolve_new_root_after_erase(
 
 // ---------- recursive dispatch ----------
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 pub(super) fn erase_at(
     frame: &mut BlobFrame<'_>,

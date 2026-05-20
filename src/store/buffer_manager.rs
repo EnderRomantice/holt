@@ -460,10 +460,8 @@ impl BufferManager {
             .is_some()
     }
 
-    /// Current number of cached blobs. Exercised by the
-    /// checkpointer unit tests; not consumed by production code
-    /// directly.
-    #[allow(dead_code)]
+    /// Current number of cached blobs.
+    #[cfg(test)]
     #[must_use]
     pub fn cached_count(&self) -> usize {
         self.cache.len()
@@ -834,9 +832,9 @@ impl BufferManager {
     /// restored (taking `min` with anything the racing writer
     /// added in the meantime); on success it stays removed.
     ///
-    /// Exercised by the buffer-manager unit tests; production
+    /// Test helper for the single-blob commit path. Production
     /// checkpoint paths use `write_through` (CAS-on-seq) instead.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn commit(&self, guid: BlobGuid) -> Result<()> {
         let drained = {
             let mut d = self.dirty.lock().unwrap();
@@ -938,11 +936,10 @@ impl BufferManager {
     /// backend. If the dirty map is empty, every seq up to
     /// `next_seq - 1` is durable.
     ///
-    /// Exercised by the buffer-manager unit tests; the conditional
-    /// truncate gate in `Tree::checkpoint` / the bg round uses
-    /// `dirty_count()` + `pending_delete_count()` instead, so this
-    /// accessor is currently test-only.
-    #[allow(dead_code)]
+    /// Test helper. The conditional truncate gate in
+    /// `Tree::checkpoint` / the bg round uses `dirty_count()` +
+    /// `pending_delete_count()` instead.
+    #[cfg(test)]
     #[must_use]
     pub fn min_unflushed_txn(&self) -> Option<u64> {
         let d = self.dirty.lock().unwrap();

@@ -24,8 +24,7 @@ fn fresh_blob() -> (Vec<u8>, BlobGuid) {
 
 fn put(frame: &mut BlobFrame<'_>, k: &[u8], v: &[u8], seq: u64) {
     let root = frame.header().root_slot;
-    let r = insert(frame, root, k, v, seq).unwrap();
-    frame.header_mut().root_slot = r.new_root_slot;
+    insert(frame, root, k, v, seq).unwrap();
 }
 
 fn get(frame: &BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
@@ -77,7 +76,6 @@ fn update_same_key_returns_previous() {
     put(&mut frame, b"k", b"v1", 1);
     let root = frame.header().root_slot;
     let r = insert(&mut frame, root, b"k", b"v2", 2).unwrap();
-    frame.header_mut().root_slot = r.new_root_slot;
     assert_eq!(r.previous.as_deref(), Some(&b"v1"[..]));
     assert_eq!(get(&frame, b"k").as_deref(), Some(&b"v2"[..]));
 }
@@ -232,7 +230,6 @@ fn many_inserts_all_readable() {
 fn del(frame: &mut BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
     let root = frame.header().root_slot;
     let r = erase(frame, root, k).unwrap();
-    frame.header_mut().root_slot = r.new_root_slot;
     r.previous
 }
 
@@ -874,15 +871,13 @@ fn compact_blob_reclaims_extents_after_churn() {
             let k = format!("k{i:04}").into_bytes();
             let v = vec![0xAB; 120];
             let root = frame.header().root_slot;
-            let out = insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
-            frame.header_mut().root_slot = out.new_root_slot;
+            insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
         }
         for i in 0..200u32 {
             if i % 2 == 0 {
                 let k = format!("k{i:04}").into_bytes();
                 let root = frame.header().root_slot;
-                let out = erase(&mut frame, root, &k).unwrap();
-                frame.header_mut().root_slot = out.new_root_slot;
+                erase(&mut frame, root, &k).unwrap();
             }
         }
     }
@@ -922,14 +917,12 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
             let k = format!("img/{i:04}.jpg").into_bytes();
             let v = vec![0xFE; 64];
             let root = frame.header().root_slot;
-            let out = insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
-            frame.header_mut().root_slot = out.new_root_slot;
+            insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
         }
         for i in 0..50u32 {
             let k = format!("img/{i:04}.jpg").into_bytes();
             let root = frame.header().root_slot;
-            let out = erase(&mut frame, root, &k).unwrap();
-            frame.header_mut().root_slot = out.new_root_slot;
+            erase(&mut frame, root, &k).unwrap();
         }
     }
     compact_blob(&mut buf).unwrap();
@@ -940,8 +933,7 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
         let k = format!("img/{i:04}.jpg").into_bytes();
         let v = vec![0xFD; 64];
         let root = frame.header().root_slot;
-        let out = insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
-        frame.header_mut().root_slot = out.new_root_slot;
+        insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
     }
     for i in 200..250u32 {
         let k = format!("img/{i:04}.jpg").into_bytes();

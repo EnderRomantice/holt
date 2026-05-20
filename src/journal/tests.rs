@@ -440,8 +440,8 @@ fn many_records_stream_round_trip() {
 
 #[test]
 fn auto_flush_keeps_user_space_buffer_bounded() {
-    // Stress test the group-commit auto-flush: append records
-    // until the per-record cost would otherwise pile up an
+    // Stress test buffered auto-drain: append records until the
+    // per-record cost would otherwise pile up an
     // unbounded `Vec`. The file should grow past the auto-flush
     // threshold while the in-memory buffer stays small between
     // calls.

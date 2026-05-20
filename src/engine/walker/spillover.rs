@@ -1,6 +1,6 @@
 //! Spillover infra — pick a subtree to migrate when a blob fills,
-//! write it through to a fresh child blob, free the source's
-//! slots, and install a `BlobNode` placeholder.
+//! stage it as a fresh dirty child blob, free the source's slots,
+//! and install a `BlobNode` placeholder.
 //!
 //! Also hosts:
 //! - `free_subtree` (recursive slot reclaim after migration)

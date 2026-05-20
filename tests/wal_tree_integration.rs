@@ -737,8 +737,7 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
     // multiple child blobs and then attempts tree-wide merge.
     // Cross-blob entry is now only the child blob's
     // `header.root_slot`, so parent BlobNodes do not carry a child
-    // entry slot that must be refreshed
-    // pass to keep W2D-safe.
+    // entry slot that needs a post-compact repair pass.
     use holt::{Backend, MemoryBackend};
     use std::sync::Arc;
 

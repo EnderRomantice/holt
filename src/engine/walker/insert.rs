@@ -26,10 +26,10 @@ use super::MAX_SPILLOVER_ATTEMPTS;
 /// that need cross-blob support should use [`insert_multi`].
 ///
 /// `seq` is the journal sequence number to stamp on the new leaf
-/// (callers should pass a monotonically-increasing value). Returns
-/// the new root slot (caller updates `header.root_slot`) and the
-/// prior value if the key already existed.
-#[cfg_attr(not(test), allow(dead_code))]
+/// (callers should pass a monotonically-increasing value). Updates
+/// `header.root_slot` in place and returns the prior value if the
+/// key already existed.
+#[cfg(test)]
 pub(super) fn insert(
     frame: &mut BlobFrame<'_>,
     root_slot: u16,
@@ -46,8 +46,8 @@ pub(super) fn insert(
     // Single-blob `insert` is test-only today and always returns
     // the prior value — preserves the existing test surface.
     let r = insert_at(frame, root_slot, key, value, 0, seq, true)?;
+    frame.header_mut().root_slot = r.slot_after;
     Ok(InsertOutcome {
-        new_root_slot: r.slot_after,
         root_dirty: true,
         previous: r.previous,
     })
@@ -109,7 +109,6 @@ pub fn insert_multi(
                 bm,
                 child_guard,
                 crossing.child_guid,
-                root_slot,
                 false,
                 key,
                 value,
@@ -130,15 +129,14 @@ pub fn insert_multi(
 
     // Root-local mutation fallback.
     let mut guard = root_pin.write();
-    let (root_guid, root_slot) = {
+    let root_guid = {
         let frame = guard.frame();
-        (frame.header().blob_guid, frame.header().root_slot)
+        frame.header().blob_guid
     };
     let outcome = lock_coupled_insert_in_blob(
         bm,
         guard,
         root_guid,
-        root_slot,
         true,
         key,
         value,
@@ -170,7 +168,6 @@ fn lock_coupled_insert_in_blob(
     bm: &BufferManager,
     mut guard: BlobWriteGuard<'_>,
     current_guid: crate::layout::BlobGuid,
-    top_root_slot: u16,
     is_top_blob: bool,
     key: &[u8],
     value: &[u8],
@@ -204,11 +201,6 @@ fn lock_coupled_insert_in_blob(
                 }
 
                 return Ok(InsertOutcome {
-                    new_root_slot: if is_top_blob {
-                        out.slot_after
-                    } else {
-                        top_root_slot
-                    },
                     root_dirty: is_top_blob,
                     previous: out.previous,
                 });
@@ -222,7 +214,6 @@ fn lock_coupled_insert_in_blob(
                     bm,
                     child_guard,
                     crossing.child_guid,
-                    top_root_slot,
                     false,
                     key,
                     value,
@@ -263,6 +254,7 @@ fn lock_coupled_insert_in_blob(
 
 // ---------- recursive dispatch ----------
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 pub(super) fn insert_at(
     frame: &mut BlobFrame<'_>,

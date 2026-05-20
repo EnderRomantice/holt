@@ -9,8 +9,8 @@
 //! - [`codec`] — binary record codec + file header. Pure
 //!   in-memory bytes ↔ `TxnOp`.
 //! - [`writer`] — append-only WAL file with
-//!   `sync_data`-on-flush durability + 64 KB group-commit
-//!   auto-flush.
+//!   `sync_data`-on-flush durability + 64 KB buffered auto-drain
+//!   (not durable group commit).
 //! - [`reader`] — forward replay scanner with graceful
 //!   torn-tail handling. Unpacks `Batch` records into per-inner
 //!   callbacks so consumers don't need a `Batch` arm.

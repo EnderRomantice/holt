@@ -115,12 +115,9 @@ same change applied inside the batch-path rename arm of
 
 - Dropped `write_optional_bytes` / `read_optional_bytes` helpers
   (no callers after Insert/Erase shed their optional slots).
-- `WalWriter::append` (the generic `&TxnOp` entry) gains
-  `#[cfg_attr(not(test), allow(dead_code))]` — only test
-  fixtures exercising structural variants (Split / Merge /
-  Compact / MemMarker / NewTree / RmTree) still go through it;
-  the four user-facing hot paths all use the per-variant fast
-  paths (`append_insert` / `append_erase` /
+- `WalWriter::append` (the generic `&TxnOp` entry) is now
+  test-only; the four user-facing hot paths use the per-variant
+  fast paths (`append_insert` / `append_erase` /
   `append_rename_object` / `append_batch`).
 - `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
   Tree helpers folded into the new `apply_batch_walker_inline`.
@@ -545,7 +542,7 @@ ubuntu + macOS CI.
 - 10-variant `TxnOp` codec (`MAGIC | LEN | SEQ | TY | BODY |
   CRC32`); torn-tail-tolerant forward replay scanner.
 - `WalWriter` with `sync_data`-on-flush durability + 64 KB
-  group-commit auto-flush.
+  buffered auto-drain.
 - `Tree::checkpoint` flushes WAL + commits BM + truncates WAL
   conditionally; replay reapplies records onto the BM-cached
   blob and resumes `next_seq` past every replayed record.

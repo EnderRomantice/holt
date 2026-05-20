@@ -23,7 +23,7 @@ use super::types::{BlobNodeCrossing, LookupResult};
 /// shared buffer (e.g. a `BufferManager` read-guard) with no
 /// copies. Returned borrows are tied to the lifetime of that
 /// underlying buffer.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn lookup<'a>(
     frame: BlobFrameRef<'a>,
     start_slot: u16,

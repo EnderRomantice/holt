@@ -61,7 +61,8 @@
 //! - `engine` — recursive walker (insert / lookup / erase /
 //!   scan / rename / compact). Its public types (range iterators,
 //!   stats) are re-exported via [`api::range`] / [`api::stats`].
-//! - `concurrency` — `HybridLatch` 3-mode lock + guards.
+//! - `concurrency` — `HybridLatch` 3-mode lock plus the
+//!   tree-wide maintenance gate.
 //! - `checkpoint` — 3-thread background checkpointer. Users opt
 //!   in via [`CheckpointConfig`].
 //!

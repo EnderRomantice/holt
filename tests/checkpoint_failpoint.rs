@@ -64,10 +64,6 @@ impl FailpointBackend {
     fn delete_count(&self) -> usize {
         self.delete_calls.load(Ordering::SeqCst)
     }
-    #[allow(dead_code)]
-    fn flush_count(&self) -> usize {
-        self.flush_calls.load(Ordering::SeqCst)
-    }
 }
 
 fn failpoint_err(msg: &'static str) -> holt::Error {

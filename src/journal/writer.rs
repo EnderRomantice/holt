@@ -4,14 +4,12 @@
 //!
 //! 1. [`WalWriter::create`] for a fresh file or
 //!    [`WalWriter::open_existing`] to resume an existing one.
-//! 2. [`WalWriter::append`] for each `TxnOp` — bytes land in an
-//!    in-memory buffer. When the buffer crosses
-//!    [`AUTO_FLUSH_THRESHOLD`] (64 KB), `append` transparently
-//!    drains it to the OS via `write_all` (no `sync_data`). This
-//!    is group-commit: the WAL bytes reach the OS page cache in
-//!    big batches without the user-space buffer growing
-//!    unboundedly, but the per-record cost is still just an
-//!    in-memory copy.
+//! 2. `append_*` encoders write records into an in-memory buffer.
+//!    When the buffer crosses [`AUTO_FLUSH_THRESHOLD`] (64 KB),
+//!    the writer transparently drains it to the OS via `write_all`
+//!    (no `sync_data`). This is buffered auto-drain, not a
+//!    durability group commit: the per-record user-space cost is
+//!    an in-memory copy, and durability is still explicit.
 //! 3. [`WalWriter::flush`] drains whatever is still pending and
 //!    runs `sync_data` so every record so far is durable past a
 //!    power failure. This is the **durability boundary**.
@@ -29,10 +27,13 @@ use std::path::{Path, PathBuf};
 
 use crate::api::errors::{Error, Result};
 
+#[cfg(test)]
+use super::codec::encode_record;
 use super::codec::{
     decode_file_header, encode_erase_record, encode_file_header, encode_insert_record,
-    encode_record, encode_rename_object_record, BatchEncoder, FileHeader, FILE_HEADER_SIZE,
+    encode_rename_object_record, BatchEncoder, FileHeader, FILE_HEADER_SIZE,
 };
+#[cfg(test)]
 use super::txn_op::TxnOp;
 
 /// Append's in-memory buffer is auto-drained to the OS page
@@ -128,18 +129,14 @@ impl WalWriter {
     }
 
     /// Header recovered on open, including the embedded tree id.
-    ///
-    /// Diagnostic — verified by codec round-trip tests but not
-    /// directly read on the `Tree::open` hot path.
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[must_use]
     pub fn header(&self) -> FileHeader {
         self.header
     }
 
-    /// Bytes written (durable + buffered) since the file was
-    /// created — useful as a stand-in offset for telemetry.
-    #[allow(dead_code)]
+    /// Bytes written (durable + buffered) since the file was created.
+    #[cfg(test)]
     #[must_use]
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written + self.pending.len() as u64
@@ -159,12 +156,10 @@ impl WalWriter {
     /// [`Self::append_erase`] / [`Self::append_rename_object`] /
     /// [`Self::append_batch`]). Those skip the `TxnOp` enum's
     /// `Vec` clones — measurable against the bench's hot path.
-    /// `append` stays as a generic test-time entry point for
-    /// exercising structural variants (Split / Merge / Compact /
-    /// MemMarker / NewTree / RmTree) end-to-end through the
-    /// writer + replay path; production code never goes through
-    /// it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Generic test-time entry point for exercising structural
+    /// variants (Split / Merge / Compact / MemMarker / NewTree /
+    /// RmTree) end-to-end through the writer + replay path.
+    #[cfg(test)]
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending);
         self.maybe_drain()
@@ -280,9 +275,8 @@ impl WalWriter {
     /// are unaffected — `discard_pending` only touches the
     /// in-memory tail since the last drain.
     ///
-    /// Currently exercised by journal unit tests only; the
-    /// `Tree::txn` mid-batch bail path doesn't call this yet.
-    #[allow(dead_code)]
+    /// Test helper for rollback semantics.
+    #[cfg(test)]
     pub fn discard_pending(&mut self) {
         self.pending.clear();
     }

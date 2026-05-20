@@ -34,9 +34,10 @@ or any per-NodeType body fails the build, not a runtime test.
 The tree grows through `BlobNode` crossings — when an insert can't
 find room in the current blob, the walker materializes a subtree
 into a fresh blob and installs a Blob-type node in the parent that
-says "the walk continues in blob X at slot Y." This composes
-recursively: each child blob is itself a full ART frame, so the
-same walker code descends across blob boundaries without
+says "the walk continues in blob X." The child blob's own
+`header.root_slot` is the authoritative entry point. This
+composes recursively: each child blob is itself a full ART frame,
+so the same walker code descends across blob boundaries without
 special-casing the crossing.
 
 ## 2. NodeType variants
@@ -45,7 +46,7 @@ special-casing the crossing.
 |------:|-----------|-----------:|------------------------------------------------|
 |     1 | Leaf      |    16 B    | `(value_size, tombstone, key_offset, seq)` + bump-allocated extent for key+value bytes |
 |     2 | Prefix    |   128 B    | Path-compressed segment (≤112 inline bytes)    |
-|     3 | Blob      |   128 B    | Cross-blob crossing (target_guid + entry_slot) |
+|     3 | Blob      |   128 B    | Cross-blob crossing (target_guid + ≤104 inline prefix bytes) |
 |     4 | Node4     |    24 B    | 1..4 children, linear scan                     |
 |     5 | Node16    |    88 B    | 5..16 children, SSE2 / NEON byte search        |
 |     6 | Node48    |   456 B    | 17..48 children, byte→slot index               |
@@ -67,7 +68,8 @@ walk(slot, key, depth) {
             Prefix    -> match prefix vs key[depth..],
                          advance depth, descend
             Node*     -> use key[depth] to pick child, descend
-            Blob      -> pin target blob, descend at entry slot
+            Blob      -> match inline prefix, pin target blob,
+                         descend at child.header.root_slot
         }
     }
 }
@@ -95,10 +97,10 @@ Three primitives keep multi-blob trees healthy.
 **`splitBlob` (spillover)** runs in-band when `insert_at` returns
 `AllocError::OutOfSpace`. It picks the largest non-`Blob` subtree
 under the current blob's first branching node, deep-clones it
-into a fresh blob via `make_blob_from_node`, persists the new
-blob, frees the source slots, and installs a `BlobNode` crossing
-in the parent. The walker then retries the insert; the descent
-now follows the new BlobNode.
+into a fresh blob via `make_blob_from_node`, stages the new blob
+in the buffer manager's dirty set, frees the source slots, and
+installs a `BlobNode` crossing in the parent. The walker then
+retries the insert; the descent now follows the new BlobNode.
 
 To keep spillover from itself OOM'ing, `alloc_node` /
 `alloc_extent` (non-`Blob`) refuse to consume the last 128 bytes
@@ -131,13 +133,12 @@ subtree gets inlined back into its parent at the `BlobNode` slot
 then the child blob is deleted. Guarded by `is_mergeable`:
 combined space + slots fit, no nested crossings, no tombstones.
 
-`Tree::compact` (today, quiescent-only — see §6) walks every
-blob, runs `compact_blob` per blob, repairs the
-`BlobNode.child_entry_ptr == child.header.root_slot` invariant
-via `refresh_blob_node_pointers` (compact_blob rewrites a child's
-root in isolation; parents need a separate sweep to catch up),
-then folds every direct-mergeable `BlobNode` child via a
-single-pass merge sweep.
+`Tree::compact` enters the tree-wide `maintenance_gate` in
+exclusive mode, walks every reachable blob, runs `compact_blob`
+per blob, then folds every direct-mergeable `BlobNode` child via
+a single-pass merge sweep. Parents do not store child entry
+slots; after a child compacts, its own `header.root_slot` remains
+the only cross-blob entry token.
 
 ## 5. Concurrency
 
@@ -183,12 +184,13 @@ its corresponding WAL record already buffered, because both
 `wal.lock`. This is the W2D-strict invariant: every backend
 mutation is preceded by a durable WAL record describing it.
 
-Concurrent writers serialise on `wal.lock`. That's the current
-barrier, not the end state. The v0.3 performance track replaces
-the coarse write shape with slot-versioned cross-blob
-lock-coupling and a journal worker / group-commit pipeline, so
-writers on disjoint child blobs do not keep an ancestor guard or
-the WAL mutex for the full mutation.
+Concurrent persistent writers still serialise on `wal.lock`.
+That's the current barrier, not the end state. Cross-blob walker
+guards are already lock-coupled: a writer reads the parent
+`BlobNode`, pins and latches the child, then releases the parent
+before mutating below that boundary. The next remaining write
+path choke point is the journal side: a worker / group-commit
+pipeline should replace the full-op WAL mutex.
 
 `Tree::rename` takes a separate `Mutex<()>` `rename_lock` around
 its multi-step `lookup → erase → insert` so other renames see it
@@ -226,11 +228,16 @@ it stopped; real mid-file corruption surfaces as
 `get_cached` on different blobs hit different shards instead of
 contending on a single mutex.
 
-It tracks "newer than backend" state in two parallel sets:
+It tracks "newer than backend" state in dirty state plus deferred
+delete state:
 
-- `dirty: Mutex<HashMap<BlobGuid, u64>>` — guid → lowest
-  unflushed WAL seq. Entry exists iff the cached image is newer
-  than backend.
+- `dirty.dirty: HashMap<BlobGuid, u64>` — guid → lowest
+  unflushed WAL seq not yet claimed by a checkpoint round. Entry
+  exists iff the cached image is newer than backend.
+- `dirty.flushing: HashMap<BlobGuid, u64>` — entries drained by
+  a checkpoint round whose cached image must remain unevictable
+  until `write_through` completes. Eviction treats both dirty maps
+  as protected.
 - `pending_deletes: Mutex<HashMap<BlobGuid, u64>>` — blobs the
   erase walker's `SubtreeGone` path unlinked from their parent
   in cache, queued for `backend.delete_blob` at the next
@@ -254,11 +261,14 @@ Both `Tree::checkpoint` (synchronous, caller-driven) and the
 background `Checkpointer` round follow the same seven-phase
 protocol, strictly ordered around the W2D invariant:
 
-1. **Snapshot + WAL flush** under `wal.lock`. Drain `dirty` +
-   `pending` sets and `wal.flush()`. Flush failure restores both
-   snapshots.
+1. **Snapshot + WAL flush** under `wal.lock`. Drain live dirty
+   entries into the checkpoint snapshot, move them into the
+   in-flight `flushing` protection set, drain pending deletes,
+   then `wal.flush()`. Flush failure restores both snapshots.
 2. **Per-blob write-through** with CAS-on-seq. Successful writes
-   retire the dirty entry; failures stay in `dirty`.
+   release the matching `flushing` protection; racing writers'
+   fresh dirty entries survive for the next round. Failures are
+   restored to live dirty.
 3. **Pre-delete sync** — `backend.flush` (data file fdatasync +
    manifest persist) so the writes from phase 2 are stable.
    Failure restores `pending`.
@@ -284,11 +294,12 @@ cold-blob eviction sweep on the same `clock_tick` mechanism.
 the calling thread so dirty state between the last bg round and
 shutdown doesn't get lost.
 
-`Tree::compact` is currently documented **NOT online-safe** —
-running concurrently with reads or writes can torn-read across
-`BlobNode` crossings. The v0.3 performance track moves this
-toward incremental online maintenance guarded by structure
-versions, not a stop-the-world compact pass.
+`Tree::compact` is online with respect to point reads and
+foreground writers through `maintenance_gate`. Range iterators
+remain best-effort snapshots because they keep a traversal stack
+between `next()` calls; callers that need strict iterator
+stability should consume the iterator during an external
+quiescent window.
 
 ## 7. Range iteration
 

@@ -300,10 +300,9 @@ impl Checkpointer {
     /// `idle_interval`). Safe to call from any thread; no-op if
     /// the planner is already running.
     ///
-    /// Currently used only from tests — writer-side threshold
-    /// wake-up (e.g. once `dirty_count` crosses a watermark) is
-    /// a planned hook for the writer paths.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test hook for waking the planner without waiting out the
+    /// remainder of `idle_interval`.
+    #[cfg(test)]
     pub(crate) fn wake(&self) {
         if let Some(h) = &self.checkpoint_handle {
             h.thread().unpark();
