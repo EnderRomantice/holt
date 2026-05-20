@@ -509,6 +509,13 @@ fn erase_at_blob_node(
             ))?;
         *cast::<BlobNode>(body)
     };
+    // Phase 2.A: capture parent's BlobNode slot version before
+    // any child-blob work — mirrors `insert_at_blob_node`. The
+    // validate at the writeback / SubtreeGone / Replaced sites
+    // below is currently a `debug_assert` because parent latch
+    // is held throughout. Phase 2.B will drop the parent guard
+    // and turn the debug_assert into a real restart-on-mismatch.
+    let parent_bn_version_at_descent = parent_frame.slot_version(bn_slot);
     let plen = bn.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
         return Err(Error::node_corrupt(
@@ -562,6 +569,19 @@ fn erase_at_blob_node(
     // The Replaced arm is structural (slot pointer rewrite, no
     // necessarily-a-tombstone) so it's tracked separately.
     let child_touched = matches!(r.signal, EraseSignal::Replaced(_)) || r.mutated;
+
+    // Phase 2.A: validate parent BlobNode slot didn't drift while
+    // we were in the child. While parent latch is held (current
+    // status), drift is impossible — debug_assert catches a Phase
+    // 1 invariant break or a premature Phase 2.B activation.
+    debug_assert_eq!(
+        parent_frame.slot_version(bn_slot),
+        parent_bn_version_at_descent,
+        "erase_at_blob_node: parent BlobNode slot {bn_slot} version drifted from \
+         {parent_bn_version_at_descent} to {} during child work — invariant \
+         violation (parent latch was supposed to be held throughout)",
+        parent_frame.slot_version(bn_slot),
+    );
 
     match r.signal {
         EraseSignal::Unchanged => {

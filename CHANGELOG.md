@@ -9,12 +9,10 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased] — v0.3 (in progress)
 
-Continuing work that's queued for the v0.3 release. The v0.3.0
-release commit (51764a9) shipped the API split + walker hot-path
-optimizations + WAL format v2; everything below extends that
-into the full v0.3 milestone and will ship as part of the final
-v0.3 tag (which may be cut as a single v0.3.0 amend or as
-v0.3.1, depending on release-time choice).
+The v0.3 milestone is still unreleased. Everything in this
+section is queued for the first v0.3 tag: the API split, walker
+hot-path optimizations, WAL format cleanup, zero-copy reads,
+batch-WAL encoding, and the first per-node-latch groundwork.
 
 The three breaking-but-surgical wins below land first; the
 multi-phase per-node-latch milestone (#27) builds on them.
@@ -28,13 +26,15 @@ Insert and `key` for Erase — the prior-value slots were dead
 weight on every returning `Tree::insert` / `Tree::remove` (the
 blind variants already wrote `None`).
 
-**File format version bumped 2 → 3.** A v0.3.0 binary opening a
-v0.3.1 WAL fails with `Error::ReplaySanityFailed` /
+**File format version bumped 2 → 3.** A binary built from the
+earlier v0.3 draft opening a v3 WAL fails with
+`Error::ReplaySanityFailed` /
 `"WAL file format version unsupported"` rather than mis-parsing
 the absent optional-bytes slot as a length prefix. **Upgrade
-path: `Tree::checkpoint()` on the v0.3.0 tree before swapping in
-the v0.3.1 binary** — checkpoint truncates the WAL to
-header-only, so the next open writes a v0.3 (= v3-format) header.
+path for local data written by the earlier v0.3 draft:
+`Tree::checkpoint()` before swapping in the new binary** —
+checkpoint truncates the WAL to header-only, so the next open
+writes a v0.3 (= v3-format) header.
 
 Concretely:
 - WAL `Insert` record body shrinks by one `optional_bytes` slot
@@ -45,7 +45,7 @@ Concretely:
 - Returning `Tree::insert` / `Tree::remove` no longer clone or
   serialise the prior value into the WAL buffer; the caller still
   receives it through the return path (walker `leaf_extent` read,
-  same as v0.3.0).
+  same as the earlier v0.3 API split).
 
 ### Breaking — `Tree::get_with` zero-copy primitive
 
@@ -55,7 +55,7 @@ closure's result. Replaces the always-copying internal lookup
 path under the hood:
 
 ```rust
-// Owned `Vec<u8>` convenience — unchanged caller-side from v0.3.0.
+// Owned `Vec<u8>` convenience — unchanged caller-side from the v0.3 API split.
 pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
 // Zero-copy primitive — pass a closure that consumes the slice.
@@ -64,7 +64,7 @@ where
     F: FnMut(&[u8]) -> R;
 ```
 
-`Tree::get` is now a one-line wrapper over `get_with` (calls it
+`Tree::get` is a one-line wrapper over `get_with` (calls it
 with `<[u8]>::to_vec`); no caller-side change for any code that
 was using `tree.get(k)`. Hot read paths that don't need owned
 bytes — existence checks, in-place decode, filter pipelines,
@@ -76,8 +76,8 @@ that takes the consume closure. External callers don't touch
 that surface (it's `pub(crate)`).
 
 Closure contract: `consume` runs after the optimistic
-`validate()` succeeds — same race window as v0.3.0's
-`v.to_vec()`. Keep the closure short to avoid widening the
+`validate()` succeeds — same race window as the owned
+`v.to_vec()` path. Keep the closure short to avoid widening the
 window past the existing baseline; for arbitrary work, copy out
 first via `<[u8]>::to_vec`.
 
@@ -85,11 +85,11 @@ first via `<[u8]>::to_vec`.
 
 `Tree::txn` (the batched-multi-op API) now uses a streaming
 `BatchEncoder` that writes inner-op bytes directly from `&[u8]`
-refs into the WAL pending buffer. The v0.3.0 path constructed
-`TxnOp::Insert { key: Vec<u8>, value: Vec<u8>, .. }` (and
-similarly for `Erase` / `RenameObject`) per inner op, then
-encoded the enum-of-`Vec`s — two extra clones per op the WAL
-never needed.
+refs into the WAL pending buffer. The previous v0.3 draft path
+constructed `TxnOp::Insert { key: Vec<u8>, value: Vec<u8>, .. }`
+(and similarly for `Erase` / `RenameObject`) per inner op, then
+encoded the enum-of-`Vec`s — two extra clones per op the WAL never
+needed.
 
 Mid-batch error handling is preserved: if a walker call returns
 `Err` partway through, the encoder's `Drop` rolls the partial
@@ -166,7 +166,39 @@ Concretely:
   (`slot_version_bumps_on_versioned_frame_mutation` in
   `src/store/buffer_manager.rs::tests`).
 
-## [0.3.0] — 2026-05-20
+### Infrastructure — per-node-latch milestone, Phase 2.A
+
+Builds the cross-blob-hop capture/validate scaffolding on top of
+Phase 1's per-slot counters. **Still no user-visible behavior
+change** — parent latch is held throughout the cross-blob hop so
+the validate is a `debug_assert` (current Phase 1 invariant
+guarantees it can never fire). Phase 2.B will drop the parent
+guard before the child hop and turn the debug_assert into a real
+restart-on-mismatch path.
+
+Concretely:
+
+- New `BlobFrame::slot_version(slot)` reader — `Acquire`-load
+  pair to `BlobFrame::bump_slot_version`'s `Release` store.
+  Returns 0 for unversioned frames (init / local-buf / test
+  paths) or out-of-range slot indices.
+- `walker::insert::insert_at_blob_node` captures the parent's
+  `BlobNode` slot version before pinning the child, then
+  `debug_assert_eq!`s the version is unchanged before the
+  optional write-back (`child_entry_ptr` mutation).
+- `walker::erase::erase_at_blob_node` mirrors the same
+  capture/validate protocol — the validate gates all three
+  return arms (`Unchanged` / `Replaced` / `SubtreeGone`).
+- Both functions document the Phase 2.A status inline and call
+  out the Phase 2.B transition path: the `debug_assert` becomes
+  a real `if cur != captured { restart-from-root }` once parent
+  guard is dropped before child pin.
+
+The scaffolding is "free" in release builds (debug_assert is a
+no-op) and exercises the Phase 1 bump pipeline end-to-end on
+every cross-blob insert / erase under tests / debug builds. Any
+regression in Phase 1's bump-on-mutation contract will surface
+as an immediate test failure on the next cross-blob op.
 
 ### Breaking — API redesign (split returning from blind)
 

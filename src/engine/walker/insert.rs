@@ -471,6 +471,7 @@ fn insert_into_inner(
 /// workloads rarely hit this since spillover always installs a
 /// BlobNode with an empty inline prefix.
 #[allow(clippy::too_many_arguments)] // wants_prev added by API split
+#[allow(clippy::too_many_lines)] // single-fn flow; splitting hurts readability around the spillover-retry loop
 fn insert_at_blob_node(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
@@ -489,6 +490,21 @@ fn insert_at_blob_node(
             ))?;
         *cast::<BlobNode>(body)
     };
+    // Phase 2.A: Capture the parent's per-slot version *before*
+    // any child-blob work. Phase 1's bump-on-mutation contract
+    // means a writer that later touches `parent_frame[bn_slot]`
+    // (spillover, compact, merge, structural rewrite) will bump
+    // this counter. We re-check the counter on the way back
+    // (`debug_assert` below) to catch any drift.
+    //
+    // Phase 2.A status: parent latch is still held throughout
+    // this function call, so concurrent writers cannot touch the
+    // parent's BlobNode slot — the assert can only fire if Phase
+    // 1's bump invariant is broken or Phase 2.B prematurely
+    // released the parent guard. Phase 2.B will restructure to
+    // drop parent guard before pinning the child and turn the
+    // debug_assert into a real `restart-from-root` branch.
+    let parent_bn_version_at_descent = parent_frame.slot_version(bn_slot);
     let plen = bn.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
         return Err(Error::node_corrupt(
@@ -587,6 +603,21 @@ fn insert_at_blob_node(
         let mut cf = guard.frame();
         cf.header_mut().root_slot = child_result.slot_after;
     }
+
+    // Phase 2.A: validate parent BlobNode slot didn't drift while
+    // we were working in the child. While parent latch is held
+    // (current Phase 2.A status) this is a `debug_assert` since
+    // drift is impossible. Phase 2.B will replace this with a
+    // proper restart-on-mismatch path once parent latch is
+    // dropped before the child hop.
+    debug_assert_eq!(
+        parent_frame.slot_version(bn_slot),
+        parent_bn_version_at_descent,
+        "insert_at_blob_node: parent BlobNode slot {bn_slot} version drifted from \
+         {parent_bn_version_at_descent} to {} during child work — invariant \
+         violation (parent latch was supposed to be held throughout)",
+        parent_frame.slot_version(bn_slot),
+    );
 
     if u32::from(child_result.slot_after) != bn.child_entry_ptr {
         let mut new_bn = bn;

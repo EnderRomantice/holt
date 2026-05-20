@@ -292,6 +292,34 @@ impl<'a> BlobFrame<'a> {
         }
     }
 
+    /// `Acquire`-load the per-slot version counter for the given
+    /// 1-based slot index. Returns 0 if this frame was constructed
+    /// via [`Self::wrap`] (no version tracking) or if the slot
+    /// index is out of range.
+    ///
+    /// Pairs with [`Self::bump_slot_version`]'s `Release` store.
+    /// Walker uses this on cross-blob descent boundaries: capture
+    /// the parent slot's version before descending into the child
+    /// blob, then re-load on the way back to verify the parent
+    /// slot didn't move during the child work.
+    ///
+    /// Phase 2.A (current): the validate is a `debug_assert`
+    /// because parent latch is held throughout the cross-blob
+    /// descent — version cannot drift while the latch is held.
+    /// Phase 2.B will drop the parent guard before child work
+    /// and turn the validate into a real restart-on-mismatch.
+    #[must_use]
+    pub(crate) fn slot_version(&self, slot: u16) -> u64 {
+        let Some(svs) = self.slot_versions else {
+            return 0;
+        };
+        if slot == 0 {
+            return 0;
+        }
+        svs.get((slot as usize) - 1)
+            .map_or(0, |av| av.load(Ordering::Acquire))
+    }
+
     /// Cheap conversion to a read-only [`BlobFrameRef`]. Useful
     /// for forwarding into walker `lookup` / `descend` paths
     /// (which take `BlobFrameRef` so they also work against
