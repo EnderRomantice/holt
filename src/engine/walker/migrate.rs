@@ -76,6 +76,22 @@ pub fn make_blob_from_node(
     Ok(MakeBlobOutcome { buf })
 }
 
+/// Cheap header-level predicate for whether `compact_blob` can
+/// reclaim anything.
+///
+/// Tombstoned leaves keep their key/value extents until compaction;
+/// freed leaf slots also imply leaked leaf extents from alloc-fresh
+/// same-key updates. Other free-list entries are normal ART shape
+/// churn (EmptyRoot release, Node4→Node16 growth, prefix splits)
+/// and are cheap to reuse in place, so they are not enough to make
+/// online `Tree::compact` pay a 512 KB scratch allocation + memcpy.
+#[must_use]
+pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
+    let h = frame.header();
+    let leaf_free_list = h.free_list_head[NodeType::Leaf as usize - 1];
+    h.tombstone_leaf_cnt != 0 || leaf_free_list != 0
+}
+
 /// Repack `buf` in place, discarding all unreachable bytes plus
 /// every tombstoned leaf.
 ///

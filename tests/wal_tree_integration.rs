@@ -780,7 +780,7 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
 fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
     // Same protocol assertion as
     // `compact_does_not_leak_pre_wal_state_to_backend`, but
-    // sized to force spillover so `Tree::compact` rewrites
+    // sized to force spillover so `Tree::compact` considers
     // multiple child blobs and then attempts tree-wide merge.
     // Cross-blob entry is now only the child blob's
     // `header.root_slot`, so parent BlobNodes do not carry a child
@@ -809,8 +809,9 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
         stats.blob_count,
     );
 
-    // Compact restructures every blob + the parent BlobNodes. It
-    // must NOT push anything to backend — only stage via dirty.
+    // Compact may rewrite blobs with reclaimable garbage and may
+    // restructure parent BlobNodes. It must NOT push anything to
+    // backend — only stage via dirty.
     tree.compact().unwrap();
     let after_compact = inner.list_blobs().unwrap();
     assert_eq!(
@@ -825,7 +826,7 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
     );
 
     // Now checkpoint and reopen-via-backend: every key must still
-    // be present (the structural rewrite preserved logical state).
+    // be present (any structural rewrite preserved logical state).
     tree.checkpoint().unwrap();
     assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
     for i in 0..1500u32 {

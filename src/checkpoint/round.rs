@@ -383,9 +383,11 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// `mark_dirty` + `mark_for_delete` protocol so the round's
 /// later phases (WAL flush → Flush tasks → Sync → pending
 /// deletes → re-Sync → truncate) handle persistence under W2D.
-/// Takes the exclusive maintenance gate so no foreground writer is
-/// lock-coupling through a child edge while that edge is being
-/// folded and queued for delete.
+/// Takes the exclusive maintenance gate around one parent at a
+/// time so no foreground writer is lock-coupling through the child
+/// edge being folded and queued for delete. The parent list itself
+/// is collected under the shared side; foreground writes may add
+/// new children concurrently, and those are left for a future pass.
 ///
 /// Returns the cumulative count of children folded.
 ///
@@ -402,17 +404,20 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
-    let _maintenance = shared.maintenance_gate.enter_exclusive();
-    let _commit = shared
-        .journal
-        .as_ref()
-        .map(|_| shared.commit_gate.enter_writer());
-    let parents = engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?;
+    let parents = {
+        let _maintenance = shared.maintenance_gate.enter_shared();
+        engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?
+    };
     let mut merged_total = 0u64;
     for guid in parents {
+        let _maintenance = shared.maintenance_gate.enter_exclusive();
         if !shared.bm.has_blob(guid)? {
             continue;
         }
+        let _commit = shared
+            .journal
+            .as_ref()
+            .map(|_| shared.commit_gate.enter_writer());
         let pin = shared.bm.pin(guid)?;
         let stats = {
             let mut guard = pin.write();

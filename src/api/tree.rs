@@ -20,7 +20,8 @@
 //!   latch version, reads the buffer, then validates; on a torn
 //!   read it restarts from the root. Readers never block writers
 //!   and writers never block readers; only structural maintenance
-//!   (`compact` / merge) takes the exclusive side.
+//!   (`compact` / merge) takes short exclusive maintenance windows
+//!   only while folding cross-blob edges.
 //! - **Writes** (`put` / `delete`) take **exclusive** mode on
 //!   each blob they touch. Persistent trees additionally enter a
 //!   short commit-publish critical section so checkpoint snapshots
@@ -28,7 +29,9 @@
 //!   fsync waiting happens after that section through the journal
 //!   group-commit worker.
 //! - **Structural maintenance** (`compact` and background merge)
-//!   takes a narrow tree-wide maintenance gate. Normal reads and
+//!   takes a narrow tree-wide maintenance gate only around
+//!   merge/delete of cross-blob edges. Blob-local compaction runs
+//!   under per-blob latches on the shared side. Normal reads and
 //!   writers take the shared side while they may cross `BlobNode`
 //!   boundaries; blob-local access still relies on per-blob
 //!   optimistic validation.
@@ -78,12 +81,12 @@ use super::txn::{BatchOp, TxnBatch};
 ///   the writer-shared `commit_gate` while publishing dirty state
 ///   and the journal record; durable fsync waiting happens after
 ///   that gate through the group-commit worker.
-/// - **Maintenance** (`compact`, background merge) takes the
-///   exclusive side of `maintenance_gate`; foreground reads and
-///   writers enter the shared side around tree traversal. This
-///   blocks subtree merge/delete while an operation is crossing
-///   blobs, while keeping all ordinary operations mutually
-///   concurrent.
+/// - **Maintenance** (`compact`, background merge) takes short
+///   exclusive windows on `maintenance_gate` while folding/deleting
+///   cross-blob edges. Blob-local compaction runs on the shared
+///   side under per-blob latches. Foreground reads and writers
+///   enter the shared side around tree traversal, so ordinary
+///   operations stay mutually concurrent.
 /// - **`rename`** holds `rename_lock` (a `Mutex<()>` scoped to
 ///   rename only) so its multi-step
 ///   `lookup → erase → insert` appears atomic to other writers.
@@ -112,9 +115,9 @@ pub struct Tree {
     ///
     /// Foreground read and mutation paths enter the shared side
     /// while they may cross `BlobNode` boundaries. `compact()` and
-    /// the background merge pass enter the exclusive side before
-    /// folding a child blob back into its parent and queuing the
-    /// child for delete.
+    /// the background merge pass enter the exclusive side only
+    /// around folding a child blob back into its parent and queuing
+    /// the child for delete.
     /// Point reads participate too: per-blob optimistic validation
     /// handles in-place rewrites, while the maintenance gate keeps
     /// a merge pass from deleting a child blob after a reader has
@@ -1271,28 +1274,32 @@ impl Tree {
     ///
     /// ## Concurrency
     ///
-    /// Safe to run while point reads are active: reads and
-    /// foreground writers take the shared maintenance gate, while
-    /// `compact()` takes the exclusive side. Phase 1 still rewrites
-    /// each blob under that blob's exclusive latch, so optimistic
-    /// readers either validate or restart if they race a blob-local
-    /// rewrite. Phase 2 cannot fold/delete a child while any
-    /// operation is lock-coupling through a `BlobNode`. Range
+    /// Safe to run while point reads are active. Phase 1 is only a
+    /// blob-local rewrite: it holds the shared maintenance side,
+    /// skips clean blobs under shared blob latches, and takes a
+    /// blob's exclusive latch only when that blob has reclaimable
+    /// garbage. Foreground operations on other blobs keep running.
+    /// Phase 2 folds `BlobNode` children under short exclusive
+    /// maintenance windows, one parent at a time, so no operation
+    /// can be lock-coupling through the edge being deleted. Range
     /// iterators remain best-effort snapshots; if the caller needs
     /// strict full-iterator stability, consume the iterator during
     /// an external quiescent window.
     ///
     /// ## Two phases:
     ///
-    /// 1. **Per-blob compact**: every reachable blob is rebuilt in
-    ///    place, dropping tombstones and reclaiming bump-area waste.
-    ///    `compact_times` bumps by one on each; `tombstone_leaf_cnt`
-    ///    resets to zero.
-    /// 2. **Tree-wide merge**: each parent blob is walked and every
-    ///    mergeable `BlobNode` child is folded back into the parent,
-    ///    then the child blob is queued for deferred deletion via
-    ///    the BM. A heavy-erase workload that leaves children
-    ///    mostly-empty collapses back toward a single root blob.
+    /// 1. **Per-blob compact**: every reachable blob with
+    ///    tombstones or freed leaf slots is rebuilt in place,
+    ///    dropping tombstones and reclaiming bump-area waste. Clean
+    ///    blobs are skipped to avoid needless 512 KB rewrites on hot
+    ///    paths. `compact_times` bumps only for blobs actually
+    ///    rebuilt; `tombstone_leaf_cnt` resets to zero there.
+    /// 2. **Tree-wide merge**: each reachable blob is walked and
+    ///    every mergeable `BlobNode` child is folded back into the
+    ///    parent, then the child blob is queued for deferred
+    ///    deletion via the BM. A heavy-erase workload that leaves
+    ///    children mostly-empty collapses back toward a single root
+    ///    blob.
     ///
     /// Both phases stage their changes via `mark_dirty` /
     /// `mark_for_delete` on the internal `BufferManager`
@@ -1321,40 +1328,70 @@ impl Tree {
     pub fn compact(&self) -> Result<()> {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
-        let _maintenance = self.maintenance_gate.enter_exclusive();
-        let _commit = self
-            .journal
-            .as_ref()
-            .map(|_| self.commit_gate.enter_writer());
+        // Phase 1 — per-blob compact. Keep this pass's reachable
+        // list for phase 2 as well; children added concurrently
+        // during this call are intentionally left for a future
+        // single-pass compact round.
+        let guids = {
+            let _maintenance = self.maintenance_gate.enter_shared();
+            let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+            for guid in &guids {
+                let pin = self.backend.pin(*guid)?;
+                let needs_compaction = {
+                    let guard = pin.read();
+                    engine::blob_needs_compaction(crate::store::BlobFrameRef::wrap(
+                        guard.as_slice(),
+                    ))
+                };
+                if !needs_compaction {
+                    drop(pin);
+                    continue;
+                }
 
-        // Phase 1 — per-blob compact.
-        let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
-        for guid in &guids {
-            let pin = self.backend.pin(*guid)?;
-            {
-                let mut guard = pin.write();
-                engine::compact_blob(&mut guard)?;
+                let _commit = self
+                    .journal
+                    .as_ref()
+                    .map(|_| self.commit_gate.enter_writer());
+                let compacted = {
+                    let mut guard = pin.write();
+                    let still_needs_compaction = {
+                        let frame = guard.frame();
+                        engine::blob_needs_compaction(frame.as_ref())
+                    };
+                    if still_needs_compaction {
+                        engine::compact_blob(&mut guard)?;
+                    }
+                    still_needs_compaction
+                };
+                if compacted {
+                    // Stage the rebuilt image; let `Tree::checkpoint`
+                    // (or the bg checkpointer) push it through under
+                    // W2D. The pin must stay alive until after
+                    // `mark_dirty` so eviction cannot drop the only
+                    // cache image in the gap.
+                    self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
+                }
+                drop(pin);
             }
-            // Stage the rebuilt image; let `Tree::checkpoint` (or
-            // the bg checkpointer) push it through under W2D.
-            // The pin must stay alive until after `mark_dirty` so
-            // eviction cannot drop the only cache image in the gap.
-            self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
-            drop(pin);
-        }
+            guids
+        };
 
-        // Phase 2 — tree-wide merge pass. Walk parents in BFS order
-        // from the root; each parent's `try_merge_children` collapses
-        // any direct `BlobNode` child whose blob is small enough to
-        // inline. Snapshot the BFS list first; merges performed
+        // Phase 2 — tree-wide merge pass. Walk this pass's reachable
+        // blobs in root-first order; each `try_merge_children`
+        // collapses any direct `BlobNode` child whose blob is small
+        // enough to inline. Snapshot the list first; merges performed
         // earlier in the iteration delete the merged child blobs,
         // so later iterations may encounter guids that no longer
         // exist — skip those rather than re-pinning a missing blob.
-        let parents = engine::collect_blob_guids(&self.backend, self.root_guid)?;
-        for guid in parents {
+        for guid in guids {
+            let _maintenance = self.maintenance_gate.enter_exclusive();
             if !self.backend.has_blob(guid)? {
                 continue;
             }
+            let _commit = self
+                .journal
+                .as_ref()
+                .map(|_| self.commit_gate.enter_writer());
             let pin = self.backend.pin(guid)?;
             let merged = {
                 let mut guard = pin.write();
@@ -1499,8 +1536,8 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_key, Tree, INLINE_PADDED_KEY_CAP};
-    use crate::api::config::TreeConfig;
+    use super::{pad_key, INLINE_PADDED_KEY_CAP};
+    use crate::TreeBuilder;
     use std::sync::mpsc::sync_channel;
     use std::thread;
     use std::time::Duration;
@@ -1523,8 +1560,22 @@ mod tests {
 
     #[test]
     fn compact_waits_for_maintenance_read_guard() {
-        let tree = Tree::open(TreeConfig::memory()).unwrap();
-        tree.put(b"k", b"v").unwrap();
+        let tree = TreeBuilder::new("ignored")
+            .memory()
+            .buffer_pool_size(16)
+            .open()
+            .unwrap();
+        let big = vec![0xCDu8; 4 * 1024];
+        for i in 0..256u32 {
+            tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+        }
+        for i in 0..248u32 {
+            tree.delete(format!("k{i:08}").as_bytes()).unwrap();
+        }
+        assert!(
+            tree.stats().unwrap().blob_count > 1,
+            "test precondition: compact must have a BlobNode merge phase"
+        );
 
         let read_guard = tree.maintenance_gate.enter_shared();
         let worker_tree = tree.clone();

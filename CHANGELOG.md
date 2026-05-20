@@ -157,9 +157,11 @@ The remaining v0.3 concurrency cleanup is now in place:
   `remove` / `rename` / `txn`) enter the shared side of a narrow
   atomic `maintenance_gate` while they may cross `BlobNode`
   boundaries.
-  `Tree::compact()` and the background checkpointer's merge pass
-  enter the exclusive side before folding child blobs back into
-  parents and queuing those children for deferred delete.
+  `Tree::compact()` runs blob-local compaction on the shared side,
+  skips clean blobs after a shared-latch header check, and both
+  manual compact plus the background checkpointer's merge pass
+  enter the exclusive side only around one parent merge/delete
+  window at a time.
 - Point reads (`get`) also take the shared
   maintenance gate so a merge cannot delete a child after a reader
   observes the parent `BlobNode`. Blob-local reads still use

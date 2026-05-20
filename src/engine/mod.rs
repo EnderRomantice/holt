@@ -25,6 +25,7 @@ pub mod walker;
 // (api::tree, api::range, api::stats). Walker-internal types stay
 // hidden behind `mod walker;`.
 pub use walker::{
-    collect_blob_guids, collect_blob_guids_silent, compact_blob, erase_multi, insert_multi,
-    lookup_multi_with, try_merge_children, EraseOutcome, RangeBuilder, RangeEntry, RangeIter,
+    blob_needs_compaction, collect_blob_guids, collect_blob_guids_silent, compact_blob,
+    erase_multi, insert_multi, lookup_multi_with, try_merge_children, EraseOutcome, RangeBuilder,
+    RangeEntry, RangeIter,
 };

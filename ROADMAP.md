@@ -99,9 +99,11 @@ v0.3's concurrency cut is implemented in the codebase:
   without self-referential guard plumbing.
 - **Maintenance is separated.** Foreground writers enter only the
   shared side of a narrow atomic `maintenance_gate` while they may
-  cross `BlobNode` boundaries. `compact()` and the background
-  merge pass enter the exclusive side before folding/deleting
-  child blobs.
+  cross `BlobNode` boundaries. `compact()` skips clean blobs after
+  a shared-latch header check, runs needed blob-local rewrite work
+  on the shared side under per-blob latches, and `compact()` plus
+  the background merge pass enter the exclusive side only around
+  the parent edge currently being folded/deleted.
   Point reads also take the shared side, but blob-local access
   remains optimistic; ordinary readers and writers still run
   concurrently with each other.

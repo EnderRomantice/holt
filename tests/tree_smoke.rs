@@ -769,20 +769,20 @@ fn stats_reflects_inserts() {
 }
 
 #[test]
-fn compact_on_empty_tree_bumps_compact_times() {
+fn compact_on_empty_tree_skips_noop_rewrite() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let before = tree.stats().unwrap();
     assert_eq!(before.total_compactions, 0);
     tree.compact().unwrap();
     let after = tree.stats().unwrap();
     assert_eq!(
-        after.total_compactions, 1,
-        "one blob compacted once → compact_times = 1"
+        after.total_compactions, 0,
+        "clean root blob must not be rebuilt just to bump compact_times"
     );
 }
 
 #[test]
-fn compact_after_writes_preserves_data_and_bumps_count() {
+fn compact_after_writes_preserves_data_and_skips_clean_blobs() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     for i in 0..32u32 {
         tree.put(format!("k{i:04}").as_bytes(), format!("v-{i}").as_bytes())
@@ -791,15 +791,18 @@ fn compact_after_writes_preserves_data_and_bumps_count() {
     let pre_space = tree.stats().unwrap().total_space_used;
     tree.compact().unwrap();
     let post = tree.stats().unwrap();
-    assert_eq!(post.total_compactions, 1);
+    assert_eq!(
+        post.total_compactions, 0,
+        "pure inserts create no tombstones/free-list garbage, so compact should skip"
+    );
     // Re-read every key — compact must not lose data.
     for i in 0..32u32 {
         let got = tree.get(format!("k{i:04}").as_bytes()).unwrap();
         assert_eq!(got.as_deref(), Some(format!("v-{i}").as_bytes()));
     }
-    // No tombstones yet (no deletes), so compact should not have
-    // grown the blob. Allow equality (no churn to reclaim).
-    assert!(post.total_space_used <= pre_space + 4096);
+    // No tombstones or freed leaf slots yet, so compact should
+    // leave the blob byte accounting untouched.
+    assert_eq!(post.total_space_used, pre_space);
 }
 
 #[test]

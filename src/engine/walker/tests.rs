@@ -6,7 +6,7 @@ use super::cast;
 use super::erase::erase;
 use super::insert::insert;
 use super::lookup::{lookup, lookup_at};
-use super::migrate::{compact_blob, make_blob_from_node};
+use super::migrate::{blob_needs_compaction, compact_blob, make_blob_from_node};
 use super::readers::read_prefix;
 use super::types::LookupResult;
 use super::writers::write_struct_to_slot;
@@ -858,6 +858,47 @@ fn compact_blob_is_noop_on_empty_tree() {
         "empty-tree compact grew unexpectedly: {before} -> {after}",
     );
     assert_eq!(frame.header().blob_guid, guid);
+}
+
+#[test]
+fn blob_needs_compaction_tracks_tombstones() {
+    let (buf_vec, _) = fresh_blob();
+    let mut buf = aligned_from_vec(&buf_vec);
+
+    {
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        assert!(!blob_needs_compaction(frame.as_ref()));
+        let root = frame.header().root_slot;
+        insert(&mut frame, root, b"k", b"v", 1).unwrap();
+        assert!(!blob_needs_compaction(frame.as_ref()));
+        let root = frame.header().root_slot;
+        erase(&mut frame, root, b"k").unwrap();
+        assert!(blob_needs_compaction(frame.as_ref()));
+    }
+
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert!(!blob_needs_compaction(frame.as_ref()));
+}
+
+#[test]
+fn blob_needs_compaction_tracks_freed_node_slots() {
+    let (buf_vec, _) = fresh_blob();
+    let mut buf = aligned_from_vec(&buf_vec);
+    let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+
+    let root = frame.header().root_slot;
+    insert(&mut frame, root, b"k", b"v", 1).unwrap();
+    assert!(!blob_needs_compaction(frame.as_ref()));
+
+    let root = frame.header().root_slot;
+    insert(&mut frame, root, b"k", &[0xAB; 128], 2).unwrap();
+
+    assert_eq!(frame.header().tombstone_leaf_cnt, 0);
+    assert!(
+        blob_needs_compaction(frame.as_ref()),
+        "alloc-fresh same-key updates leave the old leaf slot on a free list"
+    );
 }
 
 #[test]
