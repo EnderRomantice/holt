@@ -1398,6 +1398,10 @@ impl Backend for BufferManager {
         self.backend.flush()
     }
 
+    fn needs_flush(&self) -> bool {
+        self.backend.needs_flush()
+    }
+
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
         if self.is_pending_delete(guid) {
             return Ok(false);

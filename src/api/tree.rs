@@ -951,6 +951,9 @@ impl Tree {
     /// 2. **Per-blob write-through** with CAS-on-seq. The CAS
     ///    retires the dirty entry only if no racing writer bumped
     ///    it; failures stay in `dirty` for the next round.
+    ///    If the snapshot had neither dirty blobs nor pending
+    ///    deletes and the backend reports no outstanding flush
+    ///    work, skip the backend Sync path entirely.
     /// 3. **Pre-delete sync** — `backend.flush` (`sync_data` on
     ///    the data file + persist the manifest) so step 2's
     ///    writes hit stable storage *before* any manifest delete
@@ -1067,6 +1070,16 @@ impl Tree {
         let had_dirty_failure = !dirty_failed.is_empty();
         if had_dirty_failure {
             self.backend.restore_dirty(dirty_failed);
+        }
+
+        if entries.is_empty() && snap_pending.is_empty() && !self.backend.needs_flush() {
+            if let Some(journal) = &self.journal {
+                let _commit = self.commit_gate.enter_checkpoint();
+                if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
+                    journal.truncate()?;
+                }
+            }
+            return Ok(());
         }
 
         // Phase 3: pre-delete sync. Even when some writes failed at

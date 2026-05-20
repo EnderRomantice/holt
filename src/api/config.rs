@@ -26,7 +26,8 @@ pub enum Storage {
     /// `O_DIRECT` and (with the `io-uring` feature enabled) drives
     /// I/O through `io_uring`.
     Persistent {
-        /// Directory holding `blobs.dat` + `manifest.bin` + `journal.wal`.
+        /// Directory holding `blobs.dat`, `manifest.bin`,
+        /// `manifest.log`, and `journal.wal`.
         dir: PathBuf,
     },
     /// In-memory only — volatile, drops on the last `Tree` handle.

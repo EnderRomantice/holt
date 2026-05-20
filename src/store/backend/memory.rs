@@ -85,6 +85,10 @@ impl Backend for MemoryBackend {
         // RAM is durable as long as the process lives.
         Ok(())
     }
+
+    fn needs_flush(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

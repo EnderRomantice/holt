@@ -15,7 +15,7 @@
 //!   subsequent round retries the byte flush.
 
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,7 @@ struct FailpointBackend {
     fail_delete_at: AtomicUsize, // 1-based ordinal; usize::MAX = disarmed
     fail_flush_at: AtomicUsize,
     fail_write_at: AtomicUsize,
+    flush_retry_pending: AtomicBool,
 }
 
 impl FailpointBackend {
@@ -50,6 +51,7 @@ impl FailpointBackend {
             fail_delete_at: AtomicUsize::new(usize::MAX),
             fail_flush_at: AtomicUsize::new(usize::MAX),
             fail_write_at: AtomicUsize::new(usize::MAX),
+            flush_retry_pending: AtomicBool::new(false),
         }
     }
     fn arm_delete(&self, nth: usize) {
@@ -63,6 +65,9 @@ impl FailpointBackend {
     }
     fn delete_count(&self) -> usize {
         self.delete_calls.load(Ordering::SeqCst)
+    }
+    fn flush_count(&self) -> usize {
+        self.flush_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -100,9 +105,17 @@ impl Backend for FailpointBackend {
         let armed = self.fail_flush_at.load(Ordering::SeqCst);
         if n == armed {
             self.fail_flush_at.store(usize::MAX, Ordering::SeqCst);
+            self.flush_retry_pending.store(true, Ordering::SeqCst);
             return Err(failpoint_err("failpoint: flush"));
         }
-        self.inner.flush()
+        let result = self.inner.flush();
+        if result.is_ok() {
+            self.flush_retry_pending.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+    fn needs_flush(&self) -> bool {
+        self.flush_retry_pending.load(Ordering::SeqCst) || self.inner.needs_flush()
     }
     fn has_blob(&self, guid: holt::BlobGuid) -> holt::Result<bool> {
         self.inner.has_blob(guid)
@@ -110,6 +123,30 @@ impl Backend for FailpointBackend {
 }
 
 // ---------- tests ----------
+
+#[test]
+fn clean_checkpoint_skips_backend_flush() {
+    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
+    let fp_dyn: Arc<dyn Backend> = fp.clone();
+    let mut cfg = TreeConfig::memory();
+    cfg.memory_flush_on_write = false;
+    let tree = Tree::open_with_backend(cfg, fp_dyn).unwrap();
+
+    let stats = tree.stats().unwrap();
+    assert_eq!(stats.bm_dirty_count, 0);
+    assert_eq!(stats.bm_pending_delete_count, 0);
+
+    let flushes_before = fp.flush_count();
+    fp.arm_flush(flushes_before + 1);
+
+    tree.checkpoint().unwrap();
+    assert_eq!(
+        fp.flush_count(),
+        flushes_before,
+        "clean checkpoint must not issue a backend flush",
+    );
+}
 
 /// Build a tree on a failpoint-wrapped memory backend and stage
 /// at least one deferred delete in the BM's `pending_deletes`
@@ -428,6 +465,48 @@ fn bg_checkpointer_recovers_from_transient_failure() {
         assert!(
             Instant::now() < deadline,
             "bg checkpointer didn't recover from failpoint (dirty_count = {dirty})",
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn bg_checkpointer_retries_sync_after_dirty_retired() {
+    // Regression for a background-only hole: a write-through batch
+    // can retire the dirty entry, then the following backend Sync
+    // can fail. The next round still has to retry Sync even though
+    // dirty/pending are now both empty.
+    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
+    let fp_clone: Arc<dyn Backend> = fp.clone();
+
+    let mut cfg = TreeConfig::memory();
+    cfg.memory_flush_on_write = false;
+    cfg.checkpoint = CheckpointConfig {
+        enabled: true,
+        idle_interval: Duration::from_millis(10),
+        dirty_blob_threshold: 1,
+        auto_merge: false,
+        ..CheckpointConfig::default()
+    };
+    let tree = Tree::open_with_backend(cfg, fp_clone).unwrap();
+
+    let flushes_pre = fp.flush_count();
+    fp.arm_flush(flushes_pre + 1);
+    tree.put(b"k1", b"v1").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let dirty = tree.stats().unwrap().bm_dirty_count;
+        if dirty == 0 && !fp.needs_flush() && fp.flush_count() >= flushes_pre + 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bg checkpointer did not retry Sync after dirty retired \
+             (dirty={dirty}, needs_flush={}, flushes={})",
+            fp.needs_flush(),
+            fp.flush_count(),
         );
         std::thread::sleep(Duration::from_millis(20));
     }

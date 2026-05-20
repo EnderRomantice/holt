@@ -78,6 +78,14 @@ pub trait Backend: Send + Sync {
     /// Wait until every previously-returned write is durable.
     fn flush(&self) -> Result<()>;
 
+    /// Conservative hint for callers that want to skip a no-op
+    /// flush. Backends should return `true` whenever a prior
+    /// returned write, delete, or metadata update still needs
+    /// [`Self::flush`] to make it durable.
+    fn needs_flush(&self) -> bool {
+        true
+    }
+
     /// `true` iff `guid` exists. Default impl scans `list_blobs`.
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.list_blobs().map(|v| v.contains(&guid))

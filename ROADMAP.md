@@ -165,30 +165,48 @@ The background checkpointer already has planner / I/O / eviction
 threads. v0.3 makes the I/O side worth that structure:
 
 - Submit dirty blobs as batches, not one synchronous write at a
-  time.
-- On Linux, upgrade the `io_uring` path from
-  `submit_and_wait(1)` to a real queue: larger ring depth,
-  batched SQEs, CQE polling, fixed file, registered aligned
-  buffers, and optional `SQPOLL` / `IOPOLL` for direct NVMe.
-- Keep macOS on `F_NOCACHE` + `pwrite`, but keep the abstraction
-  shaped around batched writes so Linux is not held back.
-- Stop letting manifest persistence dominate checkpoint rounds:
-  add slot reuse first, then evaluate an append-only manifest log
-  if full rewrite shows up in profiles.
+  time: `Backend::write_blobs` is the checkpoint write-through
+  primitive.
+- The default Unix backend sorts and coalesces slot-contiguous
+  512 KB blob writes with `pwritev`; Linux `io_uring` keeps
+  ring-depth batched SQE submission with fixed-file registration.
+- Next Linux-only step: registered aligned buffers and optional
+  `SQPOLL` / `IOPOLL` for direct NVMe.
+- Manifest persistence now uses a base snapshot plus append-only
+  `manifest.log` set/delete deltas. Checkpoint rounds append and
+  fsync only the current delta batch; full `manifest.bin`
+  rewrites happen only as log compaction. Deleted slots become
+  reusable only after the manifest delta is durable, and reopen
+  reconstructs reusable slots from final manifest holes using
+  compact ranges rather than expanding sparse high-water files
+  into one `u64` per free slot.
+- Backends expose a conservative `needs_flush` hint. Clean manual
+  checkpoints and background idle rounds skip the data-file Sync
+  only when the backend has no outstanding data or manifest work,
+  so a previous failed Sync still forces the next retry.
+- `tests/bench_manifest_checkpoint.rs` isolates this path with
+  path-shaped insert/delete/compact/checkpoint rounds and reports
+  checkpoint latency percentiles plus manifest/WAL/data sizes.
 
 ### P3 — CPU hot-path work
 
-- Remove per-op key padding allocation. Replace `pad_key` with a
-  virtual terminator or a small-stack key view.
-- Make same-key leaf comparison borrow the stored key directly;
-  avoid allocating a `Vec` just to compare.
-- Push SIMD beyond Node16 where profiles justify it: prefix
-  compare, Node48 index scan, Node256 child scan, CRC32, and
-  copy/repack loops.
-- Keep node bodies packed and cache-line friendly. Avoid object
-  indirection or heap nodes on the hot path.
-- Use PGO/LTO as a release profile, not as a substitute for
-  simpler branch structure.
+Most of the structural CPU hot path is already in place:
+
+- `SearchKey` uses a virtual terminator, so point lookups and
+  mutations no longer allocate a padded key per operation.
+- Same-key insert/delete comparison borrows the stored leaf key
+  directly. The API allocates only when it must return the old
+  value or materialise split-prefix bytes.
+- SIMD is already used for Node16 byte search, longest-common
+  prefix, Node48 child scans, and Node256 child scans. CRC32 uses
+  `crc32fast`.
+- Node bodies stay packed in 512 KB blob frames; the hot path does
+  not allocate heap node objects or chase per-node boxes.
+
+Remaining P3 work should be profile-driven only: simplify
+branches that show up in the flamegraph, then consider targeted
+SIMD/copy-repack kernels where profiles prove the scalar path is
+still material.
 
 ### P4 — Large-tree shape control
 
@@ -205,9 +223,11 @@ threads. v0.3 makes the I/O side worth that structure:
   foreground writers through the atomic `maintenance_gate`; the
   remaining large-tree work is policy quality (when to
   split/merge/rebalance), not basic safety.
-- Add targeted benchmarks for skewed path prefixes, hot
-  directories, delete-heavy churn, and working sets larger than
-  the buffer pool.
+- Targeted large-tree shape probe is in
+  `tests/bench_large_tree_shape.rs`: skewed prefixes, hot
+  directories, delete-heavy churn, and a tiny-buffer-pool
+  persistent read probe report blob count, space/gap/tombstones,
+  spillovers, merges, and blob-hop counters.
 
 ### Deferred until after the performance core
 

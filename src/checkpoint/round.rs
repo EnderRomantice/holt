@@ -151,8 +151,12 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // whose `backend.delete_blob` or trailing Sync failed and
     // got restored) was already drained above; check the
     // snapshot's length so we don't bail out on something we
-    // just picked up.
-    if snap.is_empty() && merged == 0 && pending.is_empty() {
+    // just picked up. `needs_flush` covers the other recovery
+    // edge: a prior round may have retired dirty entries after a
+    // successful write-through but failed the following backend
+    // Sync, so there is still durable work even when dirty/pending
+    // are both empty.
+    if snap.is_empty() && merged == 0 && pending.is_empty() && !shared.bm.needs_flush() {
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");

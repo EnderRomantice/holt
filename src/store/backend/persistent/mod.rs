@@ -13,7 +13,10 @@
 //!     blobs.dat      — single packed file, blob N lives at byte
 //!                      offset N * PAGE_SIZE
 //!     manifest.bin   — small file mapping BlobGuid → slot number
-//!                      (full rewrite via tmp+rename on flush)
+//!                      plus `next_slot`; rewritten only when the
+//!                      manifest delta log is compacted
+//!     manifest.log   — append-only set/delete deltas replayed on
+//!                      open; free slots are rebuilt from holes
 //! ```
 //!
 //! Design rationale:
@@ -29,15 +32,19 @@
 //! - **4 KB-aligned I/O** (every offset is a multiple of `PAGE_SIZE`
 //!   = 512 KB, every buffer is [`AlignedBlobBuf`] = 4 KB aligned) so
 //!   `O_DIRECT` accepts every submission without `EINVAL`.
-//! - **Manifest** holds the GUID → slot mapping. Crash-safe via
-//!   atomic rename: writes go to `manifest.bin.tmp` then `rename(2)`.
+//! - **Manifest** holds the GUID → slot mapping. Checkpoint rounds
+//!   append small set/delete deltas to `manifest.log` and fsync it
+//!   instead of rewriting the whole map. When the log grows well
+//!   past the snapshot size it compacts into `manifest.bin` via
+//!   tmp+rename and truncates the log.
 //!
 //! ## I/O backend
 //!
 //! Two code paths share the same `PersistentBackend` struct:
 //!
-//! - **`pread`/`pwrite`** (default): every Unix target, every build
-//!   configuration. Uses `std::os::unix::fs::FileExt`.
+//! - **`pread`/`pwritev`** (default): every Unix target, every build
+//!   configuration. Reads use `FileExt::read_exact_at`; checkpoint
+//!   write batches coalesce slot-contiguous blobs with `pwritev`.
 //! - **`io_uring`** (`cfg(target_os = "linux")` + `feature =
 //!   "io-uring"`): submits one SQE per read/write to a dedicated
 //!   ring owned by the backend. Eliminates the per-syscall entry/
@@ -57,7 +64,10 @@ use std::io::{self, Read, Write};
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    not(all(target_os = "linux", feature = "io-uring"))
+))]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,13 +87,30 @@ use self::uring::UringContext;
 const DATA_FILENAME: &str = "blobs.dat";
 /// Filename of the manifest inside `data_dir`.
 const MANIFEST_FILENAME: &str = "manifest.bin";
+/// Append-only manifest delta log inside `data_dir`.
+const MANIFEST_LOG_FILENAME: &str = "manifest.log";
 /// Filename used as the rename staging target for the manifest.
 const MANIFEST_TMP_FILENAME: &str = "manifest.bin.tmp";
+/// Conservative iovec chunk limit used by the non-uring batch
+/// writer. POSIX guarantees at least 16; mainstream Unix kernels
+/// support 1024, and chunking keeps us below the common cap.
+#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+const PWRITEV_IOV_MAX: usize = 1024;
 
 /// Manifest file magic — recognised on load to refuse bogus files.
 const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// Manifest format version. Bumped on any breaking change.
 const MANIFEST_VERSION: u16 = 1;
+/// Per-record magic for `manifest.log`.
+const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
+const MANIFEST_LOG_TY_SET: u8 = 1;
+const MANIFEST_LOG_TY_DELETE: u8 = 2;
+const MANIFEST_LOG_HEADER_SIZE: usize = 4 + 4 + 1;
+const MANIFEST_LOG_FOOTER_SIZE: usize = 4;
+const MANIFEST_LOG_SET_BODY_SIZE: usize = 16 + 8;
+const MANIFEST_LOG_DELETE_BODY_SIZE: usize = 16;
+const MANIFEST_LOG_MIN_COMPACT_BYTES: u64 = 1024 * 1024;
+const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
 
 /// NVMe-backed, O_DIRECT, single-packed-file blob store.
 ///
@@ -96,9 +123,14 @@ pub struct PersistentBackend {
     data_file: File,
     manifest: RwLock<Manifest>,
     /// Tracks whether `manifest.bin` needs a rewrite. Data-only
-    /// overwrites of existing blobs leave this false, avoiding a
-    /// full tmp+rename manifest cycle on every checkpoint.
+    /// overwrites of existing blobs leave this false, avoiding
+    /// manifest I/O on pure data overwrites.
     manifest_dirty: AtomicBool,
+    /// Tracks returned writes that have not yet survived
+    /// `File::sync_data`. This lets checkpoint avoid a clean
+    /// `sync_data` without skipping a retry after a previous sync
+    /// failure.
+    data_dirty: AtomicBool,
     /// `io_uring` context — present iff Linux + `feature =
     /// "io-uring"`. Held behind a `Mutex` so concurrent callers
     /// serialise on the submission queue; with the single I/O
@@ -111,13 +143,49 @@ pub struct PersistentBackend {
 struct Manifest {
     /// guid → slot index (offset on disk = slot * u64::from(PAGE_SIZE)).
     slots: HashMap<BlobGuid, u64>,
-    /// Next free slot to hand out. Monotonically increasing —
-    /// slot reuse is a follow-up (buffer manager would maintain
-    /// a per-backend free list of slots released by
-    /// `delete_blob`).
+    /// Next never-used slot to hand out when no reusable slot is
+    /// available.
     next_slot: u64,
+    /// Slots whose deletion is durable in the manifest and can be
+    /// safely reused by future writes. Reopen stores contiguous
+    /// holes as ranges so a sparse high-water manifest does not
+    /// expand into one `u64` per free slot.
+    reusable_slots: ReusableSlots,
+    /// Slots removed from `slots` by `delete_blob` but not yet
+    /// durable in `manifest.bin`. They become reusable only after
+    /// `flush` successfully persists the manifest rewrite; reusing
+    /// them earlier could corrupt crash recovery by overwriting a
+    /// slot still referenced by the old on-disk manifest.
+    pending_free_slots: Vec<u64>,
     /// Path to the manifest file (for tmp+rename writes).
     path: PathBuf,
+    /// Path to the append-only manifest delta log.
+    log_path: PathBuf,
+    /// Bytes currently in `manifest.log`, used to decide when a
+    /// full snapshot compaction is worth paying for.
+    log_bytes: u64,
+    /// Ordered set/delete records not yet durable in
+    /// `manifest.log`. The in-memory `slots` map already reflects
+    /// them; this queue is the recovery contract.
+    pending_log: Vec<ManifestDelta>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManifestDelta {
+    Set { guid: BlobGuid, slot: u64 },
+    Delete { guid: BlobGuid },
+}
+
+#[derive(Debug, Default)]
+struct ReusableSlots {
+    singles: Vec<u64>,
+    ranges: Vec<FreeSlotRange>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FreeSlotRange {
+    next: u64,
+    end: u64,
 }
 
 impl PersistentBackend {
@@ -133,6 +201,7 @@ impl PersistentBackend {
 
         let data_path = data_dir.join(DATA_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
+        let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
 
         let custom_flags = {
             #[cfg(target_os = "linux")]
@@ -159,7 +228,7 @@ impl PersistentBackend {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path)?;
+        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         let uring = Mutex::new(UringContext::new(&data_file)?);
@@ -169,6 +238,7 @@ impl PersistentBackend {
             data_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
+            data_dirty: AtomicBool::new(false),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             uring,
         })
@@ -208,9 +278,9 @@ impl PersistentBackend {
         if let Some(&s) = m.slots.get(&guid) {
             return s;
         }
-        let s = m.next_slot;
-        m.next_slot += 1;
+        let s = m.allocate_slot();
         m.slots.insert(guid, s);
+        m.pending_log.push(ManifestDelta::Set { guid, slot: s });
         self.manifest_dirty.store(true, Ordering::Release);
         s
     }
@@ -224,9 +294,9 @@ impl PersistentBackend {
                 out.push(s);
                 continue;
             }
-            let s = m.next_slot;
-            m.next_slot += 1;
+            let s = m.allocate_slot();
             m.slots.insert(guid, s);
+            m.pending_log.push(ManifestDelta::Set { guid, slot: s });
             dirty = true;
             out.push(s);
         }
@@ -277,11 +347,83 @@ impl PersistentBackend {
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
     fn pwrite_many_at(&self, writes: &[(u64, &[u8])]) -> Result<()> {
-        for (offset, src) in writes {
-            self.data_file.write_all_at(src, *offset)?;
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        let mut ordered: Vec<_> = writes
+            .iter()
+            .enumerate()
+            .map(|(order, (offset, src))| OrderedWrite {
+                offset: *offset,
+                src,
+                order,
+            })
+            .collect();
+        ordered.sort_by(|a, b| a.offset.cmp(&b.offset).then(a.order.cmp(&b.order)));
+
+        let mut start = 0usize;
+        while start < ordered.len() {
+            let mut end = start + 1;
+            let mut next_offset = ordered[start].offset + ordered[start].src.len() as u64;
+            while end < ordered.len() && ordered[end].offset == next_offset {
+                next_offset += ordered[end].src.len() as u64;
+                end += 1;
+            }
+            self.pwritev_contiguous(&ordered[start..end])?;
+            start = end;
         }
         Ok(())
     }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn pwritev_contiguous(&self, writes: &[OrderedWrite<'_>]) -> Result<()> {
+        debug_assert!(!writes.is_empty());
+        for chunk in writes.chunks(PWRITEV_IOV_MAX) {
+            let mut expected = 0usize;
+            let mut iovecs = Vec::with_capacity(chunk.len());
+            for write in chunk {
+                expected += write.src.len();
+                iovecs.push(libc::iovec {
+                    iov_base: write.src.as_ptr() as *mut libc::c_void,
+                    iov_len: write.src.len(),
+                });
+            }
+            let offset = chunk[0].offset as libc::off_t;
+            let written = loop {
+                let written = unsafe {
+                    libc::pwritev(
+                        self.data_file.as_raw_fd(),
+                        iovecs.as_ptr(),
+                        iovecs.len() as libc::c_int,
+                        offset,
+                    )
+                };
+                if written >= 0 {
+                    break written as usize;
+                }
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Error::BackendIo(err));
+            };
+            if written != expected {
+                return Err(Error::BackendIo(io::Error::other(format!(
+                    "short pwritev: wrote {written} of {expected}"
+                ))));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+#[derive(Clone, Copy)]
+struct OrderedWrite<'a> {
+    offset: u64,
+    src: &'a [u8],
+    order: usize,
 }
 
 impl Backend for PersistentBackend {
@@ -294,7 +436,12 @@ impl Backend for PersistentBackend {
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let slot = self.assign_slot(guid);
         let offset = slot * u64::from(PAGE_SIZE);
-        self.pwrite_at(offset, src.as_slice())?;
+        // Bracket the syscall so a racing flush cannot clear the
+        // flag before this write has actually reached the fd.
+        self.data_dirty.store(true, Ordering::Release);
+        let result = self.pwrite_at(offset, src.as_slice());
+        self.data_dirty.store(true, Ordering::Release);
+        result?;
         Ok(())
     }
 
@@ -307,18 +454,22 @@ impl Backend for PersistentBackend {
         for ((_, src), slot) in writes.iter().zip(slots) {
             io.push((slot * u64::from(PAGE_SIZE), src.as_slice()));
         }
-        self.pwrite_many_at(&io)
+        // See `write_blob`: keep the dirty hint conservative
+        // across concurrent flush attempts and partial I/O errors.
+        self.data_dirty.store(true, Ordering::Release);
+        let result = self.pwrite_many_at(&io);
+        self.data_dirty.store(true, Ordering::Release);
+        result?;
+        Ok(())
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let mut m = self.manifest.write().unwrap();
-        if m.slots.remove(&guid).is_some() {
+        if let Some(slot) = m.slots.remove(&guid) {
+            m.pending_free_slots.push(slot);
+            m.pending_log.push(ManifestDelta::Delete { guid });
             self.manifest_dirty.store(true, Ordering::Release);
         }
-        // TODO: feed the released slot into a per-backend free
-        // list so `assign_slot` can reuse it. Today the slot
-        // leaks — the data on disk stays as garbage until a
-        // future compaction overwrites it.
         Ok(())
     }
 
@@ -332,33 +483,58 @@ impl Backend for PersistentBackend {
         // promotes any new slot. Otherwise a crash could leave the
         // manifest pointing at a slot whose data is still in NVMe's
         // write cache.
-        self.data_file.sync_data()?;
+        if self.data_dirty.swap(false, Ordering::AcqRel) {
+            if let Err(e) = self.data_file.sync_data() {
+                self.data_dirty.store(true, Ordering::Release);
+                return Err(Error::BackendIo(e));
+            }
+        }
 
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
-            let m = self.manifest.read().unwrap();
-            if let Err(e) = m.persist(&self.data_dir) {
+            let mut m = self.manifest.write().unwrap();
+            if let Err(e) = m.persist_pending_deltas(&self.data_dir) {
                 self.manifest_dirty.store(true, Ordering::Release);
                 return Err(e);
             }
+            m.pending_log.clear();
+            m.publish_pending_free_slots();
         }
         Ok(())
+    }
+
+    fn needs_flush(&self) -> bool {
+        self.data_dirty.load(Ordering::Acquire) || self.manifest_dirty.load(Ordering::Acquire)
     }
 }
 
 impl Manifest {
-    fn load_or_create(path: &Path) -> Result<Self> {
-        match File::open(path) {
-            Ok(mut f) => Self::parse(&mut f, path.to_path_buf()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
-                slots: HashMap::new(),
-                next_slot: 0,
-                path: path.to_path_buf(),
-            }),
-            Err(e) => Err(Error::BackendIo(e)),
+    fn load_or_create(path: &Path, log_path: &Path) -> Result<Self> {
+        let (mut slots, mut next_slot) = match File::open(path) {
+            Ok(mut f) => Self::parse_snapshot(&mut f)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
+            Err(e) => return Err(Error::BackendIo(e)),
+        };
+
+        let replay = Self::replay_log(log_path, &mut slots, &mut next_slot)?;
+        if replay.valid_bytes < replay.file_bytes {
+            truncate_manifest_log(log_path, replay.valid_bytes)?;
         }
+        let used_slots: Vec<_> = slots.values().copied().collect();
+        let reusable_slots = ReusableSlots::reconstruct(next_slot, &used_slots)?;
+
+        Ok(Self {
+            slots,
+            next_slot,
+            reusable_slots,
+            pending_free_slots: Vec::new(),
+            path: path.to_path_buf(),
+            log_path: log_path.to_path_buf(),
+            log_bytes: replay.valid_bytes,
+            pending_log: Vec::new(),
+        })
     }
 
-    fn parse(f: &mut File, path: PathBuf) -> Result<Self> {
+    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, u64>, u64)> {
         // Header: magic 8 + version 2 + count 4 + reserved 2 + next_slot 8 = 24 B.
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
@@ -374,23 +550,76 @@ impl Manifest {
         let next_slot = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
 
         let mut slots = HashMap::with_capacity(count);
+        let mut used_slots = Vec::with_capacity(count);
         let mut entry = [0u8; 24];
         for _ in 0..count {
             f.read_exact(&mut entry)?;
             let mut g: BlobGuid = [0u8; 16];
             g.copy_from_slice(&entry[..16]);
             let s = u64::from_le_bytes(entry[16..24].try_into().unwrap());
-            slots.insert(g, s);
+            if slots.insert(g, s).is_some() {
+                return Err(Error::node_corrupt(
+                    "PersistentBackend::Manifest::duplicate guid",
+                ));
+            }
+            used_slots.push(s);
         }
+        ReusableSlots::reconstruct(next_slot, &used_slots)?;
+        Ok((slots, next_slot))
+    }
 
-        Ok(Self {
-            slots,
-            next_slot,
-            path,
+    fn allocate_slot(&mut self) -> u64 {
+        self.reusable_slots.pop().unwrap_or_else(|| {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            slot
         })
     }
 
-    fn persist(&self, data_dir: &Path) -> Result<()> {
+    fn publish_pending_free_slots(&mut self) {
+        if self.pending_free_slots.is_empty() {
+            return;
+        }
+        self.reusable_slots
+            .append_slots(&mut self.pending_free_slots);
+    }
+
+    fn persist_pending_deltas(&mut self, data_dir: &Path) -> Result<()> {
+        if self.pending_log.is_empty() {
+            return Ok(());
+        }
+
+        let log_created = !self.log_path.exists();
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)?;
+        let mut buf = Vec::with_capacity(self.pending_log.len() * 40);
+        for delta in &self.pending_log {
+            encode_manifest_delta(*delta, &mut buf)?;
+        }
+        f.write_all(&buf)?;
+        f.sync_data()?;
+        drop(f);
+        if log_created {
+            sync_dir(data_dir)?;
+        }
+
+        self.log_bytes = self.log_bytes.saturating_add(buf.len() as u64);
+        if self.should_compact_log() {
+            self.persist_snapshot(data_dir)?;
+            self.truncate_log()?;
+        }
+        Ok(())
+    }
+
+    fn should_compact_log(&self) -> bool {
+        let snapshot_bytes = 24u64.saturating_add((self.slots.len() as u64).saturating_mul(24));
+        self.log_bytes >= MANIFEST_LOG_MIN_COMPACT_BYTES
+            && self.log_bytes >= snapshot_bytes.saturating_mul(MANIFEST_LOG_COMPACT_RATIO)
+    }
+
+    fn persist_snapshot(&self, data_dir: &Path) -> Result<()> {
         let tmp_path = data_dir.join(MANIFEST_TMP_FILENAME);
         let final_path = &self.path;
 
@@ -422,9 +651,237 @@ impl Manifest {
         std::fs::rename(&tmp_path, final_path)?;
         // Sync the parent directory so the rename itself is durable
         // (required by POSIX; ext4/xfs honour it).
-        let dir = File::open(data_dir)?;
-        dir.sync_all()?;
+        sync_dir(data_dir)?;
         Ok(())
+    }
+
+    fn truncate_log(&mut self) -> Result<()> {
+        match OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.log_path)
+        {
+            Ok(f) => {
+                f.sync_data()?;
+                self.log_bytes = 0;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.log_bytes = 0;
+                Ok(())
+            }
+            Err(e) => Err(Error::BackendIo(e)),
+        }
+    }
+
+    fn replay_log(
+        log_path: &Path,
+        slots: &mut HashMap<BlobGuid, u64>,
+        next_slot: &mut u64,
+    ) -> Result<ManifestLogReplay> {
+        let mut f = match File::open(log_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(ManifestLogReplay {
+                    file_bytes: 0,
+                    valid_bytes: 0,
+                });
+            }
+            Err(e) => return Err(Error::BackendIo(e)),
+        };
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        let mut offset = 0usize;
+        let mut valid_offset = 0usize;
+        while offset < buf.len() {
+            let remaining = buf.len() - offset;
+            if remaining < MANIFEST_LOG_HEADER_SIZE {
+                break;
+            }
+            let record_start = offset;
+            if buf[offset..offset + 4] != MANIFEST_LOG_MAGIC {
+                return Err(Error::node_corrupt("PersistentBackend::ManifestLog::magic"));
+            }
+            offset += 4;
+            let body_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let ty = buf[offset];
+            offset += 1;
+            let record_len = MANIFEST_LOG_HEADER_SIZE
+                .saturating_add(body_len)
+                .saturating_add(MANIFEST_LOG_FOOTER_SIZE);
+            if buf.len() - record_start < record_len {
+                break;
+            }
+            let expected_crc = u32::from_le_bytes(
+                buf[offset + body_len..offset + body_len + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let actual_crc = crc32fast::hash(&buf[record_start..offset + body_len]);
+            if expected_crc != actual_crc {
+                return Err(Error::node_corrupt("PersistentBackend::ManifestLog::crc"));
+            }
+            let body = &buf[offset..offset + body_len];
+            match ty {
+                MANIFEST_LOG_TY_SET => {
+                    if body.len() != MANIFEST_LOG_SET_BODY_SIZE {
+                        return Err(Error::node_corrupt(
+                            "PersistentBackend::ManifestLog::set length",
+                        ));
+                    }
+                    let mut guid = [0u8; 16];
+                    guid.copy_from_slice(&body[..16]);
+                    let slot = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                    slots.insert(guid, slot);
+                    *next_slot = (*next_slot).max(slot.saturating_add(1));
+                }
+                MANIFEST_LOG_TY_DELETE => {
+                    if body.len() != MANIFEST_LOG_DELETE_BODY_SIZE {
+                        return Err(Error::node_corrupt(
+                            "PersistentBackend::ManifestLog::delete length",
+                        ));
+                    }
+                    let mut guid = [0u8; 16];
+                    guid.copy_from_slice(body);
+                    slots.remove(&guid);
+                }
+                _ => {
+                    return Err(Error::node_corrupt(
+                        "PersistentBackend::ManifestLog::unknown op",
+                    ));
+                }
+            }
+            offset = record_start + record_len;
+            valid_offset = offset;
+        }
+        Ok(ManifestLogReplay {
+            file_bytes: buf.len() as u64,
+            valid_bytes: valid_offset as u64,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManifestLogReplay {
+    file_bytes: u64,
+    valid_bytes: u64,
+}
+
+fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> {
+    let start = out.len();
+    out.extend_from_slice(&MANIFEST_LOG_MAGIC);
+    let len_pos = out.len();
+    out.extend_from_slice(&[0u8; 4]);
+    match delta {
+        ManifestDelta::Set { guid, slot } => {
+            out.push(MANIFEST_LOG_TY_SET);
+            out.extend_from_slice(&guid);
+            out.extend_from_slice(&slot.to_le_bytes());
+        }
+        ManifestDelta::Delete { guid } => {
+            out.push(MANIFEST_LOG_TY_DELETE);
+            out.extend_from_slice(&guid);
+        }
+    }
+    let body_len = out.len() - start - MANIFEST_LOG_HEADER_SIZE;
+    let body_len = u32::try_from(body_len)
+        .map_err(|_| Error::BackendIo(io::Error::other("manifest delta record too large")))?;
+    out[len_pos..len_pos + 4].copy_from_slice(&body_len.to_le_bytes());
+    let crc = crc32fast::hash(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    let dir = File::open(path)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
+fn truncate_manifest_log(path: &Path, valid_bytes: u64) -> Result<()> {
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_len(valid_bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+impl ReusableSlots {
+    fn pop(&mut self) -> Option<u64> {
+        if let Some(slot) = self.singles.pop() {
+            return Some(slot);
+        }
+
+        let idx = self.ranges.len().checked_sub(1)?;
+        let (slot, exhausted) = {
+            let range = &mut self.ranges[idx];
+            let slot = range.next;
+            let exhausted = range.next == range.end;
+            if !exhausted {
+                range.next += 1;
+            }
+            (slot, exhausted)
+        };
+        if exhausted {
+            self.ranges.pop();
+        }
+        Some(slot)
+    }
+
+    fn append_slots(&mut self, slots: &mut Vec<u64>) {
+        self.singles.append(slots);
+    }
+
+    fn reconstruct(next_slot: u64, used_slots: &[u64]) -> Result<Self> {
+        let mut sorted = used_slots.to_vec();
+        sorted.sort_unstable();
+
+        let mut previous = None;
+        let mut lower = 0u64;
+        let mut ranges = Vec::new();
+        for &slot in &sorted {
+            if slot >= next_slot {
+                return Err(Error::node_corrupt(
+                    "PersistentBackend::Manifest::slot past next_slot",
+                ));
+            }
+            if previous == Some(slot) {
+                return Err(Error::node_corrupt(
+                    "PersistentBackend::Manifest::duplicate slot",
+                ));
+            }
+            if lower < slot {
+                ranges.push(FreeSlotRange {
+                    next: lower,
+                    end: slot - 1,
+                });
+            }
+            lower = slot + 1;
+            previous = Some(slot);
+        }
+
+        if lower < next_slot {
+            ranges.push(FreeSlotRange {
+                next: lower,
+                end: next_slot - 1,
+            });
+        }
+        ranges.reverse();
+
+        Ok(Self {
+            singles: Vec::new(),
+            ranges,
+        })
+    }
+
+    #[cfg(test)]
+    fn single_count(&self) -> usize {
+        self.singles.len()
+    }
+
+    #[cfg(test)]
+    fn range_count(&self) -> usize {
+        self.ranges.len()
     }
 }
 
@@ -500,6 +957,269 @@ mod tests {
         assert_eq!(b.len(), 1);
         let mut dst = AlignedBlobBuf::zeroed();
         b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 2);
+    }
+
+    #[test]
+    fn needs_flush_tracks_data_and_manifest_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g: BlobGuid = [0x44; 16];
+
+        assert!(!b.needs_flush());
+        b.write_blob(g, &buf_with(1)).unwrap();
+        assert!(b.needs_flush());
+        b.flush().unwrap();
+        assert!(!b.needs_flush());
+
+        b.delete_blob(g).unwrap();
+        assert!(b.needs_flush());
+        b.flush().unwrap();
+        assert!(!b.needs_flush());
+    }
+
+    #[test]
+    fn deleted_slot_is_reused_only_after_manifest_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g1: BlobGuid = [0x11; 16];
+        let g2: BlobGuid = [0x22; 16];
+        let g3: BlobGuid = [0x33; 16];
+
+        b.write_blob(g1, &buf_with(1)).unwrap();
+        b.flush().unwrap();
+        assert_eq!(b.offset_of(g1).unwrap(), 0);
+
+        b.delete_blob(g1).unwrap();
+        b.write_blob(g2, &buf_with(2)).unwrap();
+        assert_eq!(
+            b.offset_of(g2).unwrap(),
+            u64::from(PAGE_SIZE),
+            "slot removed from manifest but not flushed yet must not be reused",
+        );
+
+        b.flush().unwrap();
+        b.write_blob(g3, &buf_with(3)).unwrap();
+        assert_eq!(
+            b.offset_of(g3).unwrap(),
+            0,
+            "flushed manifest deletion makes slot reusable",
+        );
+
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g2, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 2);
+        b.read_blob(g3, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 3);
+    }
+
+    #[test]
+    fn reusable_slots_are_reconstructed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let g1: BlobGuid = [0xA1; 16];
+        let g2: BlobGuid = [0xA2; 16];
+        let g3: BlobGuid = [0xA3; 16];
+        let g4: BlobGuid = [0xA4; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g1, &buf_with(1)).unwrap();
+            b.write_blob(g2, &buf_with(2)).unwrap();
+            b.write_blob(g3, &buf_with(3)).unwrap();
+            b.flush().unwrap();
+            assert_eq!(b.offset_of(g2).unwrap(), u64::from(PAGE_SIZE));
+
+            b.delete_blob(g2).unwrap();
+            b.flush().unwrap();
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        b.write_blob(g4, &buf_with(4)).unwrap();
+        assert_eq!(
+            b.offset_of(g4).unwrap(),
+            u64::from(PAGE_SIZE),
+            "reopen should rebuild free slot list from manifest holes",
+        );
+
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g1, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 1);
+        b.read_blob(g3, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 3);
+        b.read_blob(g4, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 4);
+    }
+
+    #[test]
+    fn reusable_slots_reconstruct_sparse_manifest_as_ranges() {
+        let mut slots = ReusableSlots::reconstruct(1_000_000, &[0, 999_999]).unwrap();
+
+        assert_eq!(slots.single_count(), 0);
+        assert_eq!(slots.range_count(), 1);
+        assert_eq!(slots.pop(), Some(1));
+        assert_eq!(slots.pop(), Some(2));
+    }
+
+    #[test]
+    fn batch_write_preserves_duplicate_guid_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g1: BlobGuid = [0xB1; 16];
+        let g2: BlobGuid = [0xB2; 16];
+        let one = buf_with(1);
+        let two = buf_with(2);
+        let three = buf_with(3);
+
+        b.write_blobs(&[(g1, &one), (g1, &two), (g2, &three)])
+            .unwrap();
+        b.flush().unwrap();
+
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g1, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 2);
+        b.read_blob(g2, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 3);
+    }
+
+    #[test]
+    fn manifest_delta_log_replays_without_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let g: BlobGuid = [0xC1; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g, &buf_with(9)).unwrap();
+            b.flush().unwrap();
+            assert!(dir.path().join(MANIFEST_LOG_FILENAME).exists());
+            assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 9);
+    }
+
+    #[test]
+    fn manifest_delta_log_ignores_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let g: BlobGuid = [0xC2; 16];
+        let g2: BlobGuid = [0xC5; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g, &buf_with(10)).unwrap();
+            b.flush().unwrap();
+        }
+        {
+            let mut log = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(MANIFEST_LOG_FILENAME))
+                .unwrap();
+            log.write_all(&MANIFEST_LOG_MAGIC[..3]).unwrap();
+            log.sync_data().unwrap();
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 10);
+        b.write_blob(g2, &buf_with(11)).unwrap();
+        b.flush().unwrap();
+        drop(b);
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 10);
+        b.read_blob(g2, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 11);
+    }
+
+    #[test]
+    fn manifest_snapshot_plus_old_log_replay_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let g1: BlobGuid = [0xC3; 16];
+        let g2: BlobGuid = [0xC4; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g1, &buf_with(1)).unwrap();
+            b.flush().unwrap();
+            b.delete_blob(g1).unwrap();
+            b.flush().unwrap();
+            b.write_blob(g2, &buf_with(2)).unwrap();
+            b.flush().unwrap();
+
+            // Simulate the crash-safe middle of log compaction:
+            // the new snapshot is durable, but the old log still
+            // exists. Replaying that old log over the snapshot
+            // must be idempotent and end at the same map.
+            b.manifest
+                .read()
+                .unwrap()
+                .persist_snapshot(dir.path())
+                .unwrap();
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        assert_eq!(b.offset_of(g2).unwrap(), 0);
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g2, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 2);
+        assert!(b.read_blob(g1, &mut dst).is_err());
+    }
+
+    #[test]
+    fn manifest_delta_log_compacts_to_snapshot_when_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let g1: BlobGuid = [0xC6; 16];
+        let g2: BlobGuid = [0xC7; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g1, &buf_with(1)).unwrap();
+            b.flush().unwrap();
+            b.manifest.write().unwrap().log_bytes = MANIFEST_LOG_MIN_COMPACT_BYTES;
+
+            b.write_blob(g2, &buf_with(2)).unwrap();
+            b.flush().unwrap();
+            assert!(dir.path().join(MANIFEST_FILENAME).exists());
+            assert_eq!(
+                std::fs::metadata(dir.path().join(MANIFEST_LOG_FILENAME))
+                    .unwrap()
+                    .len(),
+                0,
+            );
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g1, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 1);
+        b.read_blob(g2, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 2);
     }
 

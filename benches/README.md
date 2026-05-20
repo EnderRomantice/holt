@@ -49,6 +49,22 @@ It spins 4 writer threads + a 5 ms-cadence background
 checkpointer + concurrent `Tree::compact()` calls triggered by a
 put counter, and tracks every `put` latency via `hdrhistogram`.
 
+A fourth probe — **large-tree shape quality** — lives in
+`tests/bench_large_tree_shape.rs`. It is a holt-only regression
+bench for skewed prefixes, hot directories, delete-heavy churn,
+and working sets larger than a tiny buffer pool. It prints
+`blob_count`, space/gap/tombstone totals, spillovers, merges, and
+average/max blob hops so split-policy changes can be judged before
+running the full RocksDB/SQLite comparator sweep.
+
+A fifth probe — **manifest/checkpoint pressure** — lives in
+`tests/bench_manifest_checkpoint.rs`. It repeatedly inserts
+path-shaped keys, deletes most of each round, compacts, and
+checkpoints. It reports checkpoint percentiles plus
+`manifest.bin`, `manifest.log`, WAL, and data-file sizes so the
+append-only manifest path can be tracked separately from point
+lookup/insert microbenches.
+
 ## Running
 
 ```sh
@@ -69,6 +85,25 @@ cargo bench --bench main -- _list
 
 # p95/p99 under bg checkpoint + compact interference (Group C):
 cargo test --release --test bench_contention_p95 \
+    -- --ignored --nocapture
+
+# Large-tree shape probe (holt only):
+cargo test --release --test bench_large_tree_shape \
+    -- --ignored --nocapture
+
+# Short shape smoke:
+HOLT_SHAPE_BENCH_KEYS=5000 \
+cargo test --release --test bench_large_tree_shape \
+    -- --ignored --nocapture
+
+# Manifest/checkpoint pressure:
+cargo test --release --test bench_manifest_checkpoint \
+    -- --ignored --nocapture
+
+# Short manifest/checkpoint smoke:
+HOLT_MANIFEST_BENCH_ROUNDS=3 \
+HOLT_MANIFEST_BENCH_KEYS_PER_ROUND=1000 \
+cargo test --release --test bench_manifest_checkpoint \
     -- --ignored --nocapture
 ```
 
