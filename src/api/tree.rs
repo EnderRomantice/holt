@@ -15,16 +15,22 @@
 //! blob behind a `HybridLatch` (LeanStore-style 3-mode latch)
 //! wrapping an `UnsafeCell<AlignedBlobBuf>`:
 //!
-//! - **Reads** (`get`) walk every blob in **optimistic** mode —
-//!   wait-free, no real lock taken. The walker snapshots the
+//! - **Reads** (`get`) take the shared maintenance gate, then walk
+//!   every blob in **optimistic** mode. The walker snapshots the
 //!   latch version, reads the buffer, then validates; on a torn
 //!   read it restarts from the root. Readers never block writers
-//!   and writers never block readers.
+//!   and writers never block readers; only structural maintenance
+//!   (`compact` / merge) takes the exclusive side.
 //! - **Writes** (`put` / `delete`) take **exclusive** mode on
 //!   each blob they touch (always starting with the root). This
 //!   serialises concurrent mutators on the same blob without any
 //!   Tree-wide writer mutex; mutations on disjoint child blobs
 //!   can proceed in parallel.
+//! - **Structural maintenance** (`compact` and background merge)
+//!   takes a narrow tree-wide maintenance gate. Normal reads and
+//!   writers take the shared side while they may cross `BlobNode`
+//!   boundaries; blob-local access still relies on per-blob
+//!   optimistic validation.
 //! - **`rename`** is multi-step (lookup probe + erase + insert)
 //!   and must be atomic across all three. It takes the
 //!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
@@ -32,7 +38,7 @@
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
@@ -55,11 +61,12 @@ use super::txn::{BatchOp, TxnBatch};
 ///
 /// ## Concurrency
 ///
-/// - **Reads** (`get`, `range`, `scan_prefix`) run wait-free
-///   against `HybridLatch::read_optimistic` — they capture each
-///   blob's latch version, read the bytes, then `validate()`.
-///   Restarts from the root on a torn read. Never blocks
-///   writers and never block each other.
+/// - **Reads** (`get`, `range`, `scan_prefix`) take the shared
+///   maintenance gate, then run against
+///   `HybridLatch::read_optimistic` — they capture each blob's
+///   latch version, read the bytes, then `validate()`. Restarts
+///   from the root on a torn read. Never blocks foreground writers
+///   and never block each other.
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
 ///   exclusively for the blobs they touch (always the root,
 ///   plus any cross-blob descent target). For persistent trees
@@ -68,6 +75,12 @@ use super::txn::{BatchOp, TxnBatch};
 ///   `Tree::put` body for the W2D-strict protocol. There is
 ///   **no** Tree-wide writer mutex; concurrent writers on
 ///   disjoint blobs do not serialize on each other.
+/// - **Maintenance** (`compact`, background merge) takes the
+///   write side of `maintenance_lock`; foreground reads and
+///   writers take the read side around tree traversal. This
+///   blocks subtree merge/delete while an operation is crossing
+///   blobs, while keeping all ordinary operations mutually
+///   concurrent.
 /// - **`rename`** holds `rename_lock` (a `Mutex<()>` scoped to
 ///   rename only) so its multi-step
 ///   `lookup → erase → insert` appears atomic to other writers.
@@ -92,6 +105,18 @@ pub struct Tree {
     /// `get` never take this lock; they coordinate via the
     /// per-blob `HybridLatch` inside the BM.
     rename_lock: Arc<Mutex<()>>,
+    /// Tree-wide structural-maintenance gate.
+    ///
+    /// Foreground read and mutation paths hold a shared guard while
+    /// they may cross `BlobNode` boundaries. `compact()` and the
+    /// background merge pass hold an exclusive guard before folding
+    /// a child blob back into its parent and queuing the child for
+    /// delete.
+    /// Point reads participate too: per-blob optimistic validation
+    /// handles in-place rewrites, while the maintenance gate keeps
+    /// a merge pass from deleting a child blob after a reader has
+    /// observed the parent `BlobNode` but before it pins the child.
+    maintenance_lock: Arc<RwLock<()>>,
     /// Monotonically-increasing sequence stamped on every record.
     /// On open the tree replays the WAL and resumes at
     /// `highest_seq + 1`.
@@ -254,6 +279,10 @@ impl Tree {
         // shares the pin via `Arc::clone`.
         let root_pin = bm.pin(root_guid)?;
 
+        // Shared structural gate for foreground writers, manual
+        // compact, and the background merge pass.
+        let maintenance_lock = Arc::new(RwLock::new(()));
+
         // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
         // configs, so the `Option` chain stays clean.
@@ -261,6 +290,7 @@ impl Tree {
             Arc::clone(&bm),
             wal.clone(),
             root_guid,
+            Arc::clone(&maintenance_lock),
             cfg.checkpoint.clone(),
         )
         .map(Arc::new);
@@ -271,6 +301,7 @@ impl Tree {
             root_guid,
             root_pin,
             rename_lock: Arc::new(Mutex::new(())),
+            maintenance_lock,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             wal,
             checkpointer,
@@ -294,11 +325,12 @@ impl Tree {
 
     /// Zero-copy lookup with a user-supplied consumer closure.
     ///
-    /// **Zero-copy and lock-free against the writer lock**: pins
-    /// each blob via the `BufferManager` and walks the cached
-    /// buffer under a shared `RwLock` read guard. N readers on
-    /// different blobs progress in parallel; readers on the same
-    /// blob also progress in parallel via the read-half.
+    /// **Zero-copy with optimistic blob reads**: pins each blob via
+    /// the `BufferManager` and walks the cached buffer under the
+    /// blob's optimistic latch. N readers on different blobs
+    /// progress in parallel; readers on the same blob also progress
+    /// in parallel without a blocking per-blob read lock. The shared
+    /// maintenance gate only excludes compact/merge.
     ///
     /// `consume` is invoked at most once on the live cache-pin
     /// slice when the key is present and the optimistic snapshot
@@ -328,6 +360,7 @@ impl Tree {
     where
         F: FnMut(&[u8]) -> R,
     {
+        let _maintenance = self.maintenance_lock.read().unwrap();
         let padded = pad_key(key);
         engine::lookup_multi_with(&self.backend, &self.root_pin, &padded, consume)
     }
@@ -385,6 +418,7 @@ impl Tree {
     /// `wal.flush` makes it durable). Concurrent writers serialise
     /// on `wal.lock` — that's the intentional barrier.
     fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
+        let _maintenance = self.maintenance_lock.read().unwrap();
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -469,6 +503,7 @@ impl Tree {
     /// `EraseOutcome.mutated` is the authoritative "anything
     /// happened" signal, independent of `EraseOutcome.previous`.
     fn delete_inner(&self, key: &[u8], wants_prev: bool) -> Result<engine::EraseOutcome> {
+        let _maintenance = self.maintenance_lock.read().unwrap();
         let padded = pad_key(key);
         // Pre-allocate the seq before the walker descends so any
         // child blob the walker touches can `mark_dirty(child, seq)`
@@ -534,6 +569,7 @@ impl Tree {
     /// `RenameObject` WAL record so its erase + insert phases
     /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
+        let _maintenance = self.maintenance_lock.read().unwrap();
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
 
@@ -672,6 +708,7 @@ impl Tree {
     }
 
     fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<()> {
+        let _maintenance = self.maintenance_lock.read().unwrap();
         let count = pending.len() as u64;
         // Serialise batches against renames + other batches so the
         // ops here see a coherent rename-free view across the
@@ -820,8 +857,9 @@ impl Tree {
     /// lex key order.
     ///
     /// Best-effort snapshot semantics: each iterator step
-    /// re-acquires a shared read guard on its current blob; the
-    /// iterator does NOT hold a write barrier across calls.
+    /// re-acquires the shared maintenance gate plus a shared read
+    /// guard on its current blob; the iterator does NOT hold a
+    /// write barrier across calls.
     /// Concurrent mutations between steps may cause a leaf to be
     /// skipped or visited twice (the path stack is raw
     /// `(blob_guid, slot)` pairs, mirroring the upstream
@@ -830,7 +868,11 @@ impl Tree {
     /// (e.g., call [`Tree::checkpoint`] and don't mutate during
     /// traversal).
     pub fn range(&self) -> RangeBuilder {
-        RangeBuilder::new(Arc::clone(&self.backend), self.root_guid)
+        RangeBuilder::new(
+            Arc::clone(&self.backend),
+            self.root_guid,
+            Arc::clone(&self.maintenance_lock),
+        )
     }
 
     /// Shorthand for `tree.range().prefix(p)` — the
@@ -973,6 +1015,8 @@ impl Tree {
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
         use std::collections::HashMap;
+
+        let _maintenance = self.maintenance_lock.read().unwrap();
 
         // Phase 1: snapshot under wal.lock so racing writers can't
         // slip a not-yet-WAL-durable dirty entry past us. WAL flush
@@ -1120,13 +1164,16 @@ impl Tree {
     ///
     /// Each blob is pinned + read under a single shared guard, so
     /// stats never block ongoing reads and only contend with writers
-    /// on a blob-by-blob basis. Returned counters are a consistent
-    /// snapshot of each individual blob but the aggregate is **not**
-    /// linearised across blobs — a concurrent writer mid-traversal
-    /// can shift one blob's counters before another's are read.
-    /// Acceptable for observability; use [`Tree::checkpoint`] first
-    /// if you need a quiescent snapshot.
+    /// on a blob-by-blob basis. The maintenance read gate prevents a
+    /// concurrent merge/compact pass from deleting a child while the
+    /// tree shape is being enumerated. Returned counters are a
+    /// consistent snapshot of each individual blob but the aggregate
+    /// is **not** linearised across foreground writers — a concurrent
+    /// writer mid-traversal can shift one blob's counters before
+    /// another's are read. Acceptable for observability; pause writes
+    /// externally if you need a quiescent snapshot.
     pub fn stats(&self) -> Result<TreeStats> {
+        let _maintenance = self.maintenance_lock.read().unwrap();
         // `Tree::stats` is an introspection path — used by users
         // checking on the tree, and (via `holt::metrics`) by
         // Prometheus scrapes that read `bm_cache_hits`,
@@ -1172,6 +1219,12 @@ impl Tree {
         let bm_cache_hits = self.backend.cache_hits();
         let bm_cache_misses = self.backend.cache_misses();
         let bm_optimistic_restarts = self.backend.optimistic_restarts();
+        let bm_walker_ops = self.backend.walker_ops();
+        let bm_walker_blob_hops = self.backend.walker_blob_hops();
+        let bm_max_blob_hops = self.backend.max_blob_hops();
+        let bm_max_cross_blob_depth = self.backend.max_cross_blob_depth();
+        let bm_spillovers = self.backend.spillover_count();
+        let bm_merges = self.backend.merge_count();
         let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
             rounds_attempted: ck.rounds_attempted(),
             rounds_succeeded: ck.rounds_succeeded(),
@@ -1193,6 +1246,12 @@ impl Tree {
             bm_cache_hits,
             bm_cache_misses,
             bm_optimistic_restarts,
+            bm_walker_ops,
+            bm_walker_blob_hops,
+            bm_max_blob_hops,
+            bm_max_cross_blob_depth,
+            bm_spillovers,
+            bm_merges,
             checkpointer,
         })
     }
@@ -1201,18 +1260,18 @@ impl Tree {
     /// fold every mergeable cross-blob crossing back into its
     /// parent.
     ///
-    /// ## Not safe to run concurrently with reads or writes.
+    /// ## Concurrency
     ///
-    /// The caller must guarantee no other thread is calling
-    /// `Tree::{put, get, delete, rename, txn, range, scan_prefix}`
-    /// for the duration of `compact()`. Phase 1 rebuilds each
-    /// blob in place. Cross-blob readers and writers use the child
-    /// blob's own `header.root_slot` as the authoritative entry.
-    /// The remaining unsafe part is broader: `compact` still
-    /// collects and rewrites blobs without a tree-wide maintenance
-    /// latch, so concurrent structural writers can race the
-    /// maintenance pass. Schedule `compact()` during a quiescent
-    /// window until that latch lands.
+    /// Safe to run while point reads are active: reads and
+    /// foreground writers take the shared maintenance gate, while
+    /// `compact()` takes the exclusive side. Phase 1 still rewrites
+    /// each blob under that blob's exclusive latch, so optimistic
+    /// readers either validate or restart if they race a blob-local
+    /// rewrite. Phase 2 cannot fold/delete a child while any
+    /// operation is lock-coupling through a `BlobNode`. Range
+    /// iterators remain best-effort snapshots; if the caller needs
+    /// strict full-iterator stability, consume the iterator during
+    /// an external quiescent window.
     ///
     /// ## Two phases:
     ///
@@ -1253,6 +1312,8 @@ impl Tree {
     pub fn compact(&self) -> Result<()> {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
+        let _maintenance = self.maintenance_lock.write().unwrap();
+
         // Phase 1 — per-blob compact.
         let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
         for guid in &guids {
@@ -1288,6 +1349,7 @@ impl Tree {
             drop(pin);
             if merged.merged > 0 {
                 self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
+                self.backend.note_merges(u64::from(merged.merged));
             }
         }
         Ok(())
@@ -1426,7 +1488,11 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_key, INLINE_PADDED_KEY_CAP};
+    use super::{pad_key, Tree, INLINE_PADDED_KEY_CAP};
+    use crate::api::config::TreeConfig;
+    use std::sync::mpsc::sync_channel;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn pad_key_short_key_stays_inline() {
@@ -1442,5 +1508,31 @@ mod tests {
         assert!(padded.heap.is_some());
         assert_eq!(padded.len(), INLINE_PADDED_KEY_CAP + 1);
         assert_eq!(padded[INLINE_PADDED_KEY_CAP], 0);
+    }
+
+    #[test]
+    fn compact_waits_for_maintenance_read_guard() {
+        let tree = Tree::open(TreeConfig::memory()).unwrap();
+        tree.put(b"k", b"v").unwrap();
+
+        let read_guard = tree.maintenance_lock.read().unwrap();
+        let worker_tree = tree.clone();
+        let (started_tx, started_rx) = sync_channel(0);
+        let (done_tx, done_rx) = sync_channel(0);
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_tree.compact().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "compact must wait behind active shared maintenance readers"
+        );
+
+        drop(read_guard);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
     }
 }

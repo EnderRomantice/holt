@@ -65,20 +65,21 @@ without coordinating.
 
 **Pre-1.0, actively maintained.** The algorithm core (insert /
 lookup / erase / rename / range / txn / compact + multi-blob
-crossings), persistent backend with `O_DIRECT` + optional
-`io_uring` fast path, physiological WAL with batched
-transactions, sharded buffer manager + 3-thread background
-checkpointer enforcing WAL-before-data, SIMD CRC32 + node
-scans, and the stateful `Tree::range` iterator (prefix
-anchoring + `start_after` + S3 delimiter) are all landed.
+crossings), online maintenance gate for compact/merge versus
+foreground reads/writes, persistent backend with `O_DIRECT` + optional
+`io_uring` fast path, physiological WAL with batched transactions,
+sharded buffer manager + 3-thread background checkpointer
+enforcing WAL-before-data, SIMD CRC32 + node scans, and the
+stateful `Tree::range` iterator (prefix anchoring, `start_after`,
+S3 delimiter) are all landed.
 240+ tests (unit + property-based + crash-and-replay +
 failpoint-injected) pass on Ubuntu + macOS CI.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature
 breakdown and [`ROADMAP.md`](ROADMAP.md) for what's queued
 (journal-worker group commit, batched `io_uring` / NVMe
-checkpoint I/O, SIMD / memory hot-path work, online maintenance
-latching, and large-tree shape control).
+checkpoint I/O, SIMD / memory hot-path work, and large-tree shape
+control).
 
 `cargo bench --bench main` runs a side-by-side comparison with
 RocksDB and SQLite across three metadata workload shapes — see

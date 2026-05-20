@@ -77,25 +77,42 @@ LeanStore, and modern NVMe engines while keeping holt's product
 boundary narrow: one embedded library, opaque byte values, no RPC
 server, no replication, no distributed object-store layer.
 
-### P0 — Remove the write-path serial choke points
+### P0 — Remove the write-path serial choke points (done)
 
-- **Slot-versioned lock coupling.** Keep the per-blob
-  `HybridLatch`, but use per-slot version counters as the
-  validation token for cross-blob descent. Writers release parent
-  guards before doing child work when the parent edge can be
-  revalidated; mismatch returns an internal restart, mirroring
-  LeanStore / Fractal ART's `OptLockNeedsRestart` shape.
-- **Flatten recursive mutation walkers.** Convert insert / erase
-  cross-blob recursion into an explicit blob-hop state machine.
-  The walker should hold the smallest possible latch set, avoid
-  ancestor retention, and make restart points obvious.
-- **Separate normal mutation from structural maintenance.**
-  Ordinary leaf update / insert / tombstone paths should not pay
-  for split / merge / compact machinery unless they actually hit
-  a full or degenerate blob.
-- **Track the right counters.** Add `restart_count`,
-  `max_blob_hops`, `avg_blob_hops`, `max_art_depth`,
-  `spillover_count`, `merge_count`, and per-op latch wait stats.
+v0.3's concurrency cut is implemented in the codebase:
+
+- **Cross-blob lock coupling.** The old parent-held fallback is
+  gone. `insert_multi` / `erase_multi` read the parent `BlobNode`,
+  pin the child, release the parent guard, and continue in the
+  child. The child blob's own `header.root_slot` is the
+  authoritative entry, so child-local splits, collapses, and
+  compaction do not require parent rewrites.
+- **No slot-version sidecar.** The earlier per-slot version plan
+  would have added ~80 KB of out-of-line state per cached blob.
+  The shipped shape avoids that memory tax by removing
+  `BlobNode.child_entry_ptr` and making the child header the only
+  cross-blob root token.
+- **Scoped walker instead of unsafe state machine.** The mutation
+  walker still uses recursive Rust scopes, but it no longer
+  retains ancestor guards across child mutation. That gives the
+  same latch lifetime as the flattened state-machine design
+  without self-referential guard plumbing.
+- **Maintenance is separated.** Foreground writers take only the
+  shared side of a narrow `maintenance_lock` while they may cross
+  `BlobNode` boundaries. `compact()` and the background merge pass
+  take the exclusive side before folding/deleting child blobs.
+  Point reads also take the shared side, but blob-local access
+  remains optimistic; ordinary readers and writers still run
+  concurrently with each other.
+- **Shape counters are exposed.** `Tree::stats()` now reports
+  mutation walker ops, total/average/max blob hops, max
+  cross-blob boundary depth, spillovers, merges, and optimistic
+  read restarts. Prometheus export includes the same counters.
+
+Still intentionally not in P0: per-op latch wait histograms. The
+current `HybridLatch` API has no timed acquisition boundary, and
+adding timing to every latch acquire should be driven by a
+contention benchmark rather than added speculatively.
 
 ### P1 — Real journal group commit
 
@@ -153,9 +170,10 @@ threads. v0.3 makes the I/O side worth that structure:
   healthy parent/child fill ratios, not just freeing any space.
 - Implement `BlobNode` inline-prefix divergence split so a bad
   blob boundary can recover into a high-fanout structure.
-- Make merge/rebalance incremental and online. `compact()` should
-  become a maintenance operation guarded by structure versions,
-  not a quiescent-only stop-the-world pass.
+- Make merge/rebalance incremental. `compact()` and background
+  merge are now online with respect to foreground writers through
+  `maintenance_lock`; the remaining large-tree work is policy
+  quality (when to split/merge/rebalance), not basic safety.
 - Add targeted benchmarks for skewed path prefixes, hot
   directories, delete-heavy churn, and working sets larger than
   the buffer pool.

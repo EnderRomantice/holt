@@ -41,6 +41,13 @@
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
 //! | `holt_bm_optimistic_restarts_total`     | counter | `TreeStats::bm_optimistic_restarts`    |
+//! | `holt_bm_walker_ops_total`              | counter | `TreeStats::bm_walker_ops`             |
+//! | `holt_bm_walker_blob_hops_total`        | counter | `TreeStats::bm_walker_blob_hops`       |
+//! | `holt_bm_avg_blob_hops`                 | gauge   | `TreeStats::bm_avg_blob_hops()`        |
+//! | `holt_bm_max_blob_hops`                 | gauge   | `TreeStats::bm_max_blob_hops`          |
+//! | `holt_bm_max_cross_blob_depth`          | gauge   | `TreeStats::bm_max_cross_blob_depth`   |
+//! | `holt_bm_spillovers_total`              | counter | `TreeStats::bm_spillovers`             |
+//! | `holt_bm_merges_total`                  | counter | `TreeStats::bm_merges`                 |
 //! | `holt_checkpoint_rounds_attempted_total`| counter | `CheckpointerStats::rounds_attempted`  |
 //! | `holt_checkpoint_rounds_succeeded_total`| counter | `CheckpointerStats::rounds_succeeded`  |
 //! | `holt_checkpoint_blobs_flushed_total`   | counter | `CheckpointerStats::blobs_flushed`     |
@@ -64,9 +71,9 @@ use crate::api::stats::TreeStats;
 #[allow(clippy::too_many_lines)] // one `metric(...)` call per emit — splitting hides the export shape
 #[must_use]
 pub fn render_prometheus(stats: &TreeStats) -> String {
-    // Pre-size for the typical payload (~1.5 KB) to avoid the
+    // Pre-size for the typical payload (~2.5 KB) to avoid the
     // first few `String::push_str` reallocations.
-    let mut out = String::with_capacity(1536);
+    let mut out = String::with_capacity(2560);
 
     metric(
         &mut out,
@@ -148,6 +155,55 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "counter",
         stats.bm_optimistic_restarts,
     );
+    metric(
+        &mut out,
+        "holt_bm_walker_ops_total",
+        "Cumulative mutation walker invocations.",
+        "counter",
+        stats.bm_walker_ops,
+    );
+    metric(
+        &mut out,
+        "holt_bm_walker_blob_hops_total",
+        "Total blob hops across mutation walkers.",
+        "counter",
+        stats.bm_walker_blob_hops,
+    );
+    metric_f64(
+        &mut out,
+        "holt_bm_avg_blob_hops",
+        "Average blob hops per mutation walker invocation.",
+        "gauge",
+        stats.bm_avg_blob_hops(),
+    );
+    metric(
+        &mut out,
+        "holt_bm_max_blob_hops",
+        "Maximum blob hops observed for one mutation walker call.",
+        "gauge",
+        stats.bm_max_blob_hops,
+    );
+    metric(
+        &mut out,
+        "holt_bm_max_cross_blob_depth",
+        "Largest key-depth at which a mutation walker entered a blob.",
+        "gauge",
+        stats.bm_max_cross_blob_depth,
+    );
+    metric(
+        &mut out,
+        "holt_bm_spillovers_total",
+        "Successful foreground spillover events.",
+        "counter",
+        stats.bm_spillovers,
+    );
+    metric(
+        &mut out,
+        "holt_bm_merges_total",
+        "BlobNode children folded back into parents by compact or merge passes.",
+        "counter",
+        stats.bm_merges,
+    );
 
     if let Some(ck) = &stats.checkpointer {
         metric(
@@ -204,6 +260,13 @@ fn metric(out: &mut String, name: &str, help: &str, ty: &str, value: u64) {
     let _ = writeln!(out, "{name} {value}");
 }
 
+#[inline]
+fn metric_f64(out: &mut String, name: &str, help: &str, ty: &str, value: f64) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {ty}");
+    let _ = writeln!(out, "{name} {value:.6}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +286,12 @@ mod tests {
             bm_cache_hits: 1_000,
             bm_cache_misses: 25,
             bm_optimistic_restarts: 3,
+            bm_walker_ops: 4,
+            bm_walker_blob_hops: 10,
+            bm_max_blob_hops: 3,
+            bm_max_cross_blob_depth: 17,
+            bm_spillovers: 2,
+            bm_merges: 1,
             checkpointer: with_checkpointer.then_some(CheckpointerStats {
                 rounds_attempted: 11,
                 rounds_succeeded: 10,
@@ -243,6 +312,9 @@ mod tests {
         // Monotonic counters keep the `_total` suffix...
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
+        assert!(out.contains("holt_bm_walker_ops_total 4\n"));
+        assert!(out.contains("holt_bm_avg_blob_hops 2.500000\n"));
+        assert!(out.contains("holt_bm_spillovers_total 2\n"));
         // ...non-monotonic gauges (sum-over-reachable-blobs) drop it.
         assert!(out.contains("# TYPE holt_slots gauge\n"));
         assert!(out.contains("holt_slots 42\n"));

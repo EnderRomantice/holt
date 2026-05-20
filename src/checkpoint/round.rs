@@ -378,6 +378,9 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// `mark_dirty` + `mark_for_delete` protocol so the round's
 /// later phases (WAL flush → Flush tasks → Sync → pending
 /// deletes → re-Sync → truncate) handle persistence under W2D.
+/// Takes the exclusive maintenance gate so no foreground writer is
+/// lock-coupling through a child edge while that edge is being
+/// folded and queued for delete.
 ///
 /// Returns the cumulative count of children folded.
 ///
@@ -394,6 +397,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
+    let _maintenance = shared.maintenance_lock.write().unwrap();
     let parents = engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?;
     let mut merged_total = 0u64;
     for guid in parents {
@@ -412,5 +416,6 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
             merged_total += u64::from(stats.merged);
         }
     }
+    shared.bm.note_merges(merged_total);
     Ok(merged_total)
 }

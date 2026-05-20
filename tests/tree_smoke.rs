@@ -700,6 +700,7 @@ fn stats_on_fresh_tree_reports_root_blob_only() {
 fn stats_reflects_inserts() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let before = tree.stats().unwrap();
+    assert_eq!(before.bm_walker_ops, 0);
     for i in 0..16u32 {
         tree.put(format!("k{i:04}").as_bytes(), b"value-bytes-here")
             .unwrap();
@@ -708,6 +709,10 @@ fn stats_reflects_inserts() {
     assert!(after.total_space_used > before.total_space_used);
     assert!(after.total_slots > before.total_slots);
     assert_eq!(after.blob_count, 1, "16 small keys still fit in one blob");
+    assert!(after.bm_walker_ops >= 16);
+    assert!(after.bm_walker_blob_hops >= after.bm_walker_ops);
+    assert!(after.bm_max_blob_hops >= 1);
+    assert!(after.bm_avg_blob_hops() >= 1.0);
 }
 
 #[test]
@@ -863,6 +868,10 @@ fn compact_merges_shrunk_child_blob_back_into_parent() {
         "the workload must spill across blobs first (got {} blobs)",
         before.blob_count,
     );
+    assert!(
+        before.bm_spillovers > 0,
+        "multi-blob workload must have recorded at least one spillover"
+    );
 
     // Drop most of the keys — only a handful of survivors stay.
     for i in 0..248u32 {
@@ -878,6 +887,10 @@ fn compact_merges_shrunk_child_blob_back_into_parent() {
         after.blob_count,
     );
     assert_eq!(after.total_tombstones, 0);
+    assert!(
+        after.bm_merges > before.bm_merges,
+        "compact should record folded child blobs"
+    );
     // Each surviving key still readable through the public API.
     for i in 248..256u32 {
         let v = tree.get(format!("k{i:08}").as_bytes()).unwrap();
@@ -941,6 +954,12 @@ fn stats_aggregates_across_multi_blob_tree() {
         "256×4 KB values must spill into multiple blobs (got {} blobs)",
         s.blob_count
     );
+    assert!(
+        s.bm_spillovers > 0,
+        "stats should expose foreground spillover count"
+    );
+    assert!(s.bm_walker_blob_hops >= s.bm_walker_ops);
+    assert!(s.bm_max_blob_hops >= 1);
     // Aggregate is just the sum of per-blob counters.
     let sum_space: u64 = s.blobs.iter().map(|b| u64::from(b.space_used)).sum();
     assert_eq!(sum_space, s.total_space_used);

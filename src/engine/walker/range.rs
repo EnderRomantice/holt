@@ -12,18 +12,19 @@
 //!
 //! ## Concurrency
 //!
-//! Best-effort snapshot semantics: each `next()` re-acquires a
-//! shared read guard on the topmost frame's blob for the duration
-//! of one step, then drops it. Writers can interleave between
-//! steps; the iterator does NOT block writers across the whole
-//! traversal. A concurrent split that relocates a leaf the
-//! iterator was about to visit may cause the leaf to be skipped or
-//! visited twice (the path stack uses raw `(guid, slot)` pairs —
-//! see the upstream `invalid iterator(#1)` warning for the same
-//! failure mode). For workloads that need strong iteration
-//! semantics, hold a Tree-wide write barrier externally.
+//! Best-effort snapshot semantics: each `next()` re-acquires the
+//! shared maintenance gate plus a shared read guard on the topmost
+//! frame's blob for the duration of one step, then drops them.
+//! Writers can interleave between steps; the iterator does NOT
+//! block writers across the whole traversal. A concurrent split
+//! that relocates a leaf the iterator was about to visit may cause
+//! the leaf to be skipped or visited twice (the path stack uses raw
+//! `(guid, slot)` pairs — see the upstream `invalid iterator(#1)`
+//! warning for the same failure mode). For workloads that need
+//! strong iteration semantics, consume the iterator during an
+//! external quiescent window.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
@@ -66,6 +67,7 @@ pub enum RangeEntry {
 pub struct RangeBuilder {
     bm: Arc<BufferManager>,
     root_guid: BlobGuid,
+    maintenance_lock: Arc<RwLock<()>>,
     prefix: Vec<u8>,
     start_after: Option<Vec<u8>>,
     delimiter: Option<u8>,
@@ -76,10 +78,15 @@ impl RangeBuilder {
     /// tree. Internal — user surface is [`crate::Tree::range`] /
     /// [`crate::Tree::scan_prefix`]; both signature dependencies
     /// (`BufferManager`, `BlobGuid`) live in crate-private modules.
-    pub(crate) fn new(bm: Arc<BufferManager>, root_guid: BlobGuid) -> Self {
+    pub(crate) fn new(
+        bm: Arc<BufferManager>,
+        root_guid: BlobGuid,
+        maintenance_lock: Arc<RwLock<()>>,
+    ) -> Self {
         Self {
             bm,
             root_guid,
+            maintenance_lock,
             prefix: Vec::new(),
             start_after: None,
             delimiter: None,
@@ -119,6 +126,7 @@ impl IntoIterator for RangeBuilder {
         RangeIter {
             bm: self.bm,
             root_guid: self.root_guid,
+            maintenance_lock: self.maintenance_lock,
             stack: Vec::new(),
             curr_key: Vec::new(),
             anchor_depth: 0,
@@ -136,6 +144,7 @@ impl IntoIterator for RangeBuilder {
 pub struct RangeIter {
     bm: Arc<BufferManager>,
     root_guid: BlobGuid,
+    maintenance_lock: Arc<RwLock<()>>,
     /// Descent stack. Empty = no init done (if `!initialized`) or
     /// exhausted (if `terminated`).
     stack: Vec<Frame>,
@@ -228,6 +237,8 @@ impl Iterator for RangeIter {
         if self.terminated {
             return None;
         }
+        let maintenance_lock = Arc::clone(&self.maintenance_lock);
+        let _maintenance = maintenance_lock.read().unwrap();
         if !self.initialized {
             if let Err(e) = self.init_descent() {
                 self.terminated = true;

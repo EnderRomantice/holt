@@ -85,10 +85,41 @@ pub struct TreeStats {
     /// snapshot and the lookup walked the tree from scratch.
     /// Spikes here indicate writer/reader contention.
     pub bm_optimistic_restarts: u64,
+    /// Cumulative mutation walker invocations (`insert_multi` /
+    /// `erase_multi`). `rename` and `txn` count their inner walker
+    /// calls separately.
+    pub bm_walker_ops: u64,
+    /// Total blob hops across mutation walker invocations. Divide
+    /// by [`Self::bm_walker_ops`] for the average.
+    pub bm_walker_blob_hops: u64,
+    /// Maximum blob hops observed for one mutation walker call.
+    pub bm_max_blob_hops: u64,
+    /// Largest key-depth at which a mutation walker entered a blob.
+    /// This is a cross-blob boundary-depth signal, not a full
+    /// per-node ART-depth trace.
+    pub bm_max_cross_blob_depth: u64,
+    /// Successful foreground spillover events.
+    pub bm_spillovers: u64,
+    /// `BlobNode` children folded back into parents by manual
+    /// compact or background merge passes.
+    pub bm_merges: u64,
     /// Background checkpointer telemetry, or `None` if the bg
     /// thread group isn't running (the default; opt in via
     /// [`crate::CheckpointConfig::enabled`]).
     pub checkpointer: Option<CheckpointerStats>,
+}
+
+impl TreeStats {
+    /// Average blob hops per mutation walker invocation.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // observability gauge; exact integer totals are exposed too
+    pub fn bm_avg_blob_hops(&self) -> f64 {
+        if self.bm_walker_ops == 0 {
+            0.0
+        } else {
+            self.bm_walker_blob_hops as f64 / self.bm_walker_ops as f64
+        }
+    }
 }
 
 /// Snapshot of the background checkpointer's accumulated

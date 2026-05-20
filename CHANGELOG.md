@@ -170,6 +170,30 @@ Concretely:
 - The old recursive `insert_at_blob_node` /
   `erase_at_blob_node` parent-held fallback arms are removed.
 
+### Performance / Correctness — online maintenance gate + shape counters
+
+The remaining v0.3 concurrency cleanup is now in place:
+
+- Foreground mutation paths (`put` / `insert` / `delete` /
+  `remove` / `rename` / `txn`) take the shared side of a narrow
+  `maintenance_lock` while they may cross `BlobNode` boundaries.
+  `Tree::compact()` and the background checkpointer's merge pass
+  take the exclusive side before folding child blobs back into
+  parents and queuing those children for deferred delete.
+- Point reads (`get` / `get_with`) also take the shared
+  maintenance gate so a merge cannot delete a child after a reader
+  observes the parent `BlobNode`. Blob-local reads still use
+  per-blob optimistic validation; ordinary readers and writers
+  remain mutually concurrent.
+- `Tree::compact()` is no longer documented as quiescent-only.
+  It is safe against active point reads and foreground writers;
+  range iterators remain best-effort snapshots because they keep a
+  raw `(blob_guid, slot)` stack across calls.
+- `Tree::stats()` and `holt::metrics::render_prometheus` now
+  expose walker/shape counters: mutation walker ops, total and
+  average blob hops, max blob hops, max cross-blob boundary depth,
+  foreground spillovers, and child-blob merges.
+
 ### Breaking — API redesign (split returning from blind)
 
 The v0.2 `put` / `delete` returned `Option<Vec<u8>>` by default,

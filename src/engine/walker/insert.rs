@@ -95,9 +95,26 @@ pub fn insert_multi(
         let frame = guard.frame();
         (frame.header().blob_guid, frame.header().root_slot)
     };
-    lock_coupled_insert_in_blob(
-        bm, guard, root_guid, root_slot, true, key, value, seq, wants_prev, 0,
-    )
+    let mut blob_hops = 0u64;
+    let mut max_cross_blob_depth = 0usize;
+    let outcome = lock_coupled_insert_in_blob(
+        bm,
+        guard,
+        root_guid,
+        root_slot,
+        true,
+        key,
+        value,
+        seq,
+        wants_prev,
+        0,
+        &mut blob_hops,
+        &mut max_cross_blob_depth,
+    );
+    if outcome.is_ok() {
+        bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+    }
+    outcome
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,7 +140,11 @@ fn lock_coupled_insert_in_blob(
     seq: u64,
     wants_prev: bool,
     depth: usize,
+    blob_hops: &mut u64,
+    max_cross_blob_depth: &mut usize,
 ) -> Result<InsertOutcome> {
+    *blob_hops = blob_hops.saturating_add(1);
+    *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
     let mut current_dirty = false;
 
     for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
@@ -170,6 +191,8 @@ fn lock_coupled_insert_in_blob(
                     seq,
                     wants_prev,
                     crossing.child_depth,
+                    blob_hops,
+                    max_cross_blob_depth,
                 );
                 drop(child_pin);
 
@@ -184,6 +207,7 @@ fn lock_coupled_insert_in_blob(
                     spillover_blob(bm, &mut frame, seq)
                         .map_err(|e| e.with_blob_guid(current_guid))?;
                 }
+                bm.note_spillover();
                 compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
                 current_dirty = true;
             }

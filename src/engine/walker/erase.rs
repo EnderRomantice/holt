@@ -74,9 +74,25 @@ pub fn erase_multi(
         let frame = guard.frame();
         (frame.header().blob_guid, frame.header().root_slot)
     };
-    lock_coupled_erase_in_blob(
-        bm, guard, root_guid, root_slot, true, key, seq, wants_prev, 0,
-    )
+    let mut blob_hops = 0u64;
+    let mut max_cross_blob_depth = 0usize;
+    let outcome = lock_coupled_erase_in_blob(
+        bm,
+        guard,
+        root_guid,
+        root_slot,
+        true,
+        key,
+        seq,
+        wants_prev,
+        0,
+        &mut blob_hops,
+        &mut max_cross_blob_depth,
+    );
+    if outcome.is_ok() {
+        bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+    }
+    outcome
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,7 +117,11 @@ fn lock_coupled_erase_in_blob(
     seq: u64,
     wants_prev: bool,
     depth: usize,
+    blob_hops: &mut u64,
+    max_cross_blob_depth: &mut usize,
 ) -> Result<EraseOutcome> {
+    *blob_hops = blob_hops.saturating_add(1);
+    *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
     let step = {
         let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
@@ -126,6 +146,8 @@ fn lock_coupled_erase_in_blob(
                 seq,
                 wants_prev,
                 crossing.child_depth,
+                blob_hops,
+                max_cross_blob_depth,
             )?;
             drop(child_pin);
             return Ok(outcome);

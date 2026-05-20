@@ -77,7 +77,7 @@ mod round;
 
 use crossbeam_channel::{bounded, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -190,6 +190,10 @@ pub(super) struct Shared {
     pub(super) wal: Option<Arc<Mutex<WalWriter>>>,
     /// GUID of the tree root — entry point for the merge-pass walk.
     pub(super) root_guid: BlobGuid,
+    /// Shared structural gate with `Tree`: the merge pass takes
+    /// the write side so it cannot fold/delete a child blob while a
+    /// foreground writer is lock-coupling through that edge.
+    pub(super) maintenance_lock: Arc<RwLock<()>>,
     pub(super) cfg: CheckpointConfig,
 
     /// Submit side of the bounded I/O queue. Cloned by the planner
@@ -233,6 +237,7 @@ impl Checkpointer {
         bm: Arc<BufferManager>,
         wal: Option<Arc<Mutex<WalWriter>>>,
         root_guid: BlobGuid,
+        maintenance_lock: Arc<RwLock<()>>,
         cfg: CheckpointConfig,
     ) -> Option<Self> {
         if !cfg.enabled {
@@ -243,6 +248,7 @@ impl Checkpointer {
             bm,
             wal,
             root_guid,
+            maintenance_lock,
             cfg,
             io_tx,
             checkpoint_stop: AtomicBool::new(false),
@@ -399,6 +405,10 @@ mod tests {
         Arc::new(BufferManager::new(Arc::new(MemoryBackend::new()), 8))
     }
 
+    fn maintenance_lock() -> Arc<RwLock<()>> {
+        Arc::new(RwLock::new(()))
+    }
+
     /// Tests that don't construct a real Tree skip the merge pass —
     /// `collect_blob_guids` would otherwise try to pin a
     /// non-existent root.
@@ -416,14 +426,15 @@ mod tests {
         let bm = make_bm();
         let cfg = CheckpointConfig::default();
         assert!(!cfg.enabled);
-        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, cfg);
+        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, maintenance_lock(), cfg);
         assert!(ck.is_none());
     }
 
     #[test]
     fn spawn_and_drop_is_leak_free() {
         let bm = make_bm();
-        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, no_merge_cfg()).expect("spawn");
+        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, maintenance_lock(), no_merge_cfg())
+            .expect("spawn");
         // Give threads a tick to actually park.
         thread::sleep(Duration::from_millis(50));
         drop(ck);
@@ -442,8 +453,14 @@ mod tests {
         bm.mark_dirty([0x42; 16], 10);
         assert_eq!(bm.dirty_count(), 1);
 
-        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, no_merge_cfg())
-            .expect("spawn");
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            TEST_ROOT_GUID,
+            maintenance_lock(),
+            no_merge_cfg(),
+        )
+        .expect("spawn");
         // Wait for at least one round to drain the dirty set.
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -464,7 +481,14 @@ mod tests {
         let bm = make_bm();
         let mut cfg = no_merge_cfg();
         cfg.idle_interval = Duration::from_secs(10);
-        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, cfg).expect("spawn");
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            TEST_ROOT_GUID,
+            maintenance_lock(),
+            cfg,
+        )
+        .expect("spawn");
 
         // Need a cached blob so snapshot_bytes finds it.
         let scratch = crate::store::backend::AlignedBlobBuf::zeroed();
@@ -510,7 +534,14 @@ mod tests {
             eviction_idle_ticks: 1, // immediately stale after one tick advance
             ..no_merge_cfg()
         };
-        let ck = Checkpointer::spawn(Arc::clone(&bm), None, TEST_ROOT_GUID, cfg).expect("spawn");
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            TEST_ROOT_GUID,
+            maintenance_lock(),
+            cfg,
+        )
+        .expect("spawn");
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

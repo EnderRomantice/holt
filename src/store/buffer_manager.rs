@@ -192,6 +192,12 @@ pub struct BufferManager {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     optimistic_restarts: AtomicU64,
+    walker_ops: AtomicU64,
+    walker_blob_hops: AtomicU64,
+    max_blob_hops: AtomicU64,
+    max_cross_blob_depth: AtomicU64,
+    spillover_count: AtomicU64,
+    merge_count: AtomicU64,
 }
 
 /// A single cached blob. Callers obtain one via
@@ -218,6 +224,17 @@ pub struct CachedBlob {
 // The `UnsafeCell` only marks the interior-mutability; the actual
 // concurrency contract is enforced by `HybridLatch`.
 unsafe impl Sync for CachedBlob {}
+
+#[inline]
+fn fetch_max_relaxed(atom: &AtomicU64, value: u64) {
+    let mut cur = atom.load(Ordering::Relaxed);
+    while value > cur {
+        match atom.compare_exchange_weak(cur, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
 
 impl CachedBlob {
     fn new(buf: AlignedBlobBuf) -> Self {
@@ -369,6 +386,12 @@ impl BufferManager {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             optimistic_restarts: AtomicU64::new(0),
+            walker_ops: AtomicU64::new(0),
+            walker_blob_hops: AtomicU64::new(0),
+            max_blob_hops: AtomicU64::new(0),
+            max_cross_blob_depth: AtomicU64::new(0),
+            spillover_count: AtomicU64::new(0),
+            merge_count: AtomicU64::new(0),
         }
     }
 
@@ -451,6 +474,68 @@ impl BufferManager {
     /// lookup walker on `validate()` failure.
     pub(crate) fn note_optimistic_restart(&self) {
         self.optimistic_restarts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative mutation walker calls (`insert_multi` /
+    /// `erase_multi`). A `rename` or `txn` contributes one count per
+    /// inner walker invocation, not one count per public API call.
+    #[must_use]
+    pub fn walker_ops(&self) -> u64 {
+        self.walker_ops.load(Ordering::Relaxed)
+    }
+
+    /// Total blob hops across mutation walkers. Divide by
+    /// [`Self::walker_ops`] to derive average blob-hop count.
+    #[must_use]
+    pub fn walker_blob_hops(&self) -> u64 {
+        self.walker_blob_hops.load(Ordering::Relaxed)
+    }
+
+    /// Maximum blob hops observed for a single mutation walker call.
+    #[must_use]
+    pub fn max_blob_hops(&self) -> u64 {
+        self.max_blob_hops.load(Ordering::Relaxed)
+    }
+
+    /// Largest key-depth at which a mutation walker entered a blob.
+    /// This is a cross-blob boundary-depth signal rather than a full
+    /// per-node ART-depth trace.
+    #[must_use]
+    pub fn max_cross_blob_depth(&self) -> u64 {
+        self.max_cross_blob_depth.load(Ordering::Relaxed)
+    }
+
+    /// Number of successful foreground spillover events.
+    #[must_use]
+    pub fn spillover_count(&self) -> u64 {
+        self.spillover_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of `BlobNode` children folded back into parents by
+    /// manual compact or background merge passes.
+    #[must_use]
+    pub fn merge_count(&self) -> u64 {
+        self.merge_count.load(Ordering::Relaxed)
+    }
+
+    /// Record one completed mutation walker traversal.
+    pub(crate) fn note_walker_blob_hops(&self, hops: u64, max_cross_blob_depth: usize) {
+        self.walker_ops.fetch_add(1, Ordering::Relaxed);
+        self.walker_blob_hops.fetch_add(hops, Ordering::Relaxed);
+        fetch_max_relaxed(&self.max_blob_hops, hops);
+        fetch_max_relaxed(&self.max_cross_blob_depth, max_cross_blob_depth as u64);
+    }
+
+    /// Record one successful spillover.
+    pub(crate) fn note_spillover(&self) {
+        self.spillover_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record child-blob merge events.
+    pub(crate) fn note_merges(&self, merged: u64) {
+        if merged != 0 {
+            self.merge_count.fetch_add(merged, Ordering::Relaxed);
+        }
     }
 
     /// Internal: look up `guid` in the cache. On a hit, stamps
