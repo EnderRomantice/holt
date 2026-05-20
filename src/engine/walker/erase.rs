@@ -19,6 +19,7 @@ use super::writers::{
     write_struct_to_slot, SHRINK_NODE16_TO_NODE4_AT, SHRINK_NODE256_TO_NODE48_AT,
     SHRINK_NODE48_TO_NODE16_AT,
 };
+use super::SearchKey;
 
 // ---------- public entry points ----------
 
@@ -56,7 +57,7 @@ pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Re
 pub fn erase_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
-    key: &[u8],
+    key: SearchKey<'_>,
     seq: u64,
     wants_prev: bool,
 ) -> Result<EraseOutcome> {
@@ -113,7 +114,7 @@ fn lock_coupled_erase_in_blob(
     mut guard: BlobWriteGuard<'_>,
     current_guid: crate::layout::BlobGuid,
     is_top_blob: bool,
-    key: &[u8],
+    key: SearchKey<'_>,
     seq: u64,
     wants_prev: bool,
     depth: usize,
@@ -208,7 +209,7 @@ pub(super) fn erase_at(
     depth: usize,
     wants_prev: bool,
 ) -> Result<EraseReturn> {
-    match erase_at_step(frame, slot, key, depth, wants_prev, false)? {
+    match erase_at_step(frame, slot, SearchKey::exact(key), depth, wants_prev, false)? {
         EraseStep::Done(r) => Ok(r),
         EraseStep::Crossing(_) => Err(Error::NotYetImplemented(
             "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
@@ -220,7 +221,7 @@ pub(super) fn erase_at(
 fn erase_at_step(
     frame: &mut BlobFrame<'_>,
     slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
     wants_prev: bool,
     allow_crossing: bool,
@@ -257,7 +258,7 @@ fn erase_at_step(
 fn blob_node_erase_step(
     frame: &BlobFrame<'_>,
     slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<EraseStep> {
     let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
@@ -270,7 +271,7 @@ fn blob_node_erase_step(
             "blob_node_erase_step: BlobNode prefix_len exceeds inline buffer",
         ));
     }
-    if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
+    if !key.range_eq(depth, &bn.bytes[..plen]) {
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
@@ -299,7 +300,7 @@ fn blob_node_erase_step(
 fn erase_at_leaf(
     frame: &mut BlobFrame<'_>,
     leaf_slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     wants_prev: bool,
 ) -> Result<EraseReturn> {
     // Always read the existing key (needed for the key-match
@@ -309,7 +310,7 @@ fn erase_at_leaf(
     // clone per op.
     let leaf = {
         let (existing_key, leaf) = read_leaf_key_ref(frame.as_ref(), leaf_slot)?;
-        if existing_key != key {
+        if !key.eq_slice(existing_key) {
             return Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: false,
@@ -348,7 +349,7 @@ fn erase_at_leaf(
 fn erase_at_prefix_step(
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
     wants_prev: bool,
     allow_crossing: bool,
@@ -362,7 +363,7 @@ fn erase_at_prefix_step(
     let prefix_bytes = &p.bytes[..plen];
     let child_slot = p.child as u16;
 
-    if depth + plen > key.len() || prefix_bytes != &key[depth..depth + plen] {
+    if !key.range_eq(depth, prefix_bytes) {
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
@@ -411,19 +412,18 @@ fn erase_at_inner_step(
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
     ntype: NodeType,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
     wants_prev: bool,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
-    if depth >= key.len() {
+    let Some(byte) = key.byte_at(depth) else {
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
             previous: None,
         }));
-    }
-    let byte = key[depth];
+    };
     let Some(child) = inner_find_child(frame, inner_slot, ntype, byte)? else {
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,

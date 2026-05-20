@@ -244,6 +244,11 @@ pub fn encode_insert_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8
     });
 }
 
+#[inline]
+pub(crate) const fn encoded_insert_record_len(key_len: usize, value_len: usize) -> usize {
+    RECORD_HEADER_SIZE + 8 + 4 + key_len + 4 + value_len + RECORD_FOOTER_SIZE
+}
+
 /// Encode an `Erase` record directly from refs. Carries key only
 /// — replay redoes from `key` alone, and the prior value (if any)
 /// is handed straight to the `Tree::remove` caller without
@@ -253,6 +258,11 @@ pub fn encode_erase_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8]
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
     });
+}
+
+#[inline]
+pub(crate) const fn encoded_erase_record_len(key_len: usize) -> usize {
+    RECORD_HEADER_SIZE + 8 + 4 + key_len + RECORD_FOOTER_SIZE
 }
 
 /// Encode a `RenameObject` record directly from refs.
@@ -270,6 +280,14 @@ pub fn encode_rename_object_record(
         write_bytes(buf, dst_key);
         buf.push(u8::from(force));
     });
+}
+
+#[inline]
+pub(crate) const fn encoded_rename_object_record_len(
+    src_key_len: usize,
+    dst_key_len: usize,
+) -> usize {
+    RECORD_HEADER_SIZE + 8 + 4 + src_key_len + 4 + dst_key_len + 1 + RECORD_FOOTER_SIZE
 }
 
 /// Streaming `Batch` record builder. Encodes inner primitive ops

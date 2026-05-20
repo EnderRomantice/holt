@@ -8,6 +8,8 @@
 //! - `readers` — decode slot bodies + leaf extents off a
 //!   `BlobFrameRef`.
 //! - `writers` — allocate fresh slots / extents and populate them.
+//! - `key` — virtual-terminator search key used by point
+//!   read/write paths.
 //! - `lookup` — [`lookup`] / [`lookup_at`] / [`lookup_multi_with`]
 //!   and single-blob descent arms. Zero-copy: walks against
 //!   `BlobFrameRef` so it's safe to run under a `BufferManager`
@@ -35,6 +37,7 @@ use std::mem::size_of;
 
 mod erase;
 mod insert;
+mod key;
 mod lookup;
 mod merge;
 mod migrate;
@@ -57,6 +60,7 @@ mod writers;
 
 pub use erase::erase_multi;
 pub use insert::insert_multi;
+pub(crate) use key::SearchKey;
 pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;
 pub use migrate::{blob_needs_compaction, compact_blob};

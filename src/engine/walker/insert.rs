@@ -11,13 +11,14 @@ use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 use super::cast;
 use super::lookup::lookup_at;
 use super::migrate::blob_needs_compaction;
-use super::readers::{longest_common, ntype_of, read_leaf_key_ref, read_prefix};
+use super::readers::{ntype_of, read_leaf_key_ref, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
     write_node4_with, write_prefix_chain, write_struct_to_slot,
 };
+use super::SearchKey;
 use super::MAX_SPILLOVER_ATTEMPTS;
 
 // ---------- public entry points ----------
@@ -38,6 +39,7 @@ pub(super) fn insert(
     value: &[u8],
     seq: u64,
 ) -> Result<InsertOutcome> {
+    let key = SearchKey::exact(key);
     if key.len() > u16::MAX as usize {
         return Err(Error::KeyTooLong { len: key.len() });
     }
@@ -75,7 +77,7 @@ pub(super) fn insert(
 pub fn insert_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
     wants_prev: bool,
@@ -170,7 +172,7 @@ fn lock_coupled_insert_in_blob(
     mut guard: BlobWriteGuard<'_>,
     current_guid: crate::layout::BlobGuid,
     is_top_blob: bool,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
     wants_prev: bool,
@@ -265,7 +267,7 @@ fn lock_coupled_insert_in_blob(
 pub(super) fn insert_at(
     frame: &mut BlobFrame<'_>,
     slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     depth: usize,
     seq: u64,
@@ -283,7 +285,7 @@ pub(super) fn insert_at(
 fn insert_at_step(
     frame: &mut BlobFrame<'_>,
     slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     depth: usize,
     seq: u64,
@@ -339,7 +341,7 @@ fn insert_at_step(
 fn blob_node_insert_crossing(
     frame: &BlobFrame<'_>,
     slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<InsertBlobCrossing> {
     let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
@@ -352,7 +354,7 @@ fn blob_node_insert_crossing(
             "blob_node_insert_crossing: BlobNode prefix_len exceeds inline buffer",
         ));
     }
-    if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
+    if !key.range_eq(depth, &bn.bytes[..plen]) {
         return Err(Error::NotYetImplemented(
             "blob_node_insert_crossing: BlobNode inline-prefix split is not yet implemented",
         ));
@@ -366,7 +368,7 @@ fn blob_node_insert_crossing(
 fn insert_into_empty_root(
     frame: &mut BlobFrame<'_>,
     empty_slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
 ) -> Result<InsertReturn> {
@@ -378,10 +380,16 @@ fn insert_into_empty_root(
     })
 }
 
+struct LeafSplitPlan {
+    common_prefix: Vec<u8>,
+    byte_existing: u8,
+    byte_new: u8,
+}
+
 fn insert_into_leaf(
     frame: &mut BlobFrame<'_>,
     leaf_slot: u16,
-    new_key: &[u8],
+    new_key: SearchKey<'_>,
     new_value: &[u8],
     depth: usize,
     seq: u64,
@@ -389,11 +397,7 @@ fn insert_into_leaf(
 ) -> Result<InsertReturn> {
     enum LeafInsertPlan {
         SameKey(Leaf),
-        Split {
-            common_prefix: Vec<u8>,
-            byte_existing: u8,
-            byte_new: u8,
-        },
+        Split(LeafSplitPlan),
     }
 
     // Always read the existing key (needed for both same-key
@@ -402,28 +406,29 @@ fn insert_into_leaf(
     // prefix bytes because subsequent writes mutate the frame.
     let plan = {
         let (existing_key, existing_leaf) = read_leaf_key_ref(frame.as_ref(), leaf_slot)?;
-        if existing_key == new_key {
+        if new_key.eq_slice(existing_key) {
             LeafInsertPlan::SameKey(existing_leaf)
         } else {
             let suffix_a = &existing_key[depth..];
-            let suffix_b = &new_key[depth..];
-            let common_len = longest_common(suffix_a, suffix_b);
+            let common_len = new_key.common_prefix_with_slice(depth, suffix_a);
 
-            if common_len == suffix_a.len() || common_len == suffix_b.len() {
+            if common_len == suffix_a.len() || common_len == new_key.remaining_len(depth) {
                 return Err(Error::NotYetImplemented(
                     "walker::insert_into_leaf: one key is a strict prefix of the other",
                 ));
             }
 
-            LeafInsertPlan::Split {
+            LeafInsertPlan::Split(LeafSplitPlan {
                 common_prefix: suffix_a[..common_len].to_vec(),
                 byte_existing: suffix_a[common_len],
-                byte_new: suffix_b[common_len],
-            }
+                byte_new: new_key
+                    .byte_at(depth + common_len)
+                    .expect("new key has divergence byte"),
+            })
         }
     };
 
-    let (common_prefix, byte_existing, byte_new) = match plan {
+    let split = match plan {
         LeafInsertPlan::SameKey(existing_leaf) => {
             // Same-key update path (covers two semantic cases via the
             // same alloc machinery):
@@ -496,40 +501,48 @@ fn insert_into_leaf(
                 previous: prev,
             });
         }
-        LeafInsertPlan::Split {
-            common_prefix,
-            byte_existing,
-            byte_new,
-        } => (common_prefix, byte_existing, byte_new),
+        LeafInsertPlan::Split(split) => split,
     };
 
     // Two different keys: split into [Prefix?] -> Node4 -> {old leaf, new leaf}.
-    let new_leaf = write_leaf(frame, new_key, new_value, seq)?;
-    let n4 = write_node4_with(
-        frame,
-        &[
-            (byte_existing, u32::from(leaf_slot)),
-            (byte_new, u32::from(new_leaf)),
-        ],
-    )?;
-
-    let final_slot = if common_prefix.is_empty() {
-        n4
-    } else {
-        write_prefix_chain(frame, &common_prefix, n4)?
-    };
-
+    let final_slot = write_leaf_split(frame, leaf_slot, new_key, new_value, seq, &split)?;
     Ok(InsertReturn {
         slot_after: final_slot,
         previous: None,
     })
 }
 
+fn write_leaf_split(
+    frame: &mut BlobFrame<'_>,
+    leaf_slot: u16,
+    new_key: SearchKey<'_>,
+    new_value: &[u8],
+    seq: u64,
+    split: &LeafSplitPlan,
+) -> Result<u16> {
+    let new_leaf = write_leaf(frame, new_key, new_value, seq)?;
+    let n4 = write_node4_with(
+        frame,
+        &[
+            (split.byte_existing, u32::from(leaf_slot)),
+            (split.byte_new, u32::from(new_leaf)),
+        ],
+    )?;
+
+    let final_slot = if split.common_prefix.is_empty() {
+        n4
+    } else {
+        write_prefix_chain(frame, &split.common_prefix, n4)?
+    };
+
+    Ok(final_slot)
+}
+
 #[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn insert_into_prefix_step(
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     depth: usize,
     seq: u64,
@@ -549,8 +562,7 @@ fn insert_into_prefix_step(
     let prefix_bytes = &p.bytes[..plen];
     let child_slot = p.child as u16;
 
-    let key_tail = &key[depth.min(key.len())..];
-    let common = longest_common(prefix_bytes, key_tail);
+    let common = key.common_prefix_with_slice(depth, prefix_bytes);
 
     if common == plen {
         let r = insert_at_step(
@@ -589,7 +601,9 @@ fn insert_into_prefix_step(
         write_prefix_chain(frame, tail_bytes, child_slot)?
     };
 
-    let new_div_byte = key[depth + common];
+    let new_div_byte = key
+        .byte_at(depth + common)
+        .expect("new key has prefix divergence byte");
     let new_leaf = write_leaf(frame, key, value, seq)?;
     let n4 = write_node4_with(
         frame,
@@ -618,19 +632,18 @@ fn insert_into_inner_step(
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
     ntype: NodeType,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     depth: usize,
     seq: u64,
     wants_prev: bool,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
-    if depth >= key.len() {
+    let Some(byte) = key.byte_at(depth) else {
         return Err(Error::NotYetImplemented(
             "walker::insert_into_inner: key terminates at an inner node",
         ));
-    }
-    let byte = key[depth];
+    };
 
     if let Some(child_slot) = inner_find_child(frame, inner_slot, ntype, byte)? {
         let r = insert_at_step(

@@ -24,6 +24,7 @@ pub mod walker;
 // Re-export only the items consumed outside the `walker` subtree
 // (api::tree, api::range, api::stats). Walker-internal types stay
 // hidden behind `mod walker;`.
+pub(crate) use walker::SearchKey;
 pub use walker::{
     blob_needs_compaction, collect_blob_guids, collect_blob_guids_silent, compact_blob,
     erase_multi, insert_multi, lookup_multi_with, try_merge_children, EraseOutcome, RangeBuilder,

@@ -16,6 +16,7 @@ use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 use super::cast;
 use super::readers::{leaf_extent, resolve_typed};
 use super::types::{BlobNodeCrossing, LookupResult};
+use super::SearchKey;
 
 /// Look up `key` in the tree rooted at `start_slot` (depth 0).
 ///
@@ -29,7 +30,7 @@ pub(super) fn lookup<'a>(
     start_slot: u16,
     key: &[u8],
 ) -> Result<LookupResult<'a>> {
-    descend(frame, start_slot, key, 0)
+    descend(frame, start_slot, SearchKey::exact(key), 0)
 }
 
 /// Continue a lookup at `start_slot` with a non-zero `depth` — used
@@ -38,7 +39,7 @@ pub(super) fn lookup<'a>(
 pub(super) fn lookup_at<'a>(
     frame: BlobFrameRef<'a>,
     start_slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     descend(frame, start_slot, key, depth)
@@ -72,7 +73,7 @@ pub(super) fn lookup_at<'a>(
 pub fn lookup_multi_with<R, F>(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
-    key: &[u8],
+    key: SearchKey<'_>,
     mut consume: F,
 ) -> Result<Option<R>>
 where
@@ -139,7 +140,7 @@ where
 fn descend<'a>(
     frame: BlobFrameRef<'a>,
     slot: u16,
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     let (ntype, body) = resolve_typed(frame, slot)?;
@@ -158,7 +159,7 @@ fn descend<'a>(
     }
 }
 
-fn blob_descend<'a>(body: &[u8], key: &[u8], depth: usize) -> Result<LookupResult<'a>> {
+fn blob_descend<'a>(body: &[u8], key: SearchKey<'_>, depth: usize) -> Result<LookupResult<'a>> {
     let b = cast::<BlobNode>(body);
     let plen = b.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
@@ -166,10 +167,7 @@ fn blob_descend<'a>(body: &[u8], key: &[u8], depth: usize) -> Result<LookupResul
             "walker::blob_descend: prefix_len exceeds inline buffer",
         ));
     }
-    if depth + plen > key.len() {
-        return Ok(LookupResult::NotFound);
-    }
-    if key[depth..depth + plen] != b.bytes[..plen] {
+    if !key.range_eq(depth, &b.bytes[..plen]) {
         return Ok(LookupResult::NotFound);
     }
     Ok(LookupResult::Crossing(BlobNodeCrossing {
@@ -181,7 +179,7 @@ fn blob_descend<'a>(body: &[u8], key: &[u8], depth: usize) -> Result<LookupResul
 fn leaf_check<'a>(
     frame: BlobFrameRef<'a>,
     body: &'a [u8],
-    key: &[u8],
+    key: SearchKey<'_>,
     _depth: usize,
 ) -> Result<LookupResult<'a>> {
     let leaf = cast::<Leaf>(body);
@@ -189,7 +187,7 @@ fn leaf_check<'a>(
         return Ok(LookupResult::NotFound);
     }
     let (leaf_key, value) = leaf_extent(frame, leaf)?;
-    if leaf_key != key {
+    if !key.eq_slice(leaf_key) {
         return Ok(LookupResult::NotFound);
     }
     Ok(LookupResult::Found(value))
@@ -198,7 +196,7 @@ fn leaf_check<'a>(
 fn prefix_descend<'a>(
     frame: BlobFrameRef<'a>,
     body: &'a [u8],
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     let p = cast::<Prefix>(body);
@@ -208,10 +206,7 @@ fn prefix_descend<'a>(
             "walker::prefix_descend: prefix_len exceeds inline buffer",
         ));
     }
-    if depth + plen > key.len() {
-        return Ok(LookupResult::NotFound);
-    }
-    if key[depth..depth + plen] != p.bytes[..plen] {
+    if !key.range_eq(depth, &p.bytes[..plen]) {
         return Ok(LookupResult::NotFound);
     }
     descend(frame, p.child as u16, key, depth + plen)
@@ -220,14 +215,13 @@ fn prefix_descend<'a>(
 fn node4_descend<'a>(
     frame: BlobFrameRef<'a>,
     body: &'a [u8],
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     let n = cast::<Node4>(body);
-    if depth >= key.len() {
+    let Some(byte) = key.byte_at(depth) else {
         return Ok(LookupResult::NotFound);
-    }
-    let byte = key[depth];
+    };
     let count = (n.count as usize).min(4);
     for i in 0..count {
         if n.keys[i] == byte {
@@ -243,14 +237,13 @@ fn node4_descend<'a>(
 fn node16_descend<'a>(
     frame: BlobFrameRef<'a>,
     body: &'a [u8],
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     let n = cast::<Node16>(body);
-    if depth >= key.len() {
+    let Some(byte) = key.byte_at(depth) else {
         return Ok(LookupResult::NotFound);
-    }
-    let byte = key[depth];
+    };
     if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
         return descend(frame, n.children[i as usize] as u16, key, depth + 1);
     }
@@ -260,14 +253,14 @@ fn node16_descend<'a>(
 fn node48_descend<'a>(
     frame: BlobFrameRef<'a>,
     body: &'a [u8],
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     let n = cast::<Node48>(body);
-    if depth >= key.len() {
+    let Some(byte) = key.byte_at(depth) else {
         return Ok(LookupResult::NotFound);
-    }
-    let idx = n.index[key[depth] as usize];
+    };
+    let idx = n.index[byte as usize];
     if idx == 0 {
         return Ok(LookupResult::NotFound);
     }
@@ -283,14 +276,14 @@ fn node48_descend<'a>(
 fn node256_descend<'a>(
     frame: BlobFrameRef<'a>,
     body: &'a [u8],
-    key: &[u8],
+    key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
     let n = cast::<Node256>(body);
-    if depth >= key.len() {
+    let Some(byte) = key.byte_at(depth) else {
         return Ok(LookupResult::NotFound);
-    }
-    let slot = n.children[key[depth] as usize];
+    };
+    let slot = n.children[byte as usize];
     if slot == 0 {
         return Ok(LookupResult::NotFound);
     }

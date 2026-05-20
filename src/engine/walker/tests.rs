@@ -10,6 +10,7 @@ use super::migrate::{blob_needs_compaction, compact_blob, make_blob_from_node};
 use super::readers::read_prefix;
 use super::types::LookupResult;
 use super::writers::write_struct_to_slot;
+use super::SearchKey;
 use crate::api::errors::Error;
 use crate::layout::{BlobGuid, BlobNode, NodeType, PAGE_SIZE};
 use crate::store::backend::AlignedBlobBuf;
@@ -700,7 +701,7 @@ fn lookup_at_continues_descent_from_supplied_depth() {
     let r0 = lookup(frame.as_ref(), root, b"img/01.jpg").unwrap();
     assert!(matches!(r0, LookupResult::Found(v) if v == b"v1"));
 
-    let r1 = lookup_at(frame.as_ref(), root, b"img/01.jpg", 0).unwrap();
+    let r1 = lookup_at(frame.as_ref(), root, SearchKey::exact(b"img/01.jpg"), 0).unwrap();
     assert!(matches!(r1, LookupResult::Found(v) if v == b"v1"));
 }
 

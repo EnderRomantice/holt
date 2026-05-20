@@ -7,7 +7,6 @@
 //! [`super::writers`].
 
 use crate::api::errors::{Error, Result};
-use crate::engine::simd;
 use crate::layout::{Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix};
 use crate::store::BlobFrameRef;
 
@@ -97,11 +96,4 @@ pub(super) fn read_node256(frame: BlobFrameRef<'_>, slot: u16) -> Result<Node256
         .body_of_slot(slot)
         .ok_or(Error::node_corrupt("read_node256: body"))?;
     Ok(*cast::<Node256>(body))
-}
-
-/// Length of the longest common prefix of `a` and `b`. SIMD on
-/// x86_64 / aarch64, scalar fallback elsewhere — see
-/// [`crate::engine::simd::longest_common_prefix`].
-pub(super) fn longest_common(a: &[u8], b: &[u8]) -> usize {
-    simd::longest_common_prefix(a, b)
 }

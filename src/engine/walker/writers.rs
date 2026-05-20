@@ -14,6 +14,7 @@ use crate::layout::{
 use crate::store::BlobFrame;
 
 use super::readers::{read_node16, read_node256, read_node4, read_node48, read_prefix};
+use super::SearchKey;
 
 pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &T) -> Result<()> {
     {
@@ -33,19 +34,20 @@ pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &
 
 pub(super) fn write_leaf(
     frame: &mut BlobFrame<'_>,
-    key: &[u8],
+    key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
 ) -> Result<u16> {
-    let ext_size = leaf_extent_size(key.len() as u32, value.len() as u32);
+    let key_len = key.len();
+    let ext_size = leaf_extent_size(key_len as u32, value.len() as u32);
     let ext = frame.alloc_extent(ext_size)?;
     {
         let s = frame
             .bytes_at_mut(ext.byte_offset, ext_size)
             .ok_or(Error::node_corrupt("write_leaf: extent out of range"))?;
-        s[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-        s[2..2 + key.len()].copy_from_slice(key);
-        s[2 + key.len()..2 + key.len() + value.len()].copy_from_slice(value);
+        s[..2].copy_from_slice(&(key_len as u16).to_le_bytes());
+        key.write_to_slice(&mut s[2..2 + key_len]);
+        s[2 + key_len..2 + key_len + value.len()].copy_from_slice(value);
     }
     let leaf_out = frame.alloc_node(NodeType::Leaf)?;
     let leaf = Leaf::live(ext.byte_offset, value.len() as u16, seq);

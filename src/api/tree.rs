@@ -2,12 +2,13 @@
 //!
 //! ## Internal key encoding
 //!
-//! Every user-supplied key is padded with a trailing `\0` byte
-//! before reaching the walker. This is a standard ART trick to
-//! resolve the "strict prefix" case where one key (e.g. `"abc"`)
-//! is a prefix of another (e.g. `"abcdef"`): the terminator
-//! guarantees the two keys diverge somewhere inside the radix
-//! tree (at the `\0` vs `'d'` byte in this example).
+//! The walker treats every user-supplied point key as if it had a
+//! trailing `\0` byte. This is a standard ART trick to resolve the
+//! "strict prefix" case where one key (e.g. `"abc"`) is a prefix
+//! of another (e.g. `"abcdef"`): the terminator guarantees the two
+//! keys diverge somewhere inside the radix tree (at the `\0` vs
+//! `'d'` byte in this example). The terminator is virtual during
+//! descent and is materialised only when a new leaf key is written.
 //!
 //! ## Concurrency model
 //!
@@ -40,8 +41,6 @@
 //!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
 //!   prevent racing renames from interleaving.
 
-use std::mem::MaybeUninit;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -52,7 +51,9 @@ use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::engine;
 use crate::engine::RangeBuilder;
 use crate::journal::codec::{
-    encode_erase_record, encode_insert_record, encode_rename_object_record, BatchEncoder,
+    encode_erase_record, encode_insert_record, encode_rename_object_record,
+    encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
+    BatchEncoder, RECORD_FOOTER_SIZE, RECORD_HEADER_SIZE,
 };
 use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
@@ -159,68 +160,19 @@ impl std::fmt::Debug for Tree {
 /// multi-tenant manifest could allocate per-tree root GUIDs.
 pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 
-const INLINE_PADDED_KEY_CAP: usize = 256;
-
-struct PaddedKey {
-    inline: [MaybeUninit<u8>; INLINE_PADDED_KEY_CAP],
-    len: usize,
-    heap: Option<Vec<u8>>,
-}
-
-impl PaddedKey {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        match &self.heap {
-            Some(heap) => heap,
-            None => {
-                // SAFETY: `pad_key` initializes exactly `len`
-                // bytes in the inline buffer: the user key bytes
-                // plus the trailing internal terminator.
-                unsafe { std::slice::from_raw_parts(self.inline.as_ptr().cast::<u8>(), self.len) }
-            }
-        }
-    }
-}
-
-impl Deref for PaddedKey {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
-
-/// Append the engine's internal terminator byte (`\0`) to a
-/// user-supplied key. See the module docs.
-#[inline]
-fn pad_key(key: &[u8]) -> PaddedKey {
-    let len = key.len() + 1;
-    if len <= INLINE_PADDED_KEY_CAP {
-        let mut inline = [MaybeUninit::uninit(); INLINE_PADDED_KEY_CAP];
-        let ptr = inline.as_mut_ptr().cast::<u8>();
-        // SAFETY: `len <= INLINE_PADDED_KEY_CAP`; we write the
-        // first `key.len()` bytes from `key`, then exactly one
-        // terminator byte after them.
-        unsafe {
-            ptr.copy_from_nonoverlapping(key.as_ptr(), key.len());
-            ptr.add(key.len()).write(0);
-        }
-        return PaddedKey {
-            inline,
-            len,
-            heap: None,
-        };
-    }
-
-    let mut padded = Vec::with_capacity(len);
-    padded.extend_from_slice(key);
-    padded.push(0u8);
-    PaddedKey {
-        inline: [MaybeUninit::uninit(); INLINE_PADDED_KEY_CAP],
-        len: 0,
-        heap: Some(padded),
-    }
+fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
+    let body_prefix_len = 8 + 4; // tree_id + inner_count
+    RECORD_HEADER_SIZE
+        + body_prefix_len
+        + ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => 1 + 8 + 4 + key.len() + 4 + value.len(),
+                BatchOp::Delete { key } => 1 + 8 + 4 + key.len(),
+                BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
+            })
+            .sum::<usize>()
+        + RECORD_FOOTER_SIZE
 }
 
 impl Tree {
@@ -346,8 +298,8 @@ impl Tree {
     /// a concurrent writer invalidates its snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let padded = pad_key(key);
-        engine::lookup_multi_with(&self.backend, &self.root_pin, &padded, <[u8]>::to_vec)
+        let search = engine::SearchKey::user(key);
+        engine::lookup_multi_with(&self.backend, &self.root_pin, search, <[u8]>::to_vec)
     }
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
@@ -404,7 +356,7 @@ impl Tree {
     /// gate through the journal worker.
     fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let padded = pad_key(key);
+        let search = engine::SearchKey::user(key);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
@@ -412,7 +364,7 @@ impl Tree {
             let outcome = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
-                &padded,
+                search,
                 value,
                 seq,
                 wants_prev,
@@ -420,7 +372,7 @@ impl Tree {
             if outcome.root_dirty {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            let mut record = Vec::new();
+            let mut record = Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
             encode_insert_record(&mut record, seq, 0, key, value);
             let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
             (outcome, ack)
@@ -432,7 +384,7 @@ impl Tree {
             let outcome = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
-                &padded,
+                search,
                 value,
                 seq,
                 wants_prev,
@@ -491,7 +443,7 @@ impl Tree {
     /// happened" signal, independent of `EraseOutcome.previous`.
     fn delete_inner(&self, key: &[u8], wants_prev: bool) -> Result<engine::EraseOutcome> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let padded = pad_key(key);
+        let search = engine::SearchKey::user(key);
         // Pre-allocate the seq before the walker descends so any
         // child blob the walker touches can `mark_dirty(child, seq)`
         // — invariant W2D (see `BufferManager` module docs) demands
@@ -504,7 +456,7 @@ impl Tree {
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
             let outcome =
-                engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
+                engine::erase_multi(&self.backend, &self.root_pin, search, seq, wants_prev)?;
             if outcome.mutated {
                 // Only mark the root if the root blob changed.
                 // Cross-blob erases mark their child blob inside
@@ -512,7 +464,7 @@ impl Tree {
                 if outcome.root_dirty {
                     self.backend.mark_dirty(self.root_guid, seq);
                 }
-                let mut record = Vec::new();
+                let mut record = Vec::with_capacity(encoded_erase_record_len(key.len()));
                 encode_erase_record(&mut record, seq, 0, key);
                 let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
                 (outcome, ack)
@@ -522,7 +474,7 @@ impl Tree {
             // No-op delete (key wasn't there) is not logged.
         } else {
             let outcome =
-                engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
+                engine::erase_multi(&self.backend, &self.root_pin, search, seq, wants_prev)?;
             if outcome.mutated && outcome.root_dirty {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
@@ -559,15 +511,15 @@ impl Tree {
     /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let src_padded = pad_key(src);
-        let dst_padded = pad_key(dst);
+        let src_search = engine::SearchKey::user(src);
+        let dst_search = engine::SearchKey::user(dst);
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
         let Some(value) =
-            engine::lookup_multi_with(&self.backend, &self.root_pin, &src_padded, <[u8]>::to_vec)?
+            engine::lookup_multi_with(&self.backend, &self.root_pin, src_search, <[u8]>::to_vec)?
         else {
             return Err(Error::NotFound);
         };
@@ -579,13 +531,8 @@ impl Tree {
 
         // Probe dst across all blobs unless overwrite is allowed.
         if !force
-            && engine::lookup_multi_with(
-                &self.backend,
-                &self.root_pin,
-                &dst_padded,
-                <[u8]>::to_vec,
-            )?
-            .is_some()
+            && engine::lookup_multi_with(&self.backend, &self.root_pin, dst_search, <[u8]>::to_vec)?
+                .is_some()
         {
             return Err(Error::DstExists);
         }
@@ -605,11 +552,11 @@ impl Tree {
         let journal_ack = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
             let erase_out =
-                engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
+                engine::erase_multi(&self.backend, &self.root_pin, src_search, seq, false)?;
             let insert_out = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
-                &dst_padded,
+                dst_search,
                 &value,
                 seq,
                 false,
@@ -617,16 +564,17 @@ impl Tree {
             if erase_out.root_dirty || insert_out.root_dirty {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            let mut record = Vec::new();
+            let mut record =
+                Vec::with_capacity(encoded_rename_object_record_len(src.len(), dst.len()));
             encode_rename_object_record(&mut record, seq, 0, src, dst, force);
             journal.submit(record, self.cfg.wal_sync_on_commit)?
         } else {
             let erase_out =
-                engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
+                engine::erase_multi(&self.backend, &self.root_pin, src_search, seq, false)?;
             let insert_out = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
-                &dst_padded,
+                dst_search,
                 &value,
                 seq,
                 false,
@@ -723,7 +671,7 @@ impl Tree {
         if let Some(journal) = &self.journal {
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
-                let mut record = Vec::new();
+                let mut record = Vec::with_capacity(encoded_batch_record_len(&pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
                 self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
@@ -764,11 +712,11 @@ impl Tree {
             let seq = base_seq + i as u64;
             match op {
                 BatchOp::Put { key, value } => {
-                    let padded = pad_key(&key);
+                    let search = engine::SearchKey::user(&key);
                     let outcome = engine::insert_multi(
                         &self.backend,
                         &self.root_pin,
-                        &padded,
+                        search,
                         &value,
                         seq,
                         false,
@@ -781,9 +729,9 @@ impl Tree {
                     }
                 }
                 BatchOp::Delete { key } => {
-                    let padded = pad_key(&key);
+                    let search = engine::SearchKey::user(&key);
                     let outcome =
-                        engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, false)?;
+                        engine::erase_multi(&self.backend, &self.root_pin, search, seq, false)?;
                     if outcome.mutated {
                         if outcome.root_dirty {
                             self.backend.mark_dirty(self.root_guid, seq);
@@ -796,12 +744,12 @@ impl Tree {
                     // matching `Tree::delete`'s contract.
                 }
                 BatchOp::Rename { src, dst, force } => {
-                    let src_padded = pad_key(&src);
-                    let dst_padded = pad_key(&dst);
+                    let src_search = engine::SearchKey::user(&src);
+                    let dst_search = engine::SearchKey::user(&dst);
                     let Some(value) = engine::lookup_multi_with(
                         &self.backend,
                         &self.root_pin,
-                        &src_padded,
+                        src_search,
                         <[u8]>::to_vec,
                     )?
                     else {
@@ -812,7 +760,7 @@ impl Tree {
                             && engine::lookup_multi_with(
                                 &self.backend,
                                 &self.root_pin,
-                                &dst_padded,
+                                dst_search,
                                 |_| (),
                             )?
                             .is_some()
@@ -822,14 +770,14 @@ impl Tree {
                         let erase_out = engine::erase_multi(
                             &self.backend,
                             &self.root_pin,
-                            &src_padded,
+                            src_search,
                             seq,
                             false,
                         )?;
                         let insert_out = engine::insert_multi(
                             &self.backend,
                             &self.root_pin,
-                            &dst_padded,
+                            dst_search,
                             &value,
                             seq,
                             false,
@@ -1489,12 +1437,12 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         // win and matches `Tree::delete`'s same-shape branch.
         let root_dirty = match op {
             TxnOp::Insert { key, value, .. } => {
-                let padded = pad_key(key);
-                engine::insert_multi(bm, &root_pin, &padded, value, seq, false)?.root_dirty
+                let search = engine::SearchKey::user(key);
+                engine::insert_multi(bm, &root_pin, search, value, seq, false)?.root_dirty
             }
             TxnOp::Erase { key, .. } => {
-                let padded = pad_key(key);
-                engine::erase_multi(bm, &root_pin, &padded, seq, false)?.root_dirty
+                let search = engine::SearchKey::user(key);
+                engine::erase_multi(bm, &root_pin, search, seq, false)?.root_dirty
             }
             TxnOp::RenameObject {
                 src_key,
@@ -1502,27 +1450,26 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 force,
                 ..
             } => {
-                let src_padded = pad_key(src_key);
-                let dst_padded = pad_key(dst_key);
+                let src_search = engine::SearchKey::user(src_key);
+                let dst_search = engine::SearchKey::user(dst_key);
                 // Existence probes pass a `|_| ()` closure so the
                 // walker doesn't even allocate / copy the value.
-                if engine::lookup_multi_with(bm, &root_pin, &src_padded, |_| ())?.is_none() {
+                if engine::lookup_multi_with(bm, &root_pin, src_search, |_| ())?.is_none() {
                     // Already reconciled in a prior replay pass —
                     // skip. `highest` was bumped above so the
                     // post-replay `next_seq` still advances past
                     // this record's seq.
                     return Ok(());
                 }
-                if !force
-                    && engine::lookup_multi_with(bm, &root_pin, &dst_padded, |_| ())?.is_some()
+                if !force && engine::lookup_multi_with(bm, &root_pin, dst_search, |_| ())?.is_some()
                 {
                     return Ok(());
                 }
-                let value = engine::lookup_multi_with(bm, &root_pin, &src_padded, <[u8]>::to_vec)?
+                let value = engine::lookup_multi_with(bm, &root_pin, src_search, <[u8]>::to_vec)?
                     .unwrap_or_default();
-                let erase_out = engine::erase_multi(bm, &root_pin, &src_padded, seq, false)?;
+                let erase_out = engine::erase_multi(bm, &root_pin, src_search, seq, false)?;
                 let insert_out =
-                    engine::insert_multi(bm, &root_pin, &dst_padded, &value, seq, false)?;
+                    engine::insert_multi(bm, &root_pin, dst_search, &value, seq, false)?;
                 erase_out.root_dirty || insert_out.root_dirty
             }
             // Structural / multi-tenant / marker variants don't
@@ -1554,26 +1501,22 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_key, INLINE_PADDED_KEY_CAP};
     use crate::TreeBuilder;
     use std::sync::mpsc::sync_channel;
     use std::thread;
     use std::time::Duration;
 
     #[test]
-    fn pad_key_short_key_stays_inline() {
-        let padded = pad_key(b"abc");
-        assert!(padded.heap.is_none());
-        assert_eq!(&*padded, b"abc\0");
-    }
+    fn strict_prefix_point_keys_round_trip_through_public_api() {
+        let tree = TreeBuilder::new("ignored").memory().open().unwrap();
+        tree.put(b"abc", b"short").unwrap();
+        tree.put(b"abcdef", b"long").unwrap();
 
-    #[test]
-    fn pad_key_long_key_uses_heap_fallback() {
-        let key = vec![b'x'; INLINE_PADDED_KEY_CAP];
-        let padded = pad_key(&key);
-        assert!(padded.heap.is_some());
-        assert_eq!(padded.len(), INLINE_PADDED_KEY_CAP + 1);
-        assert_eq!(padded[INLINE_PADDED_KEY_CAP], 0);
+        assert_eq!(tree.get(b"abc").unwrap().as_deref(), Some(&b"short"[..]));
+        assert_eq!(tree.get(b"abcdef").unwrap().as_deref(), Some(&b"long"[..]));
+        assert!(tree.delete(b"abc").unwrap());
+        assert_eq!(tree.get(b"abc").unwrap(), None);
+        assert_eq!(tree.get(b"abcdef").unwrap().as_deref(), Some(&b"long"[..]));
     }
 
     #[test]
