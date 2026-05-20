@@ -185,23 +185,30 @@ The remaining v0.3 concurrency cleanup is now in place:
   closing the pressure-window where a background sweep could drop
   the only cached image after `snapshot_dirty()` drained the dirty
   map but before the checkpoint planner copied the bytes.
+- Fresh spillover blobs now publish their cache entry and dirty
+  entry under the same dirty-lock interlock used by eviction.
+  This closes the complementary I1 window where a background
+  eviction sweep could see a just-created child blob as clean,
+  remove its cache image, and leave checkpoint with a dirty entry
+  but no bytes to flush.
 
 ### Performance / Correctness — journal group commit
 
 - Persistent trees now own a dedicated `Journal` worker instead of
   sharing `Arc<Mutex<WalWriter>>` directly.
 - Foreground writers encode a complete WAL record into owned bytes,
-  enter `commit_lock` only for walker mutation + dirty publish +
-  journal submission, then wait for the journal acknowledgement
-  outside that lock.
+  enter the writer-shared `CommitGate` only for walker mutation +
+  dirty publish + journal submission, then wait for the journal
+  acknowledgement outside that gate.
 - `wal_sync_on_commit=true` writers are batched by a short group
   window; the journal worker appends every queued record and calls
   `sync_data` once for all durable waiters in the batch.
 - Manual and background checkpoint rounds use the same
-  `commit_lock` while draining dirty/pending sets, flushing the
-  journal, and cloning snapshotted bytes. This prevents checkpoint
-  I/O from copying bytes from a writer whose WAL record was not in
-  the durable snapshot.
+  `CommitGate` on its exclusive side while draining dirty/pending
+  sets, flushing the journal, and cloning snapshotted bytes. This
+  prevents checkpoint I/O from copying bytes from a writer whose
+  WAL record was not in the durable snapshot without serialising
+  ordinary writers against each other.
 - `Tree::stats()` / Prometheus metrics expose journal appends,
   append batches, and sync counts.
 - Short-key padding now uses the 256-byte inline path without
@@ -531,8 +538,9 @@ ubuntu + macOS CI.
   validate-after, restart from root on torn read. No Tree-wide
   reader lock.
 - Persistent `put` / `delete` / `rename` / `txn` publish dirty
-  state and journal records through `commit_lock`; durable fsync
-  waits happen outside that lock through the group-commit worker.
+  state and journal records through writer-shared `CommitGate`;
+  durable fsync waits happen outside that gate through the
+  group-commit worker.
   `rename` keeps a separate `rename_lock` for its multi-step
   atomicity.
 

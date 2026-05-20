@@ -132,7 +132,7 @@ use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 
-use crate::api::errors::Result;
+use crate::api::errors::{Error, Result};
 use crate::concurrency::{Guard as LatchGuard, HybridLatch};
 use crate::layout::BlobGuid;
 
@@ -439,8 +439,8 @@ impl BufferManager {
 
     /// Drop the cache entry for `guid` if (a) it's still cached,
     /// (b) we hold the only outside reference (caller's `Arc` was
-    /// dropped before calling), and (c) nothing in the dirty map
-    /// references it.
+    /// dropped before calling), and (c) dirty / pending-delete
+    /// bookkeeping does not protect it.
     ///
     /// Returns `true` if an entry was actually evicted.
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
@@ -450,12 +450,29 @@ impl BufferManager {
                 return false;
             }
         }
+        {
+            let pending = self.pending_deletes.lock().unwrap();
+            if pending.contains_key(&guid) {
+                return false;
+            }
+        }
         // `DashMap::remove_if` checks the predicate under the
         // shard lock. `strong_count == 1` means only the shard's
         // slot holds the `Arc` (the snapshot's clone was dropped
         // by the caller; see `eviction::run_scan`).
         self.cache
-            .remove_if(&guid, |_, entry| Arc::strong_count(entry) == 1)
+            .remove_if(&guid, |_, entry| {
+                if Arc::strong_count(entry) > 1 {
+                    return false;
+                }
+                let d = self.dirty.lock().unwrap();
+                if d.is_protected(&guid) {
+                    return false;
+                }
+                drop(d);
+                let pending = self.pending_deletes.lock().unwrap();
+                !pending.contains_key(&guid)
+            })
             .is_some()
     }
 
@@ -590,6 +607,17 @@ impl BufferManager {
         let arc = Arc::clone(entry.value());
         drop(entry);
         Some(arc)
+    }
+
+    fn is_pending_delete(&self, guid: BlobGuid) -> bool {
+        self.pending_deletes.lock().unwrap().contains_key(&guid)
+    }
+
+    fn pending_delete_not_found(guid: BlobGuid) -> Error {
+        Error::BackendIo(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("blob {:02x?} is pending delete", &guid[..4]),
+        ))
     }
 
     /// Internal: insert a freshly-loaded blob into the cache.
@@ -749,6 +777,9 @@ impl BufferManager {
     /// - [`CachedBlob::read`] for blocking shared access.
     /// - [`CachedBlob::write`] for exclusive write access.
     pub fn pin(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         if let Some(entry) = self.get_cached(guid) {
             return Ok(entry);
         }
@@ -757,6 +788,9 @@ impl BufferManager {
         // canonical entry.
         let mut scratch = AlignedBlobBuf::zeroed();
         self.backend.read_blob(guid, &mut scratch)?;
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         self.insert_into_cache(guid, &scratch);
         // Almost always cached now; if another thread evicted it
         // in the gap, fall back to a fresh insert with our scratch.
@@ -789,11 +823,17 @@ impl BufferManager {
     /// itself is just not reflected in `cache_misses`. Hot
     /// scrape paths should expect most calls to be hits.
     pub fn pin_silent(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         if let Some(entry) = self.get_cached_silent(guid) {
             return Ok(entry);
         }
         let mut scratch = AlignedBlobBuf::zeroed();
         self.backend.read_blob(guid, &mut scratch)?;
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
         self.insert_into_cache(guid, &scratch);
         if let Some(entry) = self.get_cached_silent(guid) {
             return Ok(entry);
@@ -827,6 +867,9 @@ impl BufferManager {
     /// checkpointer-side drains the map via
     /// [`Self::snapshot_dirty`].
     pub fn mark_dirty(&self, guid: BlobGuid, txn_id: u64) {
+        if self.is_pending_delete(guid) {
+            return;
+        }
         let mut d = self.dirty.lock().unwrap();
         d.dirty
             .entry(guid)
@@ -843,8 +886,10 @@ impl BufferManager {
     /// restoring failed entries via [`Self::restore_dirty`].
     #[must_use]
     pub fn snapshot_dirty(&self) -> HashMap<BlobGuid, u64> {
+        let pending = self.pending_deletes.lock().unwrap();
         let mut d = self.dirty.lock().unwrap();
-        let snap = std::mem::take(&mut d.dirty);
+        let mut snap = std::mem::take(&mut d.dirty);
+        snap.retain(|guid, _| !pending.contains_key(guid));
         for (guid, txn_id) in &snap {
             d.flushing
                 .entry(*guid)
@@ -866,8 +911,13 @@ impl BufferManager {
         if entries.is_empty() {
             return;
         }
+        let pending = self.pending_deletes.lock().unwrap();
         let mut d = self.dirty.lock().unwrap();
         for (guid, t) in entries {
+            if pending.contains_key(&guid) {
+                d.flushing.remove(&guid);
+                continue;
+            }
             if matches!(d.flushing.get(&guid), Some(cur) if *cur == t) {
                 d.flushing.remove(&guid);
             }
@@ -908,12 +958,14 @@ impl BufferManager {
     /// the deletions have been applied — only then can the WAL
     /// be truncated.
     pub fn mark_for_delete(&self, guid: BlobGuid, txn_id: u64) {
+        {
+            let mut p = self.pending_deletes.lock().unwrap();
+            p.entry(guid)
+                .and_modify(|cur| *cur = (*cur).min(txn_id))
+                .or_insert(txn_id);
+        }
         self.cache.remove(&guid);
         self.dirty.lock().unwrap().remove_all(&guid);
-        let mut p = self.pending_deletes.lock().unwrap();
-        p.entry(guid)
-            .and_modify(|cur| *cur = (*cur).min(txn_id))
-            .or_insert(txn_id);
     }
 
     /// Atomically take the current pending-delete map, leaving an
@@ -1048,11 +1100,18 @@ impl BufferManager {
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(CachedBlob::new(bytes));
         entry.last_touched.store(tick, Ordering::Relaxed);
+        let mut d = self.dirty.lock().unwrap();
         // Defensive overwrite: a fresh GUID shouldn't collide, but
         // if it does we want the newest bytes to win (the dirty
         // entry below will also keep the lowest seq across both).
+        //
+        // Keep cache insertion and dirty publication under the
+        // same dirty lock. The eviction thread consults this lock
+        // before removing cold blobs; without this interlock it can
+        // see the fresh cache entry as clean and drop it in the
+        // small window before the dirty entry is inserted, leaving
+        // checkpoint with "dirty but no cache image" (I1).
         self.cache.insert(guid, entry);
-        let mut d = self.dirty.lock().unwrap();
         d.dirty
             .entry(guid)
             .and_modify(|cur| *cur = (*cur).min(seq))
@@ -1105,6 +1164,9 @@ impl Backend for BufferManager {
     }
 
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+        if self.is_pending_delete(guid) {
+            return Ok(false);
+        }
         // Fast path: shard-local check without consulting the
         // inner backend.
         if self.cache.contains_key(&guid) {
@@ -1263,15 +1325,12 @@ mod tests {
         );
     }
 
-    // Note on pending-delete + cache: `mark_for_delete` already
-    // removes the cache image (`self.cache.remove(&guid)`) in the
-    // same call as it queues the pending-delete, so under the
-    // engine's current invariant set a blob is never both cached
-    // and in `pending_deletes` simultaneously. `try_evict_lru`'s
-    // pending-delete check is kept as defense in depth — cheap
-    // (one lock + contains_key per scan) and documents the
-    // invariant for future readers — but isn't exercised by a
-    // test today.
+    // Note on pending-delete + cache: `mark_for_delete` removes
+    // the cache image (`self.cache.remove(&guid)`) in the same
+    // call as it queues the pending-delete. `pin` / `has_blob`
+    // must still treat pending-delete as a visibility barrier
+    // because the inner backend manifest intentionally keeps the
+    // blob until checkpoint applies the deferred delete.
 
     #[test]
     fn write_through_propagates_to_inner_backend() {
@@ -1322,6 +1381,31 @@ mod tests {
         assert_eq!(bm.cached_count(), 0);
         assert!(!inner.has_blob([0x33; 16]).unwrap());
         assert!(!bm.has_blob([0x33; 16]).unwrap());
+    }
+
+    #[test]
+    fn pending_delete_hides_blob_until_checkpoint_delete_applies() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        inner.write_blob([0x44; 16], &make_buf(7)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+
+        let _pin = bm.pin([0x44; 16]).unwrap();
+        assert!(bm.has_blob([0x44; 16]).unwrap());
+        bm.mark_dirty([0x44; 16], 10);
+        bm.mark_for_delete([0x44; 16], 11);
+
+        assert!(inner.has_blob([0x44; 16]).unwrap());
+        assert!(!bm.has_blob([0x44; 16]).unwrap());
+        assert!(
+            bm.pin([0x44; 16]).is_err(),
+            "pending-delete child must not be reloaded from backend"
+        );
+        bm.mark_dirty([0x44; 16], 12);
+        let mut restore = HashMap::new();
+        restore.insert([0x44; 16], 13);
+        bm.restore_dirty(restore);
+        assert_eq!(bm.dirty_count(), 0);
+        assert_eq!(bm.pending_delete_count(), 1);
     }
 
     #[test]

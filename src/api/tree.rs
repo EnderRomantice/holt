@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
-use crate::concurrency::MaintenanceGate;
+use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::engine;
 use crate::engine::RangeBuilder;
 use crate::journal::codec::{
@@ -74,10 +74,10 @@ use super::txn::{BatchOp, TxnBatch};
 ///   from the root on a torn read. Never blocks foreground writers
 ///   and never block each other.
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
-///   exclusively for the blobs they touch. Persistent trees also
-///   take `commit_lock` while publishing the mutation to dirty
-///   tracking and the journal queue; the expensive durable wait
-///   happens after that lock through the group-commit worker.
+///   exclusively for the blobs they touch. Persistent trees enter
+///   the writer-shared `commit_gate` while publishing dirty state
+///   and the journal record; durable fsync waiting happens after
+///   that gate through the group-commit worker.
 /// - **Maintenance** (`compact`, background merge) takes the
 ///   exclusive side of `maintenance_gate`; foreground reads and
 ///   writers enter the shared side around tree traversal. This
@@ -124,12 +124,12 @@ pub struct Tree {
     /// On open the tree replays the WAL and resumes at
     /// `highest_seq + 1`.
     next_seq: Arc<AtomicU64>,
-    /// Serialises the cache-mutation → dirty-publish →
-    /// journal-submit boundary in persistent mode. Checkpoint
-    /// snapshots take the same lock while draining dirty entries
-    /// and cloning their bytes, so no backend write can include
-    /// a mutation whose WAL record was not already admitted.
-    commit_lock: Arc<Mutex<()>>,
+    /// Writer-shared / checkpoint-exclusive publish barrier for
+    /// persistent mode. Foreground writers can mutate disjoint
+    /// blobs concurrently, but checkpoint waits until every
+    /// admitted writer has published its dirty state and journal
+    /// record before cloning bytes for backend write-through.
+    commit_gate: Arc<CommitGate>,
     /// Group-commit WAL worker — `Some` for persistent trees,
     /// `None` for memory trees.
     journal: Option<Arc<Journal>>,
@@ -303,7 +303,7 @@ impl Tree {
         // Shared structural gate for foreground writers, manual
         // compact, and the background merge pass.
         let maintenance_gate = Arc::new(MaintenanceGate::new());
-        let commit_lock = Arc::new(Mutex::new(()));
+        let commit_gate = Arc::new(CommitGate::new());
 
         // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
@@ -313,7 +313,7 @@ impl Tree {
             journal.clone(),
             root_guid,
             Arc::clone(&maintenance_gate),
-            Arc::clone(&commit_lock),
+            Arc::clone(&commit_gate),
             cfg.checkpoint.clone(),
         )
         .map(Arc::new);
@@ -326,7 +326,7 @@ impl Tree {
             rename_lock: Arc::new(Mutex::new(())),
             maintenance_gate,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
-            commit_lock,
+            commit_gate,
             journal,
             checkpointer,
         })
@@ -391,18 +391,19 @@ impl Tree {
     /// no prev_value field on disk since v0.3.1 / format v3).
     ///
     /// W2D-strict protocol (WAL mode): walker descent, `mark_dirty`,
-    /// and journal submission happen inside `commit_lock`. The
-    /// checkpoint round drains dirty entries and snapshots bytes
-    /// under the same lock, so any backend image it writes has a
-    /// WAL record admitted before the clone. Durable `sync_data`
-    /// waiting runs outside the lock through the journal worker.
+    /// and journal submission happen inside the writer side of
+    /// `commit_gate`. Checkpoint takes the exclusive side while
+    /// draining dirty entries and snapshotting bytes, so any
+    /// backend image it writes has a WAL record admitted before
+    /// the clone. Durable `sync_data` waiting runs outside the
+    /// gate through the journal worker.
     fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
-            let _commit = self.commit_lock.lock().unwrap();
+            let _commit = self.commit_gate.enter_writer();
             let outcome = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
@@ -496,7 +497,7 @@ impl Tree {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
-            let _commit = self.commit_lock.lock().unwrap();
+            let _commit = self.commit_gate.enter_writer();
             let outcome =
                 engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
             if outcome.mutated {
@@ -585,7 +586,7 @@ impl Tree {
         }
 
         // W2D-strict protocol: walker + mark_dirty + journal
-        // submission all happen under `commit_lock`. Sharing one
+        // submission all happen under `commit_gate`. Sharing one
         // `seq` across both erase + insert phases keeps the rename
         // atomic from the dirty-tracking perspective — failing
         // halfway leaves a coherent partial-dirty set rather than
@@ -597,7 +598,7 @@ impl Tree {
         // walker-materialised previous values would just be
         // dropped on the floor.
         let journal_ack = if let Some(journal) = &self.journal {
-            let _commit = self.commit_lock.lock().unwrap();
+            let _commit = self.commit_gate.enter_writer();
             let erase_out =
                 engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
             let insert_out = engine::insert_multi(
@@ -713,10 +714,10 @@ impl Tree {
 
         // W2D-strict protocol: all inner ops' walker mutations +
         // `mark_dirty` calls, plus the single envelope WAL submit,
-        // happen under `commit_lock` — see `Tree::put_inner`.
+        // happen under `commit_gate` — see `Tree::put_inner`.
         if let Some(journal) = &self.journal {
             let ack = {
-                let _commit = self.commit_lock.lock().unwrap();
+                let _commit = self.commit_gate.enter_writer();
                 let mut record = Vec::new();
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
                 self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
@@ -970,7 +971,7 @@ impl Tree {
     /// path restores any snapshot it drained so the next round
     /// retries.
     ///
-    /// 1. **Snapshot + journal flush** (under `commit_lock`):
+    /// 1. **Snapshot + journal flush** (under `commit_gate`):
     ///    drain BM dirty + pending-delete sets, force the journal
     ///    durable, and clone each snapshotted blob's bytes before
     ///    releasing the lock. Journal flush failure → restore both
@@ -1012,25 +1013,25 @@ impl Tree {
 
         // Phase 1: snapshot dirty/pending, force the journal
         // durable, and clone the snapshotted bytes under
-        // `commit_lock`. This closes the subtle W2D hole where a
+        // `commit_gate`. This closes the subtle W2D hole where a
         // foreground writer mutates a blob after the dirty snapshot
         // but before `snapshot_bytes`: without the shared lock, the
         // checkpoint could write bytes whose WAL record was not in
         // the flushed snapshot.
         let (_snap_dirty, snap_pending, snap_bytes) = if let Some(journal) = &self.journal {
-            let _commit = self.commit_lock.lock().unwrap();
+            let _commit = self.commit_gate.enter_checkpoint();
             let snap_dirty = self.backend.snapshot_dirty();
             let snap_pending = self.backend.snapshot_pending_deletes();
             if let Err(e) = journal.flush() {
-                self.backend.restore_dirty(snap_dirty);
                 self.backend.restore_pending_deletes(snap_pending);
+                self.backend.restore_dirty(snap_dirty);
                 return Err(e);
             }
             let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
             for (guid, expected_seq) in &snap_dirty {
                 let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
-                    self.backend.restore_dirty(snap_dirty);
                     self.backend.restore_pending_deletes(snap_pending);
+                    self.backend.restore_dirty(snap_dirty);
                     return Err(Error::Internal(
                         "checkpoint: dirty entry lost cache image — invariant I1 violated",
                     ));
@@ -1044,8 +1045,8 @@ impl Tree {
             let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
             for (guid, expected_seq) in &snap_dirty {
                 let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
-                    self.backend.restore_dirty(snap_dirty);
                     self.backend.restore_pending_deletes(snap_pending);
+                    self.backend.restore_dirty(snap_dirty);
                     return Err(Error::Internal(
                         "checkpoint: dirty entry lost cache image — invariant I1 violated",
                     ));
@@ -1150,7 +1151,7 @@ impl Tree {
         //    that entry's WAL record stays recoverable. Same
         //    logic for pending_delete_count.
         if let Some(journal) = &self.journal {
-            let _commit = self.commit_lock.lock().unwrap();
+            let _commit = self.commit_gate.enter_checkpoint();
             if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
                 journal.truncate()?;
             }
@@ -1321,6 +1322,10 @@ impl Tree {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        let _commit = self
+            .journal
+            .as_ref()
+            .map(|_| self.commit_gate.enter_writer());
 
         // Phase 1 — per-blob compact.
         let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
@@ -1330,10 +1335,12 @@ impl Tree {
                 let mut guard = pin.write();
                 engine::compact_blob(&mut guard)?;
             }
-            drop(pin);
             // Stage the rebuilt image; let `Tree::checkpoint` (or
             // the bg checkpointer) push it through under W2D.
+            // The pin must stay alive until after `mark_dirty` so
+            // eviction cannot drop the only cache image in the gap.
             self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
+            drop(pin);
         }
 
         // Phase 2 — tree-wide merge pass. Walk parents in BFS order
@@ -1354,11 +1361,14 @@ impl Tree {
                 let mut frame = guard.frame();
                 engine::try_merge_children(&self.backend, &mut frame, STRUCTURAL_SEQ)?
             };
-            drop(pin);
             if merged.merged > 0 {
+                // Keep the parent pin alive until after dirty
+                // publication; otherwise eviction could remove the
+                // updated cache image before checkpoint snapshots it.
                 self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
                 self.backend.note_merges(u64::from(merged.merged));
             }
+            drop(pin);
         }
         Ok(())
     }

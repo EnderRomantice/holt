@@ -77,12 +77,12 @@ mod round;
 
 use crossbeam_channel::{bounded, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::concurrency::MaintenanceGate;
+use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::journal::group_commit::Journal;
 use crate::layout::BlobGuid;
 use crate::store::BufferManager;
@@ -190,11 +190,12 @@ impl CheckpointConfig {
 pub(super) struct Shared {
     pub(super) bm: Arc<BufferManager>,
     pub(super) journal: Option<Arc<Journal>>,
-    /// Same commit-publish lock used by foreground writers.
-    /// Checkpoint rounds hold it while draining dirty entries and
+    /// Same writer-shared / checkpoint-exclusive publish barrier
+    /// used by foreground persistent writers. Checkpoint rounds
+    /// hold its exclusive side while draining dirty entries and
     /// cloning bytes so backend writes never include unjournaled
     /// mutations.
-    pub(super) commit_lock: Arc<Mutex<()>>,
+    pub(super) commit_gate: Arc<CommitGate>,
     /// GUID of the tree root — entry point for the merge-pass walk.
     pub(super) root_guid: BlobGuid,
     /// Shared structural gate with `Tree`: the merge pass enters
@@ -246,7 +247,7 @@ impl Checkpointer {
         journal: Option<Arc<Journal>>,
         root_guid: BlobGuid,
         maintenance_gate: Arc<MaintenanceGate>,
-        commit_lock: Arc<Mutex<()>>,
+        commit_gate: Arc<CommitGate>,
         cfg: CheckpointConfig,
     ) -> Option<Self> {
         if !cfg.enabled {
@@ -256,7 +257,7 @@ impl Checkpointer {
         let shared = Arc::new(Shared {
             bm,
             journal,
-            commit_lock,
+            commit_gate,
             root_guid,
             maintenance_gate,
             cfg,
@@ -418,8 +419,8 @@ mod tests {
         Arc::new(MaintenanceGate::new())
     }
 
-    fn commit_lock() -> Arc<Mutex<()>> {
-        Arc::new(Mutex::new(()))
+    fn commit_gate() -> Arc<CommitGate> {
+        Arc::new(CommitGate::new())
     }
 
     /// Tests that don't construct a real Tree skip the merge pass —
@@ -444,7 +445,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
-            commit_lock(),
+            commit_gate(),
             cfg,
         );
         assert!(ck.is_none());
@@ -458,7 +459,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
-            commit_lock(),
+            commit_gate(),
             no_merge_cfg(),
         )
         .expect("spawn");
@@ -485,7 +486,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
-            commit_lock(),
+            commit_gate(),
             no_merge_cfg(),
         )
         .expect("spawn");
@@ -514,7 +515,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
-            commit_lock(),
+            commit_gate(),
             cfg,
         )
         .expect("spawn");
@@ -568,7 +569,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
-            commit_lock(),
+            commit_gate(),
             cfg,
         )
         .expect("spawn");

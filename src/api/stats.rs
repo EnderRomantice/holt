@@ -161,7 +161,7 @@ pub struct CheckpointerStats {
     /// across every merge pass.
     pub merges_total: u64,
     /// WAL `truncate` calls — once per round where the planner
-    /// observed `dirty_count == 0` under the WAL lock after
+    /// observed `dirty_count == 0` under the commit gate after
     /// flushing.
     pub truncates: u64,
     /// Cache entries the eviction thread has dropped because

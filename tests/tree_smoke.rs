@@ -94,7 +94,7 @@ fn many_keys_all_readable_via_public_api() {
 }
 
 #[test]
-fn concurrent_writers_serialised_by_internal_lock() {
+fn concurrent_writers_round_trip() {
     use std::thread;
 
     let tree = Arc::new(Tree::open(TreeConfig::memory()).unwrap());

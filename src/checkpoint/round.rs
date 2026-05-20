@@ -10,12 +10,12 @@
 //!    mutations are staged through the same dirty /
 //!    pending-delete sets as foreground writes, then flushed by
 //!    this round after the WAL sync.
-//! 1. **Snapshot dirty + pending deletes** under the tree's
-//!    commit-publish lock.
+//! 1. **Snapshot dirty + pending deletes** under the exclusive
+//!    side of the tree's commit-publish gate.
 //! 2. **Flush WAL** through the journal worker so every record that
 //!    mirrors a snapshotted seq is durable before we drop it.
 //! 3. **Clone snapshotted bytes** while still holding the same
-//!    commit-publish lock, then submit one `IoTask::Flush` per blob.
+//!    commit-publish gate, then submit one `IoTask::Flush` per blob.
 //! 4. **Collect completions** — wait for each task's one-shot
 //!    completion. On any failure, restore the corresponding dirty
 //!    entry via `bm.restore_dirty` so the next round retries.
@@ -24,7 +24,7 @@
 //!    PersistentBackend's manifest persist.
 //! 6. **Truncate WAL** — only when (a) no `Flush` failed AND (b)
 //!    `bm.dirty_count() == 0` checked under the commit-publish
-//!    lock. The interlock with the writer-side dirty/journal
+//!    gate. The interlock with the writer-side dirty/journal
 //!    publish order ensures we never drop a record whose effect
 //!    isn't already in backend.
 //!
@@ -76,8 +76,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     let round_start = std::time::Instant::now();
 
     // 1+2+3. Snapshot dirty AND pending-deletes, flush the journal,
-    // then clone bytes under the same commit-publish lock used by
-    // foreground persistent writers. Holding the lock through the
+    // then clone bytes under the same commit-publish gate used by
+    // foreground persistent writers. Holding the gate through the
     // byte clone is load-bearing: a writer must not mutate a blob
     // between our dirty snapshot and `snapshot_bytes`, otherwise
     // the backend flush could include bytes whose WAL record was
@@ -87,7 +87,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // commit-publish block, a writer could (a) enter its mutation,
     // (b) walker.erase that hits `SubtreeGone` (which calls
     // `mark_for_delete`), (c) submit the erase record, (d)
-    // release the lock, before we snapshot pending; we'd then
+    // leave the gate, before we snapshot pending; we'd then
     // execute `backend.delete_blob` and re-Sync manifest while
     // the writer's WAL record was still only in the writer's
     // buffer. A crash there would leave the manifest ahead of
@@ -97,12 +97,12 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // No-WAL trees (memory mode, user-supplied backend) skip the
     // journal flush but still clone immediately after draining.
     let (snap, pending, snap_bytes) = if let Some(journal) = &shared.journal {
-        let _commit = shared.commit_lock.lock().unwrap();
+        let _commit = shared.commit_gate.enter_checkpoint();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
         if let Err(e) = journal.flush() {
-            shared.bm.restore_dirty(snap);
             shared.bm.restore_pending_deletes(pending);
+            shared.bm.restore_dirty(snap);
             return Err(e);
         }
         let mut snap_bytes = Vec::with_capacity(snap.len());
@@ -112,8 +112,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                 for (g, t) in &snap {
                     failed.entry(*g).or_insert(*t);
                 }
-                shared.bm.restore_dirty(failed);
                 shared.bm.restore_pending_deletes(pending);
+                shared.bm.restore_dirty(failed);
                 return Err(Error::Internal(
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
@@ -131,8 +131,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                 for (g, t) in &snap {
                     failed.entry(*g).or_insert(*t);
                 }
-                shared.bm.restore_dirty(failed);
                 shared.bm.restore_pending_deletes(pending);
+                shared.bm.restore_dirty(failed);
                 return Err(Error::Internal(
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
@@ -186,8 +186,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             for (g, t) in &snap {
                 failed.entry(*g).or_insert(*t);
             }
-            shared.bm.restore_dirty(failed);
             shared.bm.restore_pending_deletes(pending);
+            shared.bm.restore_dirty(failed);
             return Err(Error::Internal(
                 "checkpoint: I/O worker channel closed mid-round",
             ));
@@ -267,12 +267,12 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     }
 
     // 6. Apply pending deletes — `pending` was already drained in
-    //    step 1 under the commit-publish lock, so the writer-side WAL records
-    //    covering each unlink op are durable on disk (via the
-    //    step-2 journal flush). Phase 5 has fsync'd the per-blob writes
-    //    that the manifest delete is allowed to follow. Safe to
-    //    mutate the manifest now; the trailing re-Sync at step 7
-    //    persists it.
+    //    step 1 under the commit-publish gate, so the writer-side
+    //    WAL records covering each unlink op are durable on disk
+    //    (via the step-2 journal flush). Phase 5 has fsync'd the
+    //    per-blob writes that the manifest delete is allowed to
+    //    follow. Safe to mutate the manifest now; the trailing
+    //    re-Sync at step 7 persists it.
     let pending_count = pending.len();
     let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
     for (guid, seq) in &pending {
@@ -337,14 +337,14 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     }
 
     // 8. Truncate WAL atomically iff every snapshot landed AND no
-    //    racing writer has re-dirtied (under commit-lock check), AND
+    //    racing writer has re-dirtied (under commit-gate check), AND
     //    no deferred deletes are still queued. The pending-delete
     //    gate is essential: a queued delete means a WAL record
     //    "this blob is unlinked" hasn't yet propagated to the
     //    manifest, so truncating would orphan the unlink.
     if failed.is_empty() && pending_failed.is_empty() {
         if let Some(journal) = &shared.journal {
-            let _commit = shared.commit_lock.lock().unwrap();
+            let _commit = shared.commit_gate.enter_checkpoint();
             if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
                 journal.truncate()?;
                 shared.truncates.fetch_add(1, Ordering::Relaxed);
@@ -403,6 +403,10 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
     let _maintenance = shared.maintenance_gate.enter_exclusive();
+    let _commit = shared
+        .journal
+        .as_ref()
+        .map(|_| shared.commit_gate.enter_writer());
     let parents = engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?;
     let mut merged_total = 0u64;
     for guid in parents {
@@ -415,11 +419,14 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
             let mut frame = guard.frame();
             engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)?
         };
-        drop(pin);
         if stats.merged > 0 {
+            // Keep the parent pin alive until after dirty
+            // publication; otherwise eviction can drop the updated
+            // cache image before this round snapshots it.
             shared.bm.mark_dirty(guid, STRUCTURAL_SEQ);
             merged_total += u64::from(stats.merged);
         }
+        drop(pin);
     }
     shared.bm.note_merges(merged_total);
     Ok(merged_total)

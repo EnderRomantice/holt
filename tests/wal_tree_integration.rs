@@ -564,15 +564,15 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
         }
 
         // Wait until the background thread shrinks the WAL back
-        // to header-only — i.e. it raced a round where dirty was
-        // empty when it took the WAL lock. Give it generous time;
+        // to header-only — i.e. it completed a round where dirty
+        // was empty under the commit gate. Give it generous time;
         // the test cares about *eventual* truncate, not latency.
         let header_size_after_truncate = 32u64; // FILE_HEADER_SIZE
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             // Trigger another op so the dirty set isn't always
             // co-occupied with an in-flight write (the truncate
-            // only fires when dirty is empty under WAL lock).
+            // only fires when dirty is empty under the commit gate).
             tree.put(b"_tick", b".").unwrap();
             let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
             if wal_len <= header_size_after_truncate + 128 {
@@ -1083,8 +1083,9 @@ fn cross_blob_writes_replay_correctly_through_wal_without_checkpoint() {
 // ============================================================
 // Concurrent writer durability — regression for the W2D-strict
 // protocol that publishes walker.mutate + mark_dirty + journal
-// submission under commit_lock and makes checkpoint drain +
-// journal flush + byte snapshot use the same lock.
+// submission under the writer side of commit_gate and makes
+// checkpoint drain + journal flush + byte snapshot use the
+// exclusive side of the same gate.
 //
 // The pre-fix race: a writer marked a blob dirty + then released
 // before appending WAL; a checkpoint round in between could
@@ -1188,7 +1189,7 @@ fn concurrent_writers_and_manual_checkpoints_preserve_acked_ops() {
 
         // Background "checkpointer" — periodic manual
         // Tree::checkpoint() while writers churn. This exercises
-        // the production path: snapshot under commit_lock,
+        // the production path: snapshot under commit_gate,
         // write_through with expected_seq, conditional truncate.
         let ck_tree = Arc::clone(&tree);
         let ck_done = Arc::clone(&done);

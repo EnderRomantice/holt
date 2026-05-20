@@ -120,6 +120,10 @@ v0.3's concurrency cut is implemented in the codebase:
   `flushing` entries until their snapshotted bytes complete
   `write_through`, so eviction cannot drop the cache image in the
   gap between `snapshot_dirty()` and the planner's byte copy.
+  Fresh spillover blobs also insert the cache image and dirty
+  entry under the same dirty-lock interlock, so background eviction
+  cannot observe a new child blob as clean before checkpoint can
+  flush it.
 
 Still intentionally not in P0: per-op latch wait histograms. The
 current `HybridLatch` API has no timed acquisition boundary, and
@@ -139,20 +143,16 @@ Durable group commit is implemented:
   they arrive inside the short group window. `Tree::stats()` and
   Prometheus export journal appends, append batches, and sync
   counts so the batching ratio is observable.
-- Manual and background checkpoint rounds take the same
-  `commit_lock` while draining dirty/pending sets, flushing the
-  journal, and cloning dirty blob bytes. This is intentionally
-  conservative: it prevents backend writes from copying a blob
-  image that includes a mutation whose WAL record was not part of
-  the durable snapshot.
-
-Boundary kept on purpose: the current safe implementation still
-holds `commit_lock` across walker mutation + dirty publish +
-journal submission for persistent writes. Removing that final
-global publish section needs per-blob publish epochs (or an
-equivalent mutation-version protocol) so checkpoint byte snapshots
-can reject images that raced with an uncheckpointed writer. Do not
-delete the lock until that proof exists.
+- The old global `commit_lock` is replaced with `CommitGate`:
+  foreground writers enter the shared side while they mutate blobs,
+  publish dirty state, and submit journal records; checkpoint takes
+  the exclusive side only while draining dirty/pending sets,
+  flushing the journal, and cloning dirty blob bytes.
+- This keeps the W2D proof intact while removing writer-vs-writer
+  serialization from the persistent write hot path. Writers on
+  disjoint child blobs now contend on per-blob latches and the
+  dirty-map shard/mutex they actually touch, not a global commit
+  mutex.
 
 ### P2 — NVMe-grade checkpoint I/O
 

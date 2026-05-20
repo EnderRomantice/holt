@@ -359,37 +359,38 @@ cargo test --release --test bench_contention_p95 \
 
 | Metric           | Value         |
 | ---------------- | ------------: |
-| ops              |   6 391 929   |
-| throughput       |   266 957 ops/s |
-| **mean**         |     12.31 µs  |
-| **p50**          |      1.71 µs  |
-| **p95**          |     22.88 µs  |
-| **p99**          |    108.09 µs  |
-| p99.9            |     688.13 µs |
-| max              |  48 365.57 µs |
+| ops              |  12 823 581   |
+| throughput       |   458 850 ops/s |
+| **mean**         |      6.07 µs  |
+| **p50**          |      1.33 µs  |
+| **p95**          |      8.34 µs  |
+| **p99**          |     19.81 µs  |
+| p99.9            |     171.52 µs |
+| max              | 452 460.54 µs |
 
 ### Observations
 
-- **267 k ops/s sustained** with 4 writer threads + a
-  background checkpointer + concurrent `compact()`. Each
-  writer averages ~67 k ops/s on its own. This run predates the
-  journal-worker group-commit cut; rerun it before quoting current
-  tail-latency numbers.
-- **p50 ≈ 1.7 µs** — most puts hit only the common walker mutate
+- **459 k ops/s sustained** with 4 writer threads + a
+  background checkpointer + concurrent `compact()`. Each writer
+  averages ~115 k ops/s on its own.
+- **p50 ≈ 1.3 µs** — most puts hit only the common walker mutate
   + dirty publish + WAL append path with no maintenance
   interference.
-- **p95 ≈ 23 µs / p99 ≈ 108 µs** — in this pre-group-commit run,
-  tail was dominated by the WAL/checkpoint publish point during
-  checkpoint snapshots. Current code uses a journal worker plus
-  `commit_lock`; rerun the bench for updated numbers.
-- **p99.9 ≈ 0.69 ms** with one max outlier near 48 ms — online
-  compact no longer dominates the steady tail, but rare scheduler
-  / checkpoint interference still shows up at the extreme max.
-- This refreshed run also exercises the dirty-snapshot / eviction
-  interlock: checkpoint-owned `flushing` entries remain protected
-  until `write_through` completes, so the run finishes without the
-  previous `dirty entry lost cache image` invariant failure.
+- **p95 ≈ 8.3 µs / p99 ≈ 19.8 µs** — the writer-shared
+  `CommitGate` and journal-worker group commit removed the old
+  writer-vs-writer commit mutex from the hot path. Versus the
+  pre-group-commit run above this is ~2.7× lower p95 and ~5.5×
+  lower p99 while also raising throughput ~1.7×.
+- **p99.9 ≈ 0.17 ms** with one scheduler-scale max outlier. The
+  steady tail is now dominated by maintenance and OS scheduling,
+  not by a persistent write serialization point.
+- This run also exercises the dirty-snapshot / eviction interlock:
+  checkpoint-owned `flushing` entries stay protected until
+  `write_through` completes, and fresh spillover blobs publish
+  their cache entry + dirty bit under the same interlock. The run
+  finishes without the previous `dirty entry lost cache image`
+  invariant failure.
 
-The mean-vs-p50 gap (12.3 µs mean vs 1.7 µs p50) reflects that
-the slow tail is real but bounded — the distribution is not
-long-tailed enough to perturb the median.
+The mean-vs-p50 gap (6.1 µs mean vs 1.3 µs p50) reflects that the
+slow tail is real but bounded — the distribution is not long-tailed
+enough to perturb the median.
