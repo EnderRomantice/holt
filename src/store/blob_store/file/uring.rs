@@ -1,11 +1,11 @@
-//! `io_uring`-backed I/O context for [`super::PersistentBackend`].
+//! `io_uring`-backed I/O context for [`super::FileBlobStore`].
 //!
 //! Only compiled when **both** of the following hold:
 //!
 //! - Target is Linux (`cfg(target_os = "linux")`).
 //! - The `io-uring` feature is enabled.
 //!
-//! Otherwise the persistent backend stays on the `pread`/`pwrite`
+//! Otherwise the persistent store stays on the `pread`/`pwrite`
 //! syscall path. The feature gate keeps the `io-uring` crate out of
 //! the default dependency closure (smaller build times, smaller
 //! attack surface on platforms that don't use it) but lets Linux
@@ -18,8 +18,8 @@
 //!
 //! The `io_uring` types (`IoUring`, `SubmissionQueueEntry`,
 //! `CompletionQueueEntry`, …) are heavily `unsafe`-bound — keeping
-//! them isolated here lets the rest of `PersistentBackend` stay
-//! safe-Rust. The module exports only the backend operations:
+//! them isolated here lets the rest of `FileBlobStore` stay
+//! safe-Rust. The module exports only the store operations:
 //! [`UringContext::pread_at`], [`UringContext::pwrite_at`],
 //! [`UringContext::pwrite_many_at`],
 //! [`UringContext::pwrite_many_and_sync_at`],
@@ -28,8 +28,8 @@
 //!
 //! ## Concurrency
 //!
-//! One [`UringContext`] per [`super::PersistentBackend`]. The
-//! backend wraps it in a `Mutex` so multiple writers serialise on
+//! One [`UringContext`] per [`super::FileBlobStore`]. The
+//! store wraps it in a `Mutex` so multiple writers serialise on
 //! the submission queue. With a single I/O worker thread
 //! (`holt-ckpt-io`) the lock is uncontended on the hot path.
 //!
@@ -41,14 +41,14 @@
 //! bursts use a streaming refill/drain loop so the device sees a
 //! sustained queue instead of chunk-sized stop-and-wait waves.
 //! Batched writes are sorted by data-file offset first, matching
-//! the default `pwritev` backend's sequential shape.
+//! the default `pwritev` store's sequential shape.
 
 use std::io;
 use std::os::unix::io::AsRawFd;
 
 use io_uring::{opcode, squeue, types, IoUring};
 
-use crate::store::backend::{AlignedBlobBuf, BlobBufPool};
+use crate::store::blob_store::{AlignedBlobBuf, BlobBufPool};
 
 /// Number of SQEs / CQEs the ring is sized for. Each checkpoint
 /// blob write is one SQE; larger dirty snapshots are submitted in
@@ -58,7 +58,7 @@ const RING_DEPTH_USIZE: usize = RING_DEPTH as usize;
 const CQ_BITMAP_WORDS: usize = RING_DEPTH_USIZE.div_ceil(64);
 /// Owns a single `io_uring` plus the `RawFd` of the file we
 /// submit against. The file itself is owned by
-/// [`super::PersistentBackend::data_file`]; this struct only
+/// [`super::FileBlobStore::data_file`]; this struct only
 /// borrows its descriptor.
 pub(super) struct UringContext {
     ring: IoUring,
@@ -77,7 +77,7 @@ struct OrderedWrite<'a> {
 impl std::fmt::Debug for UringContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't dump the ring — would print SQ/CQ internals;
-        // the fd alone is enough to identify which backend file
+        // the fd alone is enough to identify which store file
         // this context drives.
         f.debug_struct("UringContext")
             .field("fd", &self.raw_fd)
@@ -97,7 +97,7 @@ impl UringContext {
             let iovecs = buffers.iovecs();
             // SAFETY: BlobBufPool owns every iovec's backing memory
             // for at least as long as this ring is registered. The
-            // backend drops/unregisters the ring before its pool Arc
+            // store drops/unregisters the ring before its pool Arc
             // can release the slab.
             unsafe {
                 ring.submitter().register_buffers(&iovecs)?;

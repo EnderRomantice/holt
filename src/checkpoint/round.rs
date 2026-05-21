@@ -19,7 +19,7 @@
 //!    `IoTask::FlushBatchAndSync`.
 //! 4. **Collect completion** — wait for the one-shot completion.
 //!    On write failure, restore the whole dirty snapshot via
-//!    `bm.restore_dirty` because a backend batch may have written
+//!    `bm.restore_dirty` because a store batch may have written
 //!    an arbitrary prefix. On sync failure, keep dirty retirement
 //!    decisions but leave pending deletes / WAL truncation blocked.
 //! 5. **Pre-delete Sync** — normally completed inside
@@ -29,7 +29,7 @@
 //!    `bm.dirty_count() == 0` checked under the commit-publish
 //!    gate. The interlock with the writer-side dirty/journal
 //!    publish order ensures we never drop a record whose effect
-//!    isn't already in backend.
+//!    isn't already in store.
 //!
 //! This function is called from two places:
 //!
@@ -46,7 +46,7 @@ use std::sync::Arc;
 use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
-use crate::store::backend::Backend;
+use crate::store::blob_store::BlobStore;
 use crate::store::buffer_manager::WriteThroughEntry;
 
 use super::io::IoTask;
@@ -84,7 +84,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // foreground persistent writers. Holding the gate through the
     // byte clone is load-bearing: a writer must not mutate a blob
     // between our dirty snapshot and `snapshot_bytes`, otherwise
-    // the backend flush could include bytes whose WAL record was
+    // the store flush could include bytes whose WAL record was
     // not part of the durable snapshot.
     //
     // If `snapshot_pending_deletes` were taken outside this
@@ -92,13 +92,13 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // (b) walker.erase that hits `SubtreeGone` (which calls
     // `mark_for_delete`), (c) submit the erase record, (d)
     // leave the gate, before we snapshot pending; we'd then
-    // execute `backend.delete_blob` and re-Sync manifest while
+    // execute `store.delete_blob` and re-Sync manifest while
     // the writer's WAL record was still only in the writer's
     // buffer. A crash there would leave the manifest ahead of
     // WAL — exactly the W2D violation deferred-delete was
     // designed to prevent.
     //
-    // No-WAL trees (memory mode, user-supplied backend) skip the
+    // No-WAL trees (memory mode, user-supplied store) skip the
     // journal flush but still clone immediately after draining.
     let (snap, pending, snap_bytes) = if let Some(journal) = &shared.journal {
         let _commit = shared.commit_gate.enter_checkpoint();
@@ -110,7 +110,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             return Err(e);
         }
         let mut snap_bytes = Vec::with_capacity(snap.len());
-        for (guid, txn_id) in &snap {
+        for (guid, seq) in &snap {
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
                 let mut failed = HashMap::new();
                 for (g, t) in &snap {
@@ -122,14 +122,14 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
             };
-            snap_bytes.push((*guid, *txn_id, bytes));
+            snap_bytes.push((*guid, *seq, bytes));
         }
         (snap, pending, snap_bytes)
     } else {
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
         let mut snap_bytes = Vec::with_capacity(snap.len());
-        for (guid, txn_id) in &snap {
+        for (guid, seq) in &snap {
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
                 let mut failed = HashMap::new();
                 for (g, t) in &snap {
@@ -141,7 +141,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
             };
-            snap_bytes.push((*guid, *txn_id, bytes));
+            snap_bytes.push((*guid, *seq, bytes));
         }
         (snap, pending, snap_bytes)
     };
@@ -150,14 +150,14 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 
     // Early-skip only when nothing at all needs attention. A
     // pending deferred-delete from a previous round (e.g. one
-    // whose `backend.delete_blob` or trailing Sync failed and
+    // whose `store.delete_blob` or trailing Sync failed and
     // got restored) was already drained above; check the
     // snapshot's length so we don't bail out on something we
     // just picked up. `needs_flush` covers the other recovery
     // edge: a prior round may have retired dirty entries after a
-    // successful write-through but failed the following backend
+    // successful write-through but failed the following store
     // Sync, so there is still durable work even when dirty/pending
-    // are both empty. A WAL-only round can skip backend Sync but
+    // are both empty. A WAL-only round can skip store Sync but
     // must still retry truncate.
     if snap.is_empty() && merged == 0 && pending.is_empty() && !shared.bm.needs_flush() {
         if let Some(journal) = &shared.journal {
@@ -183,12 +183,12 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     if !snap_bytes.is_empty() {
         let mut entries = Vec::with_capacity(snap_bytes.len());
         let mut expected = Vec::with_capacity(snap_bytes.len());
-        for (guid, txn_id, bytes) in snap_bytes {
-            expected.push((guid, txn_id));
+        for (guid, seq, bytes) in snap_bytes {
+            expected.push((guid, seq));
             entries.push(WriteThroughEntry {
                 guid,
                 bytes,
-                expected_seq: txn_id,
+                expected_seq: seq,
             });
         }
         let (tx, rx) = bounded(1);
@@ -212,7 +212,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         }
 
         // 4. Collect batch completion. On write error, restore the
-        // whole snapshot: `Backend::write_blobs` may have landed
+        // whole snapshot: `BlobStore::write_blobs` may have landed
         // any prefix, and retrying all entries is the only
         // portable recovery shape. The worker always attempts the
         // pre-delete Sync after the write attempt, preserving the
@@ -231,8 +231,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                             "holt: checkpoint flush batch failed ({} blobs): {e}",
                             expected.len()
                         );
-                        for (guid, txn_id) in expected {
-                            failed.insert(guid, txn_id);
+                        for (guid, seq) in expected {
+                            failed.insert(guid, seq);
                         }
                     }
                 }
@@ -240,8 +240,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             }
             Err(_) => {
                 // Sender dropped before sending — I/O thread died.
-                for (guid, txn_id) in expected {
-                    failed.insert(guid, txn_id);
+                for (guid, seq) in expected {
+                    failed.insert(guid, seq);
                 }
             }
         }
@@ -259,7 +259,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     //    restores `pending` because phase 6 won't run.
     if let Some(sync_result) = pre_delete_sync_result {
         if let Err(e) = sync_result {
-            eprintln!("holt: checkpoint backend Sync failed: {e}");
+            eprintln!("holt: checkpoint store Sync failed: {e}");
             shared.bm.restore_pending_deletes(pending);
             return Err(e);
         }
@@ -278,7 +278,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         match sync_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                eprintln!("holt: checkpoint backend Sync failed: {e}");
+                eprintln!("holt: checkpoint store Sync failed: {e}");
                 shared.bm.restore_pending_deletes(pending);
                 return Err(e);
             }
@@ -329,7 +329,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     }
 
     // 7. Re-Sync iff we actually deleted anything — the manifest
-    //    mutation at step 6 is in-memory until `backend.flush`
+    //    mutation at step 6 is in-memory until `store.flush`
     //    rewrites the manifest file. Skip the syscall when the
     //    pending set was empty.
     let applied_deletes = pending_count - pending_failed.len();
@@ -363,7 +363,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         match sync_rx2.recv() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                eprintln!("holt: checkpoint backend Sync (deletes) failed: {e}");
+                eprintln!("holt: checkpoint store Sync (deletes) failed: {e}");
                 shared.bm.restore_pending_deletes(restore_applied());
                 return Err(e);
             }
@@ -435,9 +435,9 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// An inline `bm.commit(parent)` + `bm.delete_blob(child)` would
 /// be wrong here — both happen pre-Sync, pre-WAL. `bm.commit`
 /// would push cache bytes (potentially including user mutations
-/// whose WAL records aren't yet durable) directly to backend, and
+/// whose WAL records aren't yet durable) directly to store, and
 /// `bm.delete_blob` would mutate the manifest in-memory which a
-/// later `backend.flush` could persist while the corresponding
+/// later `store.flush` could persist while the corresponding
 /// user WAL records still hadn't reached disk. Staging through
 /// dirty / pending-delete avoids both: the only flush path is
 /// the round's own `IoTask::FlushBatchAndSync`, which runs

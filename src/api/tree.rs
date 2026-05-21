@@ -49,7 +49,7 @@ use super::errors::{Error, Result};
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
 use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::engine;
-use crate::engine::RangeBuilder;
+use crate::engine::{RangeBuilder, RangeEntry};
 use crate::journal::codec::{
     encode_erase_record, encode_insert_record, encode_rename_object_record,
     encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
@@ -57,13 +57,13 @@ use crate::journal::codec::{
 };
 use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
-use crate::journal::txn_op::TxnOp;
+use crate::journal::wal_op::WalOp;
 use crate::layout::{BlobGuid, PAGE_SIZE};
-use crate::store::backend::{Backend, MemoryBackend, PersistentBackend};
+use crate::store::blob_store::{BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::buffer_manager::WriteThroughEntry;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
-use super::txn::{BatchOp, TxnBatch};
+use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
 
 const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
 const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
@@ -103,7 +103,7 @@ const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
 #[derive(Clone)]
 pub struct Tree {
     cfg: TreeConfig,
-    backend: Arc<BufferManager>,
+    store: Arc<BufferManager>,
     /// GUID of the blob holding the tree root. Currently a fixed
     /// sentinel; a multi-tenant manifest could allocate per-tree
     /// root GUIDs in the future.
@@ -145,7 +145,7 @@ pub struct Tree {
     /// persistent mode. Foreground writers can mutate disjoint
     /// blobs concurrently, but checkpoint waits until every
     /// admitted writer has published its dirty state and journal
-    /// record before cloning bytes for backend write-through.
+    /// record before cloning bytes for store write-through.
     commit_gate: Arc<CommitGate>,
     /// Group-commit WAL worker — `Some` for persistent trees,
     /// `None` for memory trees.
@@ -176,9 +176,16 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
         + body_prefix_len
         + ops
             .iter()
+            .filter(|op| op.emits_wal())
             .map(|op| match op {
                 BatchOp::Put { key, value } => 1 + 8 + 4 + key.len() + 4 + value.len(),
-                BatchOp::Delete { key } => 1 + 8 + 4 + key.len(),
+                BatchOp::PutIfAbsent { key, value } | BatchOp::CompareAndPut { key, value, .. } => {
+                    1 + 8 + 4 + key.len() + 4 + value.len()
+                }
+                BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => {
+                    1 + 8 + 4 + key.len()
+                }
+                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
                 BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
             })
             .sum::<usize>()
@@ -188,59 +195,59 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
 impl Tree {
     /// Open a tree using the supplied configuration.
     ///
-    /// `TreeConfig::new("/path")` opens a persistent tree at
+    /// `TreeConfig::new("/path")` opens a file-backed tree at
     /// `"/path"` (the default). `TreeConfig::memory()` opens an
     /// in-memory tree.
     ///
-    /// holt is Unix-only — the persistent backend uses `O_DIRECT`
+    /// holt is Unix-only — the file store uses `O_DIRECT`
     /// on Linux and `F_NOCACHE` on macOS. Building the crate on
     /// Windows fails at compile time (see the platform stance in
     /// `ROADMAP.md`).
     pub fn open(cfg: TreeConfig) -> Result<Self> {
-        let backend: Arc<dyn Backend> = match &cfg.storage {
-            Storage::Memory => Arc::new(MemoryBackend::new()),
-            Storage::Persistent { dir } => {
+        let store: Arc<dyn BlobStore> = match &cfg.storage {
+            Storage::Memory => Arc::new(MemoryBlobStore::new()),
+            Storage::File { dir } => {
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
                 {
-                    Arc::new(PersistentBackend::open_with_buffer_pool_hint(
+                    Arc::new(FileBlobStore::open_with_buffer_pool_hint(
                         dir,
                         cfg.buffer_pool_size,
                     )?)
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
-                    Arc::new(PersistentBackend::open(dir)?)
+                    Arc::new(FileBlobStore::open(dir)?)
                 }
             }
         };
-        // The auto-managed backend earns automatic WAL coverage.
-        Self::open_inner(cfg, backend, /*attach_wal=*/ true)
+        // The auto-managed store earns automatic WAL coverage.
+        Self::open_inner(cfg, store, /*attach_wal=*/ true)
     }
 
-    /// Open a tree with a caller-supplied [`Backend`].
+    /// Open a tree with a caller-supplied [`BlobStore`].
     ///
-    /// **No WAL is attached.** The caller's backend has its own
+    /// **No WAL is attached.** The caller's store has its own
     /// notion of durability (or is intentionally volatile —
-    /// e.g. a `MemoryBackend` standing in for a real one in a
+    /// e.g. a `MemoryBlobStore` standing in for a real one in a
     /// test); holt stays out of that decision. If you want a
-    /// WAL'd persistent tree, use [`Tree::open`] with a
-    /// `Storage::Persistent` config.
+    /// WAL'd file-backed tree, use [`Tree::open`] with a
+    /// `Storage::File` config.
     ///
-    /// The supplied backend is **transparently wrapped** with a
+    /// The supplied store is **transparently wrapped** with a
     /// `BufferManager` of `cfg.buffer_pool_size` blobs.
     /// `BufferManager` owns the in-memory blob cache; the walker
     /// pins blobs from it for both reads and writes — no separate
     /// root buffer in `Tree`.
     ///
-    /// If the backend doesn't yet contain a root blob, initialises
+    /// If the store doesn't yet contain a root blob, initialises
     /// an empty one and writes it through, flushing before
     /// returning.
-    pub fn open_with_backend(cfg: TreeConfig, backend: Arc<dyn Backend>) -> Result<Self> {
-        Self::open_inner(cfg, backend, /*attach_wal=*/ false)
+    pub fn open_with_blob_store(cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
+        Self::open_inner(cfg, store, /*attach_wal=*/ false)
     }
 
-    fn open_inner(cfg: TreeConfig, backend: Arc<dyn Backend>, attach_wal: bool) -> Result<Self> {
-        let bm: Arc<BufferManager> = Arc::new(BufferManager::new(backend, cfg.buffer_pool_size));
+    fn open_inner(cfg: TreeConfig, store: Arc<dyn BlobStore>, attach_wal: bool) -> Result<Self> {
+        let bm: Arc<BufferManager> = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
         let root_guid = ROOT_BLOB_GUID;
         if !bm.has_blob(root_guid)? {
             // Seed an empty root blob and write it through.
@@ -250,7 +257,7 @@ impl Tree {
             bm.flush()?;
         }
 
-        // Persistent trees keep a WAL alongside the data file.
+        // File-backed trees keep a WAL alongside the data file.
         // Replay every durable record onto the BM-cached blob
         // image before exposing the tree to callers: the on-disk
         // blob lags the WAL between the last `Tree::checkpoint`
@@ -299,7 +306,7 @@ impl Tree {
 
         Ok(Self {
             cfg,
-            backend: bm,
+            store: bm,
             root_guid,
             root_pin,
             rename_lock: Arc::new(Mutex::new(())),
@@ -321,8 +328,41 @@ impl Tree {
     /// a concurrent writer invalidates its snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let _maintenance = self.maintenance_gate.enter_shared();
+        self.lookup_record_unlocked(key)
+            .map(|record| record.map(|record| record.value))
+    }
+
+    /// Look up `key` and return both value bytes and the current
+    /// conditional-write version token.
+    ///
+    /// This is the preferred read before a compare-and-set update:
+    /// it avoids the two-lookup `get()` + `get_version()` pattern.
+    pub fn get_record(&self, key: &[u8]) -> Result<Option<Record>> {
+        let _maintenance = self.maintenance_gate.enter_shared();
+        self.lookup_record_unlocked(key)
+    }
+
+    /// Return the current version token for `key`.
+    ///
+    /// The token is the leaf sequence attached to the live record
+    /// and is intended only for conditional writes
+    /// ([`Self::compare_and_put`] / [`Self::delete_if_version`]).
+    /// It is not an MVCC timestamp and cannot be used to read old
+    /// values.
+    pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
+        let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.backend, &self.root_pin, search, <[u8]>::to_vec)
+        engine::lookup_multi_with(&self.store, &self.root_pin, search, |hit| {
+            RecordVersion::new(hit.seq)
+        })
+    }
+
+    fn lookup_record_unlocked(&self, key: &[u8]) -> Result<Option<Record>> {
+        let search = engine::SearchKey::user(key);
+        engine::lookup_multi_with(&self.store, &self.root_pin, search, |hit| Record {
+            value: hit.value.to_vec(),
+            version: RecordVersion::new(hit.seq),
+        })
     }
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
@@ -341,14 +381,54 @@ impl Tree {
     /// Mutates the BM-pinned root buffer in place under an
     /// exclusive write guard. Cross-blob mutations stage their
     /// changes via `mark_dirty` / `install_new_blob`; the durable
-    /// write to the inner backend happens when the WAL record
+    /// write to the inner store happens when the WAL record
     /// covering this op is on disk — driven either by the
     /// background checkpoint round or by [`Tree::checkpoint`].
     /// Per-op `memory_flush_on_write` mode drains the dirty set
     /// inline after the WAL append.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_inner(key, value, /*wants_prev=*/ false)
-            .map(|_| ())
+        self.put_inner_conditional(
+            key,
+            value,
+            /*wants_prev=*/ false,
+            engine::InsertCondition::Always,
+        )
+        .map(|_| ())
+    }
+
+    /// Insert `(key, value)` only when `key` has no live record.
+    ///
+    /// Returns `Ok(true)` when the value was inserted and `Ok(false)`
+    /// when a live value already existed. The existence check and
+    /// insert happen under the target blob's exclusive latch.
+    pub fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.put_inner_conditional(
+            key,
+            value,
+            /*wants_prev=*/ false,
+            engine::InsertCondition::IfAbsent,
+        )
+        .map(|outcome| outcome.mutated)
+    }
+
+    /// Replace `(key, value)` only when the live record currently
+    /// carries `expected_version`.
+    ///
+    /// Returns `Ok(false)` if the key is missing, tombstoned, or
+    /// has been updated since the caller obtained the version.
+    pub fn compare_and_put(
+        &self,
+        key: &[u8],
+        expected_version: RecordVersion,
+        value: &[u8],
+    ) -> Result<bool> {
+        self.put_inner_conditional(
+            key,
+            value,
+            /*wants_prev=*/ false,
+            engine::InsertCondition::IfVersion(expected_version.as_u64()),
+        )
+        .map(|outcome| outcome.mutated)
     }
 
     /// Insert or replace `(key, value)`. Returns the previous value
@@ -360,66 +440,71 @@ impl Tree {
     /// you don't need the prior value — that's the blind hot
     /// path and the right default for metadata workloads.
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.put_inner(key, value, /*wants_prev=*/ true)
+        self.put_inner_conditional(
+            key,
+            value,
+            /*wants_prev=*/ true,
+            engine::InsertCondition::Always,
+        )
+        .map(|outcome| outcome.previous)
     }
 
-    /// Shared implementation behind [`Tree::put`] (blind) and
-    /// [`Tree::insert`] (returning). `wants_prev` controls whether
-    /// the walker materialises the existing leaf's value bytes —
-    /// only the caller-visible return path is affected; the WAL
-    /// record is identical for both variants (key + value only,
-    /// no prev_value field on disk since v0.3.0 / format v3).
-    ///
-    /// W2D-strict protocol (WAL mode): walker descent, `mark_dirty`,
-    /// and journal submission happen inside the writer side of
-    /// `commit_gate`. Checkpoint takes the exclusive side while
-    /// draining dirty entries and snapshotting bytes, so any
-    /// backend image it writes has a WAL record admitted before
-    /// the clone. Durable `sync_data` waiting runs outside the
-    /// gate through the journal worker.
-    fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
+    fn put_inner_conditional(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        wants_prev: bool,
+        condition: engine::InsertCondition,
+    ) -> Result<engine::InsertOutcome> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
-            let outcome = engine::insert_multi(
-                &self.backend,
+            let outcome = engine::insert_multi_conditional(
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 search,
                 value,
                 seq,
                 wants_prev,
+                condition,
             )?;
-            if outcome.root_dirty {
-                self.backend
-                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+            if outcome.mutated {
+                if outcome.root_dirty {
+                    self.store
+                        .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                }
+                let mut record =
+                    Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
+                encode_insert_record(&mut record, seq, 0, key, value);
+                let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
+                (outcome, ack)
+            } else {
+                (outcome, None)
             }
-            let mut record = Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
-            encode_insert_record(&mut record, seq, 0, key, value);
-            let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
-            (outcome, ack)
         } else {
             // No WAL — no journal/checkpoint publish boundary to
             // race with. `memory_flush_on_write` (if set)
             // flushes dirty + pending-delete sets inline before
             // returning.
-            let outcome = engine::insert_multi(
-                &self.backend,
+            let outcome = engine::insert_multi_conditional(
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 search,
                 value,
                 seq,
                 wants_prev,
+                condition,
             )?;
             if outcome.root_dirty {
-                self.backend
+                self.store
                     .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
-            if self.cfg.memory_flush_on_write {
+            if outcome.mutated && self.cfg.memory_flush_on_write {
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
             }
@@ -428,7 +513,7 @@ impl Tree {
         if let Some(ack) = journal_ack {
             ack.wait()?;
         }
-        Ok(outcome.previous)
+        Ok(outcome)
     }
 
     /// Remove `key`. Returns `Ok(true)` if a leaf was removed,
@@ -444,8 +529,27 @@ impl Tree {
     /// fallback that unlinks a child blob queues the manifest
     /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        self.delete_inner(key, /*wants_prev=*/ false)
-            .map(|outcome| outcome.mutated)
+        self.delete_inner_conditional(
+            key,
+            /*wants_prev=*/ false,
+            engine::EraseCondition::Always,
+        )
+        .map(|outcome| outcome.mutated)
+    }
+
+    /// Remove `key` only when the live record currently carries
+    /// `expected_version`.
+    ///
+    /// Returns `Ok(false)` if the key is missing, already
+    /// tombstoned, or has been updated since the caller obtained
+    /// the version.
+    pub fn delete_if_version(&self, key: &[u8], expected_version: RecordVersion) -> Result<bool> {
+        self.delete_inner_conditional(
+            key,
+            /*wants_prev=*/ false,
+            engine::EraseCondition::IfVersion(expected_version.as_u64()),
+        )
+        .map(|outcome| outcome.mutated)
     }
 
     /// Remove `key` and return the value that was stored there
@@ -455,20 +559,20 @@ impl Tree {
     /// leaf's value before tombstoning it. Use [`Tree::delete`]
     /// when you only need to know whether the key existed.
     pub fn remove(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.delete_inner(key, /*wants_prev=*/ true)
-            .map(|outcome| outcome.previous)
+        self.delete_inner_conditional(
+            key,
+            /*wants_prev=*/ true,
+            engine::EraseCondition::Always,
+        )
+        .map(|outcome| outcome.previous)
     }
 
-    /// Shared implementation behind [`Tree::delete`] (blind bool)
-    /// and [`Tree::remove`] (returning prev). W2D-strict protocol
-    /// mirrors [`Self::put_inner`].
-    ///
-    /// Blind delete (`wants_prev = false`) saves the walker
-    /// leaf-extent value read; the WAL record itself is identical
-    /// for both variants (key only since v0.3.0 / format v3).
-    /// `EraseOutcome.mutated` is the authoritative "anything
-    /// happened" signal, independent of `EraseOutcome.previous`.
-    fn delete_inner(&self, key: &[u8], wants_prev: bool) -> Result<engine::EraseOutcome> {
+    fn delete_inner_conditional(
+        &self,
+        key: &[u8],
+        wants_prev: bool,
+        condition: engine::EraseCondition,
+    ) -> Result<engine::EraseOutcome> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
         // Pre-allocate the seq before the walker descends so any
@@ -482,20 +586,21 @@ impl Tree {
 
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
-            let outcome = engine::erase_multi(
-                &self.backend,
+            let outcome = engine::erase_multi_conditional(
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 search,
                 seq,
                 wants_prev,
+                condition,
             )?;
             if outcome.mutated {
                 // Only mark the root if the root blob changed.
                 // Cross-blob erases mark their child blob inside
                 // the walker; absent-key no-ops mark nothing.
                 if outcome.root_dirty {
-                    self.backend
+                    self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
                 let mut record = Vec::with_capacity(encoded_erase_record_len(key.len()));
@@ -507,23 +612,24 @@ impl Tree {
             }
             // No-op delete (key wasn't there) is not logged.
         } else {
-            let outcome = engine::erase_multi(
-                &self.backend,
+            let outcome = engine::erase_multi_conditional(
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 search,
                 seq,
                 wants_prev,
+                condition,
             )?;
             if outcome.mutated && outcome.root_dirty {
-                self.backend
+                self.store
                     .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
-            if self.cfg.memory_flush_on_write {
+            if outcome.mutated && self.cfg.memory_flush_on_write {
                 // Flush every blob the walker touched (root + any
                 // children) — no WAL means this is the sole
                 // durability path. snapshot_dirty drains all
-                // entries; we commit each through the backend.
+                // entries; we commit each through the store.
                 self.flush_dirty_inline()?;
                 // Plus drain any deferred deletes queued by a
                 // conservative parent-unlink path.
@@ -560,7 +666,9 @@ impl Tree {
 
         // Probe src across all blobs — zero-copy via BM pin.
         let Some(value) =
-            engine::lookup_multi_with(&self.backend, &self.root_pin, src_search, <[u8]>::to_vec)?
+            engine::lookup_multi_with(&self.store, &self.root_pin, src_search, |hit| {
+                hit.value.to_vec()
+            })?
         else {
             return Err(Error::NotFound);
         };
@@ -572,8 +680,7 @@ impl Tree {
 
         // Probe dst across all blobs unless overwrite is allowed.
         if !force
-            && engine::lookup_multi_with(&self.backend, &self.root_pin, dst_search, <[u8]>::to_vec)?
-                .is_some()
+            && engine::lookup_multi_with(&self.store, &self.root_pin, dst_search, |_| ())?.is_some()
         {
             return Err(Error::DstExists);
         }
@@ -593,7 +700,7 @@ impl Tree {
         let journal_ack = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
             let erase_out = engine::erase_multi(
-                &self.backend,
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 src_search,
@@ -601,7 +708,7 @@ impl Tree {
                 false,
             )?;
             let insert_out = engine::insert_multi(
-                &self.backend,
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 dst_search,
@@ -610,7 +717,7 @@ impl Tree {
                 false,
             )?;
             if erase_out.root_dirty || insert_out.root_dirty {
-                self.backend
+                self.store
                     .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             let mut record =
@@ -619,7 +726,7 @@ impl Tree {
             journal.submit(record, self.cfg.wal_sync_on_commit)?
         } else {
             let erase_out = engine::erase_multi(
-                &self.backend,
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 src_search,
@@ -627,7 +734,7 @@ impl Tree {
                 false,
             )?;
             let insert_out = engine::insert_multi(
-                &self.backend,
+                &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
                 dst_search,
@@ -636,7 +743,7 @@ impl Tree {
                 false,
             )?;
             if erase_out.root_dirty || insert_out.root_dirty {
-                self.backend
+                self.store
                     .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             if self.cfg.memory_flush_on_write {
@@ -656,75 +763,74 @@ impl Tree {
 
     /// Apply a batch of mutations under a single WAL record.
     ///
-    /// The closure builds a [`TxnBatch`] by calling its `put` /
-    /// `delete` / `rename` methods; on return, holt applies each
-    /// op in order against the BM and emits **one** WAL record
-    /// (`TxnOp::Batch`) covering the whole sequence. Either every
-    /// op is replayed on recovery, or none — the batch is
-    /// crash-atomic.
+    /// The closure builds a [`AtomicBatch`] by calling its `put` /
+    /// conditional write / `delete` / `rename` methods; on return,
+    /// holt first validates every logical precondition, then applies
+    /// the batch while holding the tree-wide mutation gate and emits
+    /// **one** WAL record (`WalOp::Batch`) covering the sequence.
     ///
     /// ## Atomicity contract
     ///
+    /// - **Logical atomicity**: yes. Missing rename sources,
+    ///   destination collisions, and failed conditional guards are
+    ///   detected before any walker mutation. A failing rename
+    ///   returns `Err`; a failed conditional guard returns
+    ///   `Ok(false)`. Neither publishes partial user mutations.
+    /// - **Runtime visibility**: readers and writers are blocked
+    ///   while the batch applies, so no concurrent operation can
+    ///   observe an intermediate batch state.
     /// - **Crash atomicity**: yes. The single WAL record is the
-    ///   commit point; a crash before it is written rolls back
-    ///   the whole batch on next open (the BM cache is reloaded
-    ///   from the last checkpoint and replay sees no batch).
-    /// - **Runtime isolation**: best-effort. The batch holds
-    ///   `rename_lock`, so it serialises against other `rename`
-    ///   and `txn` calls but **not** against concurrent
-    ///   `put` / `delete` — those still see per-blob exclusive
-    ///   latching only. Treat the batch as "all-or-nothing under
-    ///   crash recovery", not "fully serializable under load".
-    /// - **Mid-batch failure**: if op `N` returns an `Err`
-    ///   (e.g., rename `NotFound`), ops `0..N` are already
-    ///   applied to the BM and the WAL record is NOT written —
-    ///   so on the next open the partial work is lost via replay.
-    ///   The current process still sees the partial work through
-    ///   the BM cache. Best practice: keep batches to ops you
-    ///   know will succeed, or follow a failed `txn` with
-    ///   `Tree::checkpoint` only after recovering desired state.
+    ///   recovery commit point; replay sees the whole batch or none.
+    ///
+    /// Returns `Ok(true)` when the batch committed, `Ok(false)` when
+    /// a conditional guard failed, and `Err` for hard errors such as
+    /// a missing rename source or store/journal failure.
     ///
     /// ## Example
     ///
     /// ```no_run
     /// # use holt::{Tree, TreeConfig};
     /// # let tree = Tree::open(TreeConfig::memory()).unwrap();
-    /// tree.txn(|batch| {
+    /// tree.atomic(|batch| {
     ///     batch.put(b"a", b"1");
     ///     batch.put(b"b", b"2");
     ///     batch.delete(b"c");
     /// })
     /// .unwrap();
     /// ```
-    pub fn txn<F>(&self, build: F) -> Result<()>
+    pub fn atomic<F>(&self, build: F) -> Result<bool>
     where
-        F: FnOnce(&mut TxnBatch),
+        F: FnOnce(&mut AtomicBatch),
     {
-        let mut batch = TxnBatch::default();
+        let mut batch = AtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         self.apply_batch(batch.pending)
     }
 
-    fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<()> {
-        let _maintenance = self.maintenance_gate.enter_shared();
-        let count = pending.len() as u64;
-        // Serialise batches against renames + other batches so the
-        // ops here see a coherent rename-free view across the
-        // (multi-op) sequence.
-        let _r = self.rename_lock.lock().unwrap();
+    fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
-        // `base + index` and replay can derive it without storing
-        // per-inner seqs in the body. Pure no-op deletes burn their
-        // seq (BM dirty tracking is unaffected since no mutation
-        // happened); `next_seq` is monotonic regardless.
+        // `base + mutating_index` and replay can derive it without
+        // storing per-inner seqs in the body. Non-mutating prefix
+        // assertions are not encoded in WAL and do not consume seqs.
+        // Failed guard preflights may burn the range without
+        // emitting a WAL record; `next_seq` is monotonic, not
+        // gap-free.
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
+        if !self.preflight_batch(&pending, base_seq)? {
+            return Ok(false);
+        }
+        if count == 0 {
+            return Ok(true);
+        }
 
         // W2D-strict protocol: all inner ops' walker mutations +
         // `mark_dirty` calls, plus the single envelope WAL submit,
-        // happen under `commit_gate` — see `Tree::put_inner`.
+        // happen under `commit_gate` — see `Tree::put_inner_conditional`.
         if let Some(journal) = &self.journal {
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
@@ -748,6 +854,156 @@ impl Tree {
                 self.flush_pending_deletes_inline()?;
             }
         }
+        Ok(true)
+    }
+
+    fn preflight_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<bool> {
+        let mut overlay: std::collections::HashMap<Vec<u8>, Option<Record>> =
+            std::collections::HashMap::new();
+        let mut seq_offset = 0u64;
+
+        for op in pending {
+            let seq = if op.emits_wal() {
+                let seq = base_seq + seq_offset;
+                seq_offset += 1;
+                seq
+            } else {
+                base_seq + seq_offset
+            };
+            match op {
+                BatchOp::Put { key, value } => {
+                    Self::validate_insert_shape(key, value)?;
+                    overlay.insert(
+                        key.clone(),
+                        Some(Record {
+                            value: value.clone(),
+                            version: RecordVersion::new(seq),
+                        }),
+                    );
+                }
+                BatchOp::PutIfAbsent { key, value } => {
+                    Self::validate_insert_shape(key, value)?;
+                    if self.projected_record(&overlay, key)?.is_some() {
+                        return Ok(false);
+                    }
+                    overlay.insert(
+                        key.clone(),
+                        Some(Record {
+                            value: value.clone(),
+                            version: RecordVersion::new(seq),
+                        }),
+                    );
+                }
+                BatchOp::CompareAndPut {
+                    key,
+                    expected,
+                    value,
+                } => {
+                    Self::validate_insert_shape(key, value)?;
+                    match self.projected_record(&overlay, key)? {
+                        Some(record) if record.version == *expected => {
+                            overlay.insert(
+                                key.clone(),
+                                Some(Record {
+                                    value: value.clone(),
+                                    version: RecordVersion::new(seq),
+                                }),
+                            );
+                        }
+                        _ => return Ok(false),
+                    }
+                }
+                BatchOp::Delete { key } => {
+                    overlay.insert(key.clone(), None);
+                }
+                BatchOp::DeleteIfVersion { key, expected } => {
+                    match self.projected_record(&overlay, key)? {
+                        Some(record) if record.version == *expected => {
+                            overlay.insert(key.clone(), None);
+                        }
+                        _ => return Ok(false),
+                    }
+                }
+                BatchOp::AssertVersion { key, expected } => {
+                    match self.projected_record(&overlay, key)? {
+                        Some(record) if record.version == *expected => {}
+                        _ => return Ok(false),
+                    }
+                }
+                BatchOp::AssertPrefixEmpty { prefix } => {
+                    if !self.projected_prefix_empty(&overlay, prefix)? {
+                        return Ok(false);
+                    }
+                }
+                BatchOp::Rename { src, dst, force } => {
+                    let Some(src_record) = self.projected_record(&overlay, src)? else {
+                        return Err(Error::NotFound);
+                    };
+                    if src == dst {
+                        continue;
+                    }
+                    if !*force && self.projected_record(&overlay, dst)?.is_some() {
+                        return Err(Error::DstExists);
+                    }
+                    Self::validate_insert_shape(dst, &src_record.value)?;
+                    overlay.insert(src.clone(), None);
+                    overlay.insert(
+                        dst.clone(),
+                        Some(Record {
+                            value: src_record.value,
+                            version: RecordVersion::new(seq),
+                        }),
+                    );
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn projected_record(
+        &self,
+        overlay: &std::collections::HashMap<Vec<u8>, Option<Record>>,
+        key: &[u8],
+    ) -> Result<Option<Record>> {
+        match overlay.get(key) {
+            Some(record) => Ok(record.clone()),
+            None => self.lookup_record_unlocked(key),
+        }
+    }
+
+    fn projected_prefix_empty(
+        &self,
+        overlay: &std::collections::HashMap<Vec<u8>, Option<Record>>,
+        prefix: &[u8],
+    ) -> Result<bool> {
+        if overlay
+            .iter()
+            .any(|(key, record)| record.is_some() && key.starts_with(prefix))
+        {
+            return Ok(false);
+        }
+
+        let mut iter = self.scan_prefix(prefix).into_iter();
+        while let Some(entry) = iter.next_unlocked().transpose()? {
+            match entry {
+                RangeEntry::Key { key, .. } => match overlay.get(&key) {
+                    Some(None) => {}
+                    Some(Some(_)) | None => return Ok(false),
+                },
+                RangeEntry::CommonPrefix(_) => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    fn validate_insert_shape(key: &[u8], value: &[u8]) -> Result<()> {
+        let key_len = key.len().saturating_add(1);
+        if key_len > u16::MAX as usize {
+            return Err(Error::KeyTooLong { len: key_len });
+        }
+        if value.len() > u16::MAX as usize {
+            return Err(Error::ValueTooLong { len: value.len() });
+        }
         Ok(())
     }
 
@@ -759,19 +1015,27 @@ impl Tree {
     /// walker mutations run alone (memory-only mode). Pulling the
     /// loop out keeps the two batch paths from drifting and makes
     /// the per-variant arms readable without macro tricks.
+    #[allow(clippy::too_many_lines)] // one explicit match keeps batch apply order auditable
     fn apply_batch_walker_inline(
         &self,
         pending: Vec<BatchOp>,
         base_seq: u64,
         mut enc: Option<&mut crate::journal::codec::BatchEncoder<'_>>,
     ) -> Result<()> {
-        for (i, op) in pending.into_iter().enumerate() {
-            let seq = base_seq + i as u64;
+        let mut seq_offset = 0u64;
+        for op in pending {
+            let seq = if op.emits_wal() {
+                let seq = base_seq + seq_offset;
+                seq_offset += 1;
+                seq
+            } else {
+                base_seq + seq_offset
+            };
             match op {
                 BatchOp::Put { key, value } => {
                     let search = engine::SearchKey::user(&key);
                     let outcome = engine::insert_multi(
-                        &self.backend,
+                        &self.store,
                         &self.root_pin,
                         Some(&self.route_cache),
                         search,
@@ -780,7 +1044,61 @@ impl Tree {
                         false,
                     )?;
                     if outcome.root_dirty {
-                        self.backend
+                        self.store
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                    }
+                    if let Some(enc) = enc.as_deref_mut() {
+                        enc.push_insert(0, &key, &value);
+                    }
+                }
+                BatchOp::PutIfAbsent { key, value } => {
+                    let search = engine::SearchKey::user(&key);
+                    let outcome = engine::insert_multi_conditional(
+                        &self.store,
+                        &self.root_pin,
+                        Some(&self.route_cache),
+                        search,
+                        &value,
+                        seq,
+                        false,
+                        engine::InsertCondition::IfAbsent,
+                    )?;
+                    if !outcome.mutated {
+                        return Err(Error::Internal(
+                            "atomic preflight missed put_if_absent guard",
+                        ));
+                    }
+                    if outcome.root_dirty {
+                        self.store
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                    }
+                    if let Some(enc) = enc.as_deref_mut() {
+                        enc.push_insert(0, &key, &value);
+                    }
+                }
+                BatchOp::CompareAndPut {
+                    key,
+                    expected,
+                    value,
+                } => {
+                    let search = engine::SearchKey::user(&key);
+                    let outcome = engine::insert_multi_conditional(
+                        &self.store,
+                        &self.root_pin,
+                        Some(&self.route_cache),
+                        search,
+                        &value,
+                        seq,
+                        false,
+                        engine::InsertCondition::IfVersion(expected.as_u64()),
+                    )?;
+                    if !outcome.mutated {
+                        return Err(Error::Internal(
+                            "atomic preflight missed compare_and_put guard",
+                        ));
+                    }
+                    if outcome.root_dirty {
+                        self.store
                             .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
                     if let Some(enc) = enc.as_deref_mut() {
@@ -790,28 +1108,50 @@ impl Tree {
                 BatchOp::Delete { key } => {
                     let search = engine::SearchKey::user(&key);
                     let outcome = engine::erase_multi(
-                        &self.backend,
+                        &self.store,
                         &self.root_pin,
                         Some(&self.route_cache),
                         search,
                         seq,
                         false,
                     )?;
-                    if outcome.mutated {
-                        if outcome.root_dirty {
-                            self.backend.mark_dirty_cached(
-                                self.root_guid,
-                                seq,
-                                self.root_pin.as_ref(),
-                            );
-                        }
-                        if let Some(enc) = enc.as_deref_mut() {
-                            enc.push_erase(0, &key);
-                        }
+                    if outcome.mutated && outcome.root_dirty {
+                        self.store
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
-                    // Pure no-op deletes leave no WAL inner op,
-                    // matching `Tree::delete`'s contract.
+                    // Batch replay derives per-inner seq from the
+                    // inner index, so even no-op deletes are encoded
+                    // to keep later record versions stable across
+                    // crash/replay.
+                    if let Some(enc) = enc.as_deref_mut() {
+                        enc.push_erase(0, &key);
+                    }
                 }
+                BatchOp::DeleteIfVersion { key, expected } => {
+                    let search = engine::SearchKey::user(&key);
+                    let outcome = engine::erase_multi_conditional(
+                        &self.store,
+                        &self.root_pin,
+                        Some(&self.route_cache),
+                        search,
+                        seq,
+                        false,
+                        engine::EraseCondition::IfVersion(expected.as_u64()),
+                    )?;
+                    if !outcome.mutated {
+                        return Err(Error::Internal(
+                            "atomic preflight missed delete_if_version guard",
+                        ));
+                    }
+                    if outcome.root_dirty {
+                        self.store
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                    }
+                    if let Some(enc) = enc.as_deref_mut() {
+                        enc.push_erase(0, &key);
+                    }
+                }
+                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => {}
                 BatchOp::Rename { src, dst, force } => {
                     self.apply_batch_rename_walker(&src, &dst, force, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {
@@ -833,7 +1173,9 @@ impl Tree {
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
         let Some(value) =
-            engine::lookup_multi_with(&self.backend, &self.root_pin, src_search, <[u8]>::to_vec)?
+            engine::lookup_multi_with(&self.store, &self.root_pin, src_search, |hit| {
+                hit.value.to_vec()
+            })?
         else {
             return Err(Error::NotFound);
         };
@@ -841,14 +1183,13 @@ impl Tree {
             return Ok(());
         }
         if !force
-            && engine::lookup_multi_with(&self.backend, &self.root_pin, dst_search, |_| ())?
-                .is_some()
+            && engine::lookup_multi_with(&self.store, &self.root_pin, dst_search, |_| ())?.is_some()
         {
             return Err(Error::DstExists);
         }
 
         let erase_out = engine::erase_multi(
-            &self.backend,
+            &self.store,
             &self.root_pin,
             Some(&self.route_cache),
             src_search,
@@ -856,7 +1197,7 @@ impl Tree {
             false,
         )?;
         let insert_out = engine::insert_multi(
-            &self.backend,
+            &self.store,
             &self.root_pin,
             Some(&self.route_cache),
             dst_search,
@@ -865,7 +1206,7 @@ impl Tree {
             false,
         )?;
         if erase_out.root_dirty || insert_out.root_dirty {
-            self.backend
+            self.store
                 .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
         }
         Ok(())
@@ -876,8 +1217,7 @@ impl Tree {
     /// Returns a [`RangeBuilder`] for chaining `prefix`,
     /// `start_after`, and `delimiter`. Call
     /// [`RangeBuilder::into_iter`] (or `for entry in builder`) to
-    /// start emitting [`RangeEntry`](crate::RangeEntry) items in
-    /// lex key order.
+    /// start emitting [`RangeEntry`] items in lex key order.
     ///
     /// Restart-on-conflict cursor semantics: the iterator stores
     /// blob content versions in its path frames. If a concurrent
@@ -892,7 +1232,7 @@ impl Tree {
     /// already-emitted keys and rollups.
     pub fn range(&self) -> RangeBuilder {
         RangeBuilder::new(
-            Arc::clone(&self.backend),
+            Arc::clone(&self.store),
             self.root_guid,
             Arc::clone(&self.maintenance_gate),
         )
@@ -908,12 +1248,23 @@ impl Tree {
         self.range().prefix(prefix)
     }
 
+    /// Return `true` if no live key starts with `prefix`.
+    ///
+    /// This is a point-in-time read helper. Concurrent writers may
+    /// make the prefix non-empty immediately after it returns; use
+    /// [`AtomicBatch::assert_prefix_empty`] inside [`Self::atomic`] when
+    /// the emptiness check must be atomic with subsequent writes.
+    pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
+        let _maintenance = self.maintenance_gate.enter_shared();
+        self.projected_prefix_empty(&std::collections::HashMap::new(), prefix)
+    }
+
     /// Drain the BM dirty map and synchronously push entries to
-    /// the inner backend via batched write-through (CAS-on-seq).
+    /// the inner store via batched write-through (CAS-on-seq).
     ///
     /// Used by:
     /// - The no-WAL `memory_flush_on_write` path, where every op must
-    ///   reach backend before returning (no checkpointer to defer
+    ///   reach store before returning (no checkpointer to defer
     ///   to).
     /// - `Tree::checkpoint`, where the user explicitly asks for
     ///   a full-tree durability barrier.
@@ -927,7 +1278,7 @@ impl Tree {
     /// 那个 entry；之后 racing writer 写的 newer-seq 留给下一次
     /// flush).
     fn flush_dirty_inline(&self) -> Result<()> {
-        let snap = self.backend.snapshot_dirty();
+        let snap = self.store.snapshot_dirty();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         let mut entries = Vec::with_capacity(snap.len());
@@ -937,7 +1288,7 @@ impl Tree {
             // write-through. `None` means the blob was evicted
             // between snapshot_dirty and snapshot_bytes — invariant
             // I1 regressed, so restore the entry and fail loudly.
-            if let Some(bytes) = self.backend.snapshot_bytes(guid) {
+            if let Some(bytes) = self.store.snapshot_bytes(guid) {
                 entries.push(WriteThroughEntry {
                     guid,
                     bytes,
@@ -955,7 +1306,7 @@ impl Tree {
                 .iter()
                 .map(|entry| (entry.guid, entry.expected_seq))
                 .collect();
-            if let Err(e) = self.backend.write_through_batch(&entries) {
+            if let Err(e) = self.store.write_through_batch(&entries) {
                 for (guid, expected_seq) in expected {
                     failed.insert(guid, expected_seq);
                 }
@@ -965,7 +1316,7 @@ impl Tree {
             }
         }
         if !failed.is_empty() {
-            self.backend.restore_dirty(failed);
+            self.store.restore_dirty(failed);
         }
         if let Some(e) = first_err {
             return Err(e);
@@ -974,7 +1325,7 @@ impl Tree {
     }
 
     /// Drain the BM pending-delete queue and apply each
-    /// `backend.delete_blob` synchronously.
+    /// `store.delete_blob` synchronously.
     ///
     /// Companion to [`Self::flush_dirty_inline`] for the deferred
     /// delete protocol — `erase` ops that emptied a child blob
@@ -984,15 +1335,15 @@ impl Tree {
     ///
     /// Must run **after** `flush_dirty_inline` (any new bytes in
     /// dirty land first) and **before** the trailing
-    /// `backend.flush` (which persists the manifest deletion).
+    /// `store.flush` (which persists the manifest deletion).
     /// Restoration is automatic on individual failures — the
     /// remaining entries stay queued for the next attempt.
     fn flush_pending_deletes_inline(&self) -> Result<()> {
-        let pending = self.backend.snapshot_pending_deletes();
+        let pending = self.store.snapshot_pending_deletes();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         for (guid, seq) in pending {
-            if let Err(e) = self.backend.execute_pending_delete(guid) {
+            if let Err(e) = self.store.execute_pending_delete(guid) {
                 failed.insert(guid, seq);
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -1000,7 +1351,7 @@ impl Tree {
             }
         }
         if !failed.is_empty() {
-            self.backend.restore_pending_deletes(failed);
+            self.store.restore_pending_deletes(failed);
         }
         if let Some(e) = first_err {
             return Err(e);
@@ -1027,9 +1378,9 @@ impl Tree {
     ///    retires the dirty entry only if no racing writer bumped
     ///    it; failures stay in `dirty` for the next round.
     ///    If the snapshot had neither dirty blobs nor pending
-    ///    deletes and the backend reports no outstanding flush
-    ///    work, skip the backend Sync path entirely.
-    /// 3. **Pre-delete sync** — `backend.flush` (`sync_data` on
+    ///    deletes and the store reports no outstanding flush
+    ///    work, skip the store Sync path entirely.
+    /// 3. **Pre-delete sync** — `store.flush` (`sync_data` on
     ///    the data file + persist the manifest) so step 2's
     ///    writes hit stable storage *before* any manifest delete
     ///    runs. Sync failure → restore pending, return.
@@ -1044,7 +1395,7 @@ impl Tree {
     /// 5. **Apply pending deletes** (manifest mutation
     ///    in-memory). Each `execute_pending_delete` is idempotent
     ///    against a missing entry; failures are restored.
-    /// 6. **Post-delete sync** — re-`backend.flush` iff any delete
+    /// 6. **Post-delete sync** — re-`store.flush` iff any delete
     ///    actually applied. Failure → restore the
     ///    already-applied entries so the truncate gate stays
     ///    closed and the next round retries the sync (the manifest
@@ -1071,18 +1422,18 @@ impl Tree {
         // the flushed snapshot.
         let (_snap_dirty, snap_pending, snap_bytes) = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_checkpoint();
-            let snap_dirty = self.backend.snapshot_dirty();
-            let snap_pending = self.backend.snapshot_pending_deletes();
+            let snap_dirty = self.store.snapshot_dirty();
+            let snap_pending = self.store.snapshot_pending_deletes();
             if let Err(e) = journal.flush() {
-                self.backend.restore_pending_deletes(snap_pending);
-                self.backend.restore_dirty(snap_dirty);
+                self.store.restore_pending_deletes(snap_pending);
+                self.store.restore_dirty(snap_dirty);
                 return Err(e);
             }
             let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
             for (guid, expected_seq) in &snap_dirty {
-                let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
-                    self.backend.restore_pending_deletes(snap_pending);
-                    self.backend.restore_dirty(snap_dirty);
+                let Some(bytes) = self.store.snapshot_bytes(*guid) else {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
                     return Err(Error::Internal(
                         "checkpoint: dirty entry lost cache image — invariant I1 violated",
                     ));
@@ -1091,13 +1442,13 @@ impl Tree {
             }
             (snap_dirty, snap_pending, snap_bytes)
         } else {
-            let snap_dirty = self.backend.snapshot_dirty();
-            let snap_pending = self.backend.snapshot_pending_deletes();
+            let snap_dirty = self.store.snapshot_dirty();
+            let snap_pending = self.store.snapshot_pending_deletes();
             let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
             for (guid, expected_seq) in &snap_dirty {
-                let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
-                    self.backend.restore_pending_deletes(snap_pending);
-                    self.backend.restore_dirty(snap_dirty);
+                let Some(bytes) = self.store.snapshot_bytes(*guid) else {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
                     return Err(Error::Internal(
                         "checkpoint: dirty entry lost cache image — invariant I1 violated",
                     ));
@@ -1110,7 +1461,7 @@ impl Tree {
         // Phase 2: batch write-through with CAS-on-seq.
         //
         // A drained dirty entry **must** have a cache image —
-        // invariant I1 (dirty ⟺ cache newer than backend). If
+        // invariant I1 (dirty ⟺ cache newer than store). If
         // `snapshot_bytes` returns `None`, the BM's eviction
         // policy regressed and dropped a dirty cache image; that
         // would otherwise be a silent data-loss path (the next
@@ -1131,8 +1482,8 @@ impl Tree {
                 .iter()
                 .map(|entry| (entry.guid, entry.expected_seq))
                 .collect();
-            if let Err(e) = self.backend.write_through_batch(&entries) {
-                // Backend batch failure may have landed any prefix;
+            if let Err(e) = self.store.write_through_batch(&entries) {
+                // BlobStore batch failure may have landed any prefix;
                 // retry the whole snapshot next round.
                 for (guid, expected_seq) in expected {
                     dirty_failed.insert(guid, expected_seq);
@@ -1144,14 +1495,14 @@ impl Tree {
         }
         let had_dirty_failure = !dirty_failed.is_empty();
         if had_dirty_failure {
-            self.backend.restore_dirty(dirty_failed);
+            self.store.restore_dirty(dirty_failed);
         }
 
-        if entries.is_empty() && snap_pending.is_empty() && !self.backend.needs_flush() {
+        if entries.is_empty() && snap_pending.is_empty() && !self.store.needs_flush() {
             if let Some(journal) = &self.journal {
                 if journal.needs_checkpoint() {
                     let _commit = self.commit_gate.enter_checkpoint();
-                    if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
+                    if self.store.dirty_count() == 0 && self.store.pending_delete_count() == 0 {
                         journal.truncate()?;
                     }
                 }
@@ -1165,8 +1516,8 @@ impl Tree {
         // so those bytes are stable on disk. On sync failure,
         // pending deletes haven't been applied yet, so restore them
         // and bail.
-        if let Err(e) = self.backend.flush() {
-            self.backend.restore_pending_deletes(snap_pending);
+        if let Err(e) = self.store.flush() {
+            self.store.restore_pending_deletes(snap_pending);
             return Err(e);
         }
 
@@ -1179,7 +1530,7 @@ impl Tree {
         // child). Restore the entire pending snapshot and surface
         // the dirty error.
         if had_dirty_failure {
-            self.backend.restore_pending_deletes(snap_pending);
+            self.store.restore_pending_deletes(snap_pending);
             return Err(first_dirty_err.expect("had_dirty_failure ⇒ first_dirty_err set"));
         }
 
@@ -1187,7 +1538,7 @@ impl Tree {
         let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
         let mut first_pending_err: Option<Error> = None;
         for (guid, seq) in &snap_pending {
-            if let Err(e) = self.backend.execute_pending_delete(*guid) {
+            if let Err(e) = self.store.execute_pending_delete(*guid) {
                 pending_failed.insert(*guid, *seq);
                 if first_pending_err.is_none() {
                     first_pending_err = Some(e);
@@ -1195,7 +1546,7 @@ impl Tree {
             }
         }
         if !pending_failed.is_empty() {
-            self.backend.restore_pending_deletes(pending_failed.clone());
+            self.store.restore_pending_deletes(pending_failed.clone());
         }
 
         // Phase 6: post-delete sync iff any delete actually applied.
@@ -1207,13 +1558,13 @@ impl Tree {
         // no-op (HashMap::remove on a missing key).
         let applied_deletes = snap_pending.len() - pending_failed.len();
         if applied_deletes > 0 {
-            if let Err(e) = self.backend.flush() {
+            if let Err(e) = self.store.flush() {
                 let restore_applied: HashMap<BlobGuid, u64> = snap_pending
                     .iter()
                     .filter(|(g, _)| !pending_failed.contains_key(*g))
                     .map(|(g, s)| (*g, *s))
                     .collect();
-                self.backend.restore_pending_deletes(restore_applied);
+                self.store.restore_pending_deletes(restore_applied);
                 return Err(e);
             }
         }
@@ -1231,7 +1582,7 @@ impl Tree {
         //    logic for pending_delete_count.
         if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_checkpoint();
-            if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
+            if self.store.dirty_count() == 0 && self.store.pending_delete_count() == 0 {
                 journal.truncate()?;
             }
         }
@@ -1265,7 +1616,7 @@ impl Tree {
         // and (b) hand-rescue cold entries from the eviction
         // sweep just by looking at them. Both paths use the
         // `_silent` variants instead.
-        let guids = engine::collect_blob_guids_silent(&self.backend, self.root_guid)?;
+        let guids = engine::collect_blob_guids_silent(&self.store, self.root_guid)?;
         let mut blobs: Vec<BlobStats> = Vec::with_capacity(guids.len());
         let mut total_space_used: u64 = 0;
         let mut total_gap_space: u64 = 0;
@@ -1273,7 +1624,7 @@ impl Tree {
         let mut total_compactions: u64 = 0;
         let mut total_tombstones: u64 = 0;
         for guid in &guids {
-            let pin = self.backend.pin_silent(*guid)?;
+            let pin = self.store.pin_silent(*guid)?;
             let guard = pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let h = frame.header();
@@ -1293,18 +1644,18 @@ impl Tree {
             total_tombstones += u64::from(s.tombstone_leaf_cnt);
             blobs.push(s);
         }
-        let bm_dirty_count = self.backend.dirty_count();
-        let bm_pending_delete_count = self.backend.pending_delete_count();
-        let bm_cache_hits = self.backend.cache_hits();
-        let bm_cache_misses = self.backend.cache_misses();
-        let bm_optimistic_restarts = self.backend.optimistic_restarts();
-        let bm_range_restarts = self.backend.range_restarts();
-        let bm_walker_ops = self.backend.walker_ops();
-        let bm_walker_blob_hops = self.backend.walker_blob_hops();
-        let bm_max_blob_hops = self.backend.max_blob_hops();
-        let bm_max_cross_blob_depth = self.backend.max_cross_blob_depth();
-        let bm_spillovers = self.backend.spillover_count();
-        let bm_merges = self.backend.merge_count();
+        let bm_dirty_count = self.store.dirty_count();
+        let bm_pending_delete_count = self.store.pending_delete_count();
+        let bm_cache_hits = self.store.cache_hits();
+        let bm_cache_misses = self.store.cache_misses();
+        let bm_optimistic_restarts = self.store.optimistic_restarts();
+        let bm_range_restarts = self.store.range_restarts();
+        let bm_walker_ops = self.store.walker_ops();
+        let bm_walker_blob_hops = self.store.walker_blob_hops();
+        let bm_max_blob_hops = self.store.max_blob_hops();
+        let bm_max_cross_blob_depth = self.store.max_cross_blob_depth();
+        let bm_spillovers = self.store.spillover_count();
+        let bm_merges = self.store.merge_count();
         let journal = self.journal.as_ref().map(|j| {
             let s = j.stats();
             JournalStats {
@@ -1370,45 +1721,41 @@ impl Tree {
     ///
     /// Both phases stage their changes via `mark_dirty` /
     /// `mark_for_delete` on the internal `BufferManager`
-    /// rather than writing through to backend inline. This keeps
+    /// rather than writing through to store inline. This keeps
     /// compact compatible with invariant **W2D**: a naive
     /// `bm.commit(*guid)` per touched blob would push the cache
     /// image (including any user mutations whose WAL records
-    /// aren't yet durable) straight to backend, and a crash
-    /// before those WAL records flushed would leave the backend
+    /// aren't yet durable) straight to store, and a crash
+    /// before those WAL records flushed would leave the store
     /// at a post-mutation state with no journal to reconcile
     /// against — silent data loss after a WAL replay rebuilds
     /// the cache to the pre-mutation state.
     ///
-    /// Does **not** fsync the backend or touch the WAL — call
+    /// Does **not** fsync the store or touch the WAL — call
     /// [`Tree::checkpoint`] after if you want the rebuilt blobs
     /// durable on disk. Compaction is logically idempotent (the
     /// post-compact tree is observationally identical to the
     /// pre-compact one), so a crash mid-compact just means the
     /// next run re-does the work; the W2D protocol keeps the
-    /// backend image consistent throughout.
+    /// store image consistent throughout.
     ///
     /// This is intentionally incremental. Re-invoke `compact` until
     /// [`Tree::stats`] shows the tombstone / merge backlog has
     /// settled if you want to force a tree all the way down after a
     /// heavy churn phase.
     pub fn compact(&self) -> Result<()> {
-        if self.backend.compaction_candidate_count() == 0
-            && self.backend.merge_candidate_count() == 0
-        {
+        if self.store.compaction_candidate_count() == 0 && self.store.merge_candidate_count() == 0 {
             self.seed_maintenance_candidates()?;
         }
 
         let compact_guids = self
-            .backend
+            .store
             .pop_compaction_candidates(ONLINE_COMPACT_BLOB_BUDGET);
         for guid in compact_guids {
             self.compact_candidate_blob(guid)?;
         }
 
-        let merge_guids = self
-            .backend
-            .pop_merge_candidates(ONLINE_MERGE_PARENT_BUDGET);
+        let merge_guids = self.store.pop_merge_candidates(ONLINE_MERGE_PARENT_BUDGET);
         for guid in merge_guids {
             self.merge_candidate_parent(guid)?;
         }
@@ -1417,17 +1764,17 @@ impl Tree {
 
     fn seed_maintenance_candidates(&self) -> Result<()> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+        let guids = engine::collect_blob_guids(&self.store, self.root_guid)?;
         for guid in guids {
-            let pin = self.backend.pin(guid)?;
+            let pin = self.store.pin(guid)?;
             let guard = pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let header = frame.header();
             if engine::blob_needs_compaction(frame) {
-                self.backend.note_compaction_candidate(guid);
+                self.store.note_compaction_candidate(guid);
             }
             if header.num_ext_blobs != 0 {
-                self.backend.note_merge_candidate(guid);
+                self.store.note_merge_candidate(guid);
             }
         }
         Ok(())
@@ -1437,10 +1784,10 @@ impl Tree {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_shared();
-        if !self.backend.has_blob(guid)? {
+        if !self.store.has_blob(guid)? {
             return Ok(());
         }
-        let pin = self.backend.pin(guid)?;
+        let pin = self.store.pin(guid)?;
         let needs_compaction = {
             let guard = pin.read();
             engine::blob_needs_compaction(BlobFrameRef::wrap(guard.as_slice()))
@@ -1468,7 +1815,7 @@ impl Tree {
             // Keep the pin alive until after dirty publication so
             // eviction cannot drop the rebuilt cache image before a
             // checkpoint snapshots it.
-            self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
+            self.store.mark_dirty(guid, STRUCTURAL_SEQ);
         }
         drop(pin);
         Ok(())
@@ -1478,25 +1825,25 @@ impl Tree {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_exclusive();
-        if !self.backend.has_blob(guid)? {
+        if !self.store.has_blob(guid)? {
             return Ok(());
         }
         let _commit = self
             .journal
             .as_ref()
             .map(|_| self.commit_gate.enter_writer());
-        let pin = self.backend.pin(guid)?;
+        let pin = self.store.pin(guid)?;
         let (merged, has_children) = {
             let mut guard = pin.write();
             let mut frame = guard.frame();
-            let merged = engine::try_merge_children(&self.backend, &mut frame, STRUCTURAL_SEQ)?;
+            let merged = engine::try_merge_children(&self.store, &mut frame, STRUCTURAL_SEQ)?;
             (merged, frame.header().num_ext_blobs != 0)
         };
         if merged.merged > 0 {
-            self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
-            self.backend.note_merges(u64::from(merged.merged));
+            self.store.mark_dirty(guid, STRUCTURAL_SEQ);
+            self.store.note_merges(u64::from(merged.merged));
             if has_children {
-                self.backend.note_merge_candidate(guid);
+                self.store.note_merge_candidate(guid);
             }
         }
         drop(pin);
@@ -1540,7 +1887,7 @@ impl Tree {
 /// the **caller's** responsibility when the returned outcome says
 /// `root_dirty`. Replay must honour that contract. Without this,
 /// a `Tree::open` → `Tree::checkpoint` immediately after replay
-/// could find an empty dirty set, write nothing to backend, then
+/// could find an empty dirty set, write nothing to store, then
 /// truncate the WAL — silently losing every replayed record.
 fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<u64> {
     // Pin the root once for the entire replay loop; saves a
@@ -1561,18 +1908,18 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         // the BM-cached root image. No-op replays (e.g. an erase
         // for a key already absent because a prior replay pass
         // reconciled it) leave the cache byte-identical to
-        // backend — skipping `mark_dirty` for those is a small
+        // store — skipping `mark_dirty` for those is a small
         // win and matches `Tree::delete`'s same-shape branch.
         let root_dirty = match op {
-            TxnOp::Insert { key, value, .. } => {
+            WalOp::Insert { key, value, .. } => {
                 let search = engine::SearchKey::user(key);
                 engine::insert_multi(bm, &root_pin, None, search, value, seq, false)?.root_dirty
             }
-            TxnOp::Erase { key, .. } => {
+            WalOp::Erase { key, .. } => {
                 let search = engine::SearchKey::user(key);
                 engine::erase_multi(bm, &root_pin, None, search, seq, false)?.root_dirty
             }
-            TxnOp::RenameObject {
+            WalOp::RenameObject {
                 src_key,
                 dst_key,
                 force,
@@ -1593,8 +1940,9 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 {
                     return Ok(());
                 }
-                let value = engine::lookup_multi_with(bm, &root_pin, src_search, <[u8]>::to_vec)?
-                    .unwrap_or_default();
+                let value =
+                    engine::lookup_multi_with(bm, &root_pin, src_search, |hit| hit.value.to_vec())?
+                        .unwrap_or_default();
                 let erase_out = engine::erase_multi(bm, &root_pin, None, src_search, seq, false)?;
                 let insert_out =
                     engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq, false)?;
@@ -1603,7 +1951,7 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             // `Batch` is unpacked into per-inner callbacks inside
             // `journal::reader::replay_bytes`, so it never reaches
             // this match — defensive arm only.
-            TxnOp::Batch { .. } => false,
+            WalOp::Batch { .. } => false,
         };
         if root_dirty {
             // Honour the walker's caller-side `mark_dirty(root,

@@ -60,24 +60,24 @@ pub struct TreeStats {
     /// Per-blob breakdown in BFS order from the root.
     pub blobs: Vec<BlobStats>,
     /// Number of blobs currently dirty in the BufferManager —
-    /// modified in cache but not yet flushed to backend. With the
+    /// modified in cache but not yet flushed to store. With the
     /// background checkpointer enabled this stays bounded by the
     /// checkpoint cadence; without it, it tracks the user's
     /// explicit `Tree::checkpoint` schedule.
     pub bm_dirty_count: usize,
-    /// Number of blobs queued for deferred backend deletion —
+    /// Number of blobs queued for deferred store deletion —
     /// children unlinked by an erase walker's `SubtreeGone` path
     /// or by a merge pass, waiting for the next checkpoint round
     /// (or `Tree::checkpoint`) to issue the actual
-    /// `backend.delete_blob` + manifest re-sync.
+    /// `store.delete_blob` + manifest re-sync.
     pub bm_pending_delete_count: usize,
     /// Cumulative cache lookups served from BM cache without
-    /// going to the inner backend. Read by external observers to
+    /// going to the inner store. Read by external observers to
     /// derive a hit rate (`bm_cache_hits / (bm_cache_hits +
     /// bm_cache_misses)`); higher is better.
     pub bm_cache_hits: u64,
     /// Cumulative cache lookups that fell through to
-    /// `inner_backend.read_blob` because the entry was absent or
+    /// `inner_store.read_blob` because the entry was absent or
     /// evicted. Tracks cold-start + eviction churn.
     pub bm_cache_misses: u64,
     /// Cumulative wait-free read restarts in `Tree::get` — each
@@ -90,7 +90,7 @@ pub struct TreeStats {
     /// path and rebuilt from its monotonic lower bound.
     pub bm_range_restarts: u64,
     /// Cumulative mutation walker invocations (`insert_multi` /
-    /// `erase_multi`). `rename` and `txn` count their inner walker
+    /// `erase_multi`). `rename` and `atomic` count their inner walker
     /// calls separately.
     pub bm_walker_ops: u64,
     /// Total blob hops across mutation walker invocations. Divide
@@ -108,7 +108,7 @@ pub struct TreeStats {
     /// compact or background merge passes.
     pub bm_merges: u64,
     /// WAL/journal worker counters, or `None` for memory trees and
-    /// caller-supplied backends opened without holt's WAL.
+    /// caller-supplied stores opened without holt's WAL.
     pub journal: Option<JournalStats>,
     /// Background checkpointer telemetry, or `None` if the bg
     /// thread group isn't running (the default; opt in via

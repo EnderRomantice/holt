@@ -1,7 +1,7 @@
 //! Walker types — public outcomes + internal signals.
 
 use crate::layout::{BlobGuid, NodeType};
-use crate::store::backend::AlignedBlobBuf;
+use crate::store::blob_store::AlignedBlobBuf;
 
 // ---------- public types ----------
 
@@ -9,7 +9,7 @@ use crate::store::backend::AlignedBlobBuf;
 #[derive(Debug)]
 pub enum LookupResult<'a> {
     /// Match found — borrowed view of the value bytes.
-    Found(&'a [u8]),
+    Found(LookupHit<'a>),
     /// No leaf in the tree matches `key`.
     NotFound,
     /// Descent reached a [`NodeType::Blob`] crossing. The caller
@@ -17,6 +17,15 @@ pub enum LookupResult<'a> {
     /// and continue from the child blob's own `header.root_slot`
     /// with `depth = child_depth`.
     Crossing(BlobNodeCrossing),
+}
+
+/// Borrowed lookup hit.
+#[derive(Debug, Clone, Copy)]
+pub struct LookupHit<'a> {
+    /// Value bytes borrowed from the pinned blob.
+    pub value: &'a [u8],
+    /// Leaf sequence attached to the value.
+    pub seq: u64,
 }
 
 /// Where a single-blob walker descent stopped at a BlobNode.
@@ -39,6 +48,9 @@ pub struct InsertOutcome {
     pub root_dirty: bool,
     /// If the key already existed, the value it carried before.
     pub previous: Option<Vec<u8>>,
+    /// `true` iff the walker inserted or updated a leaf. Conditional
+    /// insert paths use `false` for "guard did not pass".
+    pub mutated: bool,
 }
 
 /// Outcome of an [`super::erase::erase`] / [`super::erase::erase_multi`].
@@ -67,9 +79,29 @@ pub struct EraseOutcome {
 /// image holding a clone of the source subtree.
 #[derive(Debug)]
 pub struct MakeBlobOutcome {
-    /// New blob's full 512 KB image — write this to the backend
+    /// New blob's full 512 KB image — write this to the store
     /// under `new_guid`.
     pub buf: AlignedBlobBuf,
+}
+
+/// Guard applied to an insert/update attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertCondition {
+    /// Always insert or replace.
+    Always,
+    /// Insert only when no live record currently exists at the key.
+    IfAbsent,
+    /// Replace only when a live record exists with this sequence.
+    IfVersion(u64),
+}
+
+/// Guard applied to an erase attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EraseCondition {
+    /// Delete any live record matching the key.
+    Always,
+    /// Delete only when the live leaf carries this sequence.
+    IfVersion(u64),
 }
 
 // ---------- internal types (pub(super) for sibling submodules) ----------
@@ -82,6 +114,8 @@ pub(super) struct InsertReturn {
     pub(super) slot_after: u16,
     /// Prior value if the key already existed.
     pub(super) previous: Option<Vec<u8>>,
+    /// `true` iff bytes changed in the blob.
+    pub(super) mutated: bool,
 }
 
 /// What an erase descent tells its parent to do.

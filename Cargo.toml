@@ -57,10 +57,10 @@ proptest = { version = "1", default-features = false, features = ["std", "fork",
 
 [features]
 default = []
-# Linux-only fast path: route PersistentBackend reads + writes
+# Linux-only fast path: route FileBlobStore reads + writes
 # through io_uring instead of pread/pwrite syscalls. On non-Linux
 # targets the feature is a no-op (the underlying `io-uring` crate
-# is gated to `cfg(target_os = "linux")`, so PersistentBackend
+# is gated to `cfg(target_os = "linux")`, so FileBlobStore
 # stays on the pread/pwrite path). Adds the `io-uring` crate as a
 # build dep.
 io-uring = ["dep:io-uring"]

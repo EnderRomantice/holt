@@ -66,8 +66,8 @@ without coordinating.
 ## Project status
 
 **Pre-1.0, actively maintained.** The v0.3 metadata-engine core is
-landed: insert / lookup / erase / rename / range / txn / compact,
-multi-blob crossings, online maintenance gates, persistent backend
+landed: insert / lookup / erase / rename / range / atomic / compact,
+multi-blob crossings, online maintenance gates, persistent store
 with `O_DIRECT` and optional Linux `io_uring`, logical WAL
 with group commit, sharded buffer manager, 3-thread background
 checkpointer, SIMD CRC32 + node scans, and stateful `Tree::range`
@@ -92,10 +92,11 @@ holt = "=0.3.0"
 
 The supported 0.3 user surface is deliberately small:
 `TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
-`RangeEntry`, `RangeIter`, `TxnBatch`, `CheckpointConfig`,
+`RangeEntry`, `RangeIter`, `AtomicBatch`, `Record`, `RecordVersion`,
+`CheckpointConfig`,
 `TreeStats` / related stats structs, `Error` / `Result`, and the
-custom-backend surface (`Backend`, `MemoryBackend`,
-`PersistentBackend`, `AlignedBlobBuf`, `BlobGuid`). Internal
+custom-store surface (`BlobStore`, `MemoryBlobStore`,
+`FileBlobStore`, `AlignedBlobBuf`, `BlobGuid`). Internal
 layout, WAL, walker, and buffer-manager modules are not public API.
 
 ### Open a tree
@@ -105,7 +106,7 @@ Two storage modes; same `TreeBuilder`, one knob switches between them:
 ```rust
 use holt::TreeBuilder;
 
-// Persistent (production), Unix-only — Linux `O_DIRECT`,
+// File-backed production mode, Unix-only — Linux `O_DIRECT`,
 // macOS `F_NOCACHE`. The directory is created if missing.
 let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
     .buffer_pool_size(128)        // pinned 512 KB blobs (default 64)
@@ -148,21 +149,53 @@ tree.put(b"old/path", b"v")?;
 tree.rename(b"old/path", b"new/path", /*force=*/ false)?;
 ```
 
-### Atomic batched transaction
+### Conditional writes
 
-Multiple ops under one WAL record — either all replayed on
-recovery, or none. Returns `Err` mid-batch on a failing rename
-(e.g. `src` missing); earlier ops in the batch are still applied
-to the in-memory cache but the batch WAL record is not emitted,
-so a subsequent reopen-from-WAL drops the partial work.
+`RecordVersion` is Holt's lightweight compare-and-set token. It is
+not an MVCC timestamp and does not provide historical snapshot
+reads; it only says "this live record still has the same leaf seq".
 
 ```rust
-tree.txn(|batch| {
+tree.put_if_absent(b"users/alice", b"{...}")?;
+let record = tree.get_record(b"users/alice")?.unwrap();
+
+let updated: bool = tree.compare_and_put(
+    b"users/alice",
+    record.version,
+    b"{\"tier\":\"hot\"}",
+)?;
+assert!(updated);
+
+let current = tree.get_version(b"users/alice")?.unwrap();
+let deleted: bool = tree.delete_if_version(b"users/alice", current)?;
+assert!(deleted);
+
+// Point-in-time read helper for rmdir-style metadata checks.
+assert!(tree.is_prefix_empty(b"users/alice/")?);
+```
+
+### Atomic batch
+
+Multiple ops under one WAL record. Holt preflights rename and
+conditional-write / prefix-emptiness guards before mutating,
+applies the batch behind the tree-wide mutation gate, then emits
+one Batch WAL record.
+`Ok(true)` means committed, `Ok(false)` means a conditional guard
+failed and nothing was published, and `Err` reports hard failures
+such as a missing rename source or destination collision.
+
+```rust
+let template = tree.get_record(b"users/template")?.unwrap();
+let committed = tree.atomic(|batch| {
+    batch.assert_version(b"users/template", template.version);
     batch.put(b"users/alice", b"{...}");
     batch.put(b"users/bob",   b"{...}");
+    batch.put_if_absent(b"users/new", b"{...}");
     batch.delete(b"users/legacy-account");
+    batch.assert_prefix_empty(b"users/temp/");
     batch.rename(b"users/temp", b"users/permanent", true);
 })?;
+assert!(committed);
 ```
 
 ### Range scan with S3 delimiter rollup
@@ -176,13 +209,13 @@ tree.txn(|batch| {
 use holt::RangeEntry;
 
 // Simple prefix scan — `take(50)` for a paged "first 50" view.
-let first_50: Vec<(Vec<u8>, Vec<u8>)> = tree
+let first_50: Vec<_> = tree
     .range()
     .prefix(b"users/")
     .into_iter()
     .take(50)
     .map(|r| r.map(|e| match e {
-        RangeEntry::Key { key, value } => (key, value),
+        RangeEntry::Key { key, value, version } => (key, value, version),
         _ => unreachable!("no delimiter set"),
     }))
     .collect::<Result<_, _>>()?;
@@ -205,7 +238,7 @@ Per-op writes land in the journal worker + BufferManager cache.
 Disk-truth advances at:
 
 - **`Tree::checkpoint()`** — flush the journal (`sync_data`),
-  write dirty blobs through to the backend, `fdatasync` the backend,
+  write dirty blobs through to the store, `fdatasync` the store,
   truncate the WAL. Call this at your own application checkpoint
   cadence.
 - **WAL auto-flush** — once the WAL writer's pending buffer

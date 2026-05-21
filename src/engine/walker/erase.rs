@@ -10,7 +10,7 @@ use super::lookup::lookup_at;
 use super::readers::{
     ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
-use super::types::{EraseOutcome, EraseReturn, EraseSignal, LookupResult};
+use super::types::{EraseCondition, EraseOutcome, EraseReturn, EraseSignal, LookupResult};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
     shrink_node16_to_node4, shrink_node256_to_node48, shrink_node48_to_node16, write_prefix_chain,
@@ -63,6 +63,29 @@ pub fn erase_multi(
     seq: u64,
     wants_prev: bool,
 ) -> Result<EraseOutcome> {
+    erase_multi_conditional(
+        bm,
+        root_pin,
+        route_cache,
+        key,
+        seq,
+        wants_prev,
+        EraseCondition::Always,
+    )
+}
+
+/// Conditional variant of [`erase_multi`]. Used by
+/// `Tree::delete_if_version` so the version check and tombstone
+/// write happen under the same exclusive blob latch.
+pub fn erase_multi_conditional(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    seq: u64,
+    wants_prev: bool,
+    condition: EraseCondition,
+) -> Result<EraseOutcome> {
     // The caller (typically `Tree`) keeps `root_pin` alive across
     // every op so we skip `BufferManager`'s pin-Mutex on the hot
     // root hop. The guard-aware walker performs a single descent:
@@ -73,7 +96,7 @@ pub fn erase_multi(
     // `seq` is the WAL seq the caller pre-allocated for this op;
     // every child blob the walker mutates gets a corresponding
     // `bm.mark_dirty(child_guid, seq)` so the checkpoint round
-    // flushes WAL **before** the child bytes reach the backend.
+    // flushes WAL **before** the child bytes reach the store.
     let mut blob_hops = 0u64;
     let mut max_cross_blob_depth = 0usize;
 
@@ -95,6 +118,7 @@ pub fn erase_multi(
                 key,
                 seq,
                 wants_prev,
+                condition,
                 route.child_depth,
                 &mut blob_hops,
                 &mut max_cross_blob_depth,
@@ -130,6 +154,7 @@ pub fn erase_multi(
                     key,
                     seq,
                     wants_prev,
+                    condition,
                     crossing.child_depth,
                     &mut blob_hops,
                     &mut max_cross_blob_depth,
@@ -166,6 +191,7 @@ pub fn erase_multi(
         key,
         seq,
         wants_prev,
+        condition,
         0,
         &mut blob_hops,
         &mut max_cross_blob_depth,
@@ -197,6 +223,7 @@ fn lock_coupled_erase_in_blob(
     key: SearchKey<'_>,
     seq: u64,
     wants_prev: bool,
+    condition: EraseCondition,
     depth: usize,
     blob_hops: &mut u64,
     max_cross_blob_depth: &mut usize,
@@ -206,8 +233,10 @@ fn lock_coupled_erase_in_blob(
     let step = {
         let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
-        erase_at_step(&mut frame, root_slot, key, depth, wants_prev, true)
-            .map_err(|e| e.with_blob_guid(current_guid))?
+        erase_at_step(
+            &mut frame, root_slot, key, depth, wants_prev, condition, true,
+        )
+        .map_err(|e| e.with_blob_guid(current_guid))?
     };
 
     let r = match step {
@@ -226,6 +255,7 @@ fn lock_coupled_erase_in_blob(
                 key,
                 seq,
                 wants_prev,
+                condition,
                 crossing.child_depth,
                 blob_hops,
                 max_cross_blob_depth,
@@ -290,7 +320,15 @@ pub(super) fn erase_at(
     depth: usize,
     wants_prev: bool,
 ) -> Result<EraseReturn> {
-    match erase_at_step(frame, slot, SearchKey::exact(key), depth, wants_prev, false)? {
+    match erase_at_step(
+        frame,
+        slot,
+        SearchKey::exact(key),
+        depth,
+        wants_prev,
+        EraseCondition::Always,
+        false,
+    )? {
         EraseStep::Done(r) => Ok(r),
         EraseStep::Crossing(_) => Err(Error::NotYetImplemented(
             "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
@@ -305,6 +343,7 @@ fn erase_at_step(
     key: SearchKey<'_>,
     depth: usize,
     wants_prev: bool,
+    condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
@@ -317,12 +356,29 @@ fn erase_at_step(
             mutated: false,
             previous: None,
         })),
-        NodeType::Leaf => erase_at_leaf(frame, slot, key, wants_prev).map(EraseStep::Done),
-        NodeType::Prefix => {
-            erase_at_prefix_step(frame, slot, key, depth, wants_prev, allow_crossing)
+        NodeType::Leaf => {
+            erase_at_leaf(frame, slot, key, wants_prev, condition).map(EraseStep::Done)
         }
+        NodeType::Prefix => erase_at_prefix_step(
+            frame,
+            slot,
+            key,
+            depth,
+            wants_prev,
+            condition,
+            allow_crossing,
+        ),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner_step(frame, slot, ntype, key, depth, wants_prev, allow_crossing)
+            erase_at_inner_step(
+                frame,
+                slot,
+                ntype,
+                key,
+                depth,
+                wants_prev,
+                condition,
+                allow_crossing,
+            )
         }
         NodeType::Blob => {
             if allow_crossing {
@@ -383,6 +439,7 @@ fn erase_at_leaf(
     leaf_slot: u16,
     key: SearchKey<'_>,
     wants_prev: bool,
+    condition: EraseCondition,
 ) -> Result<EraseReturn> {
     // Always read the existing key (needed for the key-match
     // check). Only materialise the prev value when the caller
@@ -407,6 +464,15 @@ fn erase_at_leaf(
             mutated: false,
             previous: None,
         });
+    }
+    if let EraseCondition::IfVersion(expected) = condition {
+        if leaf.seq != expected {
+            return Ok(EraseReturn {
+                signal: EraseSignal::Unchanged,
+                mutated: false,
+                previous: None,
+            });
+        }
     }
     let prev = if wants_prev {
         let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &leaf)?;
@@ -433,6 +499,7 @@ fn erase_at_prefix_step(
     key: SearchKey<'_>,
     depth: usize,
     wants_prev: bool,
+    condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
     // `Prefix` is `Copy` — `p` is owned on the stack, so we can
@@ -458,6 +525,7 @@ fn erase_at_prefix_step(
         key,
         depth + plen,
         wants_prev,
+        condition,
         allow_crossing,
     )?;
     let EraseStep::Done(r) = r else {
@@ -496,6 +564,7 @@ fn erase_at_inner_step(
     key: SearchKey<'_>,
     depth: usize,
     wants_prev: bool,
+    condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
     let Some(byte) = key.byte_at(depth) else {
@@ -513,7 +582,15 @@ fn erase_at_inner_step(
         }));
     };
 
-    let r = erase_at_step(frame, child, key, depth + 1, wants_prev, allow_crossing)?;
+    let r = erase_at_step(
+        frame,
+        child,
+        key,
+        depth + 1,
+        wants_prev,
+        condition,
+        allow_crossing,
+    )?;
     let EraseStep::Done(r) = r else {
         return Ok(r);
     };

@@ -2,16 +2,19 @@
 //!
 //! - [`BlobFrame`] — typed view over one 512 KB blob, with bump
 //!   allocator + per-NodeType free list.
-//! - [`backend`] — pluggable storage backend trait
-//!   (memory / persistent / future io_uring).
-//! - [`BufferManager`] — LRU-bounded cache wrapping any `Backend`,
-//!   itself implementing `Backend` so it's transparent.
+//! - [`blob_store`] — blob-addressed storage trait and bundled
+//!   memory / file-backed stores.
+//! - [`buffer_manager`] — cache residency, dirty tracking,
+//!   deferred deletes, and per-blob latching.
+//! - [`BufferManager`] — LRU-bounded cache wrapping any `BlobStore`;
+//!   it also implements `BlobStore` so it remains transparent above
+//!   the store layer.
 
-pub mod backend;
 mod blob_frame;
-// `pub(crate)` so internal crates can name
-// `crate::store::buffer_manager::STRUCTURAL_SEQ` directly; the
-// public API still goes through the re-exports below.
+pub mod blob_store;
+// `pub(crate)` so walkers/checkpoint code can name cache-internal
+// guard types and `STRUCTURAL_SEQ` without exposing store internals
+// through the crate API.
 pub(crate) mod buffer_manager;
 
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};

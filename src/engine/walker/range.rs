@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use crate::api::atomic::RecordVersion;
 use crate::api::errors::{Error, Result};
 use crate::concurrency::MaintenanceGate;
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
@@ -49,12 +50,15 @@ use crate::engine::simd;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RangeEntry {
-    /// A leaf — user key + value (engine terminator already stripped).
+    /// A leaf — user key + value + live record version (engine
+    /// terminator already stripped).
     Key {
         /// User-supplied key bytes (terminator byte stripped).
         key: Vec<u8>,
         /// Value bytes.
         value: Vec<u8>,
+        /// Current compare-and-set token for this live leaf.
+        version: RecordVersion,
     },
     /// S3-style rollup — a common prefix collapsed because the
     /// caller set a [`RangeBuilder::delimiter`] and the iterator
@@ -269,6 +273,7 @@ fn project_range_leaf(
     Ok(LeafAction::Key {
         key: user_key.to_vec(),
         value: value.to_vec(),
+        version: RecordVersion::new(leaf.seq),
     })
 }
 
@@ -322,7 +327,11 @@ enum RangeAdvance {
 enum LeafAction {
     Skip,
     Done,
-    Key { key: Vec<u8>, value: Vec<u8> },
+    Key {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        version: RecordVersion,
+    },
     CommonPrefix(Vec<u8>),
 }
 
@@ -348,32 +357,30 @@ impl Iterator for RangeIter {
     type Item = Result<RangeEntry>;
 
     fn next(&mut self) -> Option<Result<RangeEntry>> {
-        'restart: loop {
+        self.next_maybe_guarded(true)
+    }
+}
+
+impl RangeIter {
+    /// Advance without entering `maintenance_gate`.
+    /// Caller must already hold the tree's maintenance guard.
+    pub(crate) fn next_unlocked(&mut self) -> Option<Result<RangeEntry>> {
+        self.next_maybe_guarded(false)
+    }
+
+    fn next_maybe_guarded(&mut self, enter_gate: bool) -> Option<Result<RangeEntry>> {
+        loop {
             if self.terminated {
                 return None;
             }
-            let maintenance_gate = Arc::clone(&self.maintenance_gate);
-            let _maintenance = maintenance_gate.enter_shared();
-            if !self.initialized {
-                match self.init_descent() {
-                    Ok(InitResult::Ready) => {
-                        self.initialized = true;
-                    }
-                    Ok(InitResult::Empty) => {
-                        self.terminated = true;
-                        return None;
-                    }
-                    Ok(InitResult::Restart) => {
-                        self.restart_cursor();
-                        continue 'restart;
-                    }
-                    Err(e) => {
-                        self.terminated = true;
-                        return Some(Err(e));
-                    }
-                }
-            }
-            match self.advance_to_next_entry() {
+            let step = if enter_gate {
+                let maintenance_gate = Arc::clone(&self.maintenance_gate);
+                let _maintenance = maintenance_gate.enter_shared();
+                self.next_step()
+            } else {
+                self.next_step()
+            };
+            match step {
                 Ok(RangeAdvance::Done) => {
                     self.terminated = true;
                     return None;
@@ -389,9 +396,20 @@ impl Iterator for RangeIter {
             }
         }
     }
-}
 
-impl RangeIter {
+    fn next_step(&mut self) -> Result<RangeAdvance> {
+        if !self.initialized {
+            match self.init_descent()? {
+                InitResult::Ready => {
+                    self.initialized = true;
+                }
+                InitResult::Empty => return Ok(RangeAdvance::Done),
+                InitResult::Restart => return Ok(RangeAdvance::Restart),
+            }
+        }
+        self.advance_to_next_entry()
+    }
+
     fn init_descent(&mut self) -> Result<InitResult> {
         let seek_start = self.effective_seek_start();
         if matches!(seek_start, SeekStart::Empty) {
@@ -666,13 +684,21 @@ impl RangeIter {
                         match kv {
                             LeafAction::Skip => {}
                             LeafAction::Done => return Ok(RangeAdvance::Done),
-                            LeafAction::Key { key, value } => {
+                            LeafAction::Key {
+                                key,
+                                value,
+                                version,
+                            } => {
                                 if !self.path_is_still_valid() {
                                     return Ok(RangeAdvance::Restart);
                                 }
                                 self.lower_bound = Some(LowerBound::Exclusive(key.clone()));
                                 self.last_common_prefix = None;
-                                return Ok(RangeAdvance::Entry(RangeEntry::Key { key, value }));
+                                return Ok(RangeAdvance::Entry(RangeEntry::Key {
+                                    key,
+                                    value,
+                                    version,
+                                }));
                             }
                             LeafAction::CommonPrefix(common) => {
                                 if !self.path_is_still_valid() {

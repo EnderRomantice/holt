@@ -14,8 +14,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// Backend I/O failure.
-    BackendIo(std::io::Error),
+    /// BlobStore I/O failure.
+    BlobStoreIo(std::io::Error),
     /// Bump allocator / slot table exhaustion / invalid alloc.
     Alloc(AllocError),
     /// Free-list misuse.
@@ -131,7 +131,7 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BackendIo(e) => write!(f, "backend I/O: {e}"),
+            Self::BlobStoreIo(e) => write!(f, "store I/O: {e}"),
             Self::Alloc(e) => write!(f, "alloc: {e}"),
             Self::Free(e) => write!(f, "free: {e}"),
             Self::KeyTooLong { len } => write!(f, "key too long ({len} bytes; max {})", u16::MAX),
@@ -177,7 +177,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::BackendIo(e) => Some(e),
+            Self::BlobStoreIo(e) => Some(e),
             Self::Alloc(e) => Some(e),
             Self::Free(e) => Some(e),
             _ => None,
@@ -187,7 +187,7 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Self::BackendIo(e)
+        Self::BlobStoreIo(e)
     }
 }
 impl From<AllocError> for Error {

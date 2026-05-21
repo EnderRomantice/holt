@@ -7,7 +7,7 @@ use super::config::{Storage, TreeConfig};
 use super::tree::Tree;
 use crate::api::errors::Result;
 use crate::checkpoint::CheckpointConfig;
-use crate::store::backend::Backend;
+use crate::store::blob_store::BlobStore;
 
 /// Fluent constructor for [`Tree`].
 ///
@@ -24,7 +24,7 @@ use crate::store::backend::Backend;
 ///     .open()?;
 /// ```
 #[derive(Debug, Clone)]
-#[must_use = "TreeBuilder is consumed by `.open()` / `.open_with_backend()`; chained setters return a fresh builder you must use"]
+#[must_use = "TreeBuilder is consumed by `.open()` / `.open_with_blob_store()`; chained setters return a fresh builder you must use"]
 pub struct TreeBuilder {
     cfg: TreeConfig,
 }
@@ -74,9 +74,9 @@ impl TreeBuilder {
         Tree::open(self.cfg)
     }
 
-    /// Open with a caller-supplied [`Backend`] (overrides the
+    /// Open with a caller-supplied [`BlobStore`] (overrides the
     /// builder's storage mode).
-    pub fn open_with_backend(self, backend: Arc<dyn Backend>) -> Result<Tree> {
-        Tree::open_with_backend(self.cfg, backend)
+    pub fn open_with_blob_store(self, store: Arc<dyn BlobStore>) -> Result<Tree> {
+        Tree::open_with_blob_store(self.cfg, store)
     }
 }

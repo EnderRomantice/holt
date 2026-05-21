@@ -12,7 +12,7 @@ use super::codec::{
     crc32, encode_file_header, FileHeader, FILE_HEADER_SIZE, FORMAT_VERSION, RECORD_MAGIC,
 };
 use super::reader::replay;
-use super::txn_op::TxnOp;
+use super::wal_op::WalOp;
 use super::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
 use crate::api::errors::Error;
 
@@ -31,26 +31,26 @@ fn append_raw_record(out: &mut Vec<u8>, seq: u64, ty: u8, body: &[u8]) {
     out.extend_from_slice(&crc.to_le_bytes());
 }
 
-fn sample_ops() -> Vec<TxnOp> {
+fn sample_ops() -> Vec<WalOp> {
     vec![
-        TxnOp::Insert {
+        WalOp::Insert {
             tree_id: 0,
             seq: 1,
             key: b"img/01.jpg".to_vec(),
             value: vec![0xAA; 64],
         },
-        TxnOp::Insert {
+        WalOp::Insert {
             tree_id: 0,
             seq: 2,
             key: b"img/02.jpg".to_vec(),
             value: vec![0xBB; 64],
         },
-        TxnOp::Erase {
+        WalOp::Erase {
             tree_id: 0,
             seq: 3,
             key: b"img/01.jpg".to_vec(),
         },
-        TxnOp::RenameObject {
+        WalOp::RenameObject {
             tree_id: 0,
             seq: 4,
             src_key: b"img/02.jpg".to_vec(),
@@ -129,7 +129,7 @@ fn open_existing_resumes_append_position() {
     {
         let mut w = WalWriter::create(&path, 7).unwrap();
         w.append(
-            &TxnOp::Insert {
+            &WalOp::Insert {
                 tree_id: 0,
                 seq: 1,
                 key: b"k1".to_vec(),
@@ -146,7 +146,7 @@ fn open_existing_resumes_append_position() {
         let mut w = WalWriter::open_existing(&path).unwrap();
         assert_eq!(w.header().tree_id, 7);
         w.append(
-            &TxnOp::Erase {
+            &WalOp::Erase {
                 tree_id: 0,
                 seq: 2,
                 key: b"k1".to_vec(),
@@ -201,7 +201,7 @@ fn unflushed_records_are_lost_after_drop() {
     {
         let mut w = WalWriter::create(&path, 0).unwrap();
         w.append(
-            &TxnOp::Insert {
+            &WalOp::Insert {
                 tree_id: 0,
                 seq: 1,
                 key: b"transient".to_vec(),
@@ -320,7 +320,7 @@ fn replay_callback_can_short_circuit() {
     let mut w = WalWriter::create(&path, 0).unwrap();
     for i in 0..10 {
         w.append(
-            &TxnOp::Insert {
+            &WalOp::Insert {
                 tree_id: 0,
                 seq: i + 1,
                 key: format!("k{i}").into_bytes(),
@@ -390,7 +390,7 @@ fn discard_pending_keeps_already_flushed_records() {
     let mut w = WalWriter::create(&path, 0).unwrap();
 
     w.append(
-        &TxnOp::Insert {
+        &WalOp::Insert {
             tree_id: 0,
             seq: 1,
             key: b"k1".to_vec(),
@@ -402,7 +402,7 @@ fn discard_pending_keeps_already_flushed_records() {
     w.flush().unwrap();
 
     w.append(
-        &TxnOp::Insert {
+        &WalOp::Insert {
             tree_id: 0,
             seq: 2,
             key: b"k2".to_vec(),
@@ -440,7 +440,7 @@ fn truncate_reuses_live_wal_file_in_place() {
     let path = wal_path(&dir);
     let mut w = WalWriter::create(&path, 0).unwrap();
     w.append(
-        &TxnOp::Insert {
+        &WalOp::Insert {
             tree_id: 0,
             seq: 1,
             key: b"before-truncate".to_vec(),
@@ -457,7 +457,7 @@ fn truncate_reuses_live_wal_file_in_place() {
     assert_eq!(fs::metadata(&path).unwrap().len(), FILE_HEADER_SIZE as u64);
 
     w.append(
-        &TxnOp::Insert {
+        &WalOp::Insert {
             tree_id: 0,
             seq: 2,
             key: b"after-truncate".to_vec(),
@@ -493,7 +493,7 @@ fn many_records_stream_round_trip() {
         let mut w = WalWriter::create(&path, 0).unwrap();
         for i in 1..=N {
             w.append(
-                &TxnOp::Insert {
+                &WalOp::Insert {
                     tree_id: 0,
                     seq: i,
                     key: format!("k{i:04}").into_bytes(),
@@ -534,7 +534,7 @@ fn auto_flush_keeps_user_space_buffer_bounded() {
     let target_records = (AUTO_FLUSH_THRESHOLD / 80) * 3;
     for i in 0..target_records as u64 {
         w.append(
-            &TxnOp::Insert {
+            &WalOp::Insert {
                 tree_id: 0,
                 seq: i + 1,
                 key: format!("k{i:06}").into_bytes(),
@@ -594,7 +594,7 @@ fn appending_after_external_truncate_grows_file_again() {
 
     let mut w = WalWriter::create(&path, 0).unwrap();
     w.append(
-        &TxnOp::Insert {
+        &WalOp::Insert {
             tree_id: 0,
             seq: 1,
             key: b"keep".to_vec(),
@@ -616,7 +616,7 @@ fn appending_after_external_truncate_grows_file_again() {
 
     // The writer still appends successfully.
     w.append(
-        &TxnOp::Insert {
+        &WalOp::Insert {
             tree_id: 0,
             seq: 2,
             key: b"after-truncate".to_vec(),

@@ -10,7 +10,7 @@ use super::lookup::lookup_at;
 use super::migrate::blob_needs_compaction;
 use super::readers::{ntype_of, read_leaf_key_ref, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
-use super::types::{InsertOutcome, InsertReturn, LookupResult};
+use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
     write_node4_with, write_prefix_chain, write_struct_to_slot,
@@ -55,6 +55,7 @@ pub(super) fn insert(
     Ok(InsertOutcome {
         root_dirty: true,
         previous: r.previous,
+        mutated: true,
     })
 }
 
@@ -66,7 +67,7 @@ pub(super) fn insert(
 /// Child blobs encountered during descent are pinned in the same
 /// BM cache and mutated in place. The walker tags every touched
 /// child via `bm.mark_dirty(child_guid, seq)`; the actual
-/// backend write is the checkpoint round's job (and only happens
+/// store write is the checkpoint round's job (and only happens
 /// after the WAL record for `seq` is durable — invariant W2D).
 ///
 /// `wants_prev` controls whether the walker reads + clones the
@@ -84,6 +85,32 @@ pub fn insert_multi(
     value: &[u8],
     seq: u64,
     wants_prev: bool,
+) -> Result<InsertOutcome> {
+    insert_multi_conditional(
+        bm,
+        root_pin,
+        route_cache,
+        key,
+        value,
+        seq,
+        wants_prev,
+        InsertCondition::Always,
+    )
+}
+
+/// Conditional variant of [`insert_multi`]. Used by the public
+/// compare-and-set APIs so the existence/version check and mutation
+/// happen while the target blob is exclusively latched.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_multi_conditional(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    value: &[u8],
+    seq: u64,
+    wants_prev: bool,
+    condition: InsertCondition,
 ) -> Result<InsertOutcome> {
     if key.len() > u16::MAX as usize {
         return Err(Error::KeyTooLong { len: key.len() });
@@ -120,6 +147,7 @@ pub fn insert_multi(
                 value,
                 seq,
                 wants_prev,
+                condition,
                 route.child_depth,
                 &mut blob_hops,
                 &mut max_cross_blob_depth,
@@ -158,6 +186,7 @@ pub fn insert_multi(
                 value,
                 seq,
                 wants_prev,
+                condition,
                 crossing.child_depth,
                 &mut blob_hops,
                 &mut max_cross_blob_depth,
@@ -187,6 +216,7 @@ pub fn insert_multi(
         value,
         seq,
         wants_prev,
+        condition,
         0,
         &mut blob_hops,
         &mut max_cross_blob_depth,
@@ -219,6 +249,7 @@ fn lock_coupled_insert_in_blob(
     value: &[u8],
     seq: u64,
     wants_prev: bool,
+    condition: InsertCondition,
     depth: usize,
     blob_hops: &mut u64,
     max_cross_blob_depth: &mut usize,
@@ -232,27 +263,32 @@ fn lock_coupled_insert_in_blob(
             let mut frame = guard.frame();
             let root_slot = frame.header().root_slot;
             insert_at_step(
-                &mut frame, root_slot, key, value, depth, seq, wants_prev, true,
+                &mut frame, root_slot, key, value, depth, seq, wants_prev, condition, true,
             )
         };
         match r {
             Ok(InsertStep::Done(out)) => {
                 let needs_compaction = {
                     let mut frame = guard.frame();
-                    frame.header_mut().root_slot = out.slot_after;
-                    blob_needs_compaction(frame.as_ref())
+                    if out.mutated {
+                        frame.header_mut().root_slot = out.slot_after;
+                        blob_needs_compaction(frame.as_ref())
+                    } else {
+                        false
+                    }
                 };
                 drop(guard);
                 if needs_compaction {
                     bm.note_compaction_candidate(current_guid);
                 }
-                if !is_top_blob {
+                if out.mutated && !is_top_blob {
                     bm.mark_dirty_cached(current_guid, seq, current_entry);
                 }
 
                 return Ok(InsertOutcome {
-                    root_dirty: is_top_blob,
+                    root_dirty: is_top_blob && out.mutated,
                     previous: out.previous,
+                    mutated: out.mutated,
                 });
             }
             Ok(InsertStep::Crossing(crossing)) => {
@@ -270,6 +306,7 @@ fn lock_coupled_insert_in_blob(
                     value,
                     seq,
                     wants_prev,
+                    condition,
                     crossing.child_depth,
                     blob_hops,
                     max_cross_blob_depth,
@@ -317,7 +354,17 @@ pub(super) fn insert_at(
     seq: u64,
     wants_prev: bool,
 ) -> Result<InsertReturn> {
-    match insert_at_step(frame, slot, key, value, depth, seq, wants_prev, false)? {
+    match insert_at_step(
+        frame,
+        slot,
+        key,
+        value,
+        depth,
+        seq,
+        wants_prev,
+        InsertCondition::Always,
+        false,
+    )? {
         InsertStep::Done(r) => Ok(r),
         InsertStep::Crossing(_) => Err(Error::NotYetImplemented(
             "walker::insert_at: BlobNode crossing requires BufferManager — use insert_multi",
@@ -334,6 +381,7 @@ fn insert_at_step(
     depth: usize,
     seq: u64,
     wants_prev: bool,
+    condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
@@ -342,10 +390,11 @@ fn insert_at_step(
             "walker::insert_at: hit NodeType::Invalid",
         )),
         NodeType::EmptyRoot => {
-            insert_into_empty_root(frame, slot, key, value, seq).map(InsertStep::Done)
+            insert_into_empty_root(frame, slot, key, value, seq, condition).map(InsertStep::Done)
         }
         NodeType::Leaf => {
-            insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev).map(InsertStep::Done)
+            insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev, condition)
+                .map(InsertStep::Done)
         }
         NodeType::Prefix => insert_into_prefix_step(
             frame,
@@ -355,6 +404,7 @@ fn insert_at_step(
             depth,
             seq,
             wants_prev,
+            condition,
             allow_crossing,
         ),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
@@ -367,15 +417,24 @@ fn insert_at_step(
                 depth,
                 seq,
                 wants_prev,
+                condition,
                 allow_crossing,
             )
         }
-        NodeType::Blob => {
-            blob_node_insert_step(frame, slot, key, value, depth, seq, allow_crossing)
-        }
+        NodeType::Blob => blob_node_insert_step(
+            frame,
+            slot,
+            key,
+            value,
+            depth,
+            seq,
+            condition,
+            allow_crossing,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)] // condition threads through same walker shape
 fn blob_node_insert_step(
     frame: &mut BlobFrame<'_>,
     slot: u16,
@@ -383,6 +442,7 @@ fn blob_node_insert_step(
     value: &[u8],
     depth: usize,
     seq: u64,
+    condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
     let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
@@ -418,6 +478,14 @@ fn blob_node_insert_step(
     let existing_div_byte = prefix[common];
     debug_assert_ne!(existing_div_byte, new_div_byte);
 
+    if matches!(condition, InsertCondition::IfVersion(_)) {
+        return Ok(InsertStep::Done(InsertReturn {
+            slot_after: slot,
+            previous: None,
+            mutated: false,
+        }));
+    }
+
     // Keep the old BlobNode slot so parent pointers do not move.
     // The branch byte is consumed by the new Node4, so the BlobNode
     // only keeps the remaining inline tail before crossing to the
@@ -443,6 +511,7 @@ fn blob_node_insert_step(
     Ok(InsertStep::Done(InsertReturn {
         slot_after: final_slot,
         previous: None,
+        mutated: true,
     }))
 }
 
@@ -452,12 +521,21 @@ fn insert_into_empty_root(
     key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
+    condition: InsertCondition,
 ) -> Result<InsertReturn> {
+    if matches!(condition, InsertCondition::IfVersion(_)) {
+        return Ok(InsertReturn {
+            slot_after: empty_slot,
+            previous: None,
+            mutated: false,
+        });
+    }
     let new_slot = write_leaf(frame, key, value, seq)?;
     frame.free_node(empty_slot)?;
     Ok(InsertReturn {
         slot_after: new_slot,
         previous: None,
+        mutated: true,
     })
 }
 
@@ -467,6 +545,7 @@ struct LeafSplitPlan {
     byte_new: u8,
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn insert_into_leaf(
     frame: &mut BlobFrame<'_>,
     leaf_slot: u16,
@@ -475,6 +554,7 @@ fn insert_into_leaf(
     depth: usize,
     seq: u64,
     wants_prev: bool,
+    condition: InsertCondition,
 ) -> Result<InsertReturn> {
     enum LeafInsertPlan {
         SameKey(Leaf),
@@ -511,6 +591,25 @@ fn insert_into_leaf(
 
     let split = match plan {
         LeafInsertPlan::SameKey(existing_leaf) => {
+            if existing_leaf.tombstone == 0 {
+                match condition {
+                    InsertCondition::Always => {}
+                    InsertCondition::IfVersion(expected) if existing_leaf.seq == expected => {}
+                    InsertCondition::IfAbsent | InsertCondition::IfVersion(_) => {
+                        return Ok(InsertReturn {
+                            slot_after: leaf_slot,
+                            previous: None,
+                            mutated: false,
+                        });
+                    }
+                }
+            } else if matches!(condition, InsertCondition::IfVersion(_)) {
+                return Ok(InsertReturn {
+                    slot_after: leaf_slot,
+                    previous: None,
+                    mutated: false,
+                });
+            }
             // Same-key update path (covers two semantic cases via the
             // same alloc machinery):
             //
@@ -564,6 +663,7 @@ fn insert_into_leaf(
                 return Ok(InsertReturn {
                     slot_after: leaf_slot,
                     previous: prev,
+                    mutated: true,
                 });
             }
 
@@ -580,16 +680,26 @@ fn insert_into_leaf(
             return Ok(InsertReturn {
                 slot_after: new_slot,
                 previous: prev,
+                mutated: true,
             });
         }
         LeafInsertPlan::Split(split) => split,
     };
+
+    if matches!(condition, InsertCondition::IfVersion(_)) {
+        return Ok(InsertReturn {
+            slot_after: leaf_slot,
+            previous: None,
+            mutated: false,
+        });
+    }
 
     // Two different keys: split into [Prefix?] -> Node4 -> {old leaf, new leaf}.
     let final_slot = write_leaf_split(frame, leaf_slot, new_key, new_value, seq, &split)?;
     Ok(InsertReturn {
         slot_after: final_slot,
         previous: None,
+        mutated: true,
     })
 }
 
@@ -628,6 +738,7 @@ fn insert_into_prefix_step(
     depth: usize,
     seq: u64,
     wants_prev: bool,
+    condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
     // `Prefix` is `Copy` and `read_prefix` returns it by value, so
@@ -654,6 +765,7 @@ fn insert_into_prefix_step(
             depth + plen,
             seq,
             wants_prev,
+            condition,
             allow_crossing,
         )?;
         let InsertStep::Done(r) = r else {
@@ -665,6 +777,7 @@ fn insert_into_prefix_step(
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: pfx_slot,
             previous: r.previous,
+            mutated: r.mutated,
         }));
     }
 
@@ -675,16 +788,24 @@ fn insert_into_prefix_step(
     }
 
     let existing_div_byte = prefix_bytes[common];
+    let new_div_byte = key
+        .byte_at(depth + common)
+        .expect("new key has prefix divergence byte");
+
+    if matches!(condition, InsertCondition::IfVersion(_)) {
+        return Ok(InsertStep::Done(InsertReturn {
+            slot_after: pfx_slot,
+            previous: None,
+            mutated: false,
+        }));
+    }
+
     let tail_bytes = &prefix_bytes[common + 1..];
     let existing_branch_slot = if tail_bytes.is_empty() {
         child_slot
     } else {
         write_prefix_chain(frame, tail_bytes, child_slot)?
     };
-
-    let new_div_byte = key
-        .byte_at(depth + common)
-        .expect("new key has prefix divergence byte");
     let new_leaf = write_leaf(frame, key, value, seq)?;
     let n4 = write_node4_with(
         frame,
@@ -705,6 +826,7 @@ fn insert_into_prefix_step(
     Ok(InsertStep::Done(InsertReturn {
         slot_after: final_slot,
         previous: None,
+        mutated: true,
     }))
 }
 
@@ -718,6 +840,7 @@ fn insert_into_inner_step(
     depth: usize,
     seq: u64,
     wants_prev: bool,
+    condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
     let Some(byte) = key.byte_at(depth) else {
@@ -735,6 +858,7 @@ fn insert_into_inner_step(
             depth + 1,
             seq,
             wants_prev,
+            condition,
             allow_crossing,
         )?;
         let InsertStep::Done(r) = r else {
@@ -746,13 +870,22 @@ fn insert_into_inner_step(
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: inner_slot,
             previous: r.previous,
+            mutated: r.mutated,
         }));
     }
 
+    if matches!(condition, InsertCondition::IfVersion(_)) {
+        return Ok(InsertStep::Done(InsertReturn {
+            slot_after: inner_slot,
+            previous: None,
+            mutated: false,
+        }));
+    }
     let new_leaf = write_leaf(frame, key, value, seq)?;
     let possibly_grown = inner_add_child(frame, inner_slot, ntype, byte, u32::from(new_leaf))?;
     Ok(InsertStep::Done(InsertReturn {
         slot_after: possibly_grown,
         previous: None,
+        mutated: true,
     }))
 }

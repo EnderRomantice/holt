@@ -87,7 +87,7 @@ impl Journal {
         // Existing WAL bytes are replayable, but we cannot prove
         // they were fsync-durable in the previous process. The
         // first checkpoint after reopen must issue a WAL flush
-        // before it makes replayed effects durable in the backend.
+        // before it makes replayed effects durable in the store.
         let initial_durable_work = if initial_wal_work == 0 {
             0
         } else {

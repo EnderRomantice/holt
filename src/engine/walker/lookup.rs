@@ -15,7 +15,7 @@ use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{leaf_extent, resolve_typed};
-use super::types::{BlobNodeCrossing, LookupResult};
+use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
 use super::SearchKey;
 
 /// Look up `key` in the tree rooted at `start_slot` (depth 0).
@@ -57,7 +57,7 @@ pub(super) fn lookup_at<'a>(
 /// the parent-side path is stale too. Restarting catches the
 /// new tree shape from the top.
 ///
-/// On match `consume` is invoked on the live cache-pin slice and
+/// On match `consume` is invoked on the live cache-pin hit and
 /// its return value is wrapped into `Some(_)`; on `NotFound`
 /// returns `Ok(None)`. The closure runs after the optimistic
 /// `validate()` succeeds — same race contract as the v0.2 owned
@@ -77,7 +77,7 @@ pub fn lookup_multi_with<R, F>(
     mut consume: F,
 ) -> Result<Option<R>>
 where
-    F: FnMut(&[u8]) -> R,
+    F: FnMut(LookupHit<'_>) -> R,
 {
     // Outer loop: each iteration is one full attempt; we restart
     // here when an optimistic snapshot is invalidated.
@@ -99,7 +99,7 @@ where
             }
             match result {
                 Err(e) => return Err(e),
-                Ok(LookupResult::Found(v)) => return Ok(Some(consume(v))),
+                Ok(LookupResult::Found(hit)) => return Ok(Some(consume(hit))),
                 Ok(LookupResult::NotFound) => return Ok(None),
                 Ok(LookupResult::Crossing(c)) => c,
             }
@@ -124,7 +124,7 @@ where
             }
             match result {
                 Err(e) => return Err(e),
-                Ok(LookupResult::Found(v)) => return Ok(Some(consume(v))),
+                Ok(LookupResult::Found(hit)) => return Ok(Some(consume(hit))),
                 Ok(LookupResult::NotFound) => return Ok(None),
                 Ok(LookupResult::Crossing(c)) => {
                     current_guid = c.child_guid;
@@ -190,7 +190,10 @@ fn leaf_check<'a>(
     if !key.eq_slice(leaf_key) {
         return Ok(LookupResult::NotFound);
     }
-    Ok(LookupResult::Found(value))
+    Ok(LookupResult::Found(LookupHit {
+        value,
+        seq: leaf.seq,
+    }))
 }
 
 fn prefix_descend<'a>(

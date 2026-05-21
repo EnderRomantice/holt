@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use holt::{Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig, TreeStats};
+use holt::{BlobStore, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, TreeStats};
 
 #[test]
 fn open_memory_get_on_empty_tree_returns_none() {
@@ -25,26 +25,26 @@ fn builder_memory_path() {
 }
 
 #[test]
-fn open_with_explicit_backend_round_trips_root_blob() {
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+fn open_with_explicit_blob_store_round_trips_root_blob() {
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let _t = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
-    let blobs_after_first = backend.list_blobs().unwrap().len();
+    let blobs_after_first = store.list_blobs().unwrap().len();
     assert!(blobs_after_first >= 1, "root blob should be present");
 
     let _t2 = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
     assert_eq!(
-        backend.list_blobs().unwrap().len(),
+        store.list_blobs().unwrap().len(),
         blobs_after_first,
         "re-open must not allocate a fresh root"
     );
 }
 
 #[test]
-fn checkpoint_is_idempotent_on_memory_backend() {
+fn checkpoint_is_idempotent_on_memory_store() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.checkpoint().unwrap();
     tree.checkpoint().unwrap();
@@ -72,6 +72,102 @@ fn put_returns_previous_value_on_update() {
         Some(&b"v1"[..])
     );
     assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+}
+
+#[test]
+fn conditional_puts_use_record_versions() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    assert!(tree.get_version(b"k").unwrap().is_none());
+
+    assert!(tree.put_if_absent(b"k", b"v1").unwrap());
+    assert!(!tree.put_if_absent(b"k", b"blocked").unwrap());
+    assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
+
+    let v1 = tree.get_version(b"k").unwrap().unwrap();
+    assert!(tree.compare_and_put(b"k", v1, b"v2").unwrap());
+    assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+
+    assert!(
+        !tree.compare_and_put(b"k", v1, b"stale").unwrap(),
+        "stale version must not overwrite the newer value",
+    );
+    assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+}
+
+#[test]
+fn get_record_returns_value_and_version_together() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"k", b"v1").unwrap();
+
+    let record = tree.get_record(b"k").unwrap().unwrap();
+    assert_eq!(record.value, b"v1");
+    assert_eq!(
+        tree.get_version(b"k").unwrap().unwrap(),
+        record.version,
+        "get_record must return the live CAS token from the same lookup",
+    );
+}
+
+#[test]
+fn conditional_delete_uses_record_versions() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"k", b"v1").unwrap();
+    let v1 = tree.get_version(b"k").unwrap().unwrap();
+
+    tree.put(b"k", b"v2").unwrap();
+    assert!(!tree.delete_if_version(b"k", v1).unwrap());
+    assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+
+    let v2 = tree.get_version(b"k").unwrap().unwrap();
+    assert!(tree.delete_if_version(b"k", v2).unwrap());
+    assert!(tree.get(b"k").unwrap().is_none());
+    assert!(tree.get_version(b"k").unwrap().is_none());
+
+    assert!(tree.put_if_absent(b"k", b"v3").unwrap());
+    assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v3"[..]));
+}
+
+#[test]
+fn conditional_put_reaches_cross_blob_children() {
+    let tree = TreeBuilder::new("scratch")
+        .memory()
+        .buffer_pool_size(8)
+        .open()
+        .unwrap();
+    let big = vec![0xCDu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("obj/{i:04}/meta").as_bytes(), &big)
+            .unwrap();
+    }
+
+    let key = b"obj/0128/meta";
+    let version = tree.get_version(key).unwrap().unwrap();
+    assert!(tree.compare_and_put(key, version, b"small").unwrap());
+    assert_eq!(tree.get(key).unwrap().as_deref(), Some(&b"small"[..]));
+
+    assert!(!tree.compare_and_put(key, version, b"stale").unwrap());
+    assert_eq!(tree.get(key).unwrap().as_deref(), Some(&b"small"[..]));
+}
+
+#[test]
+fn failed_compare_and_put_on_absent_prefix_path_is_noop() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"img/aaaa", b"a").unwrap();
+    tree.put(b"img/aaab", b"b").unwrap();
+
+    let before = tree.stats().unwrap();
+    assert!(!tree
+        .compare_and_put(
+            b"img/aazz",
+            holt::RecordVersion::from_raw(u64::MAX),
+            b"nope",
+        )
+        .unwrap(),);
+    let after = tree.stats().unwrap();
+
+    assert!(tree.get(b"img/aazz").unwrap().is_none());
+    assert_eq!(before.total_slots, after.total_slots);
+    assert_eq!(before.total_space_used, after.total_space_used);
 }
 
 #[test]
@@ -336,9 +432,9 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
     // but doesn't push past the `MAX_SPILLOVER_ATTEMPTS` per-call
     // budget. ~2000 keys × ~250 B per leaf = ~500 KB → ~50 KB has
     // to spill out via splitBlob.
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
 
     const N: u32 = 2000;
@@ -354,13 +450,13 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
         assert_eq!(
             tree.get(&k).unwrap().as_deref(),
             Some(&value[..]),
-            "post-spillover lookup failed at key {k:?}; backend has {} blob(s)",
-            backend.list_blobs().unwrap().len(),
+            "post-spillover lookup failed at key {k:?}; store has {} blob(s)",
+            store.list_blobs().unwrap().len(),
         );
     }
 
     // Spillover should have created at least one child blob.
-    let blobs = backend.list_blobs().unwrap();
+    let blobs = store.list_blobs().unwrap();
     assert!(
         blobs.len() >= 2,
         "expected auto-spillover to allocate at least 1 child blob, got {} total blob(s)",
@@ -372,16 +468,16 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
 fn concurrent_reads_across_multi_blob_tree_via_buffer_manager() {
     // Builds a multi-blob tree (forces auto-spillover), then
     // hammers `Tree::get` from N threads concurrently. The
-    // BufferManager between Tree and the inner backend keeps the
+    // BufferManager between Tree and the inner store keeps the
     // child blobs cached after the first read; per-blob locks
     // mean concurrent reads on *different* blobs don't fight for
     // a single mutex.
     use std::thread;
 
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = Arc::new(
         TreeBuilder::new("ignored")
-            .open_with_backend(backend.clone())
+            .open_with_blob_store(store.clone())
             .unwrap(),
     );
 
@@ -392,7 +488,7 @@ fn concurrent_reads_across_multi_blob_tree_via_buffer_manager() {
     }
     // Multi-blob pre-cond.
     assert!(
-        backend.list_blobs().unwrap().len() >= 2,
+        store.list_blobs().unwrap().len() >= 2,
         "test pre-cond: {} keys × 200 B values should overflow into multiple blobs",
         N,
     );
@@ -478,9 +574,9 @@ fn compact_then_insert_reclaims_extent_leak() {
     // force spillover much sooner. With compact wired into the
     // OOM recovery path, the extent leak is recoverable and the
     // workload stays in many fewer blobs (often the single root).
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
 
     let val = vec![0x42; 200];
@@ -515,9 +611,9 @@ fn multi_blob_delete_round_trip() {
     // child blobs. Delete a key that lives in a child blob;
     // verify it disappears from the tree (including across
     // crossings). Also verify the rest of the keys still resolve.
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
 
     const N: u32 = 2000;
@@ -526,7 +622,7 @@ fn multi_blob_delete_round_trip() {
         tree.put(format!("k{i:08}").as_bytes(), &value).unwrap();
     }
     assert!(
-        backend.list_blobs().unwrap().len() >= 2,
+        store.list_blobs().unwrap().len() >= 2,
         "test pre-cond: expected multi-blob state",
     );
 
@@ -577,9 +673,9 @@ fn multi_blob_rename_round_trip() {
     // makes the budget tight). Within-existing-keys renames are
     // the realistic metadata workload anyway (move foo/bar → foo/baz
     // where both directory entries exist).
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
 
     const N: u32 = 2000;
@@ -592,7 +688,7 @@ fn multi_blob_rename_round_trip() {
         tree.put(format!("k{i:08}").as_bytes(), v).unwrap();
     }
     assert!(
-        backend.list_blobs().unwrap().len() >= 2,
+        store.list_blobs().unwrap().len() >= 2,
         "test pre-cond: expected multi-blob state",
     );
 
@@ -628,12 +724,12 @@ fn multi_blob_rename_round_trip() {
 #[test]
 fn auto_spillover_preserves_data_across_reopen() {
     // After auto-spillover the tree is multi-blob. Closing and
-    // reopening the same backend must surface the same key/value
+    // reopening the same store must surface the same key/value
     // mapping (root blob + all spilled child blobs are persisted).
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     {
         let tree = TreeBuilder::new("ignored")
-            .open_with_backend(backend.clone())
+            .open_with_blob_store(store.clone())
             .unwrap();
         for i in 0..2000u32 {
             tree.put(format!("k{i:08}").as_bytes(), &[0xCD; 192])
@@ -643,15 +739,15 @@ fn auto_spillover_preserves_data_across_reopen() {
     }
 
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
     for i in 0..2000u32 {
         let k = format!("k{i:08}").into_bytes();
         let v = tree.get(&k).unwrap();
         assert!(
             v.is_some(),
-            "post-reopen lookup failed at key {k:?}; backend has {} blob(s)",
-            backend.list_blobs().unwrap().len(),
+            "post-reopen lookup failed at key {k:?}; store has {} blob(s)",
+            store.list_blobs().unwrap().len(),
         );
     }
 }
@@ -1024,17 +1120,18 @@ fn stats_aggregates_across_multi_blob_tree() {
 }
 
 #[test]
-fn txn_applies_buffered_ops_in_order() {
+fn atomic_applies_buffered_ops_in_order() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"seed", b"S").unwrap();
 
-    tree.txn(|batch| {
-        batch.put(b"a", b"1");
-        batch.put(b"b", b"2");
-        batch.delete(b"seed");
-        batch.rename(b"a", b"aa", false);
-    })
-    .unwrap();
+    assert!(tree
+        .atomic(|batch| {
+            batch.put(b"a", b"1");
+            batch.put(b"b", b"2");
+            batch.delete(b"seed");
+            batch.rename(b"a", b"aa", false);
+        })
+        .unwrap());
 
     assert!(tree.get(b"seed").unwrap().is_none());
     assert!(tree.get(b"a").unwrap().is_none());
@@ -1043,24 +1140,20 @@ fn txn_applies_buffered_ops_in_order() {
 }
 
 #[test]
-fn txn_empty_batch_is_a_noop() {
+fn atomic_empty_batch_is_a_noop() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"unchanged", b"X").unwrap();
 
-    tree.txn(|_batch| {}).unwrap();
+    assert!(tree.atomic(|_batch| {}).unwrap());
 
     assert_eq!(tree.get(b"unchanged").unwrap().as_deref(), Some(&b"X"[..]));
 }
 
 #[test]
-fn txn_returns_error_when_rename_src_missing_and_leaves_prior_ops_applied() {
-    // Contract per Tree::txn doc: mid-batch failure leaves the
-    // already-applied ops in the BM cache (they're not rolled
-    // back), and the WAL record is NOT written — so a future
-    // reopen-via-replay would lose the whole batch.
+fn atomic_returns_error_when_rename_src_missing_without_partial_publish() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let err = tree
-        .txn(|batch| {
+        .atomic(|batch| {
             batch.put(b"committed", b"C");
             batch.rename(b"missing-src", b"dst", false);
             batch.put(b"never-reached", b"N");
@@ -1070,10 +1163,220 @@ fn txn_returns_error_when_rename_src_missing_and_leaves_prior_ops_applied() {
         matches!(err, holt::Error::NotFound),
         "expected NotFound from rename of missing src, got {err:?}",
     );
-    // The pre-failure put landed in the BM cache.
-    assert_eq!(tree.get(b"committed").unwrap().as_deref(), Some(&b"C"[..]),);
-    // The post-failure put never ran.
+    assert!(
+        tree.get(b"committed").unwrap().is_none(),
+        "preflight failure must not publish earlier batch ops",
+    );
     assert!(tree.get(b"never-reached").unwrap().is_none());
+}
+
+#[test]
+fn atomic_conditional_guard_failure_is_invisible() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"guarded", b"v1").unwrap();
+    let stale = tree.get_version(b"guarded").unwrap().unwrap();
+    tree.put(b"guarded", b"v2").unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.put(b"before", b"B");
+            batch.compare_and_put(b"guarded", stale, b"stale-write");
+            batch.put(b"after", b"A");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert_eq!(tree.get(b"guarded").unwrap().as_deref(), Some(&b"v2"[..]));
+    assert!(tree.get(b"before").unwrap().is_none());
+    assert!(tree.get(b"after").unwrap().is_none());
+}
+
+#[test]
+fn atomic_conditional_ops_commit_in_order() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"update", b"old").unwrap();
+    tree.put(b"delete", b"live").unwrap();
+    let update_v = tree.get_record(b"update").unwrap().unwrap().version;
+    let delete_v = tree.get_record(b"delete").unwrap().unwrap().version;
+
+    assert!(tree
+        .atomic(|batch| {
+            batch.put_if_absent(b"create", b"new");
+            batch.compare_and_put(b"update", update_v, b"newer");
+            batch.delete_if_version(b"delete", delete_v);
+        })
+        .unwrap());
+
+    assert_eq!(tree.get(b"create").unwrap().as_deref(), Some(&b"new"[..]));
+    assert_eq!(tree.get(b"update").unwrap().as_deref(), Some(&b"newer"[..]));
+    assert!(tree.get(b"delete").unwrap().is_none());
+}
+
+#[test]
+fn is_prefix_empty_tracks_live_keys() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    assert!(tree.is_prefix_empty(b"dir/").unwrap());
+
+    tree.put(b"dir/child", b"child").unwrap();
+    assert!(!tree.is_prefix_empty(b"dir/").unwrap());
+    assert!(tree.is_prefix_empty(b"missing/").unwrap());
+
+    tree.delete(b"dir/child").unwrap();
+    assert!(tree.is_prefix_empty(b"dir/").unwrap());
+}
+
+#[test]
+fn atomic_assert_prefix_empty_failure_is_invisible() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"dir", b"meta").unwrap();
+    tree.put(b"dir/child", b"child").unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.assert_prefix_empty(b"dir/");
+            batch.delete(b"dir");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert_eq!(tree.get(b"dir").unwrap().as_deref(), Some(&b"meta"[..]));
+    assert_eq!(
+        tree.get(b"dir/child").unwrap().as_deref(),
+        Some(&b"child"[..])
+    );
+}
+
+#[test]
+fn atomic_assert_prefix_empty_observes_staged_deletes() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"dir", b"meta").unwrap();
+    tree.put(b"dir/child", b"child").unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.delete(b"dir/child");
+            batch.assert_prefix_empty(b"dir/");
+            batch.delete(b"dir");
+        })
+        .unwrap();
+
+    assert!(committed);
+    assert!(tree.get(b"dir").unwrap().is_none());
+    assert!(tree.get(b"dir/child").unwrap().is_none());
+}
+
+#[test]
+fn atomic_assert_prefix_empty_still_sees_non_deleted_live_child() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"dir/a", b"a").unwrap();
+    tree.put(b"dir/b", b"b").unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.delete(b"dir/a");
+            batch.assert_prefix_empty(b"dir/");
+            batch.put(b"marker", b"should-not-publish");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert_eq!(tree.get(b"dir/a").unwrap().as_deref(), Some(&b"a"[..]));
+    assert_eq!(tree.get(b"dir/b").unwrap().as_deref(), Some(&b"b"[..]));
+    assert!(tree.get(b"marker").unwrap().is_none());
+}
+
+#[test]
+fn atomic_assert_prefix_empty_observes_staged_puts() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.put(b"dir/new", b"new");
+            batch.assert_prefix_empty(b"dir/");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert!(tree.get(b"dir/new").unwrap().is_none());
+}
+
+#[test]
+fn atomic_assert_version_copies_without_bumping_source() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"src", b"payload").unwrap();
+    let src = tree.get_record(b"src").unwrap().unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.assert_version(b"src", src.version);
+            batch.put(b"dst", &src.value);
+        })
+        .unwrap();
+
+    assert!(committed);
+    let src_after = tree.get_record(b"src").unwrap().unwrap();
+    assert_eq!(
+        src_after.version, src.version,
+        "assert_version must not rewrite or bump the guarded source",
+    );
+    assert_eq!(tree.get(b"dst").unwrap().as_deref(), Some(&b"payload"[..]));
+}
+
+#[test]
+fn atomic_assert_version_failure_is_invisible() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"src", b"v1").unwrap();
+    let stale = tree.get_version(b"src").unwrap().unwrap();
+    tree.put(b"src", b"v2").unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.assert_version(b"src", stale);
+            batch.put(b"dst", b"should-not-publish");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert_eq!(tree.get(b"src").unwrap().as_deref(), Some(&b"v2"[..]));
+    assert!(tree.get(b"dst").unwrap().is_none());
+}
+
+#[test]
+fn atomic_assert_version_observes_staged_deletes() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"src", b"v1").unwrap();
+    let version = tree.get_version(b"src").unwrap().unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.delete(b"src");
+            batch.assert_version(b"src", version);
+            batch.put(b"dst", b"should-not-publish");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert_eq!(tree.get(b"src").unwrap().as_deref(), Some(&b"v1"[..]));
+    assert!(tree.get(b"dst").unwrap().is_none());
+}
+
+#[test]
+fn atomic_assert_version_observes_staged_updates() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"src", b"v1").unwrap();
+    let old = tree.get_version(b"src").unwrap().unwrap();
+
+    let committed = tree
+        .atomic(|batch| {
+            batch.compare_and_put(b"src", old, b"v2");
+            batch.assert_version(b"src", old);
+            batch.put(b"side", b"should-not-publish");
+        })
+        .unwrap();
+
+    assert!(!committed);
+    assert_eq!(tree.get(b"src").unwrap().as_deref(), Some(&b"v1"[..]));
+    assert!(tree.get(b"side").unwrap().is_none());
 }
 
 // ----------------------------------------------------------------
@@ -1115,7 +1418,7 @@ fn range_no_filter_walks_all_keys_in_lex_order() {
         .range()
         .into_iter()
         .map(|r| match r.unwrap() {
-            RangeEntry::Key { key, value } => (key, value),
+            RangeEntry::Key { key, value, .. } => (key, value),
             RangeEntry::CommonPrefix(_) => panic!("no delimiter set"),
             _ => panic!("RangeEntry got a new variant"),
         })
@@ -1128,6 +1431,38 @@ fn range_no_filter_walks_all_keys_in_lex_order() {
             (b"banana".to_vec(), b"yellow".to_vec()),
             (b"cherry".to_vec(), b"dark".to_vec()),
         ]
+    );
+}
+
+#[test]
+fn range_key_entries_expose_live_versions() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"img/a", b"v1").unwrap();
+    tree.put(b"img/b", b"v2").unwrap();
+    tree.put(b"img/a", b"v3").unwrap();
+    let a = tree.get_record(b"img/a").unwrap().unwrap();
+    let b = tree.get_record(b"img/b").unwrap().unwrap();
+
+    let got: Vec<_> = tree
+        .scan_prefix(b"img/")
+        .into_iter()
+        .map(|r| match r.unwrap() {
+            RangeEntry::Key {
+                key,
+                value,
+                version,
+            } => (key, value, version),
+            RangeEntry::CommonPrefix(_) => panic!("no delimiter set"),
+            _ => panic!("RangeEntry got a new variant"),
+        })
+        .collect();
+
+    assert_eq!(
+        got,
+        vec![
+            (b"img/a".to_vec(), b"v3".to_vec(), a.version),
+            (b"img/b".to_vec(), b"v2".to_vec(), b.version),
+        ],
     );
 }
 
@@ -1369,6 +1704,39 @@ fn range_start_after_seeks_across_blob_crossings() {
         .map(|i| format!("k{i:08}").into_bytes())
         .collect();
     assert_eq!(got, expected);
+}
+
+#[test]
+fn range_key_versions_match_point_lookup_across_blob_crossings() {
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(16)
+        .open()
+        .unwrap();
+    let big = vec![0xABu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "workload must spill into multiple blobs",
+    );
+
+    for entry in tree.range().start_after(b"k00000127").into_iter().take(16) {
+        match entry.unwrap() {
+            RangeEntry::Key {
+                key,
+                value,
+                version,
+            } => {
+                assert_eq!(value.len(), big.len());
+                let point = tree.get_record(&key).unwrap().unwrap();
+                assert_eq!(point.version, version);
+                assert_eq!(point.value, value);
+            }
+            other => panic!("unexpected range entry: {other:?}"),
+        }
+    }
 }
 
 #[test]

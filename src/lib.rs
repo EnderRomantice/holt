@@ -11,7 +11,7 @@
 //! ## Current status
 //!
 //! All core layers — layout, walker (insert / lookup / erase /
-//! range / spillover / compact / merge), persistent backend
+//! range / spillover / compact / merge), persistent store
 //! (`O_DIRECT` + optional `io_uring`), WAL with replay, sharded
 //! buffer manager, background checkpointer — are in place and
 //! covered by integration + property tests. See `ROADMAP.md`
@@ -26,7 +26,7 @@
 //! tree.put(b"img/01.jpg", b"rgb_data")?;
 //! let v: Vec<u8> = tree.get(b"img/01.jpg")?.unwrap();
 //! for entry in tree.scan_prefix(b"img/").into_iter().take(10) {
-//!     if let RangeEntry::Key { key, value } = entry? {
+//!     if let RangeEntry::Key { key, value, .. } = entry? {
 //!         println!("{key:?} -> {value:?}");
 //!     }
 //! }
@@ -37,9 +37,9 @@
 //!
 //! Public modules (the supported, SemVer-committed import surface):
 //!
-//! - [`api`] — high-level [`Tree`] + [`TxnBatch`] +
-//!   [`TreeBuilder`], plus the curated [`api::range`] /
-//!   [`api::stats`] re-export modules.
+//! - [`api`] — high-level [`Tree`] + [`AtomicBatch`] +
+//!   [`Record`] / [`RecordVersion`] + [`TreeBuilder`], plus the curated
+//!   [`api::stats`] module.
 //!
 //! Everything else is `pub(crate)`. The user surface is
 //! deliberately narrow so the on-disk format, WAL record codec,
@@ -53,14 +53,14 @@
 //!   per-NodeType bodies). Pinned at compile time via
 //!   `const _: () = assert!(...)` blocks per file.
 //! - `journal` — WAL codec + replay scanner + writer.
-//! - `store` — buffer manager + blob-frame allocator + backend
-//!   trait machinery. The supported backend surface
-//!   ([`Backend`], [`MemoryBackend`], [`PersistentBackend`],
+//! - `store` — buffer manager + blob-frame allocator + store
+//!   trait machinery. The supported store surface
+//!   ([`BlobStore`], [`MemoryBlobStore`], [`FileBlobStore`],
 //!   [`AlignedBlobBuf`]) is re-exported at the crate root for
-//!   users who want to plug in a custom backend.
+//!   users who want to plug in a custom store.
 //! - `engine` — recursive walker (insert / lookup / erase /
-//!   scan / rename / compact). Its public types (range iterators,
-//!   stats) are re-exported via [`api::range`] / [`api::stats`].
+//!   scan / rename / compact). Range iterator types are re-exported
+//!   at the crate root; stats live in [`api::stats`].
 //! - `concurrency` — `HybridLatch` 3-mode lock plus the
 //!   tree-wide maintenance gate.
 //! - `checkpoint` — 3-thread background checkpointer. Users opt
@@ -69,7 +69,7 @@
 //! ## Platform support
 //!
 //! holt is **Unix-only by design**: Linux (`O_DIRECT` fast path,
-//! `io_uring` on the persistent backend) and macOS (`F_NOCACHE`).
+//! `io_uring` on the file store) and macOS (`F_NOCACHE`).
 //! Windows is out of scope and the crate refuses to compile there
 //! — see the platform stance in `ROADMAP.md`.
 
@@ -123,7 +123,7 @@
 
 // Hard scope gate — see the "Platform support" section in the
 // module docs. Building holt for Windows is intentionally
-// unsupported; the persistent backend's `O_DIRECT` / `F_NOCACHE`
+// unsupported; the file store's `O_DIRECT` / `F_NOCACHE`
 // path has no Windows analog worth maintaining for this project.
 #[cfg(not(unix))]
 compile_error!(
@@ -159,20 +159,20 @@ pub use api::errors::{Error, Result};
 pub use api::tree::Tree;
 
 // Range-scan iterator surface.
-pub use api::range::{RangeBuilder, RangeEntry, RangeIter};
+pub use engine::{RangeBuilder, RangeEntry, RangeIter};
 
 // Stats snapshots returned by `Tree::stats`.
 pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
 
-// Single-record batched transactions.
-pub use api::txn::TxnBatch;
+// Single-record atomic batches.
+pub use api::atomic::{AtomicBatch, Record, RecordVersion};
 
 // Background checkpointer policy. The `Checkpointer` handle
 // itself is crate-internal; users opt in via this config.
 pub use checkpoint::CheckpointConfig;
 
-// Backend trait + bundled backends + zero-copy blob buffer.
-// Users implementing a custom `Backend` need `BlobGuid` to name
+// BlobStore trait + bundled stores + zero-copy blob buffer.
+// Users implementing a custom `BlobStore` need `BlobGuid` to name
 // the blob they're storing.
 pub use layout::BlobGuid;
-pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
+pub use store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};

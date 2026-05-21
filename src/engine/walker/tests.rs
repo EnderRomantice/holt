@@ -13,7 +13,7 @@ use super::writers::write_struct_to_slot;
 use super::SearchKey;
 use crate::api::errors::Error;
 use crate::layout::{BlobGuid, BlobNode, NodeType, PAGE_SIZE};
-use crate::store::backend::AlignedBlobBuf;
+use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::BlobFrame;
 
 fn fresh_blob() -> (Vec<u8>, BlobGuid) {
@@ -31,7 +31,7 @@ fn put(frame: &mut BlobFrame<'_>, k: &[u8], v: &[u8], seq: u64) {
 fn get(frame: &BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
     let root = frame.header().root_slot;
     match lookup(frame.as_ref(), root, k).unwrap() {
-        LookupResult::Found(v) => Some(v.to_vec()),
+        LookupResult::Found(hit) => Some(hit.value.to_vec()),
         LookupResult::NotFound => None,
         LookupResult::Crossing(_) => {
             panic!("walker unit tests never construct a BlobNode")
@@ -699,10 +699,10 @@ fn lookup_at_continues_descent_from_supplied_depth() {
     let root = frame.header().root_slot;
 
     let r0 = lookup(frame.as_ref(), root, b"img/01.jpg").unwrap();
-    assert!(matches!(r0, LookupResult::Found(v) if v == b"v1"));
+    assert!(matches!(r0, LookupResult::Found(hit) if hit.value == b"v1"));
 
     let r1 = lookup_at(frame.as_ref(), root, SearchKey::exact(b"img/01.jpg"), 0).unwrap();
-    assert!(matches!(r1, LookupResult::Found(v) if v == b"v1"));
+    assert!(matches!(r1, LookupResult::Found(hit) if hit.value == b"v1"));
 }
 
 #[test]
@@ -771,7 +771,7 @@ fn read_value_from_new_blob(buf: &mut AlignedBlobBuf, key: &[u8]) -> Option<Vec<
     let frame = BlobFrame::wrap(buf.as_mut_slice());
     let root = frame.header().root_slot;
     match lookup(frame.as_ref(), root, key).unwrap() {
-        LookupResult::Found(v) => Some(v.to_vec()),
+        LookupResult::Found(hit) => Some(hit.value.to_vec()),
         _ => None,
     }
 }
@@ -1002,7 +1002,7 @@ fn compact_blob_reclaims_extents_after_churn() {
             assert!(matches!(r, LookupResult::NotFound));
         } else {
             match r {
-                LookupResult::Found(got) => assert_eq!(got, v),
+                LookupResult::Found(got) => assert_eq!(got.value, v.as_slice()),
                 _ => panic!("survivor {k:?} missing after compact"),
             }
         }
@@ -1042,7 +1042,7 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
         let v = vec![0xFD; 64];
         let root = frame.header().root_slot;
         match lookup(frame.as_ref(), root, &k).unwrap() {
-            LookupResult::Found(got) => assert_eq!(got, v),
+            LookupResult::Found(got) => assert_eq!(got.value, v.as_slice()),
             _ => panic!("post-compact insert {k:?} unreadable"),
         }
     }
@@ -1064,14 +1064,14 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
 /// against a synthetic shape.
 #[test]
 fn tree_get_and_put_follow_child_header_root_across_blob_node() {
-    use crate::store::backend::{Backend, MemoryBackend};
+    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
     use crate::TreeBuilder;
     use std::sync::Arc;
 
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     {
         let tree = TreeBuilder::new("ignored")
-            .open_with_backend(backend.clone())
+            .open_with_blob_store(store.clone())
             .unwrap();
         for i in 0..10u32 {
             let k = format!("k{i:02}").into_bytes();
@@ -1084,7 +1084,7 @@ fn tree_get_and_put_follow_child_header_root_across_blob_node() {
     let child_guid = [0xAA; 16];
 
     let mut root_buf = AlignedBlobBuf::zeroed();
-    backend.read_blob(root_guid, &mut root_buf).unwrap();
+    store.read_blob(root_guid, &mut root_buf).unwrap();
 
     let (saved_root_slot, mut child_outcome) = {
         let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
@@ -1101,14 +1101,14 @@ fn tree_get_and_put_follow_child_header_root_across_blob_node() {
         child_root_slot, 1,
         "test needs child header root to differ from the default slot"
     );
-    backend.write_blob(child_guid, &child_outcome.buf).unwrap();
+    store.write_blob(child_guid, &child_outcome.buf).unwrap();
 
     replace_root_with_blob_node(&mut root_buf, child_guid);
     let _ = saved_root_slot;
-    backend.write_blob(root_guid, &root_buf).unwrap();
+    store.write_blob(root_guid, &root_buf).unwrap();
 
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
     tree.put(b"k00", b"updated").unwrap();
     assert!(tree.delete(b"k01").unwrap());
@@ -1145,14 +1145,14 @@ fn tree_get_and_put_follow_child_header_root_across_blob_node() {
 /// fast path.
 #[test]
 fn tree_put_and_delete_follow_nested_child_header_roots() {
-    use crate::store::backend::{Backend, MemoryBackend};
+    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
     use crate::TreeBuilder;
     use std::sync::Arc;
 
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     {
         let tree = TreeBuilder::new("ignored")
-            .open_with_backend(backend.clone())
+            .open_with_blob_store(store.clone())
             .unwrap();
         for i in 0..12u32 {
             let k = format!("k{i:02}").into_bytes();
@@ -1166,7 +1166,7 @@ fn tree_put_and_delete_follow_nested_child_header_roots() {
     let grandchild_guid = [0xCC; 16];
 
     let mut root_buf = AlignedBlobBuf::zeroed();
-    backend.read_blob(root_guid, &mut root_buf).unwrap();
+    store.read_blob(root_guid, &mut root_buf).unwrap();
 
     let mut child_outcome = {
         let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
@@ -1200,16 +1200,16 @@ fn tree_put_and_delete_follow_nested_child_header_roots() {
         "test needs grandchild header root to differ from the default slot"
     );
 
-    backend
+    store
         .write_blob(grandchild_guid, &grandchild_outcome.buf)
         .unwrap();
     replace_root_with_blob_node(&mut child_buf, grandchild_guid);
-    backend.write_blob(child_guid, &child_buf).unwrap();
+    store.write_blob(child_guid, &child_buf).unwrap();
     replace_root_with_blob_node(&mut root_buf, child_guid);
-    backend.write_blob(root_guid, &root_buf).unwrap();
+    store.write_blob(root_guid, &root_buf).unwrap();
 
     let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
+        .open_with_blob_store(store.clone())
         .unwrap();
     tree.put(b"k00", b"updated").unwrap();
     tree.put(b"k99", b"new").unwrap();

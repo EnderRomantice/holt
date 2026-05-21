@@ -848,7 +848,7 @@ fn bench_list_plain(
             let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
             for entry in holt.range().prefix(black_box(prefix)) {
                 match entry.unwrap() {
-                    RangeEntry::Key { key, value } => out.push((key, value)),
+                    RangeEntry::Key { key, value, .. } => out.push((key, value)),
                     RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
                     _ => unreachable!("RangeEntry got a new variant"),
                 }
@@ -917,7 +917,7 @@ fn bench_list_plain_persistent(
             let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(take);
             for entry in holt.range().prefix(black_box(prefix)) {
                 match entry.unwrap() {
-                    RangeEntry::Key { key, value } => out.push((key, value)),
+                    RangeEntry::Key { key, value, .. } => out.push((key, value)),
                     RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
                     _ => unreachable!("RangeEntry got a new variant"),
                 }

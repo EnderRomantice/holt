@@ -31,7 +31,7 @@ use crate::api::errors::{Error, Result};
 use super::codec::encode_record;
 use super::codec::{decode_file_header, encode_file_header, FileHeader, FILE_HEADER_SIZE};
 #[cfg(test)]
-use super::txn_op::TxnOp;
+use super::wal_op::WalOp;
 
 /// Append's in-memory buffer is auto-drained to the OS page
 /// cache once it crosses this many bytes. Drops user-space
@@ -143,7 +143,7 @@ impl WalWriter {
         self.bytes_written + self.pending.len() as u64 > FILE_HEADER_SIZE as u64
     }
 
-    /// Stage a single `TxnOp` for the next flush.
+    /// Stage a single `WalOp` for the next flush.
     ///
     /// The record is encoded into the pending buffer in memory.
     /// If the buffer crosses [`AUTO_FLUSH_THRESHOLD`] the writer
@@ -156,7 +156,7 @@ impl WalWriter {
     /// hot paths encode records before handing them to the
     /// group-commit journal worker.
     #[cfg(test)]
-    pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
+    pub fn append(&mut self, op: &WalOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending);
         self.maybe_drain()
     }
@@ -228,7 +228,7 @@ impl WalWriter {
     /// live WAL back to [`FILE_HEADER_SIZE`], then `sync_data`.
     /// After checkpoint the old records are redundant: if a crash
     /// leaves the old file length in place, replay is safe; if it
-    /// leaves the truncated length, backend is already durable.
+    /// leaves the truncated length, store is already durable.
     /// Avoiding temp-file rename keeps the checkpoint tail cheap.
     ///
     /// Any `pending` records buffered since the last `flush` are

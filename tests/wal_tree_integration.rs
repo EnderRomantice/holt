@@ -163,20 +163,20 @@ fn replay_then_checkpoint_then_reopen_preserves_data() {
     // loses data" hole:
     //
     // 1. Open, put N keys, drop without checkpoint (WAL has
-    //    every record on disk; backend root blob is still
+    //    every record on disk; store root blob is still
     //    pristine because nothing was flushed).
     // 2. Reopen — `replay_wal` re-applies every WAL record onto
     //    the BM-cached root. The root blob's IN-MEMORY image now
-    //    matches the post-put state; the backend image is still
+    //    matches the post-put state; the store image is still
     //    the empty seeded root.
     // 3. Immediately call `tree.checkpoint()` — this must flush
-    //    the cached root through to backend BEFORE truncating
+    //    the cached root through to store BEFORE truncating
     //    the WAL. The v0.2-pre `replay_wal` didn't `mark_dirty`
     //    the root, so the dirty set was empty after replay; the
     //    checkpoint round drained nothing, wrote nothing to
-    //    backend, and then truncated the WAL — silently losing
+    //    store, and then truncated the WAL — silently losing
     //    every replayed record.
-    // 4. Reopen again — the backend is the sole source of truth
+    // 4. Reopen again — the store is the sole source of truth
     //    now (WAL was truncated). All keys must still be there.
     let dir = tempdir().unwrap();
     let cfg = durable_cfg(dir.path());
@@ -201,13 +201,13 @@ fn replay_then_checkpoint_then_reopen_preserves_data() {
             );
         }
         // Now checkpoint. **This must flush the replayed state
-        // to backend before truncating the WAL.**
+        // to store before truncating the WAL.**
         tree.checkpoint().unwrap();
         let wal_size_after = fs::metadata(wal_path(dir.path())).unwrap().len();
         assert_eq!(wal_size_after, 32, "WAL truncated to header-only");
     }
 
-    // Round 3: backend is the source of truth (WAL empty). If
+    // Round 3: store is the source of truth (WAL empty). If
     // checkpoint didn't actually flush the replayed state, this
     // reopen sees the pre-put pristine root and every get returns
     // None.
@@ -309,6 +309,36 @@ fn rename_through_wal_replays_correctly() {
     assert_eq!(tree.get(b"a").unwrap(), None);
     assert_eq!(tree.get(b"a2").unwrap().as_deref(), Some(&b"v-a"[..]));
     assert_eq!(tree.get(b"b").unwrap().as_deref(), Some(&b"v-b"[..]));
+}
+
+#[test]
+fn conditional_writes_replay_through_wal() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        assert!(tree.put_if_absent(b"cas/k", b"v1").unwrap());
+        assert!(!tree.put_if_absent(b"cas/k", b"blocked").unwrap());
+
+        let v1 = tree.get_version(b"cas/k").unwrap().unwrap();
+        assert!(tree.compare_and_put(b"cas/k", v1, b"v2").unwrap());
+        assert!(!tree.compare_and_put(b"cas/k", v1, b"stale").unwrap());
+
+        let v2 = tree.get_version(b"cas/k").unwrap().unwrap();
+        assert!(!tree.delete_if_version(b"cas/k", v1).unwrap());
+        assert!(tree.delete_if_version(b"cas/k", v2).unwrap());
+
+        assert!(tree.put_if_absent(b"cas/resurrected", b"live").unwrap());
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert!(tree.get(b"cas/k").unwrap().is_none());
+    assert!(tree.get_version(b"cas/k").unwrap().is_none());
+    assert_eq!(
+        tree.get(b"cas/resurrected").unwrap().as_deref(),
+        Some(&b"live"[..]),
+    );
 }
 
 #[test]
@@ -445,18 +475,18 @@ fn next_seq_resumes_past_replayed_records() {
 }
 
 #[test]
-fn open_with_backend_attaches_no_wal() {
-    use holt::{Backend, MemoryBackend, TreeBuilder};
+fn open_with_blob_store_attaches_no_wal() {
+    use holt::{BlobStore, MemoryBlobStore, TreeBuilder};
     use std::sync::Arc;
 
     let dir = tempdir().unwrap();
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
 
-    // open_with_backend deliberately bypasses WAL — `dir` here is
-    // informational; the backend stores in memory.
+    // open_with_blob_store deliberately bypasses WAL — `dir` here is
+    // informational; the store stores in memory.
     {
         let tree = TreeBuilder::new(dir.path())
-            .open_with_backend(backend.clone())
+            .open_with_blob_store(store.clone())
             .unwrap();
         tree.put(b"k", b"v").unwrap();
     }
@@ -511,7 +541,7 @@ fn many_round_trips_through_checkpoint_boundaries() {
 
 #[test]
 fn batch_persists_through_crash_and_replay() {
-    // Tree::txn emits one Batch WAL record; on reopen the replay
+    // Tree::atomic emits one Batch WAL record; on reopen the replay
     // unpacks it transparently into per-inner callbacks so every
     // op in the batch comes back. `wal_sync_on_commit = true`
     // makes the simulated crash drop right after the batch flush.
@@ -523,7 +553,7 @@ fn batch_persists_through_crash_and_replay() {
         // Seed something to mutate inside the batch.
         tree.put(b"seed", b"S").unwrap();
 
-        tree.txn(|b| {
+        tree.atomic(|b| {
             b.put(b"batch-a", b"A");
             b.put(b"batch-b", b"B");
             b.delete(b"seed");
@@ -538,6 +568,190 @@ fn batch_persists_through_crash_and_replay() {
     assert!(tree.get(b"batch-a").unwrap().is_none());
     assert_eq!(tree.get(b"batch-aa").unwrap().as_deref(), Some(&b"A"[..]));
     assert_eq!(tree.get(b"batch-b").unwrap().as_deref(), Some(&b"B"[..]));
+}
+
+#[test]
+fn batch_conditional_ops_replay_with_stable_versions() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+    let seed_version_after_atomic;
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"seed", b"v1").unwrap();
+        let seed_v1 = tree.get_record(b"seed").unwrap().unwrap().version;
+
+        assert!(tree
+            .atomic(|b| {
+                // Deliberately no-op but still encoded inside the
+                // Batch WAL record so later inner seqs replay with
+                // the same record versions.
+                b.delete(b"missing");
+                b.compare_and_put(b"seed", seed_v1, b"v2");
+                b.put_if_absent(b"created", b"new");
+            })
+            .unwrap());
+        seed_version_after_atomic = tree.get_record(b"seed").unwrap().unwrap().version;
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let seed = tree.get_record(b"seed").unwrap().unwrap();
+    assert_eq!(seed.value, b"v2");
+    assert_eq!(
+        seed.version, seed_version_after_atomic,
+        "Batch replay must preserve per-inner seq even when an earlier inner op is a no-op",
+    );
+    assert_eq!(tree.get(b"created").unwrap().as_deref(), Some(&b"new"[..]));
+}
+
+#[test]
+fn batch_prefix_assertions_do_not_shift_replay_versions() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+    let k1_version;
+    let k2_version;
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        assert!(tree
+            .atomic(|b| {
+                b.assert_prefix_empty(b"guard/");
+                b.put(b"batch/k1", b"v1");
+                b.assert_prefix_empty(b"other/");
+                b.put(b"batch/k2", b"v2");
+            })
+            .unwrap());
+        k1_version = tree.get_record(b"batch/k1").unwrap().unwrap().version;
+        k2_version = tree.get_record(b"batch/k2").unwrap().unwrap().version;
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let k1 = tree.get_record(b"batch/k1").unwrap().unwrap();
+    let k2 = tree.get_record(b"batch/k2").unwrap().unwrap();
+    assert_eq!(k1.value, b"v1");
+    assert_eq!(k2.value, b"v2");
+    assert_eq!(
+        k1.version, k1_version,
+        "prefix assertions must not consume Batch WAL inner sequence numbers",
+    );
+    assert_eq!(
+        k2.version, k2_version,
+        "prefix assertions must not shift later replay versions",
+    );
+}
+
+#[test]
+fn batch_version_assertions_do_not_shift_replay_versions() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+    let seed_version;
+    let copied_version;
+    let later_version;
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"seed", b"payload").unwrap();
+        let seed = tree.get_record(b"seed").unwrap().unwrap();
+        assert!(tree
+            .atomic(|b| {
+                b.assert_version(b"seed", seed.version);
+                b.put(b"copied", &seed.value);
+                b.assert_version(b"seed", seed.version);
+                b.put(b"later", b"v2");
+            })
+            .unwrap());
+        seed_version = tree.get_record(b"seed").unwrap().unwrap().version;
+        copied_version = tree.get_record(b"copied").unwrap().unwrap().version;
+        later_version = tree.get_record(b"later").unwrap().unwrap().version;
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let seed = tree.get_record(b"seed").unwrap().unwrap();
+    let copied = tree.get_record(b"copied").unwrap().unwrap();
+    let later = tree.get_record(b"later").unwrap().unwrap();
+    assert_eq!(seed.value, b"payload");
+    assert_eq!(copied.value, b"payload");
+    assert_eq!(later.value, b"v2");
+    assert_eq!(
+        seed.version, seed_version,
+        "assert_version must not rewrite the guarded source",
+    );
+    assert_eq!(
+        copied.version, copied_version,
+        "assert_version must not consume Batch WAL inner sequence numbers",
+    );
+    assert_eq!(
+        later.version, later_version,
+        "assert_version must not shift later replay versions",
+    );
+}
+
+#[test]
+fn atomic_assert_only_batch_does_not_append_wal_or_consume_seq() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"seed", b"payload").unwrap();
+        let seed = tree.get_record(b"seed").unwrap().unwrap();
+        let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
+
+        assert!(tree
+            .atomic(|b| {
+                b.assert_version(b"seed", seed.version);
+                b.assert_prefix_empty(b"empty/");
+            })
+            .unwrap());
+
+        assert_eq!(
+            fs::metadata(wal_path(dir.path())).unwrap().len(),
+            wal_len,
+            "assert-only atomic batches must not emit WAL records",
+        );
+        assert_eq!(
+            tree.get_record(b"seed").unwrap().unwrap().version,
+            seed.version,
+            "assert-only atomic batches must not consume record versions",
+        );
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert_eq!(tree.get(b"seed").unwrap().as_deref(), Some(&b"payload"[..]));
+}
+
+#[test]
+fn failed_atomic_guard_does_not_append_wal_or_publish() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"guarded", b"v1").unwrap();
+        let stale = tree.get_version(b"guarded").unwrap().unwrap();
+        tree.put(b"guarded", b"v2").unwrap();
+        let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
+
+        let committed = tree
+            .atomic(|b| {
+                b.assert_version(b"guarded", stale);
+                b.put(b"side", b"should-not-publish");
+            })
+            .unwrap();
+
+        assert!(!committed);
+        assert_eq!(
+            fs::metadata(wal_path(dir.path())).unwrap().len(),
+            wal_len,
+            "failed preflight must not append a Batch WAL record",
+        );
+        assert!(tree.get(b"side").unwrap().is_none());
+        assert_eq!(tree.get(b"guarded").unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert!(tree.get(b"side").unwrap().is_none());
+    assert_eq!(tree.get(b"guarded").unwrap().as_deref(), Some(&b"v2"[..]));
 }
 
 #[test]
@@ -559,7 +773,7 @@ fn batch_crash_before_flush_loses_whole_batch() {
         // Batch goes through the BM cache but the WAL flush is
         // deferred; without a checkpoint, the on-disk WAL stays
         // empty for these ops.
-        tree.txn(|b| {
+        tree.atomic(|b| {
             b.put(b"vanish-a", b"VA");
             b.put(b"vanish-b", b"VB");
         })
@@ -582,7 +796,7 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
     // bounded (it gets truncated to header-only on rounds where
     // nothing else is racing the writer) AND every written value
     // remains observable after reopen (because the round flushed
-    // the cached root into backend before truncating).
+    // the cached root into store before truncating).
     use holt::{CheckpointConfig, TreeBuilder};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -635,7 +849,7 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
 
     // After reopen, every key is still readable — the bg
     // checkpointer's flush sequence (commit → fdatasync →
-    // truncate) made the backend the durable source of truth.
+    // truncate) made the store the durable source of truth.
     let tree = Tree::open(TreeConfig::new(dir.path())).unwrap();
     for i in 0..500u32 {
         let k = format!("bg/{i:04}");
@@ -649,28 +863,28 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
 }
 
 #[test]
-fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
+fn spillover_new_blobs_deferred_to_store_until_checkpoint() {
     // Regression test for the v0.2 W2D fix: spillover used to call
     // `bm.write_blob → bm.flush` inline, leaking the new child
-    // blob's bytes to the inner backend before any WAL record
+    // blob's bytes to the inner store before any WAL record
     // covering the spillover-triggering op was durable. The fix
     // routes the new blob through `install_new_blob` (cache +
-    // dirty), so the backend write happens only after the
+    // dirty), so the store write happens only after the
     // checkpoint round has flushed WAL first.
-    use holt::{Backend, MemoryBackend};
+    use holt::{BlobStore, MemoryBlobStore};
     use std::sync::Arc;
 
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
 
-    // `open_with_backend` skips the WAL and the bg checkpointer
+    // `open_with_blob_store` skips the WAL and the bg checkpointer
     // (default `CheckpointConfig::disabled`). Disable
     // `memory_flush_on_write` too so the test can observe the dirty-set
     // state between ops and the explicit `checkpoint` call.
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
-    let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, Arc::clone(&inner)).unwrap();
 
-    // Inner backend starts with only the seeded root.
+    // Inner store starts with only the seeded root.
     let initial = inner.list_blobs().unwrap();
     assert_eq!(initial.len(), 1, "open seeds only the root blob");
 
@@ -693,16 +907,16 @@ fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
         "every spillover'd blob + root must be tracked dirty",
     );
 
-    // **The point of the test**: the inner backend has NOT yet
+    // **The point of the test**: the inner store has NOT yet
     // received the spillover'd child blobs. Pre-fix, the inline
     // `bm.write_blob` call in `spillover_blob` would have pushed
     // them through immediately — a crash here would have left
-    // orphans in backend.
+    // orphans in store.
     let mid = inner.list_blobs().unwrap();
     assert_eq!(
         mid.len(),
         1,
-        "inner backend must NOT see spillover'd children until checkpoint (got {} blobs)",
+        "inner store must NOT see spillover'd children until checkpoint (got {} blobs)",
         mid.len(),
     );
 
@@ -719,11 +933,11 @@ fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
     assert_eq!(
         final_blobs.len() as u32,
         stats.blob_count,
-        "after checkpoint, inner backend has every reachable blob",
+        "after checkpoint, inner store has every reachable blob",
     );
 
     // Sanity: every payload still readable through the tree
-    // (sourced from the freshly-flushed inner backend on a
+    // (sourced from the freshly-flushed inner store on a
     // cache miss).
     for i in 0..1000u32 {
         let k = format!("k{i:05}");
@@ -733,32 +947,32 @@ fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
 }
 
 #[test]
-fn compact_does_not_leak_pre_wal_state_to_backend() {
+fn compact_does_not_leak_pre_wal_state_to_store() {
     // Regression test: `Tree::compact` used to call
     // `bm.commit(*guid)` for every touched blob, which pushes
     // the cached image (including unflushed-WAL user mutations)
-    // straight to backend. A crash before the user's WAL record
-    // was durable would have left the backend at the post-put
+    // straight to store. A crash before the user's WAL record
+    // was durable would have left the store at the post-put
     // state while the WAL contained no record — and the next
     // reopen-via-WAL-replay would have re-built a state that
     // looks like "put never happened" (cache rebuilt from WAL =
     // empty; checkpoint then truncates the empty WAL; reopen
-    // sees the backend which still has post-put state, but the
+    // sees the store which still has post-put state, but the
     // user-visible model now disagrees with the durable image).
     //
     // The simplest demonstration: turn off WAL fsync, put a key,
     // run compact (which races the WAL flush), drop without
     // checkpoint, reopen. Pre-fix, compact had already shoved
-    // the put's bytes into the backend; the put's WAL record
+    // the put's bytes into the store; the put's WAL record
     // never made it to disk (`wal_sync_on_commit = false` and no
     // explicit checkpoint), so the open-time replay sees no
     // record and considers `next_seq` to start at 1 — but the
-    // backend has the put. Mixing those would surface as either
+    // store has the put. Mixing those would surface as either
     // a phantom value or a torn state on subsequent ops.
     //
     // Post-fix, compact only marks dirty + leaves flushing to
     // the user / checkpointer. With no checkpoint between put
-    // and drop, the backend stays at the pre-put state, the WAL
+    // and drop, the store stays at the pre-put state, the WAL
     // is empty (records weren't fsync'd), and reopen sees the
     // pristine root → `get` returns None. That's the expected
     // "lost write under no-fsync, no-checkpoint" semantics; the
@@ -767,23 +981,23 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
     // We verify the post-fix invariant by checking that
     // `tree.stats().bm_dirty_count > 0` *after* compact (i.e.,
     // compact left things dirty rather than flushing them
-    // through), and that the backend file size remains at the
+    // through), and that the store file size remains at the
     // initial seeded-root size (no spillover blobs leaked
     // through).
-    use holt::{Backend, MemoryBackend};
+    use holt::{BlobStore, MemoryBlobStore};
     use std::sync::Arc;
 
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
 
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false; // no implicit per-op flush
-    let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, Arc::clone(&inner)).unwrap();
 
     let initial = inner.list_blobs().unwrap();
     assert_eq!(initial.len(), 1, "open seeds only the root blob");
 
     // Put a key so the root blob's cache image diverges from
-    // backend. mark_dirty(root, seq) fires inside Tree::put.
+    // store. mark_dirty(root, seq) fires inside Tree::put.
     tree.put(b"key", b"value").unwrap();
     assert!(
         tree.stats().unwrap().bm_dirty_count >= 1,
@@ -791,17 +1005,17 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
     );
 
     // Now compact. Pre-fix, this would commit the root through
-    // to backend, eagerly persisting the put's bytes without
+    // to store, eagerly persisting the put's bytes without
     // any WAL gate. Post-fix, compact only restructures cache +
     // marks dirty.
     tree.compact().unwrap();
 
-    // Backend still pristine — compact did NOT flush.
+    // BlobStore still pristine — compact did NOT flush.
     let after_compact = inner.list_blobs().unwrap();
     assert_eq!(
         after_compact.len(),
         1,
-        "compact must not push cache state to backend",
+        "compact must not push cache state to store",
     );
     // And the root is still dirty: the put + the compact reshuffle
     // are both staged in cache, waiting for `checkpoint` to
@@ -811,33 +1025,33 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
         "compact must leave dirty entries (not auto-flush)",
     );
 
-    // Now actually checkpoint — backend receives the merged state.
+    // Now actually checkpoint — store receives the merged state.
     tree.checkpoint().unwrap();
     assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
 
     // Sanity: value still readable through the freshly-flushed
-    // backend.
+    // store.
     assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(&b"value"[..]),);
 }
 
 #[test]
-fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
+fn multi_blob_compact_does_not_leak_pre_wal_state_to_store() {
     // Same protocol assertion as
-    // `compact_does_not_leak_pre_wal_state_to_backend`, but
+    // `compact_does_not_leak_pre_wal_state_to_store`, but
     // sized to force spillover so `Tree::compact` considers
     // multiple child blobs and then attempts tree-wide merge.
     // Cross-blob entry is now only the child blob's
     // `header.root_slot`, so parent BlobNodes do not carry a child
     // entry slot that needs a post-compact repair pass.
-    use holt::{Backend, MemoryBackend};
+    use holt::{BlobStore, MemoryBlobStore};
     use std::sync::Arc;
 
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
-    let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, Arc::clone(&inner)).unwrap();
 
-    // Inner backend starts with only the seeded root.
+    // Inner store starts with only the seeded root.
     assert_eq!(inner.list_blobs().unwrap().len(), 1);
 
     // Stuff enough data to force at least two spillovers so the
@@ -855,13 +1069,13 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
 
     // Compact may rewrite blobs with reclaimable garbage and may
     // restructure parent BlobNodes. It must NOT push anything to
-    // backend — only stage via dirty.
+    // store — only stage via dirty.
     tree.compact().unwrap();
     let after_compact = inner.list_blobs().unwrap();
     assert_eq!(
         after_compact.len(),
         1,
-        "multi-blob compact must not push cache state to backend (got {} blobs)",
+        "multi-blob compact must not push cache state to store (got {} blobs)",
         after_compact.len(),
     );
     assert!(
@@ -869,7 +1083,7 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
         "compact must leave dirty entries waiting for the next checkpoint",
     );
 
-    // Now checkpoint and reopen-via-backend: every key must still
+    // Now checkpoint and reopen-via-store: every key must still
     // be present (any structural rewrite preserved logical state).
     tree.checkpoint().unwrap();
     assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
@@ -938,7 +1152,7 @@ fn batch_replay_then_checkpoint_then_reopen_preserves_data() {
     // Round 1: durable batch, no checkpoint.
     {
         let tree = Tree::open(cfg.clone()).unwrap();
-        tree.txn(|b| {
+        tree.atomic(|b| {
             b.put(b"a", b"1");
             b.put(b"b", b"2");
             b.put(b"c", b"3");
@@ -954,7 +1168,7 @@ fn batch_replay_then_checkpoint_then_reopen_preserves_data() {
         tree.checkpoint().unwrap();
     }
 
-    // Round 3: backend is sole source of truth (WAL truncated).
+    // Round 3: store is sole source of truth (WAL truncated).
     {
         let tree = Tree::open(cfg).unwrap();
         assert_eq!(tree.get(b"a").unwrap(), None);
@@ -996,14 +1210,14 @@ fn rename_replay_is_idempotent_across_two_drops() {
     // rename replay path's "src already gone" branch must fire
     // — the cache after the put-replay has `dst` (the cache
     // image isn't durable yet, but the put record re-fills it).
-    // Actually the cache is rebuilt fresh from an empty backend
+    // Actually the cache is rebuilt fresh from an empty store
     // every reopen, so this exercises the same path; the test
     // just guarantees no drift across repeated replays.
     {
         let tree = Tree::open(cfg.clone()).unwrap();
         assert!(tree.get(b"src").unwrap().is_none());
         assert_eq!(tree.get(b"dst").unwrap().as_deref(), Some(&b"v1"[..]));
-        // Now checkpoint and reopen — backend must hold the
+        // Now checkpoint and reopen — store must hold the
         // post-rename state.
         tree.checkpoint().unwrap();
     }
@@ -1135,9 +1349,9 @@ fn cross_blob_writes_replay_correctly_through_wal_without_checkpoint() {
 // The pre-fix race: a writer marked a blob dirty + then released
 // before appending WAL; a checkpoint round in between could
 // snapshot the dirty entry, flush a stale WAL (no record yet),
-// write the cache image to backend, sync — and the writer's
-// WAL append then landed AFTER backend was already past it. On
-// crash the WAL truncate point + backend image disagreed.
+// write the cache image to store, sync — and the writer's
+// WAL append then landed AFTER store was already past it. On
+// crash the WAL truncate point + store image disagreed.
 //
 // These tests aren't deterministic race triggers (they can't
 // reliably interleave writer/checkpointer threads at a single
@@ -1264,7 +1478,7 @@ fn concurrent_writers_and_manual_checkpoints_preserve_acked_ops() {
         done.store(true, Ordering::Relaxed);
         ck_handle.join().unwrap();
 
-        // One final checkpoint to make backend the source of
+        // One final checkpoint to make store the source of
         // truth before drop (we'll re-open with the same WAL
         // path and don't want replay to mask a missed write).
         tree.checkpoint().unwrap();

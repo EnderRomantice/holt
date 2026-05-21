@@ -77,7 +77,7 @@ fn spillover_min_child_bytes() -> u32 {
 ///
 /// Returns the BlobNode slot installed in `frame` so callers /
 /// tests can verify. The new blob lives in the BM cache + dirty
-/// map; its backend write happens during the next checkpoint round
+/// map; its store write happens during the next checkpoint round
 /// (after the WAL record for the spillover-triggering op is
 /// durable — invariant W2D).
 ///
@@ -103,7 +103,7 @@ pub(super) fn spillover_blob(
     // inline `bm.write_blob(new_guid, ...) + bm.flush()` here
     // would violate invariant W2D: a crash between the inline
     // write and the user's WAL flush would leave an orphan in
-    // backend AND the parent's BlobNode staged only in cache —
+    // store AND the parent's BlobNode staged only in cache —
     // and a racing checkpointer could flush the parent's
     // BlobNode before the user's WAL record was durable,
     // leaving the on-disk parent pointing at the pre-spillover
@@ -556,7 +556,7 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
 ///   Closes the cross-process collision class "process A
 ///   crashes, process B starts on the same machine, OS reuses
 ///   pid, counter resets to 1 → identical GUID; new spillover
-///   overwrites the crashed process's orphan blob in backend".
+///   overwrites the crashed process's orphan blob in store".
 /// - **byte 15** — magic tag `0xD4` so a fresh GUID can never
 ///   collide with `ROOT_BLOB_GUID = [0; 16]`.
 ///

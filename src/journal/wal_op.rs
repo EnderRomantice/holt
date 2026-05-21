@@ -1,9 +1,9 @@
-//! TxnOp variants — durable logical redo records.
+//! WalOp variants — durable logical redo records.
 //!
 //! Each variant carries the minimal info needed to replay the
 //! operation deterministically during WAL recovery.
 
-/// Transaction-op variants emitted by the public tree API.
+/// Logical WAL operation variants emitted by the public tree API.
 ///
 /// Variant tags are stable on-disk constants — see the `TY_*`
 /// block in [`super::codec`]. Never renumber; only append.
@@ -14,7 +14,7 @@
 // doesn't fire on those fields in non-test builds.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub enum TxnOp {
+pub enum WalOp {
     /// Single-key insert / update.
     ///
     /// Replay only redoes from `(key, value)`; there is no
@@ -24,7 +24,7 @@ pub enum TxnOp {
     Insert {
         /// Owning tree root identifier.
         tree_id: u64,
-        /// MVCC seq this op was committed at.
+        /// WAL sequence this op was committed at.
         seq: u64,
         /// Key bytes.
         key: Vec<u8>,
@@ -41,7 +41,7 @@ pub enum TxnOp {
     Erase {
         /// Owning tree root identifier.
         tree_id: u64,
-        /// MVCC seq this op was committed at.
+        /// WAL sequence this op was committed at.
         seq: u64,
         /// Key bytes.
         key: Vec<u8>,
@@ -50,7 +50,7 @@ pub enum TxnOp {
     RenameObject {
         /// Owning tree root identifier.
         tree_id: u64,
-        /// MVCC seq.
+        /// WAL sequence.
         seq: u64,
         /// Source key.
         src_key: Vec<u8>,
@@ -62,7 +62,7 @@ pub enum TxnOp {
     /// Batch — one WAL record carrying multiple primitive ops so a
     /// crash either replays all of them or none.
     ///
-    /// Emitted by [`crate::Tree::txn`]. Inner ops are primitive
+    /// Emitted by [`crate::Tree::atomic`]. Inner ops are primitive
     /// variants only (`Insert` / `Erase` / `RenameObject` today);
     /// nested `Batch`es are rejected at encode + decode. Each
     /// inner op carries `seq = outer_seq + index`; the outer
@@ -72,6 +72,6 @@ pub enum TxnOp {
         /// Owning tree root identifier.
         tree_id: u64,
         /// Inner ops, applied in order.
-        ops: Vec<TxnOp>,
+        ops: Vec<WalOp>,
     },
 }

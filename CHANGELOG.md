@@ -9,13 +9,46 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Added
+
+- Added lightweight conditional-write API for metadata-style
+  compare-and-set flows: `Record`, `RecordVersion`,
+  `Tree::get_record`, `Tree::get_version`,
+  `Tree::put_if_absent`, `Tree::compare_and_put`, and
+  `Tree::delete_if_version`. Versions are current leaf sequence
+  tokens, not MVCC snapshot timestamps.
+- Added conditional `AtomicBatch` operations:
+  `put_if_absent`, `compare_and_put`, `delete_if_version`, and
+  read-only `assert_version`.
+- Added prefix-emptiness guards for metadata delete flows:
+  `Tree::is_prefix_empty` for read checks and
+  `AtomicBatch::assert_prefix_empty` for atomic batch preflight.
+- `RangeEntry::Key` now includes the live `RecordVersion` so
+  list-then-CAS metadata workflows do not need a second lookup.
+- Added a `cargo-fuzz` harness (`fuzz/fuzz_targets/atomic_model.rs`)
+  that checks persistent reopen/checkpoint, range scans,
+  conditional writes, and atomic batches against a `BTreeMap`
+  oracle.
+
 ### Changed
 
-- WAL `TxnOp` is now a logical redo surface only: `Insert`,
+- Renamed the public custom storage surface around the actual
+  blob-granular contract: `Backend` → `BlobStore`,
+  `MemoryBackend` → `MemoryBlobStore`, `PersistentBackend` →
+  `FileBlobStore`, `Tree::open_with_backend` /
+  `TreeBuilder::open_with_backend` → `open_with_blob_store`,
+  `Storage::Persistent` → `Storage::File`, and
+  `Error::BackendIo` → `Error::BlobStoreIo`. Internally,
+  `src/store/backend/persistent` is now
+  `src/store/blob_store/file`.
+- WAL `WalOp` is now a logical redo surface only: `Insert`,
   `Erase`, `RenameObject`, and `Batch`. Removed draft
   structural / multi-tree variants that production never emitted
   and replay previously treated as successful no-ops; their old
   draft tags now fail decode as unsupported records.
+- `Tree::atomic` now returns `Result<bool>` and preflights logical
+  failures before mutation. Rename errors publish no partial batch;
+  failed conditional guards return `Ok(false)`.
 
 ### Fixed
 
@@ -36,7 +69,7 @@ extreme metadata-engine performance track builds on them.
 
 ### Breaking — WAL format v3 (drops dead audit fields)
 
-`TxnOp::Insert.prev_value` and `TxnOp::Erase.value` are gone.
+`WalOp::Insert.prev_value` and `WalOp::Erase.value` are gone.
 Both were documented as "for replay reversibility" but replay is
 an idempotent forward redo that only consumes `(key, value)` for
 Insert and `key` for Erase — the prior-value slots were dead
@@ -80,12 +113,12 @@ contention contract, not just a convenience method. For the
 metadata-engine surface we want to stabilize now, owned `Vec<u8>`
 lookups plus range iteration are the right external boundary.
 
-### Performance — `txn()` batch bypasses `TxnOp` enum
+### Performance — `atomic()` batch bypasses `WalOp` enum
 
-`Tree::txn` (the batched-multi-op API) now uses a streaming
+`Tree::atomic` (the batched-multi-op API) now uses a streaming
 `BatchEncoder` that writes inner-op bytes directly from `&[u8]`
 refs into the WAL pending buffer. The previous v0.3 draft path
-constructed `TxnOp::Insert { key: Vec<u8>, value: Vec<u8>, .. }`
+constructed `WalOp::Insert { key: Vec<u8>, value: Vec<u8>, .. }`
 (and similarly for `Erase` / `RenameObject`) per inner op, then
 encoded the enum-of-`Vec`s — two extra clones per op the WAL never
 needed.
@@ -95,7 +128,7 @@ Mid-batch error handling is preserved: if a walker call returns
 record bytes off the WAL pending buffer (truncate to where
 `begin` started). On `Ok`, the encoder backpatches the inner
 count + body length and appends the CRC — byte-identical to
-what the old `encode_record(&TxnOp::Batch { .. })` path would
+what the old `encode_record(&WalOp::Batch { .. })` path would
 have produced (verified by `batch_encoder_wire_matches_encode_record`
 in `src/journal/codec.rs::tests`).
 
@@ -114,7 +147,7 @@ same change applied inside the batch-path rename arm of
 
 - Dropped `write_optional_bytes` / `read_optional_bytes` helpers
   (no callers after Insert/Erase shed their optional slots).
-- `WalWriter::append` (the generic `&TxnOp` entry) is now
+- `WalWriter::append` (the generic `&WalOp` entry) is now
   test-only. Foreground mutation paths encode owned WAL records
   with the per-variant codec helpers and hand those bytes to the
   journal worker.
@@ -171,7 +204,7 @@ Concretely:
 The remaining v0.3 concurrency cleanup is now in place:
 
 - Foreground mutation paths (`put` / `insert` / `delete` /
-  `remove` / `rename` / `txn`) enter the shared side of a narrow
+  `remove` / `rename` / `atomic`) enter the shared side of a narrow
   atomic `maintenance_gate` while they may cross `BlobNode`
   boundaries.
   `Tree::compact()` runs blob-local compaction on the shared side,
@@ -280,7 +313,7 @@ Migrating from v0.2.x:
 
 ### Breaking — WAL format
 
-`TxnOp::Erase.value` changed from `Vec<u8>` (always present) to
+`WalOp::Erase.value` changed from `Vec<u8>` (always present) to
 `Option<Vec<u8>>`: `Some(prev)` on the returning `Tree::remove`
 path, `None` on the blind `Tree::delete` path. Wire shape: the
 trailing `bytes(value)` became `optional_bytes(value)`.
@@ -392,15 +425,15 @@ metadata-native mixes and delimiter directory rollup.
   `holt::store` are now `pub(crate)`. The supported `holt::*`
   surface is `Tree`, `TreeBuilder`, `TreeConfig`, `Storage`,
   `Error`, `Result`, `RangeBuilder`, `RangeEntry`, `RangeIter`,
-  `BlobStats`, `TreeStats`, `CheckpointerStats`, `TxnBatch`,
-  `CheckpointConfig`, `Backend`, `MemoryBackend`,
-  `PersistentBackend`, `AlignedBlobBuf`, `BlobGuid`. The
+  `BlobStats`, `TreeStats`, `CheckpointerStats`, `AtomicBatch`,
+  `CheckpointConfig`, `BlobStore`, `MemoryBlobStore`,
+  `FileBlobStore`, `AlignedBlobBuf`, `BlobGuid`. The
   `metrics::render_prometheus` renderer is part of the
   `metrics`-feature surface.
 - **`pub use holt::BufferManager` removed**; `BufferManager` is
   internal.
 - **`BlobGuid` now re-exported at the crate root** for custom
-  `Backend` implementations.
+  `BlobStore` implementations.
 - **`RangeBuilder::new` is `pub(crate)`** — use `Tree::range()` /
   `Tree::scan_prefix()`.
 - **`TreeConfig::checkpoint_byte_interval` field +
@@ -454,7 +487,7 @@ metadata-native mixes and delimiter directory rollup.
 
 ### Added
 
-- **`io-uring` feature flag** (Linux only). `PersistentBackend`
+- **`io-uring` feature flag** (Linux only). `FileBlobStore`
   reads/writes route through a per-backend `io_uring` (depth 8)
   instead of `pread`/`pwrite`.
 - **`tracing` feature flag** (off by default). Structured
@@ -532,7 +565,7 @@ Full numbers in [`benches/RESULTS.md`](benches/RESULTS.md).
 
 First crates.io release. The v0.1 cycle built the engine end-to-
 end on a single Unix-only stack: ART core, multi-blob `splitBlob`
-/ `mergeBlob` / `compactBlob`, `PersistentBackend` (`O_DIRECT`
+/ `mergeBlob` / `compactBlob`, `FileBlobStore` (`O_DIRECT`
 Linux + `F_NOCACHE` macOS), logical WAL with replay,
 S3-style range iteration with delimiter rollup. 203 tests on
 ubuntu + macOS CI.
@@ -570,7 +603,7 @@ ubuntu + macOS CI.
 - Wait-free `Tree::get` walker — optimistic snapshots with
   validate-after, restart from root on torn read. No Tree-wide
   reader lock.
-- Persistent `put` / `delete` / `rename` / `txn` publish dirty
+- Persistent `put` / `delete` / `rename` / `atomic` publish dirty
   state and journal records through writer-shared `CommitGate`;
   durable fsync waits happen outside that gate through the
   group-commit worker.
@@ -579,12 +612,12 @@ ubuntu + macOS CI.
 
 ### Persistence
 
-- `MemoryBackend` and `PersistentBackend` (single packed
+- `MemoryBlobStore` and `FileBlobStore` (single packed
   `blobs.dat` + atomic-rename `manifest.bin`, `O_DIRECT` Linux,
   `F_NOCACHE` macOS).
-- `Backend` trait + `AlignedBlobBuf` 4 KB-aligned zero-copy
+- `BlobStore` trait + `AlignedBlobBuf` 4 KB-aligned zero-copy
   buffer.
-- 10-variant `TxnOp` codec (`MAGIC | LEN | SEQ | TY | BODY |
+- 10-variant `WalOp` codec (`MAGIC | LEN | SEQ | TY | BODY |
   CRC32`); torn-tail-tolerant forward replay scanner.
 - `WalWriter` with `sync_data`-on-flush durability + 64 KB
   buffered auto-drain, driven by a dedicated journal
@@ -592,7 +625,7 @@ ubuntu + macOS CI.
 - `Tree::checkpoint` flushes WAL + commits BM + truncates WAL
   conditionally; replay reapplies records onto the BM-cached
   blob and resumes `next_seq` past every replayed record.
-- `TxnOp::Batch` (`TY_BATCH = 10`) carries N primitive ops under
+- `WalOp::Batch` (`TY_BATCH = 10`) carries N primitive ops under
   one record with shared CRC and derived seqs; replay
   transparently flattens to per-inner callbacks.
 
@@ -605,11 +638,11 @@ ubuntu + macOS CI.
 - `Tree::range()` stateful iterator — `.prefix(p)`,
   `.start_after(k)`, `.delimiter(b)` (S3-style rollup with
   `CommonPrefix` dedup). Forward-only, best-effort snapshot.
-- `Tree::txn(|batch| { ... })` — batched mutations under one
-  `TxnOp::Batch` WAL record. Crash-atomic, runtime isolation is
+- `Tree::atomic(|batch| { ... })` — batched mutations under one
+  `WalOp::Batch` WAL record. Crash-atomic, runtime isolation is
   best-effort.
 - `Tree::checkpoint()`, `Tree::stats()`.
-- Typed `Error` (`BackendIo` / `Alloc` / `Free` / `KeyTooLong`
+- Typed `Error` (`BlobStoreIo` / `Alloc` / `Free` / `KeyTooLong`
   / `ValueTooLong` / `NotYetImplemented` / `NodeCorrupt` /
   `ReplaySanityFailed` / `NotFound` / `DstExists`).
   `#[non_exhaustive]` so new variants are non-breaking in minor

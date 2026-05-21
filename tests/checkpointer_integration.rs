@@ -45,7 +45,7 @@ struct Run {
     /// — we let the bg thread (or its absence) decide what's
     /// durable).
     final_wal: u64,
-    /// Backend data file size after drop (bg's Drop runs a final
+    /// BlobStore data file size after drop (bg's Drop runs a final
     /// round so this should always be populated).
     final_data: u64,
     /// `Tree::open` time on a fresh handle pointing at the same

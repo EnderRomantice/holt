@@ -99,7 +99,7 @@ and SQLite page cache may all contain data touched during preload
 or Criterion warmup. This is a foreground WAL/cache benchmark, not
 a cold data-file I/O benchmark:
 
-- **holt**: `TreeConfig::new(tempdir)` (PersistentBackend with
+- **holt**: `TreeConfig::new(tempdir)` (FileBlobStore with
   `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every mutation
   submits an encoded record to the journal worker;
   `wal_sync_on_commit` stays at its default `false`. Blobs only

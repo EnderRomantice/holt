@@ -22,7 +22,7 @@ use crate::layout::{
     leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
     BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
-use crate::store::backend::AlignedBlobBuf;
+use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
 use super::cast;
@@ -64,9 +64,9 @@ pub fn make_blob_from_node(
 }
 
 /// Same as [`make_blob_from_node`], but allocates the destination
-/// from the buffer manager's backend-preferred allocator. Spillover
+/// from the buffer manager's store-preferred allocator. Spillover
 /// uses this path so fresh child blobs enter the cache backed by
-/// registered `io_uring` buffers when the persistent backend has a
+/// registered `io_uring` buffers when the persistent store has a
 /// fixed-buffer pool.
 pub fn make_blob_from_node_in(
     bm: &BufferManager,
@@ -299,7 +299,7 @@ pub fn merge_blob(
     // before the next checkpoint round's Sync); on crash that
     // would leave the parent in cache pointing at no child
     // while manifest persistence raced ahead through any
-    // unrelated `backend.flush`.
+    // unrelated `store.flush`.
     bm.mark_for_delete(child_guid, seq);
 
     #[cfg(feature = "tracing")]

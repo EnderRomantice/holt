@@ -22,10 +22,10 @@ workload can use it on a single node.
 
 Delivered: 9-NodeType ART layout pinned at compile time, recursive
 walker (insert / lookup / erase / rename), cross-blob `splitBlob`
-/ `mergeBlob` / `compactBlob`, `PersistentBackend` (`O_DIRECT`
+/ `mergeBlob` / `compactBlob`, `FileBlobStore` (`O_DIRECT`
 Linux + `F_NOCACHE` macOS), logical WAL with replay,
 `Tree::range` iterator with prefix + start-after + S3-style
-delimiter rollup, `Tree::txn` batch transactions under one WAL
+delimiter rollup, `Tree::atomic` atomic batches under one WAL
 record, four examples (`basic_kv` / `filesystem_meta` /
 `session_store` / `s3_metadata`), property-based tests against a
 `HashMap` oracle, criterion benches vs RocksDB + SQLite.
@@ -165,7 +165,7 @@ The background checkpointer already has planner / I/O / eviction
 threads. v0.3 makes the I/O side worth that structure:
 
 - Submit dirty blobs as batches, not one synchronous write at a
-  time: `Backend::write_blobs` is the checkpoint write-through
+  time: `BlobStore::write_blobs` is the checkpoint write-through
   primitive.
 - The default Unix backend sorts and coalesces slot-contiguous
   512 KB blob writes with `pwritev`; Linux `io_uring` keeps
@@ -281,7 +281,7 @@ embed-in-your-process, Unix-only. Out of scope:
   RPC server (PUT/GET/LIST inode handlers, multi-tenant bucket
   registry, RPC worker pool). holt does not reproduce any of
   that. The alignment is bounded to the **metadata engine**: ART
-  core, blob layout, WAL, latching, range iterator. `TxnOp`
+  core, blob layout, WAL, latching, range iterator. `WalOp`
   variants holt journals share wire shape with the upstream so a
   future RPC layer could re-use the format, but holt itself ships
   no multi-root registry, no bucket namespace, no RPC dispatcher.

@@ -58,15 +58,15 @@ mod writers;
 // submodule paths and are only consumed by sibling submodules and
 // the walker's own `tests`.
 
-pub use erase::erase_multi;
-pub use insert::insert_multi;
+pub use erase::{erase_multi, erase_multi_conditional};
+pub use insert::{insert_multi, insert_multi_conditional};
 pub(crate) use key::SearchKey;
 pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;
 pub use migrate::{blob_needs_compaction, compact_blob};
 pub use range::{RangeBuilder, RangeEntry, RangeIter};
 pub use scan::{collect_blob_guids, collect_blob_guids_silent};
-pub use types::EraseOutcome;
+pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
 // ---------- shared internals ----------
 

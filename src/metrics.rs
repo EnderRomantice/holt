@@ -135,7 +135,7 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     metric(
         &mut out,
         "holt_bm_pending_delete_count",
-        "Number of blobs queued for deferred backend deletion.",
+        "Number of blobs queued for deferred store deletion.",
         "gauge",
         stats.bm_pending_delete_count as u64,
     );
@@ -149,7 +149,7 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     metric(
         &mut out,
         "holt_bm_cache_misses_total",
-        "Cumulative buffer-manager cache misses (fell through to backend).",
+        "Cumulative buffer-manager cache misses (fell through to store).",
         "counter",
         stats.bm_cache_misses,
     );
@@ -259,7 +259,7 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         metric(
             &mut out,
             "holt_checkpoint_blobs_flushed_total",
-            "Blobs the checkpointer's I/O worker wrote through to backend.",
+            "Blobs the checkpointer's I/O worker wrote through to store.",
             "counter",
             ck.blobs_flushed,
         );

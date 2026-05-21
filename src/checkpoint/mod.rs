@@ -17,9 +17,9 @@
 //!          ▼
 //! ┌──────────────────────────────────────────────────────────┐
 //! │ io_thread (I/O executor)                                 │
-//! │   recv IoTask -> backend.write_blob / backend.flush      │
+//! │   recv IoTask -> store.write_blob / store.flush      │
 //! │                                                          │
-//! │   ── Unix:  pread/pwritev through PersistentBackend      │
+//! │   ── Unix:  pread/pwritev through FileBlobStore      │
 //! │   ── Linux: io_uring fixed-file/fixed-buffer fast path   │
 //! └──────────────────────────────────────────────────────────┘
 //!
@@ -192,7 +192,7 @@ pub(super) struct Shared {
     /// Same writer-shared / checkpoint-exclusive publish barrier
     /// used by foreground persistent writers. Checkpoint rounds
     /// hold its exclusive side while draining dirty entries and
-    /// cloning bytes so backend writes never include unjournaled
+    /// cloning bytes so store writes never include unjournaled
     /// mutations.
     pub(super) commit_gate: Arc<CommitGate>,
     /// Shared structural gate with `Tree`: the merge pass enters
@@ -403,11 +403,11 @@ fn checkpoint_main(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::backend::{Backend, MemoryBackend};
+    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
     use std::time::Instant;
 
     fn make_bm() -> Arc<BufferManager> {
-        Arc::new(BufferManager::new(Arc::new(MemoryBackend::new()), 8))
+        Arc::new(BufferManager::new(Arc::new(MemoryBlobStore::new()), 8))
     }
 
     fn maintenance_gate() -> Arc<MaintenanceGate> {
@@ -453,7 +453,7 @@ mod tests {
     fn round_drains_dirty_set_via_io_queue() {
         let bm = make_bm();
         // Prime a cached entry so snapshot_bytes returns Some.
-        let mut scratch = crate::store::backend::AlignedBlobBuf::zeroed();
+        let mut scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
         scratch.as_mut_slice()[100] = 0xAB;
         bm.write_blob([0x42; 16], &scratch).unwrap();
         let _pin = bm.pin([0x42; 16]).unwrap();
@@ -498,7 +498,7 @@ mod tests {
         .expect("spawn");
 
         // Need a cached blob so snapshot_bytes finds it.
-        let scratch = crate::store::backend::AlignedBlobBuf::zeroed();
+        let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
         bm.write_blob([0x01; 16], &scratch).unwrap();
         let _pin = bm.pin([0x01; 16]).unwrap();
         bm.mark_dirty([0x01; 16], 1);
@@ -521,7 +521,7 @@ mod tests {
     fn eviction_thread_drops_cold_entries() {
         let bm = make_bm();
         // Prime a cached entry and let it go cold.
-        let scratch = crate::store::backend::AlignedBlobBuf::zeroed();
+        let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
         bm.write_blob([0xEE; 16], &scratch).unwrap();
         let _ = bm.pin([0xEE; 16]).unwrap();
         // Drop the pin so try_evict_cold sees strong_count == 1.

@@ -1,4 +1,4 @@
-//! In-memory backend.
+//! In-memory store.
 //!
 //! Stores each blob as an [`AlignedBlobBuf`] inside an
 //! `RwLock<HashMap>`. Read-heavy workloads scale across cores; the
@@ -11,7 +11,7 @@ use std::sync::RwLock;
 use crate::api::errors::{Error, Result};
 use crate::layout::BlobGuid;
 
-use super::{AlignedBlobBuf, Backend};
+use super::{AlignedBlobBuf, BlobStore};
 
 /// Concurrent in-memory blob store.
 ///
@@ -19,12 +19,12 @@ use super::{AlignedBlobBuf, Backend};
 /// the working set fits comfortably in RAM and durability is not
 /// required.
 #[derive(Debug, Default)]
-pub struct MemoryBackend {
+pub struct MemoryBlobStore {
     inner: RwLock<HashMap<BlobGuid, AlignedBlobBuf>>,
 }
 
-impl MemoryBackend {
-    /// Construct an empty backend.
+impl MemoryBlobStore {
+    /// Construct an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -43,11 +43,11 @@ impl MemoryBackend {
     }
 }
 
-impl Backend for MemoryBackend {
+impl BlobStore for MemoryBlobStore {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         let g = self.inner.read().unwrap();
         let src = g.get(&guid).ok_or_else(|| {
-            Error::BackendIo(io::Error::new(
+            Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("blob {:02x?} not found", &guid[..4]),
             ))
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn write_then_read_round_trip() {
-        let b = MemoryBackend::new();
+        let b = MemoryBlobStore::new();
         let g: BlobGuid = [0xAB; 16];
         b.write_blob(g, &buf_with(42)).unwrap();
 
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn delete_removes_the_blob() {
-        let b = MemoryBackend::new();
+        let b = MemoryBlobStore::new();
         let g: BlobGuid = [0xCD; 16];
         b.write_blob(g, &buf_with(7)).unwrap();
         b.delete_blob(g).unwrap();
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn write_replaces_existing() {
-        let b = MemoryBackend::new();
+        let b = MemoryBlobStore::new();
         let g: BlobGuid = [0xEF; 16];
         b.write_blob(g, &buf_with(1)).unwrap();
         b.write_blob(g, &buf_with(99)).unwrap();
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn list_returns_every_inserted_guid() {
-        let b = MemoryBackend::new();
+        let b = MemoryBlobStore::new();
         for i in 0..8 {
             let g: BlobGuid = [i as u8; 16];
             b.write_blob(g, &buf_with(i as u8)).unwrap();
@@ -153,14 +153,14 @@ mod tests {
 
     #[test]
     fn flush_is_noop_and_idempotent() {
-        let b = MemoryBackend::new();
+        let b = MemoryBlobStore::new();
         b.flush().unwrap();
         b.flush().unwrap();
     }
 
     #[test]
     fn read_into_caller_buffer_does_not_share_storage() {
-        let b = MemoryBackend::new();
+        let b = MemoryBlobStore::new();
         let g: BlobGuid = [0x11; 16];
         b.write_blob(g, &buf_with(5)).unwrap();
 
@@ -179,7 +179,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let b = Arc::new(MemoryBackend::new());
+        let b = Arc::new(MemoryBlobStore::new());
         let g: BlobGuid = [0x77; 16];
         b.write_blob(g, &buf_with(123)).unwrap();
 

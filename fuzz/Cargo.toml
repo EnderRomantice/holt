@@ -1,0 +1,26 @@
+[package]
+name = "holt-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+tempfile = "3"
+holt = { path = ".." }
+
+# Keep this helper crate out of the parent workspace, matching the
+# standard cargo-fuzz layout used by storage-engine projects such
+# as sled.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "atomic_model"
+path = "fuzz_targets/atomic_model.rs"
+test = false
+doc = false

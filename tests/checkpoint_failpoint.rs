@@ -1,14 +1,14 @@
 //! Fault-injection tests for the checkpoint round's
 //! deferred-delete + Sync paths.
 //!
-//! Wraps a real backend (`MemoryBackend` or `PersistentBackend`)
-//! in a [`FailpointBackend`] that can be told to fail the N-th
+//! Wraps a real store (`MemoryBlobStore` or `FileBlobStore`)
+//! in a [`FailpointBlobStore`] that can be told to fail the N-th
 //! `delete_blob` / `flush` / `write_blob` call. The tests verify
 //! that:
 //!
-//! - A failed `backend.delete_blob` keeps the entry in
+//! - A failed `store.delete_blob` keeps the entry in
 //!   `pending_deletes` so a subsequent round retries.
-//! - A failed `backend.flush` after partial deletes restores the
+//! - A failed `store.flush` after partial deletes restores the
 //!   already-applied entries so the next round re-Syncs (and
 //!   `delete_blob` retry is idempotent).
 //! - A failed `write_blob` keeps the entry in `dirty` so a
@@ -21,17 +21,17 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
-use holt::{AlignedBlobBuf, Backend, CheckpointConfig, MemoryBackend, Tree, TreeConfig};
+use holt::{AlignedBlobBuf, BlobStore, CheckpointConfig, MemoryBlobStore, Tree, TreeConfig};
 
-// ---------- failpoint backend ----------
+// ---------- failpoint store ----------
 
-/// Backend wrapper that counts every call and can fail the N-th
+/// BlobStore wrapper that counts every call and can fail the N-th
 /// `delete_blob` / `flush` / `write_blob`. The fault counter is
 /// **one-shot** — once it fires (the call N matches), the counter
 /// is reset to `usize::MAX`; subsequent calls succeed via the
-/// inner backend. Tests can rearm with `arm_*` between rounds.
-struct FailpointBackend {
-    inner: Arc<dyn Backend>,
+/// inner store. Tests can rearm with `arm_*` between rounds.
+struct FailpointBlobStore {
+    inner: Arc<dyn BlobStore>,
     delete_calls: AtomicUsize,
     flush_calls: AtomicUsize,
     write_calls: AtomicUsize,
@@ -41,8 +41,8 @@ struct FailpointBackend {
     flush_retry_pending: AtomicBool,
 }
 
-impl FailpointBackend {
-    fn new(inner: Arc<dyn Backend>) -> Self {
+impl FailpointBlobStore {
+    fn new(inner: Arc<dyn BlobStore>) -> Self {
         Self {
             inner,
             delete_calls: AtomicUsize::new(0),
@@ -72,10 +72,10 @@ impl FailpointBackend {
 }
 
 fn failpoint_err(msg: &'static str) -> holt::Error {
-    holt::Error::BackendIo(io::Error::other(msg))
+    holt::Error::BlobStoreIo(io::Error::other(msg))
 }
 
-impl Backend for FailpointBackend {
+impl BlobStore for FailpointBlobStore {
     fn read_blob(&self, guid: holt::BlobGuid, dst: &mut AlignedBlobBuf) -> holt::Result<()> {
         self.inner.read_blob(guid, dst)
     }
@@ -125,13 +125,13 @@ impl Backend for FailpointBackend {
 // ---------- tests ----------
 
 #[test]
-fn clean_checkpoint_skips_backend_flush() {
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
-    let fp_dyn: Arc<dyn Backend> = fp.clone();
+fn clean_checkpoint_skips_flush_inner() {
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
+    let fp_dyn: Arc<dyn BlobStore> = fp.clone();
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
-    let tree = Tree::open_with_backend(cfg, fp_dyn).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, fp_dyn).unwrap();
 
     let stats = tree.stats().unwrap();
     assert_eq!(stats.bm_dirty_count, 0);
@@ -144,23 +144,23 @@ fn clean_checkpoint_skips_backend_flush() {
     assert_eq!(
         fp.flush_count(),
         flushes_before,
-        "clean checkpoint must not issue a backend flush",
+        "clean checkpoint must not issue a store flush",
     );
 }
 
-/// Build a tree on a failpoint-wrapped memory backend and stage
+/// Build a tree on a failpoint-wrapped memory store and stage
 /// at least one deferred delete in the BM's `pending_deletes`
 /// set via the **merge pass**: insert enough to force spillover,
 /// delete most of one child's keys so it becomes mergeable,
 /// then run `Tree::compact` so phase 2's `merge_blob` queues a
 /// `mark_for_delete` on the now-empty / now-small child.
-fn setup_with_pending_delete() -> (Arc<dyn Backend>, Arc<FailpointBackend>, Tree) {
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
-    let fp_dyn: Arc<dyn Backend> = fp.clone();
+fn setup_with_pending_delete() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, Tree) {
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
+    let fp_dyn: Arc<dyn BlobStore> = fp.clone();
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
-    let tree = Tree::open_with_backend(cfg, fp_dyn).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, fp_dyn).unwrap();
 
     // Stuff enough data to force at least one spillover, then
     // delete the bulk of it so the remaining shape is mergeable.
@@ -222,20 +222,20 @@ fn pending_delete_execute_failure_is_retried_next_round() {
     tree.checkpoint().unwrap();
     assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
 
-    // Final state: backend manifest count equals tree blob count
+    // Final state: store manifest count equals tree blob count
     // (no orphan slots, no missing slots).
-    let backend_blobs = inner.list_blobs().unwrap();
+    let store_blobs = inner.list_blobs().unwrap();
     let stats = tree.stats().unwrap();
     assert_eq!(
-        backend_blobs.len() as u32,
+        store_blobs.len() as u32,
         stats.blob_count,
-        "after retry, backend manifest count = tree blob count",
+        "after retry, store manifest count = tree blob count",
     );
 }
 
 #[test]
 fn pending_delete_sync_failure_keeps_state_for_retry() {
-    // Inject failure into the **second** `backend.flush` — the
+    // Inject failure into the **second** `store.flush` — the
     // one that persists the manifest after the deferred-delete
     // phase. The pre-delete data Sync (step 3 of
     // `Tree::checkpoint`) should succeed; only the post-delete
@@ -248,9 +248,9 @@ fn pending_delete_sync_failure_keeps_state_for_retry() {
 
     // `Tree::checkpoint`'s flush calls in order:
     //   1. journal flush — but no WAL here, so doesn't hit
-    //      backend (no FailpointBackend::flush call).
-    //   2. `backend.flush` (data Sync, step 3) — call #1.
-    //   3. `backend.flush` (manifest Sync, step 5) — call #2.
+    //      store (no FailpointBlobStore::flush call).
+    //   2. `store.flush` (data Sync, step 3) — call #1.
+    //   3. `store.flush` (manifest Sync, step 5) — call #2.
     // Arm to fail flush call #2.
     fp.arm_flush(2);
     let result1 = tree.checkpoint();
@@ -272,12 +272,12 @@ fn pending_delete_sync_failure_keeps_state_for_retry() {
     tree.checkpoint().unwrap();
     assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
 
-    let backend_blobs = inner.list_blobs().unwrap();
+    let store_blobs = inner.list_blobs().unwrap();
     let stats = tree.stats().unwrap();
     assert_eq!(
-        backend_blobs.len() as u32,
+        store_blobs.len() as u32,
         stats.blob_count,
-        "after retry, backend manifest count = tree blob count",
+        "after retry, store manifest count = tree blob count",
     );
 }
 
@@ -285,12 +285,12 @@ fn pending_delete_sync_failure_keeps_state_for_retry() {
 fn dirty_write_failure_is_retried_next_round() {
     // Failpoint inject into `write_blob` — the byte flush path.
     // The dirty entry must survive into the next round for retry.
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
-    let fp_clone: Arc<dyn Backend> = fp.clone();
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
+    let fp_clone: Arc<dyn BlobStore> = fp.clone();
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
-    let tree = Tree::open_with_backend(cfg, fp_clone).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, fp_clone).unwrap();
 
     tree.put(b"k1", b"v1").unwrap();
     let writes_pre = fp.write_calls.load(Ordering::SeqCst);
@@ -382,7 +382,7 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
 
 #[test]
 fn pre_delete_sync_failure_restores_pending() {
-    // Regression for the bug where the pre-delete `backend.flush`
+    // Regression for the bug where the pre-delete `store.flush`
     // failure path drained `pending` (the checkpoint snapshot) but
     // never restored it — losing every queued unlink intent. The
     // fix restores `pending` on every Sync-failure return path
@@ -391,7 +391,7 @@ fn pre_delete_sync_failure_restores_pending() {
     let pending_before = tree.stats().unwrap().bm_pending_delete_count;
     assert!(pending_before > 0, "setup precondition");
 
-    // First `backend.flush` call inside `tree.checkpoint` is the
+    // First `store.flush` call inside `tree.checkpoint` is the
     // pre-delete data Sync at phase 3 — arm to fail it.
     let flushes_pre = fp.flush_calls.load(Ordering::SeqCst);
     fp.arm_flush(flushes_pre + 1);
@@ -411,10 +411,10 @@ fn pre_delete_sync_failure_restores_pending() {
     );
 
     // Phase 6 didn't run, so no manifest delete applied.
-    let backend_blobs = inner.list_blobs().unwrap();
+    let store_blobs = inner.list_blobs().unwrap();
     let stats = tree.stats().unwrap();
     assert_eq!(
-        backend_blobs.len() as u32,
+        store_blobs.len() as u32,
         stats.blob_count,
         "no manifest delete must have applied while pre-delete Sync failed",
     );
@@ -429,14 +429,14 @@ fn bg_checkpointer_recovers_from_transient_failure() {
     // Same shape but with the background checkpointer driving
     // the round, not manual `tree.checkpoint`. Verify the
     // bg loop eventually drains everything.
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
-    let fp_clone: Arc<dyn Backend> = fp.clone();
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
+    let fp_clone: Arc<dyn BlobStore> = fp.clone();
 
     let dir = tempdir().unwrap();
     // Use TreeBuilder with WAL + bg checkpointer to exercise
     // the full round path.
-    let _ = dir; // we use open_with_backend (no WAL), so dir unused
+    let _ = dir; // we use open_with_blob_store (no WAL), so dir unused
 
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
@@ -447,7 +447,7 @@ fn bg_checkpointer_recovers_from_transient_failure() {
         auto_merge: false,
         ..CheckpointConfig::default()
     };
-    let tree = Tree::open_with_backend(cfg, fp_clone).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, fp_clone).unwrap();
 
     // Stuff some data + arm a transient write failure.
     tree.put(b"k1", b"v1").unwrap();
@@ -473,12 +473,12 @@ fn bg_checkpointer_recovers_from_transient_failure() {
 #[test]
 fn bg_checkpointer_retries_sync_after_dirty_retired() {
     // Regression for a background-only hole: a write-through batch
-    // can retire the dirty entry, then the following backend Sync
+    // can retire the dirty entry, then the following store Sync
     // can fail. The next round still has to retry Sync even though
     // dirty/pending are now both empty.
-    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let fp = Arc::new(FailpointBackend::new(Arc::clone(&inner)));
-    let fp_clone: Arc<dyn Backend> = fp.clone();
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
+    let fp_clone: Arc<dyn BlobStore> = fp.clone();
 
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
@@ -489,7 +489,7 @@ fn bg_checkpointer_retries_sync_after_dirty_retired() {
         auto_merge: false,
         ..CheckpointConfig::default()
     };
-    let tree = Tree::open_with_backend(cfg, fp_clone).unwrap();
+    let tree = Tree::open_with_blob_store(cfg, fp_clone).unwrap();
 
     let flushes_pre = fp.flush_count();
     fp.arm_flush(flushes_pre + 1);

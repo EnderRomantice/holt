@@ -20,7 +20,7 @@ use std::path::Path;
 use crate::api::errors::{Error, Result};
 
 use super::codec::{decode_file_header, decode_record, FileHeader, FILE_HEADER_SIZE};
-use super::txn_op::TxnOp;
+use super::wal_op::WalOp;
 
 /// Outcome of a successful scan.
 ///
@@ -53,7 +53,7 @@ pub struct ReplayStats {
 /// offset patched onto any sanity-failure variant it carries.
 pub fn replay<F>(path: &Path, mut callback: F) -> Result<(FileHeader, ReplayStats)>
 where
-    F: FnMut(&TxnOp, u64, u64) -> Result<()>,
+    F: FnMut(&WalOp, u64, u64) -> Result<()>,
 {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
@@ -66,7 +66,7 @@ where
 /// (file vs. raw buffer) with the same logic.
 pub fn replay_bytes<F>(bytes: &[u8], callback: &mut F) -> Result<(FileHeader, ReplayStats)>
 where
-    F: FnMut(&TxnOp, u64, u64) -> Result<()>,
+    F: FnMut(&WalOp, u64, u64) -> Result<()>,
 {
     if bytes.len() < FILE_HEADER_SIZE {
         return Err(Error::ReplaySanityFailed {
@@ -85,10 +85,10 @@ where
         match decode_record(&bytes[offset..]) {
             Ok(r) => {
                 // Flatten Batch transparently: the callback never
-                // sees a `TxnOp::Batch`, just the inner primitive
+                // sees a `WalOp::Batch`, just the inner primitive
                 // ops with derived seqs (`base + i`, mirroring the
                 // encoder's contiguous seq reservation).
-                if let TxnOp::Batch { ops, .. } = &r.op {
+                if let WalOp::Batch { ops, .. } = &r.op {
                     for (i, inner) in ops.iter().enumerate() {
                         let inner_seq = r.seq.wrapping_add(i as u64);
                         callback(inner, inner_seq, offset as u64)

@@ -1,10 +1,10 @@
 //! `BufferManager` — LRU-bounded blob cache.
 //!
 //! Sits between a [`Tree`](crate::Tree) and its underlying
-//! [`Backend`]. Itself implements `Backend`, so it's a transparent
+//! [`BlobStore`]. Itself implements `BlobStore`, so it's a transparent
 //! drop-in: callers see the same `read_blob` / `write_blob` /
 //! `flush` API, but reads of recently-touched blobs hit the cache
-//! and skip the inner backend's I/O.
+//! and skip the inner store's I/O.
 //!
 //! ## Write protocol — staged through `dirty` + `pending_deletes`
 //!
@@ -20,10 +20,10 @@
 //!   / [`BufferManager::restore_dirty`].
 //!
 //! The `write_blob` trait method is still write-through (cache +
-//! backend in one call). Internal call sites that produce a new
+//! store in one call). Internal call sites that produce a new
 //! blob (spillover) or unlink one (erase's `SubtreeGone` /
 //! merge) go through [`BufferManager::install_new_blob`] /
-//! [`BufferManager::mark_for_delete`] instead, so the backend
+//! [`BufferManager::mark_for_delete`] instead, so the store
 //! write or manifest mutation is deferred until the next flush —
 //! invariant **W2D** below.
 //!
@@ -33,21 +33,21 @@
 //! [`BufferManager::mark_dirty`] with the WAL seq that authored
 //! the change. The internal dirty state keeps the **lowest**
 //! unflushed seq per blob — that value is the WAL trim watermark
-//! for that blob (records below it are already in backend, so the
+//! for that blob (records below it are already in store, so the
 //! WAL doesn't need them). A checkpoint round moves drained
 //! entries into an in-flight `flushing` set until their cached
-//! bytes have reached the backend; eviction treats both maps as
+//! bytes have reached the store; eviction treats both maps as
 //! protected.
 //!
 //! Erase ops that empty a child blob queue a deferred deletion
-//! via [`BufferManager::mark_for_delete`] — the `backend.delete_blob`
+//! via [`BufferManager::mark_for_delete`] — the `store.delete_blob`
 //! syscall runs only after the corresponding WAL record is on
 //! disk.
 //!
 //! Invariants:
 //!
 //! - **I1**: a `(guid, _)` entry exists in `dirty` iff the cached
-//!   image of `guid` is newer than the backend image.
+//!   image of `guid` is newer than the store image.
 //! - **I2**: WAL `trim_id <= min(dirty.values()) - 1` (or
 //!   `next_seq - 1` if `dirty` is empty).
 //! - **I3**: [`BufferManager::snapshot_dirty`] drains the map
@@ -55,7 +55,7 @@
 //!   round land in the new (empty) map and are tracked for the
 //!   next round. [`BufferManager::snapshot_pending_deletes`] has
 //!   the same drain semantics.
-//! - **W2D**: any byte written to `backend.data_file` or any
+//! - **W2D**: any byte written to `store.data_file` or any
 //!   manifest mutation persisted to disk must have its
 //!   corresponding WAL record durably on disk first.
 //!
@@ -123,19 +123,24 @@
 //! would otherwise be a per-blob bottleneck on multi-threaded
 //! workloads.
 
-use std::cell::UnsafeCell;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::{Deref, DerefMut};
+mod cached_blob;
+mod mutation;
+
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 
 use crate::api::errors::{Error, Result};
-use crate::concurrency::{Guard as LatchGuard, HybridLatch};
 use crate::layout::BlobGuid;
 
-use super::backend::{AlignedBlobBuf, Backend};
+use super::blob_store::{AlignedBlobBuf, BlobStore};
+
+pub use cached_blob::{BlobWriteGuard, CachedBlob};
+use mutation::{
+    bookkeeping_shard_idx, pop_candidate_batch, CandidateKind, MutationState, BOOKKEEPING_SHARDS,
+};
 
 /// Sentinel seq for dirty / pending-delete entries that originate
 /// from purely structural mutations (compact, merge pass) — they
@@ -147,13 +152,10 @@ use super::backend::{AlignedBlobBuf, Backend};
 /// the truncate gate already refuses to fire).
 pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 
-const BOOKKEEPING_SHARDS: usize = 64;
-const CLEAN_DIRTY_SEQ: u64 = 0;
-
 /// One pre-snapshotted blob image ready for checkpoint write-through.
 ///
 /// The bytes are owned by the checkpoint round / I/O task so the
-/// backend write never holds a cache read guard. `expected_seq` is
+/// store write never holds a cache read guard. `expected_seq` is
 /// the dirty-map value that was drained into `flushing`; successful
 /// batch writes retire that exact flushing entry without stomping a
 /// racing writer's newer dirty entry.
@@ -163,142 +165,9 @@ pub(crate) struct WriteThroughEntry {
     pub(crate) expected_seq: u64,
 }
 
-#[derive(Default)]
-struct MutationState {
-    /// New dirty entries not yet claimed by a checkpoint round.
-    dirty: HashMap<BlobGuid, u64>,
-    /// Dirty entries drained by a checkpoint round whose cached
-    /// image still has to survive until checkpoint write-through
-    /// completes.
-    flushing: HashMap<BlobGuid, u64>,
-    /// Blobs unlinked from the tree but not yet deleted from the
-    /// backend manifest because WAL/checkpoint ordering still owns
-    /// them.
-    pending_deletes: HashMap<BlobGuid, u64>,
-    /// In-memory maintenance hints for blobs whose local garbage
-    /// is worth checking before the next online compact pass.
-    ///
-    /// This is advisory only. Dirty / flushing / pending-delete own
-    /// correctness; candidate loss can only delay maintenance until
-    /// a later seed scan or explicit compact pass rediscovers it.
-    compact_candidates: MaintenanceQueue,
-    /// In-memory maintenance hints for parent blobs that own at
-    /// least one `BlobNode` crossing and may be worth a merge pass.
-    merge_candidates: MaintenanceQueue,
-}
-
-impl MutationState {
-    fn is_protected(&self, guid: &BlobGuid) -> bool {
-        self.dirty.contains_key(guid) || self.flushing.contains_key(guid)
-    }
-
-    fn is_protected_or_pending(&self, guid: &BlobGuid) -> bool {
-        self.is_protected(guid) || self.pending_deletes.contains_key(guid)
-    }
-
-    fn remove_dirty(&mut self, guid: &BlobGuid) {
-        self.dirty.remove(guid);
-        self.flushing.remove(guid);
-    }
-
-    fn remove_maintenance_candidates(&mut self, guid: &BlobGuid) -> (bool, bool) {
-        (
-            self.compact_candidates.remove(guid),
-            self.merge_candidates.remove(guid),
-        )
-    }
-}
-
-#[derive(Default)]
-struct MaintenanceQueue {
-    set: HashSet<BlobGuid>,
-    queue: VecDeque<BlobGuid>,
-}
-
-impl MaintenanceQueue {
-    fn insert(&mut self, guid: BlobGuid) -> bool {
-        if self.set.insert(guid) {
-            self.queue.push_back(guid);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn remove(&mut self, guid: &BlobGuid) -> bool {
-        self.set.remove(guid)
-    }
-
-    fn pop_batch(&mut self, limit: usize) -> Vec<BlobGuid> {
-        let mut out = Vec::new();
-        while out.len() < limit {
-            let Some(guid) = self.queue.pop_front() else {
-                break;
-            };
-            if self.set.remove(&guid) {
-                out.push(guid);
-            }
-        }
-        out
-    }
-}
-
-fn bookkeeping_shard_idx(guid: &BlobGuid) -> usize {
-    debug_assert!(BOOKKEEPING_SHARDS.is_power_of_two());
-
-    let mut lo_bytes = [0u8; 8];
-    let mut hi_bytes = [0u8; 8];
-    lo_bytes.copy_from_slice(&guid[0..8]);
-    hi_bytes.copy_from_slice(&guid[8..16]);
-    let lo = u64::from_le_bytes(lo_bytes);
-    let hi = u64::from_le_bytes(hi_bytes);
-    let mut h = lo ^ hi.rotate_left(27);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    (h as usize) & (BOOKKEEPING_SHARDS - 1)
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CandidateKind {
-    Compact,
-    Merge,
-}
-
-fn pop_candidate_batch(
-    shards: &[Mutex<MutationState>; BOOKKEEPING_SHARDS],
-    cursor: &AtomicUsize,
-    total: &AtomicUsize,
-    kind: CandidateKind,
-    limit: usize,
-) -> Vec<BlobGuid> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let start = cursor.fetch_add(1, Ordering::Relaxed) & (BOOKKEEPING_SHARDS - 1);
-    for offset in 0..BOOKKEEPING_SHARDS {
-        let idx = (start + offset) & (BOOKKEEPING_SHARDS - 1);
-        let shard = &shards[idx];
-        let mut state = shard.lock().unwrap();
-        let queue = match kind {
-            CandidateKind::Compact => &mut state.compact_candidates,
-            CandidateKind::Merge => &mut state.merge_candidates,
-        };
-        let remaining = limit - out.len();
-        let popped = queue.pop_batch(remaining);
-        total.fetch_sub(popped.len(), Ordering::Relaxed);
-        out.extend(popped);
-        if out.len() == limit {
-            return out;
-        }
-    }
-    out
-}
-
 /// LRU-bounded blob cache; see the module docs.
 pub struct BufferManager {
-    backend: Arc<dyn Backend>,
+    store: Arc<dyn BlobStore>,
     capacity: usize,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
@@ -348,41 +217,6 @@ pub struct BufferManager {
     merge_count: AtomicU64,
 }
 
-/// A single cached blob. Callers obtain one via
-/// [`BufferManager::pin`] and then take an optimistic / shared /
-/// exclusive guard on it to access the underlying 512 KB buffer
-/// with zero copies.
-///
-/// Holding the `Arc<CachedBlob>` prevents the entry from being
-/// evicted, so traversals that pin a blob can borrow into it for
-/// as long as the pin is alive.
-pub struct CachedBlob {
-    latch: HybridLatch,
-    buf: UnsafeCell<AlignedBlobBuf>,
-    /// Fast-path low-watermark for dirty tracking. `0` means no
-    /// live dirty-map entry is known for this cached blob; any
-    /// non-zero value is the lowest unflushed seq observed by
-    /// `mark_dirty`.
-    ///
-    /// The authoritative enumeration source remains
-    /// `MutationState::dirty`. This hint lets repeated writes to an
-    /// already-dirty cached blob skip the shard mutex when the
-    /// existing low-watermark already covers the new seq.
-    dirty_seq_hint: AtomicU64,
-    /// Stamp set by `BufferManager` on every `pin` / `get_cached`.
-    /// Read by the eviction thread to decide if this entry is
-    /// cold enough to drop. Relaxed reads/writes — see
-    /// [`BufferManager::clock`].
-    last_touched: AtomicU64,
-}
-
-// SAFETY: every access to `buf` is gated by `latch`, which provides
-// the standard reader-writer exclusion (plus an optimistic mode
-// whose reads are revalidated by the caller before being trusted).
-// The `UnsafeCell` only marks the interior-mutability; the actual
-// concurrency contract is enforced by `HybridLatch`.
-unsafe impl Sync for CachedBlob {}
-
 #[inline]
 fn fetch_max_relaxed(atom: &AtomicU64, value: u64) {
     let mut cur = atom.load(Ordering::Relaxed);
@@ -394,198 +228,14 @@ fn fetch_max_relaxed(atom: &AtomicU64, value: u64) {
     }
 }
 
-impl CachedBlob {
-    fn new(buf: AlignedBlobBuf) -> Self {
-        Self {
-            latch: HybridLatch::new(),
-            buf: UnsafeCell::new(buf),
-            dirty_seq_hint: AtomicU64::new(CLEAN_DIRTY_SEQ),
-            last_touched: AtomicU64::new(0),
-        }
-    }
-
-    /// Try to cover `txn_id` with this blob's dirty hint.
-    ///
-    /// Returns `true` when the caller must still publish/merge the
-    /// guid into `MutationState::dirty`; returns `false` when the
-    /// existing hint already has a lower-or-equal unflushed seq and
-    /// therefore the dirty map entry is already sufficient.
-    fn dirty_hint_needs_map_publish(&self, txn_id: u64) -> bool {
-        let mut cur = self.dirty_seq_hint.load(Ordering::Acquire);
-        loop {
-            if cur != CLEAN_DIRTY_SEQ && cur <= txn_id {
-                return false;
-            }
-            let next = if cur == CLEAN_DIRTY_SEQ {
-                txn_id
-            } else {
-                cur.min(txn_id)
-            };
-            match self.dirty_seq_hint.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-
-    fn take_dirty_hint(&self) -> Option<u64> {
-        match self.dirty_seq_hint.swap(CLEAN_DIRTY_SEQ, Ordering::AcqRel) {
-            CLEAN_DIRTY_SEQ => None,
-            seq => Some(seq),
-        }
-    }
-
-    fn clear_dirty_hint(&self) {
-        self.dirty_seq_hint
-            .store(CLEAN_DIRTY_SEQ, Ordering::Release);
-    }
-
-    /// Logical tick at which this entry was last looked up. Used
-    /// by the eviction thread to classify the entry as cold.
-    #[must_use]
-    pub(crate) fn last_touched(&self) -> u64 {
-        self.last_touched.load(Ordering::Relaxed)
-    }
-
-    /// Wait-free read snapshot. No real lock taken — the caller
-    /// reads bytes through [`OptimisticGuard::as_slice`] and then
-    /// calls [`OptimisticGuard::validate`] to confirm no writer
-    /// lapped the snapshot. If validation fails the caller must
-    /// discard everything read and restart.
-    pub fn read_optimistic(&self) -> OptimisticGuard<'_> {
-        OptimisticGuard {
-            latch: LatchGuard::optimistic(&self.latch),
-            buf: &self.buf,
-        }
-    }
-
-    /// Shared read access — blocks while a writer holds the latch
-    /// exclusively, but N shared readers run concurrently.
-    pub fn read(&self) -> BlobReadGuard<'_> {
-        BlobReadGuard {
-            _latch: LatchGuard::shared(&self.latch),
-            buf: &self.buf,
-        }
-    }
-
-    /// Current blob content version. For route validation, read it
-    /// while holding a shared guard on the same blob so the version
-    /// and parent edge are stable until the child is pinned.
-    #[must_use]
-    pub(crate) fn content_version(&self) -> u64 {
-        self.latch.current_version()
-    }
-
-    /// Exclusive write access — blocks until idle, then runs
-    /// alone. Bumps the version on release so concurrent
-    /// optimistic readers detect the change and restart.
-    pub fn write(&self) -> BlobWriteGuard<'_> {
-        BlobWriteGuard {
-            _latch: LatchGuard::exclusive(&self.latch),
-            buf: &self.buf,
-        }
-    }
-}
-
-/// Wait-free guard returned by [`CachedBlob::read_optimistic`].
-///
-/// Reads from `as_slice()` may be **torn** (a concurrent writer
-/// could be mid-mutation). The caller must finish reading and
-/// call [`OptimisticGuard::validate`]; if `validate` returns
-/// `false`, every byte read through this guard is potentially
-/// stale and must be discarded.
-pub struct OptimisticGuard<'a> {
-    latch: LatchGuard<'a>,
-    buf: &'a UnsafeCell<AlignedBlobBuf>,
-}
-
-impl<'a> OptimisticGuard<'a> {
-    /// Pointer-style view of the 512 KB buffer. Bytes may be torn
-    /// — see the type-level docs.
-    #[must_use]
-    pub fn as_slice(&self) -> &'a [u8] {
-        // SAFETY: the optimistic guard holds the latch in
-        // `Optimistic` mode (no real lock); reads through this
-        // borrow may race with a writer. The walker treats any
-        // result derived from such a borrow as untrusted until
-        // `validate()` confirms it; corrupt bodies surface as
-        // `Error::NodeCorrupt` rather than panics because the
-        // layout decoders bounds-check every field.
-        unsafe { (&*self.buf.get()).as_slice() }
-    }
-
-    /// Returns `true` if no exclusive writer modified the buffer
-    /// between the snapshot and now.
-    #[must_use]
-    pub fn validate(&self) -> bool {
-        self.latch.validate()
-    }
-}
-
-/// Shared-mode read guard returned by [`CachedBlob::read`].
-///
-/// Derefs to `&AlignedBlobBuf`; call `.as_slice()` for byte-level
-/// access.
-pub struct BlobReadGuard<'a> {
-    _latch: LatchGuard<'a>,
-    buf: &'a UnsafeCell<AlignedBlobBuf>,
-}
-
-impl Deref for BlobReadGuard<'_> {
-    type Target = AlignedBlobBuf;
-    fn deref(&self) -> &AlignedBlobBuf {
-        // SAFETY: shared-mode latch excludes writers.
-        unsafe { &*self.buf.get() }
-    }
-}
-
-/// Exclusive-mode write guard returned by [`CachedBlob::write`].
-///
-/// Derefs to `&mut AlignedBlobBuf`; call `.as_mut_slice()` for
-/// byte-level access. For walker paths that mutate the typed
-/// [`crate::store::BlobFrame`] view, prefer [`Self::frame`].
-pub struct BlobWriteGuard<'a> {
-    _latch: LatchGuard<'a>,
-    buf: &'a UnsafeCell<AlignedBlobBuf>,
-}
-
-impl BlobWriteGuard<'_> {
-    /// Construct a [`crate::store::BlobFrame`] view over this guard's buffer.
-    pub fn frame(&mut self) -> super::BlobFrame<'_> {
-        super::BlobFrame::wrap(self.as_mut_slice())
-    }
-}
-
-impl Deref for BlobWriteGuard<'_> {
-    type Target = AlignedBlobBuf;
-    fn deref(&self) -> &AlignedBlobBuf {
-        // SAFETY: exclusive-mode latch excludes all other access.
-        unsafe { &*self.buf.get() }
-    }
-}
-
-impl DerefMut for BlobWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut AlignedBlobBuf {
-        // SAFETY: exclusive-mode latch excludes all other access,
-        // and `&mut self` ensures no other borrow of this guard
-        // exists.
-        unsafe { &mut *self.buf.get() }
-    }
-}
-
 impl BufferManager {
-    /// Wrap `backend` with a cache of at most `capacity` blobs
+    /// Wrap `store` with a cache of at most `capacity` blobs
     /// (each blob is 512 KB on the heap). A `capacity` of 0 is
     /// clamped to 1.
     #[must_use]
-    pub fn new(backend: Arc<dyn Backend>, capacity: usize) -> Self {
+    pub fn new(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
         Self {
-            backend,
+            store,
             capacity: capacity.max(1),
             cache: DashMap::new(),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
@@ -672,7 +322,7 @@ impl BufferManager {
     }
 
     /// Cumulative cache lookup hits (`get_cached` found the entry
-    /// without consulting the inner backend). Relaxed-ordered;
+    /// without consulting the inner store). Relaxed-ordered;
     /// reads are observability-only.
     #[must_use]
     pub fn cache_hits(&self) -> u64 {
@@ -680,7 +330,7 @@ impl BufferManager {
     }
 
     /// Cumulative cache lookup misses — every miss is followed by
-    /// an `inner_backend.read_blob` and an `insert_into_cache`.
+    /// an `inner_store.read_blob` and an `insert_into_cache`.
     #[must_use]
     pub fn cache_misses(&self) -> u64 {
         self.cache_misses.load(Ordering::Relaxed)
@@ -715,7 +365,7 @@ impl BufferManager {
     }
 
     /// Cumulative mutation walker calls (`insert_multi` /
-    /// `erase_multi`). A `rename` or `txn` contributes one count per
+    /// `erase_multi`). A `rename` or `atomic` contributes one count per
     /// inner walker invocation, not one count per public API call.
     #[must_use]
     pub fn walker_ops(&self) -> u64 {
@@ -823,7 +473,7 @@ impl BufferManager {
     }
 
     fn pending_delete_not_found(guid: BlobGuid) -> Error {
-        Error::BackendIo(std::io::Error::new(
+        Error::BlobStoreIo(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("blob {:02x?} is pending delete", &guid[..4]),
         ))
@@ -838,7 +488,7 @@ impl BufferManager {
     }
 
     /// Internal: insert a freshly-loaded owned blob into the cache
-    /// without cloning its 512 KB payload. Used on backend read
+    /// without cloning its 512 KB payload. Used on store read
     /// misses so an allocator-provided registered buffer can become
     /// the cached image directly.
     fn insert_owned_into_cache(&self, guid: BlobGuid, contents: AlignedBlobBuf) {
@@ -849,7 +499,7 @@ impl BufferManager {
             entry
         });
         // Re-stamp even on existing entries — a concurrent thread
-        // may have populated the slot while we read from backend;
+        // may have populated the slot while we read from store;
         // either way "just observed" is "freshly touched".
         inserted.value().last_touched.store(tick, Ordering::Relaxed);
         drop(inserted);
@@ -900,7 +550,7 @@ impl BufferManager {
     /// reclaim with its own tick-driven cadence.
     ///
     /// **Dirty / pending-delete check is load-bearing** for the
-    /// `dirty ⟺ cache image newer than backend` (invariant I1)
+    /// `dirty ⟺ cache image newer than store` (invariant I1)
     /// and `pending-delete ⟺ cache image must outlive the
     /// manifest unlink` properties. Without this check, an inline
     /// overflow can drop a cache image while its dirty entry stays
@@ -968,7 +618,7 @@ impl BufferManager {
     /// clear any dirty bookkeeping for it. Called from
     /// `delete_blob`, where the blob is going away entirely and
     /// any pending dirty write would race with the delete in the
-    /// backend.
+    /// store.
     fn evict_from_cache(&self, guid: BlobGuid) {
         if let Some((_, entry)) = self.cache.remove(&guid) {
             entry.clear_dirty_hint();
@@ -982,7 +632,7 @@ impl BufferManager {
 
     /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
     ///
-    /// On a cache miss, the blob is loaded from the inner backend
+    /// On a cache miss, the blob is loaded from the inner store
     /// into a fresh cache entry first. The returned `Arc` keeps the
     /// entry alive (and unevictable) until it is dropped — callers
     /// should hold pins only as long as they're actively traversing
@@ -1000,11 +650,11 @@ impl BufferManager {
         if let Some(entry) = self.get_cached(guid) {
             return Ok(entry);
         }
-        // Cache miss — load from inner backend, then take a second
+        // Cache miss — load from inner store, then take a second
         // lookup so the cache, not our scratch buffer, owns the
         // canonical entry.
-        let mut scratch = self.backend.alloc_blob_buf_uninit();
-        self.backend.read_blob(guid, &mut scratch)?;
+        let mut scratch = self.store.alloc_blob_buf_uninit();
+        self.store.read_blob(guid, &mut scratch)?;
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
@@ -1016,8 +666,8 @@ impl BufferManager {
         }
         // Pathological: insert raced with eviction. Build an
         // entry directly from scratch and force-insert it.
-        let mut scratch = self.backend.alloc_blob_buf_uninit();
-        self.backend.read_blob(guid, &mut scratch)?;
+        let mut scratch = self.store.alloc_blob_buf_uninit();
+        self.store.read_blob(guid, &mut scratch)?;
         let entry = Arc::new(CachedBlob::new(scratch));
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         entry.last_touched.store(tick, Ordering::Relaxed);
@@ -1034,7 +684,7 @@ impl BufferManager {
     /// just by looking at them.
     ///
     /// **Miss-path behaviour**: a `pin_silent` miss still loads
-    /// the blob from the inner backend and inserts it into the
+    /// the blob from the inner store and inserts it into the
     /// cache (via `insert_into_cache`, which stamps
     /// `last_touched` like any other insert) — the alternative
     /// (return `Err`) would surprise callers and the load is
@@ -1048,8 +698,8 @@ impl BufferManager {
         if let Some(entry) = self.get_cached_silent(guid) {
             return Ok(entry);
         }
-        let mut scratch = self.backend.alloc_blob_buf_uninit();
-        self.backend.read_blob(guid, &mut scratch)?;
+        let mut scratch = self.store.alloc_blob_buf_uninit();
+        self.store.read_blob(guid, &mut scratch)?;
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
@@ -1057,8 +707,8 @@ impl BufferManager {
         if let Some(entry) = self.get_cached_silent(guid) {
             return Ok(entry);
         }
-        let mut scratch = self.backend.alloc_blob_buf_uninit();
-        self.backend.read_blob(guid, &mut scratch)?;
+        let mut scratch = self.store.alloc_blob_buf_uninit();
+        self.store.read_blob(guid, &mut scratch)?;
         let entry = Arc::new(CachedBlob::new(scratch));
         // We still stamp last_touched on the truly-pathological
         // race-with-eviction fallback path — the entry is being
@@ -1072,7 +722,7 @@ impl BufferManager {
 
     // ---------- dirty tracking ----------
 
-    /// Tag `guid` as dirty at WAL seq `txn_id`.
+    /// Tag `guid` as dirty at WAL seq `seq`.
     ///
     /// Called by every mutation path after a successful in-cache
     /// write to a blob. The internal dirty map keeps the **lowest**
@@ -1087,21 +737,21 @@ impl BufferManager {
     /// This is the writer-side of the dirty-tracking contract; the
     /// checkpointer-side drains the map via
     /// [`Self::snapshot_dirty`].
-    pub fn mark_dirty(&self, guid: BlobGuid, txn_id: u64) {
+    pub fn mark_dirty(&self, guid: BlobGuid, seq: u64) {
         let cached = self.get_cached_silent(guid);
-        self.mark_dirty_with_hint(guid, txn_id, cached.as_deref());
+        self.mark_dirty_with_hint(guid, seq, cached.as_deref());
     }
 
     /// Same contract as [`Self::mark_dirty`], but the caller
     /// already holds the cached blob pin from the walker descent.
     /// This avoids a second DashMap lookup on the mutation hot path.
-    pub(crate) fn mark_dirty_cached(&self, guid: BlobGuid, txn_id: u64, entry: &CachedBlob) {
-        self.mark_dirty_with_hint(guid, txn_id, Some(entry));
+    pub(crate) fn mark_dirty_cached(&self, guid: BlobGuid, seq: u64, entry: &CachedBlob) {
+        self.mark_dirty_with_hint(guid, seq, Some(entry));
     }
 
-    fn mark_dirty_with_hint(&self, guid: BlobGuid, txn_id: u64, cached: Option<&CachedBlob>) {
+    fn mark_dirty_with_hint(&self, guid: BlobGuid, seq: u64, cached: Option<&CachedBlob>) {
         if let Some(entry) = cached {
-            if !entry.dirty_hint_needs_map_publish(txn_id) {
+            if !entry.dirty_hint_needs_map_publish(seq) {
                 return;
             }
         }
@@ -1115,15 +765,15 @@ impl BufferManager {
         state
             .dirty
             .entry(guid)
-            .and_modify(|cur| *cur = (*cur).min(txn_id))
-            .or_insert(txn_id);
+            .and_modify(|cur| *cur = (*cur).min(seq))
+            .or_insert(seq);
     }
 
     /// Drain the current dirty entries from every bookkeeping shard,
     /// leaving empty per-shard dirty maps behind for concurrent
     /// writers.
     ///
-    /// Returned map maps `guid -> lowest unflushed txn_id`. The
+    /// Returned map maps `guid -> lowest unflushed seq`. The
     /// caller (background checkpointer) is responsible for flushing
     /// each blob and either accepting the drain (on success) or
     /// restoring failed entries via [`Self::restore_dirty`].
@@ -1135,16 +785,16 @@ impl BufferManager {
         let mut out = HashMap::new();
         for shard in &self.mutation {
             let mut state = shard.lock().unwrap();
-            for (guid, txn_id) in &mut state.dirty {
+            for (guid, seq) in &mut state.dirty {
                 if let Some(hinted_seq) = self
                     .get_cached_silent(*guid)
                     .and_then(|entry| entry.take_dirty_hint())
                 {
-                    *txn_id = (*txn_id).min(hinted_seq);
+                    *seq = (*seq).min(hinted_seq);
                 }
             }
             let snap = std::mem::take(&mut state.dirty);
-            for (guid, txn_id) in snap {
+            for (guid, seq) in snap {
                 if state.pending_deletes.contains_key(&guid) {
                     if let Some(entry) = self.get_cached_silent(guid) {
                         entry.clear_dirty_hint();
@@ -1154,9 +804,9 @@ impl BufferManager {
                 state
                     .flushing
                     .entry(guid)
-                    .and_modify(|cur| *cur = (*cur).min(txn_id))
-                    .or_insert(txn_id);
-                out.insert(guid, txn_id);
+                    .and_modify(|cur| *cur = (*cur).min(seq))
+                    .or_insert(seq);
+                out.insert(guid, seq);
             }
         }
         out
@@ -1168,7 +818,7 @@ impl BufferManager {
     /// caller's value.
     ///
     /// Used by the checkpointer when a flush attempt fails — the
-    /// snapshotted entries that didn't make it to backend must stay
+    /// snapshotted entries that didn't make it to store must stay
     /// tracked for the next round.
     pub fn restore_dirty(&self, entries: HashMap<BlobGuid, u64>) {
         if entries.is_empty() {
@@ -1210,16 +860,16 @@ impl BufferManager {
 
     // ---------- deferred delete (W2D for erase) ----------
 
-    /// Tag `guid` for **deferred** backend deletion at WAL seq
-    /// `txn_id`. Removes the blob from cache + dirty (the cache
+    /// Tag `guid` for **deferred** store deletion at WAL seq
+    /// `seq`. Removes the blob from cache + dirty (the cache
     /// image is dead; a lingering dirty entry would chase a
-    /// soon-deleted slot) and queues the `backend.delete_blob`
+    /// soon-deleted slot) and queues the `store.delete_blob`
     /// call for the next checkpoint round.
     ///
     /// Used by the erase walker's `SubtreeGone` branch. The naive
     /// alternative — calling `bm.delete_blob` inline — modifies
     /// the in-memory manifest before the WAL record covering the
-    /// unlink is durable; a racing `backend.flush` (from any other
+    /// unlink is durable; a racing `store.flush` (from any other
     /// op's checkpoint) would persist the manifest's "child gone"
     /// view to disk while the WAL still lacks the erase record,
     /// and on reopen the root's `BlobNode` points at a slot the
@@ -1230,13 +880,13 @@ impl BufferManager {
     /// plus initial manifest snapshot durable) and re-Syncs once
     /// the deletions have been applied — only then can the WAL
     /// be truncated.
-    pub fn mark_for_delete(&self, guid: BlobGuid, txn_id: u64) {
+    pub fn mark_for_delete(&self, guid: BlobGuid, seq: u64) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
         state
             .pending_deletes
             .entry(guid)
-            .and_modify(|cur| *cur = (*cur).min(txn_id))
-            .or_insert(txn_id);
+            .and_modify(|cur| *cur = (*cur).min(seq))
+            .or_insert(seq);
         state.remove_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
@@ -1249,7 +899,7 @@ impl BufferManager {
     /// Drain the current pending-delete entries from every
     /// bookkeeping shard, leaving empty per-shard maps behind.
     /// Caller (checkpoint round / manual `Tree::checkpoint`) is
-    /// responsible for executing each `backend.delete_blob` or
+    /// responsible for executing each `store.delete_blob` or
     /// restoring on failure.
     #[must_use]
     pub fn snapshot_pending_deletes(&self) -> HashMap<BlobGuid, u64> {
@@ -1277,7 +927,7 @@ impl BufferManager {
         }
     }
 
-    /// Number of blobs waiting for deferred backend deletion.
+    /// Number of blobs waiting for deferred store deletion.
     /// Reads as zero under the WAL-truncate gate are part of the
     /// "WAL records are all redundant" invariant.
     #[must_use]
@@ -1352,12 +1002,12 @@ impl BufferManager {
         self.merge_candidate_total.load(Ordering::Relaxed)
     }
 
-    /// Execute a queued deletion against the inner backend.
-    /// Manifest mutation is in-memory; subsequent `backend.flush`
+    /// Execute a queued deletion against the inner store.
+    /// Manifest mutation is in-memory; subsequent `store.flush`
     /// makes it durable. Failure is the caller's restoration
     /// concern.
     pub(crate) fn execute_pending_delete(&self, guid: BlobGuid) -> Result<()> {
-        self.backend.delete_blob(guid)
+        self.store.delete_blob(guid)
     }
 
     /// Snapshot the cached bytes for `guid` into a freshly allocated
@@ -1365,30 +1015,30 @@ impl BufferManager {
     ///
     /// Used by the background checkpointer to hand off bytes to
     /// the I/O worker thread without keeping the shared read guard
-    /// open across the actual `backend.write_blob` call. The read
+    /// open across the actual `store.write_blob` call. The read
     /// guard is held only for the duration of the 512 KB memcpy, so
     /// writers don't block on long-running (especially io_uring)
     /// I/O.
     pub(crate) fn snapshot_bytes(&self, guid: BlobGuid) -> Option<AlignedBlobBuf> {
         let entry = self.get_cached(guid)?;
         let buf = entry.read();
-        let mut out = self.backend.alloc_blob_buf_uninit();
+        let mut out = self.store.alloc_blob_buf_uninit();
         out.as_mut_slice().copy_from_slice(buf.as_slice());
         Some(out)
     }
 
-    /// Allocate a zero-filled blob buffer from the inner backend's
+    /// Allocate a zero-filled blob buffer from the inner store's
     /// preferred allocator.
     #[must_use]
     pub(crate) fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
-        self.backend.alloc_blob_buf_zeroed()
+        self.store.alloc_blob_buf_zeroed()
     }
 
-    /// Push a whole checkpoint snapshot to the inner backend using
+    /// Push a whole checkpoint snapshot to the inner store using
     /// its native batch path, then retire each matching flushing
-    /// entry. On backend error the caller must restore the whole
+    /// entry. On store error the caller must restore the whole
     /// dirty snapshot; we intentionally retire nothing because the
-    /// backend contract permits an arbitrary written prefix.
+    /// store contract permits an arbitrary written prefix.
     pub(crate) fn write_through_batch(&self, entries: &[WriteThroughEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -1397,7 +1047,7 @@ impl BufferManager {
             .iter()
             .map(|entry| (entry.guid, &entry.bytes))
             .collect();
-        self.backend.write_blobs_with_data_sync(&writes)?;
+        self.store.write_blobs_with_data_sync(&writes)?;
         for entry in entries {
             self.retire_write_through(entry.guid, entry.expected_seq);
         }
@@ -1429,20 +1079,20 @@ impl BufferManager {
         }
     }
 
-    /// Forward `flush` to the inner backend without touching the
+    /// Forward `flush` to the inner store without touching the
     /// cache. Used by the I/O worker for `IoTask::Sync`.
-    pub(crate) fn backend_flush(&self) -> Result<()> {
-        self.backend.flush()
+    pub(crate) fn flush_inner(&self) -> Result<()> {
+        self.store.flush()
     }
 
     /// Stage a freshly-created blob in cache and tag it dirty at
-    /// `seq` — the unified `mark_dirty → checkpoint round → backend
+    /// `seq` — the unified `mark_dirty → checkpoint round → store
     /// write` protocol takes ownership from there.
     ///
     /// Used by spillover when it produces a new child blob: the
-    /// bytes must NOT reach backend before the WAL record covering
+    /// bytes must NOT reach store before the WAL record covering
     /// the op that triggered spillover (invariant W2D). Deferring
-    /// the backend write via the dirty map preserves that ordering;
+    /// the store write via the dirty map preserves that ordering;
     /// the previous code's inline `write_blob → flush` here let the
     /// new child's bytes land on disk before the user's WAL record
     /// was durable, so a crash between the two left an orphan blob
@@ -1454,7 +1104,7 @@ impl BufferManager {
     /// Overflow eviction can't fire on this fresh entry — its
     /// `dirty` entry would survive but the cache image wouldn't,
     /// breaking invariant **I1** (dirty ⟺ cache newer than
-    /// backend). Inline overflow eviction is therefore skipped
+    /// store). Inline overflow eviction is therefore skipped
     /// here; the background eviction thread or the next round's
     /// flush will catch up.
     pub(crate) fn install_new_blob(&self, guid: BlobGuid, bytes: AlignedBlobBuf, seq: u64) {
@@ -1481,7 +1131,7 @@ impl BufferManager {
     }
 }
 
-impl Backend for BufferManager {
+impl BlobStore for BufferManager {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         // Cache hit?
         if let Some(entry) = self.get_cached(guid) {
@@ -1489,8 +1139,8 @@ impl Backend for BufferManager {
             dst.as_mut_slice().copy_from_slice(buf.as_slice());
             return Ok(());
         }
-        // Cache miss — load from inner backend and cache.
-        self.backend.read_blob(guid, dst)?;
+        // Cache miss — load from inner store and cache.
+        self.store.read_blob(guid, dst)?;
         self.insert_into_cache(guid, dst);
         Ok(())
     }
@@ -1498,14 +1148,14 @@ impl Backend for BufferManager {
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         // Transparent write-through: if cached, refresh the
         // cached image; either way, always write to the inner
-        // backend in the same call so durability is unchanged.
+        // store in the same call so durability is unchanged.
         if let Some(entry) = self.get_cached(guid) {
             let mut buf = entry.write();
             buf.as_mut_slice().copy_from_slice(src.as_slice());
             entry.clear_dirty_hint();
         }
-        self.backend.write_blob(guid, src)?;
-        // Backend now holds these exact bytes; any pending dirty
+        self.store.write_blob(guid, src)?;
+        // BlobStore now holds these exact bytes; any pending dirty
         // entry for this blob is satisfied. Subsequent writes via
         // the pin/write-guard path will re-mark it.
         let mut state = self.mutation_shard(guid).lock().unwrap();
@@ -1524,7 +1174,7 @@ impl Backend for BufferManager {
                 entry.clear_dirty_hint();
             }
         }
-        self.backend.write_blobs(writes)?;
+        self.store.write_blobs(writes)?;
         for (guid, _) in writes {
             let mut state = self.mutation_shard(*guid).lock().unwrap();
             state.remove_dirty(guid);
@@ -1537,20 +1187,20 @@ impl Backend for BufferManager {
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         self.evict_from_cache(guid);
-        self.backend.delete_blob(guid)
+        self.store.delete_blob(guid)
     }
 
     fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
-        self.backend.list_blobs()
+        self.store.list_blobs()
     }
 
     fn flush(&self) -> Result<()> {
         // Write-through mode: nothing pending in cache.
-        self.backend.flush()
+        self.store.flush()
     }
 
     fn needs_flush(&self) -> bool {
-        self.backend.needs_flush()
+        self.store.needs_flush()
     }
 
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
@@ -1558,18 +1208,18 @@ impl Backend for BufferManager {
             return Ok(false);
         }
         // Fast path: shard-local check without consulting the
-        // inner backend.
+        // inner store.
         if self.cache.contains_key(&guid) {
             return Ok(true);
         }
-        self.backend.has_blob(guid)
+        self.store.has_blob(guid)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::backend::MemoryBackend;
+    use crate::store::blob_store::MemoryBlobStore;
 
     fn make_buf(byte_at_100: u8) -> AlignedBlobBuf {
         let mut b = AlignedBlobBuf::zeroed();
@@ -1579,7 +1229,7 @@ mod tests {
 
     #[test]
     fn read_caches_after_first_load() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0xAB; 16], &make_buf(7)).unwrap();
 
         let bm = BufferManager::new(inner.clone(), 4);
@@ -1598,7 +1248,7 @@ mod tests {
 
     #[test]
     fn lru_eviction_at_capacity() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         for i in 0..10u8 {
             let mut g = [0u8; 16];
             g[0] = i;
@@ -1631,13 +1281,13 @@ mod tests {
     /// checked `Arc::strong_count == 1` — it would happily evict
     /// a dirty cache image, leaving the dirty entry orphaned in
     /// the dirty map. That broke invariant I1 (dirty ⟺ cache
-    /// newer than backend) and silently lost the cache mutation
+    /// newer than store) and silently lost the cache mutation
     /// (memory mode) / stuck the WAL truncate gate forever
     /// (persistent mode).
     #[test]
     fn lru_eviction_skips_dirty_entries() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        // Pre-populate the inner backend with three blobs whose
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        // Pre-populate the inner store with three blobs whose
         // bytes we'll be able to distinguish.
         for i in 0..3u8 {
             let mut g = [0u8; 16];
@@ -1717,7 +1367,7 @@ mod tests {
 
     #[test]
     fn maintenance_candidates_are_unique_and_fifo_budgeted() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let bm = BufferManager::new(inner, 4);
         let mut buckets = vec![Vec::<BlobGuid>::new(); BOOKKEEPING_SHARDS];
         for i in 0..=u8::MAX {
@@ -1748,7 +1398,7 @@ mod tests {
 
     #[test]
     fn maintenance_candidate_drain_rotates_across_shards() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let bm = BufferManager::new(inner, 4);
         let mut by_shard = [None::<BlobGuid>; BOOKKEEPING_SHARDS];
         let mut counter = 0u32;
@@ -1779,12 +1429,12 @@ mod tests {
     // the cache image (`self.cache.remove(&guid)`) in the same
     // call as it queues the pending-delete. `pin` / `has_blob`
     // must still treat pending-delete as a visibility barrier
-    // because the inner backend manifest intentionally keeps the
+    // because the inner store manifest intentionally keeps the
     // blob until checkpoint applies the deferred delete.
 
     #[test]
-    fn write_through_propagates_to_inner_backend() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    fn write_through_propagates_to_inner_store() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let bm = BufferManager::new(inner.clone(), 4);
 
         bm.write_blob([0xCD; 16], &make_buf(0x42)).unwrap();
@@ -1798,7 +1448,7 @@ mod tests {
 
     #[test]
     fn write_through_updates_cache_if_present() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0xEF; 16], &make_buf(1)).unwrap();
         let bm = BufferManager::new(inner.clone(), 4);
 
@@ -1811,14 +1461,14 @@ mod tests {
         bm.write_blob([0xEF; 16], &make_buf(99)).unwrap();
 
         // Subsequent read through the BM sees the updated value
-        // (came from the refreshed cache, not the inner backend).
+        // (came from the refreshed cache, not the inner store).
         bm.read_blob([0xEF; 16], &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 99);
     }
 
     #[test]
     fn delete_evicts_from_cache_and_inner() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0x33; 16], &make_buf(5)).unwrap();
         let bm = BufferManager::new(inner.clone(), 4);
 
@@ -1835,7 +1485,7 @@ mod tests {
 
     #[test]
     fn pending_delete_hides_blob_until_checkpoint_delete_applies() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0x44; 16], &make_buf(7)).unwrap();
         let bm = BufferManager::new(inner.clone(), 4);
 
@@ -1848,7 +1498,7 @@ mod tests {
         assert!(!bm.has_blob([0x44; 16]).unwrap());
         assert!(
             bm.pin([0x44; 16]).is_err(),
-            "pending-delete child must not be reloaded from backend"
+            "pending-delete child must not be reloaded from store"
         );
         bm.mark_dirty([0x44; 16], 12);
         let mut restore = HashMap::new();
@@ -1860,7 +1510,7 @@ mod tests {
 
     #[test]
     fn has_blob_fast_path_avoids_inner_when_cached() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0x77; 16], &make_buf(11)).unwrap();
         let bm = BufferManager::new(inner.clone(), 4);
 
@@ -1876,8 +1526,8 @@ mod tests {
     // ---------- dirty-tracking tests ----------
 
     #[test]
-    fn mark_dirty_keeps_lowest_txn_id() {
-        let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
+    fn mark_dirty_keeps_lowest_seq() {
+        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
         bm.mark_dirty([0x01; 16], 50);
         bm.mark_dirty([0x01; 16], 30);
         bm.mark_dirty([0x01; 16], 99);
@@ -1888,7 +1538,7 @@ mod tests {
 
     #[test]
     fn cached_dirty_hint_resets_after_snapshot() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0xD1; 16];
         inner.write_blob(guid, &make_buf(1)).unwrap();
         let bm = BufferManager::new(inner, 4);
@@ -1910,7 +1560,7 @@ mod tests {
 
     #[test]
     fn cached_dirty_hint_preserves_lower_restored_seq() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0xD2; 16];
         inner.write_blob(guid, &make_buf(1)).unwrap();
         let bm = BufferManager::new(inner, 4);
@@ -1937,7 +1587,7 @@ mod tests {
 
     #[test]
     fn snapshot_dirty_drains_atomically() {
-        let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
+        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
         bm.mark_dirty([0x01; 16], 10);
         bm.mark_dirty([0x02; 16], 20);
 
@@ -1958,7 +1608,7 @@ mod tests {
 
     #[test]
     fn snapshot_dirty_drains_every_bookkeeping_shard() {
-        let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
+        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
         let mut guids: [Option<BlobGuid>; BOOKKEEPING_SHARDS] = [None; BOOKKEEPING_SHARDS];
 
         for i in 0..20_000u64 {
@@ -1990,7 +1640,7 @@ mod tests {
 
     #[test]
     fn snapshot_dirty_protects_flushing_entry_from_eviction() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0x55; 16];
         inner.write_blob(guid, &make_buf(1)).unwrap();
         let bm = BufferManager::new(inner, 1);
@@ -2033,7 +1683,7 @@ mod tests {
 
     #[test]
     fn restore_dirty_merges_keeping_min() {
-        let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
+        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
         // Pretend a flush snapshot drained these:
         let mut snap = HashMap::new();
         snap.insert([0x01; 16], 10);
@@ -2061,7 +1711,7 @@ mod tests {
         // same blob dirty with a newer seq (200). The writer's
         // mutation is NOT in our snapshot bytes, so the entry
         // must survive the retire path.
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0xAA; 16], &make_buf(0)).unwrap();
         let bm = BufferManager::new(inner, 4);
         let _pin = bm.pin([0xAA; 16]).unwrap();
@@ -2094,7 +1744,7 @@ mod tests {
         // sequence. A fresh structural mutation can therefore have
         // the same dirty value as a checkpoint's older snapshot;
         // equality alone must not retire it.
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0xA5; 16], &make_buf(0)).unwrap();
         let bm = BufferManager::new(inner, 4);
         let _pin = bm.pin([0xA5; 16]).unwrap();
@@ -2122,7 +1772,7 @@ mod tests {
         // Counterpart to the race test: when the dirty entry
         // still matches the snapshot's seq (no racing writer),
         // checkpoint write-through does retire it.
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0xBB; 16], &make_buf(0)).unwrap();
         let bm = BufferManager::new(inner, 4);
         let _pin = bm.pin([0xBB; 16]).unwrap();
@@ -2142,7 +1792,7 @@ mod tests {
 
     #[test]
     fn write_through_batch_retires_clean_snapshots() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let g1 = [0xB1; 16];
         let g2 = [0xB2; 16];
         inner.write_blob(g1, &make_buf(0)).unwrap();
@@ -2177,7 +1827,7 @@ mod tests {
 
     #[test]
     fn write_through_batch_keeps_racing_writer_dirty_entry() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let g1 = [0xC1; 16];
         let g2 = [0xC2; 16];
         inner.write_blob(g1, &make_buf(0)).unwrap();
@@ -2208,21 +1858,21 @@ mod tests {
 
     #[test]
     fn write_blob_through_trait_clears_dirty() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let bm = BufferManager::new(inner, 4);
 
         bm.mark_dirty([0x88; 16], 100);
         assert_eq!(bm.dirty_count(), 1);
 
-        // The Backend-trait write_blob is write-through and so
+        // The BlobStore-trait write_blob is write-through and so
         // satisfies the dirty entry by construction.
-        Backend::write_blob(&bm, [0x88; 16], &make_buf(9)).unwrap();
+        BlobStore::write_blob(&bm, [0x88; 16], &make_buf(9)).unwrap();
         assert_eq!(bm.dirty_count(), 0);
     }
 
     #[test]
     fn delete_blob_drops_dirty_entry() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         inner.write_blob([0x99; 16], &make_buf(1)).unwrap();
         let bm = BufferManager::new(inner, 4);
 
@@ -2230,7 +1880,7 @@ mod tests {
         bm.mark_dirty([0x99; 16], 7);
         assert_eq!(bm.dirty_count(), 1);
 
-        Backend::delete_blob(&bm, [0x99; 16]).unwrap();
+        BlobStore::delete_blob(&bm, [0x99; 16]).unwrap();
         assert_eq!(
             bm.dirty_count(),
             0,
@@ -2239,12 +1889,12 @@ mod tests {
     }
 
     #[test]
-    fn install_new_blob_caches_and_marks_dirty_without_backend_write() {
+    fn install_new_blob_caches_and_marks_dirty_without_store_write() {
         // The unified-protocol fix: spillover's new child blob
-        // must land in cache + dirty, NOT in the inner backend,
+        // must land in cache + dirty, NOT in the inner store,
         // so the checkpoint round can enforce the W2D ordering
-        // (WAL flush THEN backend write).
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // (WAL flush THEN store write).
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let bm = BufferManager::new(Arc::clone(&inner), 4);
 
         let new_guid = [0xCC; 16];
@@ -2260,10 +1910,10 @@ mod tests {
         assert_eq!(snap[&new_guid], 42);
         bm.restore_dirty(snap);
 
-        // Inner backend has nothing yet.
+        // Inner store has nothing yet.
         assert!(
             !inner.has_blob(new_guid).unwrap(),
-            "install_new_blob must defer the backend write to the checkpoint round",
+            "install_new_blob must defer the store write to the checkpoint round",
         );
 
         // Pinning the blob returns the cached image.
@@ -2274,7 +1924,7 @@ mod tests {
         drop(pin);
 
         // After the production checkpoint primitive runs, the inner
-        // backend has the bytes and the dirty entry is cleared.
+        // store has the bytes and the dirty entry is cleared.
         let snap = bm.snapshot_dirty();
         let bytes = bm.snapshot_bytes(new_guid).unwrap();
         bm.write_through_batch(&[WriteThroughEntry {
@@ -2283,7 +1933,7 @@ mod tests {
             expected_seq: snap[&new_guid],
         }])
         .unwrap();
-        bm.backend_flush().unwrap();
+        bm.flush_inner().unwrap();
         assert_eq!(bm.dirty_count(), 0);
         assert!(inner.has_blob(new_guid).unwrap());
         let mut dst = AlignedBlobBuf::zeroed();
@@ -2295,7 +1945,7 @@ mod tests {
     fn concurrent_reads_on_different_blobs_progress() {
         use std::thread;
 
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         for i in 0..16u8 {
             let mut g = [0u8; 16];
             g[0] = i;

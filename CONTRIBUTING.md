@@ -52,6 +52,22 @@ cargo bench --bench main -- kv_get             # a single scenario
 Results land in `target/criterion/`. See `benches/README.md` for the
 methodology and the apples-to-apples ground rules vs RocksDB.
 
+## Fuzzing
+
+The repository follows the usual cargo-fuzz layout used by projects
+such as sled: a separate `fuzz/` crate that depends on the root
+library without joining the normal workspace.
+
+```bash
+cargo install cargo-fuzz
+cargo fuzz run atomic_model
+```
+
+`atomic_model` drives a persistent tree against a `BTreeMap` oracle,
+including reopen/checkpoint, range scans, conditional writes, and
+atomic batches. Crash artifacts and generated corpora live under
+`fuzz/artifacts/` and `fuzz/corpus/` and are ignored by git.
+
 ## Conventions
 
 ### Code

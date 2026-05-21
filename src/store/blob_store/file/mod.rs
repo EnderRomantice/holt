@@ -1,4 +1,4 @@
-//! `PersistentBackend` — file-backed durable blob store.
+//! `FileBlobStore` — file-backed durable blob store.
 //!
 //! Available on every Unix platform. The Linux build opens the
 //! packed data file with `O_DIRECT` so the kernel does not cache
@@ -27,7 +27,7 @@
 //!   kernel page tables and fs metadata trivial.
 //! - **O_DIRECT / F_NOCACHE** bypasses the page cache: ours *is*
 //!   the cache. The buffer manager owns dirty pages and flushes
-//!   through the backend; the kernel must not silently cache
+//!   through the store; the kernel must not silently cache
 //!   anything. The packed data file is preallocated in coarse
 //!   chunks (`posix_fallocate` on Linux, `F_PREALLOCATE` on
 //!   macOS) so checkpoint bursts do not repeatedly pay file-growth
@@ -41,20 +41,20 @@
 //!   past the snapshot size it compacts into `manifest.bin` via
 //!   tmp+rename and truncates the log.
 //!
-//! ## I/O backend
+//! ## I/O store
 //!
-//! Two code paths share the same `PersistentBackend` struct:
+//! Two code paths share the same `FileBlobStore` struct:
 //!
 //! - **`pread`/`pwritev`** (default): every Unix target, every build
 //!   configuration. Reads use `FileExt::read_exact_at`; checkpoint
 //!   write batches coalesce slot-contiguous blobs with `pwritev`.
 //! - **`io_uring`** (`cfg(target_os = "linux")` + `feature =
 //!   "io-uring"`): submits one SQE per read/write to a dedicated
-//!   ring owned by the backend. Eliminates the per-syscall entry/
+//!   ring owned by the store. Eliminates the per-syscall entry/
 //!   exit cost on Linux.
 //!
 //! Both paths share the same on-disk layout and the same
-//! `Backend::flush` semantics (`sync_data` + manifest persist).
+//! `BlobStore::flush` semantics (`sync_data` + manifest persist).
 //! Switching between them is an internal performance toggle; no
 //! caller-visible behaviour changes.
 
@@ -78,7 +78,7 @@ use crate::layout::{BlobGuid, PAGE_SIZE};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use super::BlobBufPool;
-use super::{AlignedBlobBuf, Backend};
+use super::{AlignedBlobBuf, BlobStore};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use self::uring::UringContext;
@@ -129,11 +129,11 @@ const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
 
 /// NVMe-backed, O_DIRECT, single-packed-file blob store.
 ///
-/// Construct via [`PersistentBackend::open`]. Thread-safe; the
+/// Construct via [`FileBlobStore::open`]. Thread-safe; the
 /// underlying file handle is shared and `pread`/`pwrite` are
 /// atomic at the syscall boundary.
 #[derive(Debug)]
-pub struct PersistentBackend {
+pub struct FileBlobStore {
     data_dir: PathBuf,
     data_file: File,
     manifest: RwLock<Manifest>,
@@ -220,8 +220,8 @@ struct FreeSlotRange {
     end: u64,
 }
 
-impl PersistentBackend {
-    /// Open or create a persistent backend at `data_dir`.
+impl FileBlobStore {
+    /// Open or create a persistent store at `data_dir`.
     ///
     /// Creates the directory if missing. On Linux opens the packed
     /// data file with `O_DIRECT | O_CLOEXEC`; on other Unixes opens
@@ -384,7 +384,7 @@ impl PersistentBackend {
     fn offset_of(&self, guid: BlobGuid) -> Result<u64> {
         let m = self.manifest.read().unwrap();
         let slot = m.slots.get(&guid).copied().ok_or_else(|| {
-            Error::BackendIo(io::Error::new(
+            Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("blob {:02x?} not in manifest", &guid[..4]),
             ))
@@ -572,10 +572,10 @@ impl PersistentBackend {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(Error::BackendIo(err));
+                return Err(Error::BlobStoreIo(err));
             };
             if written != expected {
-                return Err(Error::BackendIo(io::Error::other(format!(
+                return Err(Error::BlobStoreIo(io::Error::other(format!(
                     "short pwritev: wrote {written} of {expected}"
                 ))));
             }
@@ -631,7 +631,7 @@ fn registered_buffer_slots(buffer_pool_size: usize) -> usize {
 #[cfg(target_os = "linux")]
 fn preallocate_data_file(file: &File, len: u64) -> Result<()> {
     let len = libc::off_t::try_from(len)
-        .map_err(|_| Error::BackendIo(io::Error::other("data file length exceeds off_t")))?;
+        .map_err(|_| Error::BlobStoreIo(io::Error::other("data file length exceeds off_t")))?;
     let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) };
     if rc == 0 {
         return Ok(());
@@ -640,7 +640,7 @@ fn preallocate_data_file(file: &File, len: u64) -> Result<()> {
     if preallocate_unsupported(&err) {
         return Ok(());
     }
-    Err(Error::BackendIo(err))
+    Err(Error::BlobStoreIo(err))
 }
 
 #[cfg(target_os = "macos")]
@@ -650,7 +650,7 @@ fn preallocate_data_file(file: &File, len: u64) -> Result<()> {
         return Ok(());
     }
     let reserve = libc::off_t::try_from(len - current)
-        .map_err(|_| Error::BackendIo(io::Error::other("data file length exceeds off_t")))?;
+        .map_err(|_| Error::BlobStoreIo(io::Error::other("data file length exceeds off_t")))?;
     let mut store = libc::fstore_t {
         fst_flags: libc::F_ALLOCATECONTIG,
         fst_posmode: libc::F_PEOFPOSMODE,
@@ -667,7 +667,7 @@ fn preallocate_data_file(file: &File, len: u64) -> Result<()> {
             if preallocate_unsupported(&err) {
                 return Ok(());
             }
-            return Err(Error::BackendIo(err));
+            return Err(Error::BlobStoreIo(err));
         }
     }
 
@@ -697,7 +697,7 @@ fn preallocate_unsupported(err: &io::Error) -> bool {
     }
 }
 
-impl Backend for PersistentBackend {
+impl BlobStore for FileBlobStore {
     fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         if let Some(pool) = &self.registered_buffers {
@@ -817,7 +817,7 @@ impl Manifest {
         let (mut slots, mut next_slot) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
-            Err(e) => return Err(Error::BackendIo(e)),
+            Err(e) => return Err(Error::BlobStoreIo(e)),
         };
 
         let replay = Self::replay_log(log_path, &mut slots, &mut next_slot)?;
@@ -844,11 +844,11 @@ impl Manifest {
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
         if hdr[..8] != MANIFEST_MAGIC {
-            return Err(Error::node_corrupt("PersistentBackend::Manifest::magic"));
+            return Err(Error::node_corrupt("FileBlobStore::Manifest::magic"));
         }
         let version = u16::from_le_bytes([hdr[8], hdr[9]]);
         if version != MANIFEST_VERSION {
-            return Err(Error::node_corrupt("PersistentBackend::Manifest::version"));
+            return Err(Error::node_corrupt("FileBlobStore::Manifest::version"));
         }
         let count = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;
         // hdr[14..16] reserved (zero).
@@ -864,7 +864,7 @@ impl Manifest {
             let s = u64::from_le_bytes(entry[16..24].try_into().unwrap());
             if slots.insert(g, s).is_some() {
                 return Err(Error::node_corrupt(
-                    "PersistentBackend::Manifest::duplicate guid",
+                    "FileBlobStore::Manifest::duplicate guid",
                 ));
             }
             used_slots.push(s);
@@ -938,7 +938,7 @@ impl Manifest {
         hdr[..8].copy_from_slice(&MANIFEST_MAGIC);
         hdr[8..10].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
         let count = u32::try_from(self.slots.len()).map_err(|_| {
-            Error::BackendIo(io::Error::other("manifest slot count exceeds u32::MAX"))
+            Error::BlobStoreIo(io::Error::other("manifest slot count exceeds u32::MAX"))
         })?;
         hdr[10..14].copy_from_slice(&count.to_le_bytes());
         // Bytes 14..16 reserved (zero).
@@ -975,7 +975,7 @@ impl Manifest {
                 self.log_bytes = 0;
                 Ok(())
             }
-            Err(e) => Err(Error::BackendIo(e)),
+            Err(e) => Err(Error::BlobStoreIo(e)),
         }
     }
 
@@ -992,7 +992,7 @@ impl Manifest {
                     valid_bytes: 0,
                 });
             }
-            Err(e) => return Err(Error::BackendIo(e)),
+            Err(e) => return Err(Error::BlobStoreIo(e)),
         };
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
@@ -1005,7 +1005,7 @@ impl Manifest {
             }
             let record_start = offset;
             if buf[offset..offset + 4] != MANIFEST_LOG_MAGIC {
-                return Err(Error::node_corrupt("PersistentBackend::ManifestLog::magic"));
+                return Err(Error::node_corrupt("FileBlobStore::ManifestLog::magic"));
             }
             offset += 4;
             let body_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
@@ -1025,14 +1025,14 @@ impl Manifest {
             );
             let actual_crc = crc32fast::hash(&buf[record_start..offset + body_len]);
             if expected_crc != actual_crc {
-                return Err(Error::node_corrupt("PersistentBackend::ManifestLog::crc"));
+                return Err(Error::node_corrupt("FileBlobStore::ManifestLog::crc"));
             }
             let body = &buf[offset..offset + body_len];
             match ty {
                 MANIFEST_LOG_TY_SET => {
                     if body.len() != MANIFEST_LOG_SET_BODY_SIZE {
                         return Err(Error::node_corrupt(
-                            "PersistentBackend::ManifestLog::set length",
+                            "FileBlobStore::ManifestLog::set length",
                         ));
                     }
                     let mut guid = [0u8; 16];
@@ -1044,7 +1044,7 @@ impl Manifest {
                 MANIFEST_LOG_TY_DELETE => {
                     if body.len() != MANIFEST_LOG_DELETE_BODY_SIZE {
                         return Err(Error::node_corrupt(
-                            "PersistentBackend::ManifestLog::delete length",
+                            "FileBlobStore::ManifestLog::delete length",
                         ));
                     }
                     let mut guid = [0u8; 16];
@@ -1053,7 +1053,7 @@ impl Manifest {
                 }
                 _ => {
                     return Err(Error::node_corrupt(
-                        "PersistentBackend::ManifestLog::unknown op",
+                        "FileBlobStore::ManifestLog::unknown op",
                     ));
                 }
             }
@@ -1091,7 +1091,7 @@ fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> 
     }
     let body_len = out.len() - start - MANIFEST_LOG_HEADER_SIZE;
     let body_len = u32::try_from(body_len)
-        .map_err(|_| Error::BackendIo(io::Error::other("manifest delta record too large")))?;
+        .map_err(|_| Error::BlobStoreIo(io::Error::other("manifest delta record too large")))?;
     out[len_pos..len_pos + 4].copy_from_slice(&body_len.to_le_bytes());
     let crc = crc32fast::hash(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
@@ -1147,12 +1147,12 @@ impl ReusableSlots {
         for &slot in &sorted {
             if slot >= next_slot {
                 return Err(Error::node_corrupt(
-                    "PersistentBackend::Manifest::slot past next_slot",
+                    "FileBlobStore::Manifest::slot past next_slot",
                 ));
             }
             if previous == Some(slot) {
                 return Err(Error::node_corrupt(
-                    "PersistentBackend::Manifest::duplicate slot",
+                    "FileBlobStore::Manifest::duplicate slot",
                 ));
             }
             if lower < slot {
@@ -1219,12 +1219,12 @@ mod tests {
 
     /// Skip every test in this module when O_DIRECT isn't supported
     /// by the filesystem we landed on (e.g. tmpfs on some kernels,
-    /// or macOS-mounted-via-CI). Returns the open backend or `None`
+    /// or macOS-mounted-via-CI). Returns the open store or `None`
     /// to skip cleanly.
-    fn try_open(dir: &Path) -> Option<PersistentBackend> {
-        match PersistentBackend::open(dir) {
+    fn try_open(dir: &Path) -> Option<FileBlobStore> {
+        match FileBlobStore::open(dir) {
             Ok(b) => Some(b),
-            Err(Error::BackendIo(e)) if e.raw_os_error() == Some(libc::EINVAL) => {
+            Err(Error::BlobStoreIo(e)) if e.raw_os_error() == Some(libc::EINVAL) => {
                 eprintln!("skipping: O_DIRECT not supported on this fs");
                 None
             }

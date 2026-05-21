@@ -29,7 +29,7 @@ fn collect_kv(
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     iter.into_iter()
         .filter_map(|r| match r.unwrap() {
-            RangeEntry::Key { key, value } => Some((key, value)),
+            RangeEntry::Key { key, value, .. } => Some((key, value)),
             RangeEntry::CommonPrefix(_) => None,
             _ => panic!("RangeEntry got a new variant"),
         })
@@ -123,6 +123,44 @@ fn apply(tree: &Tree, ops: &[Op]) -> HashMap<Vec<u8>, Vec<u8>> {
     oracle
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleAtomicErr {
+    NotFound,
+    DstExists,
+}
+
+fn apply_atomic_to_oracle(
+    oracle: &mut HashMap<Vec<u8>, Vec<u8>>,
+    ops: &[Op],
+) -> std::result::Result<(), OracleAtomicErr> {
+    let mut staged = oracle.clone();
+    for op in ops {
+        match op {
+            Op::Put(k, v) => {
+                staged.insert(k.clone(), v.clone());
+            }
+            Op::Delete(k) => {
+                staged.remove(k);
+            }
+            Op::Rename(s, d, force) => {
+                let Some(v) = staged.get(s).cloned() else {
+                    return Err(OracleAtomicErr::NotFound);
+                };
+                if s == d {
+                    continue;
+                }
+                if !*force && staged.contains_key(d) {
+                    return Err(OracleAtomicErr::DstExists);
+                }
+                staged.remove(s);
+                staged.insert(d.clone(), v);
+            }
+        }
+    }
+    *oracle = staged;
+    Ok(())
+}
+
 /// Read every (key, value) pair back out of `tree` and assert
 /// it matches the oracle bit-for-bit. Also checks that a key
 /// not in the oracle returns `None`.
@@ -186,15 +224,10 @@ proptest! {
         check(&tree, &oracle);
     }
 
-    /// `Tree::txn` batches: feed random batches (each containing
-    /// a mix of put/delete/rename inner ops) and verify the
-    /// post-batch tree matches a per-batch-applied oracle.
-    ///
-    /// Catches batch-level bugs the single-op suite misses:
-    /// - mid-batch error rollback (we use `force=true` renames
-    ///   only so any error is a real bug)
-    /// - inner-op seq stitching (`base_seq + i`)
-    /// - WAL Batch envelope unpacking on replay
+    /// `Tree::atomic` batches: preflight each random batch against a
+    /// staged `HashMap` oracle, then verify holt either commits the
+    /// same staged state or rejects the whole batch without partial
+    /// publication.
     #[test]
     fn batch_round_trips_against_oracle(
         batches in vec(vec(op_strategy(), 1..=8), 1..=30),
@@ -203,85 +236,28 @@ proptest! {
         let mut oracle: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
         for batch in &batches {
-            // Force rename through so we don't have to model
-            // DstExists rollback inside a batch — the batch
-            // primitive doesn't yet expose mid-batch error
-            // recovery to the caller anyway.
-            let force_renames: Vec<Op> = batch
-                .iter()
-                .map(|op| match op {
-                    Op::Rename(s, d, _) => Op::Rename(s.clone(), d.clone(), true),
-                    other => other.clone(),
-                })
-                .collect();
-
-            // First apply to the oracle so we know the expected
-            // outcome; then build a TxnBatch with the same ops.
-            for op in &force_renames {
-                match op {
-                    Op::Put(k, v) => {
-                        oracle.insert(k.clone(), v.clone());
-                    }
-                    Op::Delete(k) => {
-                        oracle.remove(k);
-                    }
-                    Op::Rename(s, d, _) => {
-                        if let Some(v) = oracle.remove(s) {
-                            oracle.insert(d.clone(), v);
-                        }
-                    }
-                }
-            }
-
-            // Pre-skip if any rename has missing src — the tree's
-            // batch will surface NotFound on the inner rename and
-            // abort the rest of the batch. We avoid that by
-            // pre-checking the post-oracle and skipping the batch
-            // if it contained a missing-src rename.
-            let mut probe: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-            // re-apply to a fresh probe to find missing-src renames
-            for op in &force_renames {
-                match op {
-                    Op::Put(k, v) => { probe.insert(k.clone(), v.clone()); }
-                    Op::Delete(k) => { probe.remove(k); }
-                    Op::Rename(s, d, _) => {
-                        if probe.contains_key(s) {
-                            let v = probe.remove(s).unwrap();
-                            probe.insert(d.clone(), v);
-                        }
-                        // else: rename will NotFound, oracle path
-                        // above already kept it absent — but the
-                        // tree's TxnBatch can't represent a
-                        // best-effort rename inside a batch, so
-                        // this is the test's blind spot. Skip
-                        // batches with missing-src renames.
-                    }
-                }
-            }
-            let has_missing_rename = force_renames.iter().any(|op| matches!(op, Op::Rename(s, _, _) if !probe.contains_key(s) && force_renames.iter().take_while(|o| !std::ptr::eq(*o, op)).all(|prev| match prev { Op::Rename(_, d, _) => d != s, _ => true })));
-            let _ = has_missing_rename; // unused — we accept the divergence and just rebuild oracle to match
-            let _ = ();
-
-            tree.txn(|tx| {
-                for op in &force_renames {
+            let expected = apply_atomic_to_oracle(&mut oracle, batch);
+            let got = tree.atomic(|tx| {
+                for op in batch {
                     match op {
                         Op::Put(k, v) => tx.put(k, v),
                         Op::Delete(k) => tx.delete(k),
                         Op::Rename(s, d, force) => tx.rename(s, d, *force),
                     }
                 }
-            })
-            .ok();
-        }
-
-        // Re-derive oracle from scratch through tree.range so
-        // we don't have to encode mid-batch NotFound semantics
-        // — the post-state is whatever the tree's batch applied.
-        let tree_view: HashMap<Vec<u8>, Vec<u8>> = collect_kv(tree.range()).into_iter().collect();
-        // Sanity: every tree key is reachable via `get` too.
-        for (k, v) in &tree_view {
-            let got = tree.get(k).unwrap();
-            prop_assert_eq!(got.as_deref(), Some(v.as_slice()));
+            });
+            match (got, expected) {
+                (Ok(true), Ok(())) => {}
+                (Err(holt::Error::NotFound), Err(OracleAtomicErr::NotFound)) => {}
+                (Err(holt::Error::DstExists), Err(OracleAtomicErr::DstExists)) => {}
+                (other, expected) => {
+                    prop_assert!(
+                        false,
+                        "atomic result mismatch: tree={other:?}, oracle={expected:?}",
+                    );
+                }
+            }
+            check(&tree, &oracle);
         }
     }
 

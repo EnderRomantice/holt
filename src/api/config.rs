@@ -3,8 +3,8 @@
 //! `TreeConfig` captures both **where** the tree lives ([`Storage`])
 //! and how the engine internals are sized.
 //!
-//! The default — built via [`TreeConfig::new`] — is **persistent**
-//! at the supplied directory. Override to memory mode with
+//! The default — built via [`TreeConfig::new`] — is a file-backed
+//! durable tree at the supplied directory. Override to memory mode with
 //! [`TreeConfig::memory`] (or via [`crate::TreeBuilder::memory`]).
 
 use std::path::PathBuf;
@@ -13,8 +13,8 @@ use crate::checkpoint::CheckpointConfig;
 
 /// Where the tree's data lives.
 ///
-/// `Persistent` is the production target. `Memory` is for tests,
-/// scratch use, and platforms without a usable file-backed backend.
+/// `File` is the production target. `Memory` is for tests,
+/// scratch use, and platforms without a usable file-backed store.
 ///
 /// `#[non_exhaustive]` so adding new storage variants (e.g., a
 /// future `RemoteObjectStore`) is a non-breaking change.
@@ -22,10 +22,10 @@ use crate::checkpoint::CheckpointConfig;
 #[non_exhaustive]
 pub enum Storage {
     /// File-backed durable storage at `dir`. On Linux the
-    /// [`crate::PersistentBackend`] opens the underlying file with
+    /// [`crate::FileBlobStore`] opens the underlying file with
     /// `O_DIRECT` and (with the `io-uring` feature enabled) drives
     /// I/O through `io_uring`.
-    Persistent {
+    File {
         /// Directory holding `blobs.dat`, `manifest.bin`,
         /// `manifest.log`, and `journal.wal`.
         dir: PathBuf,
@@ -61,16 +61,16 @@ pub struct TreeConfig {
     /// per-op durability flip this to `true`.
     pub wal_sync_on_commit: bool,
     /// **Memory-only** BM-commit toggle (no effect on
-    /// persistent trees — the WAL + `Tree::checkpoint` is the
+    /// file-backed trees — the WAL + `Tree::checkpoint` is the
     /// durability path there; see [`Self::wal_sync_on_commit`]).
     ///
     /// For memory trees: `true` (the default) drains the BM
-    /// dirty set into the backing `Backend` after every `put` /
-    /// `delete` / `rename`, so custom backends supplied via
-    /// [`crate::Tree::open_with_backend`] see state mirrored
+    /// dirty set into the backing `BlobStore` after every `put` /
+    /// `delete` / `rename`, so custom stores supplied via
+    /// [`crate::Tree::open_with_blob_store`] see state mirrored
     /// per op. `false` defers all writes to an explicit
     /// `Tree::checkpoint` call — useful in benches where the
-    /// memcpy through `MemoryBackend` is uninteresting.
+    /// memcpy through `MemoryBlobStore` is uninteresting.
     pub memory_flush_on_write: bool,
     /// Background checkpointer policy. Default disabled —
     /// callers drive [`crate::Tree::checkpoint`] synchronously.
@@ -80,13 +80,13 @@ pub struct TreeConfig {
 }
 
 impl TreeConfig {
-    /// Persistent tree rooted at `dir`. This is the **default**
+    /// File-backed durable tree rooted at `dir`. This is the **default**
     /// shape — `Tree::open(TreeConfig::new("/var/lib/myapp"))` is
     /// what production code typically writes.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(dir: P) -> Self {
         Self {
-            storage: Storage::Persistent { dir: dir.into() },
+            storage: Storage::File { dir: dir.into() },
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
             memory_flush_on_write: true,
@@ -113,12 +113,12 @@ impl TreeConfig {
     }
 
     /// Path of the WAL file for this configuration, if any.
-    /// Persistent trees keep their log next to the data file at
+    /// File-backed trees keep their log next to the data file at
     /// `<dir>/journal.wal`; memory trees have no WAL.
     #[must_use]
     pub fn wal_path(&self) -> Option<PathBuf> {
         match &self.storage {
-            Storage::Persistent { dir } => Some(dir.join("journal.wal")),
+            Storage::File { dir } => Some(dir.join("journal.wal")),
             Storage::Memory => None,
         }
     }

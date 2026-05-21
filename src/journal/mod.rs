@@ -2,10 +2,10 @@
 //!
 //! Layered design:
 //!
-//! - [`txn_op`] — the `TxnOp` variant union for durable logical
+//! - [`wal_op`] — the `WalOp` variant union for durable logical
 //!   mutations (`Insert`, `Erase`, `RenameObject`, `Batch`).
 //! - [`codec`] — binary record codec + file header. Pure
-//!   in-memory bytes ↔ `TxnOp`.
+//!   in-memory bytes ↔ `WalOp`.
 //! - [`writer`] — append-only WAL file with
 //!   `sync_data`-on-flush durability + 64 KB buffered auto-drain
 //!   mechanics.
@@ -24,7 +24,7 @@
 pub mod codec;
 pub(crate) mod group_commit;
 pub mod reader;
-pub mod txn_op;
+pub mod wal_op;
 pub mod writer;
 
 #[cfg(test)]

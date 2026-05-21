@@ -170,19 +170,26 @@ BlobNode may have moved too, so re-entry has to be the tree root).
 
 ### Writer synchronisation — per-blob latches + publish gates
 
-`Tree::put` / `Tree::delete` / `Tree::txn` enter the shared side
-of `maintenance_gate` while they may cross `BlobNode` boundaries.
-That prevents a maintenance merge from deleting a child after a
+`Tree::put` / `Tree::delete` enter the shared side of
+`maintenance_gate` while they may cross `BlobNode` boundaries. That
+prevents a maintenance merge from deleting a child after a
 foreground walker has observed the parent edge but before it pins
 the child. Blob-local conflicts are handled by the per-blob
 `HybridLatch`: disjoint child blobs can mutate concurrently.
+
+`Tree::atomic` takes the exclusive side of the same gate for its short
+preflight + apply window. That makes logical failures invisible to
+concurrent readers/writers: rename, conditional, and
+prefix-emptiness guards are checked before any walker mutation, and
+no ordinary operation can observe the intermediate state while the
+committed batch is being applied.
 
 Persistent writers also enter the writer side of `CommitGate`
 while they mutate cached blobs, publish dirty/pending-delete
 state, and submit an already-encoded WAL record to the journal
 worker. The checkpoint path takes the checkpoint side of the same
 gate while draining dirty state, flushing the journal, and cloning
-bytes. This is the W2D boundary: any backend image written by a
+bytes. This is the W2D boundary: any store image written by a
 checkpoint has a WAL record admitted and flushed before the bytes
 are copied for write-through.
 
@@ -196,9 +203,9 @@ atomically. `put` / `delete` / `get` never take `rename_lock`.
 
 ## 6. Persistence + crash safety
 
-### WAL — logical redo log of TxnOps
+### WAL — logical redo log of WalOps
 
-Mutations emit encoded `TxnOp` records to an append-only
+Mutations emit encoded `WalOp` records to an append-only
 `journal.wal` file via the journal worker. The durable variants
 are the logical API mutations: `Insert`, `Erase`, `RenameObject`,
 and `Batch`. Blob-shape changes (`splitBlob`, `mergeBlob`,
@@ -223,25 +230,25 @@ it stopped; real mid-file corruption surfaces as
 
 ### `BufferManager` — cache + dirty/pending tracking
 
-`BufferManager` wraps any `Backend` and itself implements
-`Backend` (drop-in for the write path). Backed by a sharded
+`BufferManager` wraps any `BlobStore` and itself implements
+`BlobStore` (drop-in for the write path). Backed by a sharded
 `DashMap<BlobGuid, Arc<CachedBlob>>` so concurrent `pin` /
 `get_cached` on different blobs hit different shards instead of
 contending on a single mutex.
 
-It tracks "newer than backend" state in dirty state plus deferred
+It tracks "newer than store" state in dirty state plus deferred
 delete state:
 
 - `dirty.dirty: HashMap<BlobGuid, u64>` — guid → lowest
   unflushed WAL seq not yet claimed by a checkpoint round. Entry
-  exists iff the cached image is newer than backend.
+  exists iff the cached image is newer than store.
 - `dirty.flushing: HashMap<BlobGuid, u64>` — entries drained by
   a checkpoint round whose cached image must remain unevictable
   until `write_through` completes. Eviction treats both dirty maps
   as protected.
 - `pending_deletes: Mutex<HashMap<BlobGuid, u64>>` — blobs the
   erase walker's `SubtreeGone` path unlinked from their parent
-  in cache, queued for `backend.delete_blob` at the next
+  in cache, queued for `store.delete_blob` at the next
   checkpoint round so the manifest mutation can't race ahead of
   the WAL record covering the unlink.
 
@@ -272,7 +279,7 @@ protocol, strictly ordered around the W2D invariant:
    Successful writes release the matching `flushing` protection;
    racing writers' fresh dirty entries survive for the next round.
    Failures are restored to live dirty.
-3. **Pre-delete sync** — `backend.flush` (data file fdatasync +
+3. **Pre-delete sync** — `store.flush` (data file fdatasync +
    manifest persist) so the writes from phase 2 are stable.
    Failure restores `pending`.
 4. **Abort-on-dirty-failure gate.** Any phase-2 failure restores
@@ -309,7 +316,9 @@ instead of continuing through stale `(blob_guid, slot)` state.
 
 `Tree::range()` and `Tree::scan_prefix(p)` return a
 `RangeBuilder` → `RangeIter` yielding `RangeEntry::{Key,
-CommonPrefix}` items in lex order. The builder chains:
+CommonPrefix}` items in lex order. `Key` entries carry key, value,
+and the live `RecordVersion` from the same leaf emit. The builder
+chains:
 
 - `.prefix(p)` — marker-aware lower-bound seek to the prefix range;
   no full-tree scan.
@@ -332,10 +341,10 @@ because stale paths are handled internally. It is still not MVCC:
 a long scan can observe keys committed after iterator creation if
 they sort after the current cursor.
 
-## 8. Backend abstraction
+## 8. BlobStore abstraction
 
 ```rust
-pub trait Backend: Send + Sync {
+pub trait BlobStore: Send + Sync {
     fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf;
     fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf;
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
@@ -357,20 +366,20 @@ durable on the underlying medium.
 
 Implementations:
 
-- **`MemoryBackend`** — `RwLock<HashMap<BlobGuid,
+- **`MemoryBlobStore`** — `RwLock<HashMap<BlobGuid,
   AlignedBlobBuf>>`. For tests, micro-benches, and ephemeral
   workloads.
-- **`PersistentBackend`** — single packed `blobs.dat` (blob N at
+- **`FileBlobStore`** — single packed `blobs.dat` (blob N at
   byte offset `N × PAGE_SIZE`) plus `manifest.bin` snapshot and
   append-only `manifest.log` deltas. Opens with `O_DIRECT` on
   Linux, `F_NOCACHE` (`fcntl`) on macOS.
 - **`io_uring` fast path** (`cfg(target_os = "linux") + feature
-  = "io-uring"`) — `PersistentBackend` routes reads, batched
-  writes, and data-file fsync through a per-backend ring with a
+  = "io-uring"`) — `FileBlobStore` routes reads, batched
+  writes, and data-file fsync through a per-store ring with a
   fixed file and a bounded registered-buffer pool. Non-Linux builds
   with the feature flag still get the syscall path.
 
-`Backend` is part of the public API surface so users can plug in
+`BlobStore` is part of the public API surface so users can plug in
 custom storage; everything else (`BufferManager`, `BlobFrame`,
 the walker guards) is `pub(crate)`.
 
@@ -399,8 +408,8 @@ only when `CheckpointConfig::enabled = true`.
 |---|---|
 | Crash mid-write | WAL replay restores the tree to the last durable record. Uncommitted partial writes drop. |
 | WAL torn tail | Replay yields every complete record before the chop, reports the byte offset where it stopped. Real mid-file corruption surfaces as `Error::ReplaySanityFailed`. |
-| Partial `backend.flush` | Manifest deltas are appended and fsync'd before becoming the recovery contract; full manifest snapshots use tmp+rename. Data file writes are O_DIRECT aligned (atomic at 4 KB on NVMe). |
-| Out of disk space | Backend write errors propagate as `Error::BackendIo`; the dirty entry stays in BM for retry, no state corruption. |
+| Partial `store.flush` | Manifest deltas are appended and fsync'd before becoming the recovery contract; full manifest snapshots use tmp+rename. Data file writes are O_DIRECT aligned (atomic at 4 KB on NVMe). |
+| Out of disk space | BlobStore write errors propagate as `Error::BlobStoreIo`; the dirty entry stays in BM for retry, no state corruption. |
 | OOM in buffer pool | Clock-tick eviction reclaims cold blobs; pinned blobs are skipped until released. |
 | Checkpoint mid-failure | Each phase restores any drained state on error return so the next round retries cleanly (see §6 phase 1-7). |
 
