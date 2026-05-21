@@ -1,14 +1,16 @@
-//! End-to-end measurement of the v0.2 background checkpointer.
+//! Background checkpointer integration coverage.
 //!
-//! Not a criterion microbench — wall-clock + on-disk numbers
-//! comparing the same write workload with the checkpointer
-//! disabled vs enabled. Gated as a regular test so `cargo test`
-//! can sanity-check the numbers; the assertions only check
-//! correctness (the bg-checkpointer-enabled run actually keeps
-//! the WAL bounded), the numeric printout is the interesting
-//! output.
+//! These tests compare the same write workload with the
+//! checkpointer disabled vs enabled. The printed wall-clock and
+//! on-disk numbers are diagnostic only; the assertions check the
+//! integration contract that the enabled background checkpointer
+//! bounds and truncates the WAL.
 //!
-//! Run with `cargo test --release --test bench_bg_checkpointer -- --nocapture`.
+//! Run the long cases explicitly with:
+//!
+//! ```bash
+//! cargo test --release --test checkpointer_integration -- --ignored --nocapture
+//! ```
 
 use std::fs;
 use std::path::PathBuf;
@@ -195,8 +197,8 @@ fn run_paced_workload(
     }
 }
 
-// `#[ignore]` — timing-sensitive measurement, not a correctness
-// test. Run via `cargo test --release --test bench_bg_checkpointer -- --ignored --nocapture`.
+// `#[ignore]` keeps this long, timing-sensitive integration case
+// out of the default test suite.
 #[test]
 #[ignore]
 fn bg_checkpointer_bounds_wal_under_paced_writes() {

@@ -31,13 +31,20 @@
 //! ## Fairness
 //!
 //! All three engines run in their "no-WAL, batched flush" mode
-//! for the memory variant, and "WAL on, no per-op fsync" for the
+//! for the memory variant, and "hot WAL, no per-op fsync" for the
 //! persistent variant:
 //!
 //! | Mode       | holt                                        | RocksDB                              | SQLite                                              |
 //! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|
 //! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` |
-//! | persistent | `TreeConfig::new(dir)`, `memory_flush_on_write=false` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=NORMAL`, file-backed |
+//! | persistent | `TreeConfig::new(dir)`, hot BufferManager + WAL worker | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=NORMAL`, file-backed |
+//!
+//! The `*_persist_*` groups are intentionally hot-service
+//! measurements. They do **not** claim to measure cold data-file
+//! I/O after reopen. For that, use
+//! `benches/cold_io.rs`, which closes every engine,
+//! drops file cache on Linux via `posix_fadvise(DONTNEED)`, then
+//! times cold-ish `get` / same-key `put`.
 //!
 //! ## Running
 //!
@@ -143,11 +150,12 @@ fn make_holt() -> Tree {
     Tree::open(cfg).expect("holt open")
 }
 
-/// Persistent holt on a temp dir. Each `put` lands in the WAL
-/// writer's buffer + BufferManager cache; the persistent
-/// backend only gets a `pwrite` at spillover or `checkpoint()`.
-/// Matches RocksDB's `WAL=on, sync=false` (per-op durable to OS
-/// page cache, not fsync'd) and SQLite's `WAL + synchronous=NORMAL`.
+/// Hot persistent holt on a temp dir. Each `put` lands in the
+/// WAL writer's buffer + BufferManager cache; the persistent
+/// data file only gets a `pwrite` at spillover or checkpoint.
+/// Matches RocksDB's `WAL=on, sync=false` and SQLite's `WAL +
+/// synchronous=NORMAL` as a hot service profile, not as a cold
+/// data-file I/O profile.
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let cfg = TreeConfig::new(dir.path());
@@ -408,9 +416,10 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
     }
 }
 
-// Persistent variant: all three engines on disk with WAL/durability
-// on (each at the `sync=off` profile — durable past a process crash
-// but not a power loss).
+// Hot persistent variant: all three engines are disk-backed with
+// WAL on and per-op fsync off. This isolates foreground WAL/cache
+// cost under a warm service state. Cold data-file I/O after reopen
+// is measured by `benches/cold_io.rs` instead.
 fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
     let key_count = pairs.len();
 

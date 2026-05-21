@@ -71,9 +71,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-use std::sync::Mutex;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
@@ -143,11 +141,19 @@ pub struct PersistentBackend {
     /// overwrites of existing blobs leave this false, avoiding
     /// manifest I/O on pure data overwrites.
     manifest_dirty: AtomicBool,
-    /// Tracks returned writes that have not yet survived
-    /// `File::sync_data`. This lets checkpoint avoid a clean
-    /// `sync_data` without skipping a retry after a previous sync
-    /// failure.
-    data_dirty: AtomicBool,
+    /// Monotonic counter bumped before each data-file write.
+    /// `flush` syncs up to the observed epoch instead of clearing
+    /// a single bool, so a racing writer cannot be hidden by a
+    /// concurrent successful sync.
+    data_write_epoch: AtomicU64,
+    /// Highest data write epoch known to have survived
+    /// `fdatasync` / `File::sync_data`.
+    data_sync_epoch: AtomicU64,
+    /// Serializes the durability boundary between slot assignment,
+    /// data writes, data sync, and manifest persistence. This is
+    /// not on the read path; checkpoint I/O already funnels through
+    /// one worker, and Linux `io_uring` also has one SQ owner.
+    data_io_lock: Mutex<()>,
     /// Highest slot count the packed data file has been
     /// best-effort preallocated to.
     preallocated_slots: AtomicU64,
@@ -296,7 +302,9 @@ impl PersistentBackend {
             data_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
-            data_dirty: AtomicBool::new(false),
+            data_write_epoch: AtomicU64::new(0),
+            data_sync_epoch: AtomicU64::new(0),
+            data_io_lock: Mutex::new(()),
             preallocated_slots: AtomicU64::new(preallocated_slots),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             uring,
@@ -348,7 +356,9 @@ impl PersistentBackend {
             data_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
-            data_dirty: AtomicBool::new(false),
+            data_write_epoch: AtomicU64::new(0),
+            data_sync_epoch: AtomicU64::new(0),
+            data_io_lock: Mutex::new(()),
             preallocated_slots: AtomicU64::new(preallocated_slots),
         })
     }
@@ -415,6 +425,38 @@ impl PersistentBackend {
         out
     }
 
+    fn mark_data_write_started(&self) -> u64 {
+        self.data_write_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn mark_data_synced(&self, epoch: u64) {
+        self.data_sync_epoch.fetch_max(epoch, Ordering::AcqRel);
+    }
+
+    fn data_needs_sync(&self) -> Option<u64> {
+        let written = self.data_write_epoch.load(Ordering::Acquire);
+        let synced = self.data_sync_epoch.load(Ordering::Acquire);
+        (synced < written).then_some(written)
+    }
+
+    fn prepare_blob_writes<'a>(
+        &self,
+        writes: &'a [(BlobGuid, &'a AlignedBlobBuf)],
+    ) -> Result<Vec<(u64, &'a AlignedBlobBuf)>> {
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots = self.assign_slots(writes.iter().map(|(guid, _)| *guid));
+        if let Some(required_slots) = slots.iter().map(|slot| slot.saturating_add(1)).max() {
+            self.ensure_data_capacity(required_slots)?;
+        }
+        let mut io = Vec::with_capacity(writes.len());
+        for ((_, src), slot) in writes.iter().zip(slots) {
+            io.push((slot * u64::from(PAGE_SIZE), *src));
+        }
+        Ok(io)
+    }
+
     // ---------- I/O dispatch (uring vs pread/pwrite) ----------
     //
     // Two paired cfg-gated helpers per direction: the active one
@@ -446,6 +488,13 @@ impl PersistentBackend {
     fn pwrite_many_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
         ring.pwrite_many_at(writes)?;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn pwrite_many_and_sync_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
+        let mut ring = self.uring.lock().unwrap();
+        ring.pwrite_many_and_sync_at(writes)?;
         Ok(())
     }
 
@@ -676,37 +725,48 @@ impl Backend for PersistentBackend {
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+        let _io = self.data_io_lock.lock().unwrap();
         let slot = self.assign_slot(guid);
         let offset = slot * u64::from(PAGE_SIZE);
         self.ensure_data_capacity(slot.saturating_add(1))?;
-        // Bracket the syscall so a racing flush cannot clear the
-        // flag before this write has actually reached the fd.
-        self.data_dirty.store(true, Ordering::Release);
-        let result = self.pwrite_at(offset, src);
-        self.data_dirty.store(true, Ordering::Release);
-        result?;
+        self.mark_data_write_started();
+        self.pwrite_at(offset, src)?;
         Ok(())
     }
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        let _io = self.data_io_lock.lock().unwrap();
+        let io = self.prepare_blob_writes(writes)?;
+        if io.is_empty() {
+            return Ok(());
+        }
+        self.mark_data_write_started();
+        self.pwrite_many_at(&io)?;
+        Ok(())
+    }
+
+    fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
         if writes.is_empty() {
             return Ok(());
         }
-        let slots = self.assign_slots(writes.iter().map(|(guid, _)| *guid));
-        if let Some(required_slots) = slots.iter().map(|slot| slot.saturating_add(1)).max() {
-            self.ensure_data_capacity(required_slots)?;
+        let _io = self.data_io_lock.lock().unwrap();
+
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        {
+            let io = self.prepare_blob_writes(writes)?;
+            let epoch = self.mark_data_write_started();
+            self.pwrite_many_and_sync_at(&io)?;
+            self.mark_data_synced(epoch);
+            Ok(())
         }
-        let mut io = Vec::with_capacity(writes.len());
-        for ((_, src), slot) in writes.iter().zip(slots) {
-            io.push((slot * u64::from(PAGE_SIZE), *src));
+
+        #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+        {
+            let io = self.prepare_blob_writes(writes)?;
+            self.mark_data_write_started();
+            self.pwrite_many_at(&io)?;
+            Ok(())
         }
-        // See `write_blob`: keep the dirty hint conservative
-        // across concurrent flush attempts and partial I/O errors.
-        self.data_dirty.store(true, Ordering::Release);
-        let result = self.pwrite_many_at(&io);
-        self.data_dirty.store(true, Ordering::Release);
-        result?;
-        Ok(())
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
@@ -725,15 +785,14 @@ impl Backend for PersistentBackend {
     }
 
     fn flush(&self) -> Result<()> {
+        let _io = self.data_io_lock.lock().unwrap();
         // Order matters: data must be on disk before the manifest
         // promotes any new slot. Otherwise a crash could leave the
         // manifest pointing at a slot whose data is still in NVMe's
         // write cache.
-        if self.data_dirty.swap(false, Ordering::AcqRel) {
-            if let Err(e) = self.sync_data_file() {
-                self.data_dirty.store(true, Ordering::Release);
-                return Err(e);
-            }
+        if let Some(epoch) = self.data_needs_sync() {
+            self.sync_data_file()?;
+            self.mark_data_synced(epoch);
         }
 
         if self.manifest_dirty.swap(false, Ordering::AcqRel) {
@@ -749,7 +808,7 @@ impl Backend for PersistentBackend {
     }
 
     fn needs_flush(&self) -> bool {
-        self.data_dirty.load(Ordering::Acquire) || self.manifest_dirty.load(Ordering::Acquire)
+        self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire)
     }
 }
 

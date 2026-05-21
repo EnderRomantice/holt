@@ -1,10 +1,11 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! Parameter sweep over `CheckpointConfig::idle_interval` — the one
 //! tunable that visibly moves writer overhead, peak WAL size, and
 //! reopen latency in the same direction or the other.
 //!
-//! Run with:
-//!
-//!     cargo test --release --test bench_checkpoint_sweep -- --nocapture
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target.
 //!
 //! The other two cadence knobs (`io_queue_capacity`,
 //! `eviction_idle_ticks`) are deliberately *not* swept here:
@@ -112,7 +113,7 @@ fn run_paced(cfg_factory: impl Fn(&Path) -> TreeConfig) -> (Duration, u64, u64, 
 // CI runners (especially debug builds on macOS). Tagged `#[ignore]`
 // so the default `cargo test` keeps green; run explicitly via:
 //
-//     cargo test --release --test bench_checkpoint_sweep -- --ignored --nocapture
+// Internal probe: port into a temporary Cargo target before running.
 #[test]
 #[ignore]
 fn idle_interval_sweep() {

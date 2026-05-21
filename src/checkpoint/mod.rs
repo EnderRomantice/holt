@@ -9,9 +9,8 @@
 //! │   park_timeout(idle_interval)                            │
 //! │     ├─ run_merge_pass                                    │
 //! │     ├─ snapshot_dirty + journal.flush                    │
-//! │     ├─ submit one IoTask::FlushBatch for dirty blobs     │
-//! │     ├─ wait completions                                  │
-//! │     ├─ submit IoTask::Sync, wait                         │
+//! │     ├─ submit IoTask::FlushBatchAndSync for dirty blobs  │
+//! │     ├─ wait completion                                   │
 //! │     └─ journal.truncate iff dirty_count == 0             │
 //! └────────┬─────────────────────────────────────────────────┘
 //!          │ IoTask (bounded crossbeam channel)
@@ -20,8 +19,8 @@
 //! │ io_thread (I/O executor)                                 │
 //! │   recv IoTask -> backend.write_blob / backend.flush      │
 //! │                                                          │
-//! │   ── Current: sync pread/pwrite via PersistentBackend    │
-//! │   ── Next:    io_uring submit + CQE poll (feature flag)  │
+//! │   ── Unix:  pread/pwritev through PersistentBackend      │
+//! │   ── Linux: io_uring fixed-file/fixed-buffer fast path   │
 //! └──────────────────────────────────────────────────────────┘
 //!
 //! ┌──────────────────────────────────────────────────────────┐
@@ -151,8 +150,8 @@ pub struct CheckpointConfig {
     /// Default 1024 — roughly "untouched for the last ~1024
     /// `pin`/`get_cached` operations".
     pub eviction_idle_ticks: u64,
-    /// Bounded I/O queue capacity (depth of `FlushBatch` / `Sync`
-    /// tasks in flight between the planner and the I/O thread).
+    /// Bounded I/O queue capacity (depth of checkpoint I/O tasks
+    /// in flight between the planner and the I/O thread).
     /// Bigger = more parallelism head-room for io_uring; smaller
     /// = tighter back-pressure on the planner.
     ///

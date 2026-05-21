@@ -169,9 +169,13 @@ threads. v0.3 makes the I/O side worth that structure:
   primitive.
 - The default Unix backend sorts and coalesces slot-contiguous
   512 KB blob writes with `pwritev`; Linux `io_uring` keeps
-  ring-depth batched SQE submission with fixed-file registration.
-- Next Linux-only step: registered aligned buffers and optional
-  `SQPOLL` / `IOPOLL` for direct NVMe.
+  ring-depth batched SQE submission with fixed-file and
+  fixed-buffer registration.
+- Experimental `SQPOLL` / `IOPOLL` / linked-fsync modes are not
+  part of the v0.3 path: on Holt's short checkpoint batches they
+  did not improve throughput, and keeping them would make the I/O
+  completion path harder to audit. The next real Linux step is a
+  dedicated async I/O scheduler, not more ring flags.
 - Manifest persistence now uses a base snapshot plus append-only
   `manifest.log` set/delete deltas. Checkpoint rounds append and
   fsync only the current delta batch; full `manifest.bin`

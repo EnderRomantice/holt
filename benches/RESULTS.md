@@ -6,7 +6,8 @@ End-to-end criterion micro-benches comparing holt against
 `bundled` libsqlite3, so contributors don't need a system
 SQLite installation). Three workload shapes (KV, S3
 object-store metadata, POSIX filesystem metadata) ×
-{ memory, persistent } × { get, put, mixed, list, list-delim }.
+{ memory, hot persistent } × { get, put, mixed, list,
+list-delim }.
 
 ## Reproducing
 
@@ -41,14 +42,18 @@ comparison.
   refreshed before a release tag.
 - **RocksDB**: 0.24 (`librocksdb-sys` 0.18, bundled)
 - **SQLite**: rusqlite 0.39 (bundled libsqlite3)
-- **Knob alignment**: all three engines use comparable
-  "per-op durable to OS page cache, not fsync'd" semantics —
-  see the durability matrix at the top of `benches/main.rs`.
+- **Knob alignment**: the Criterion `*_persist_*` groups are
+  hot persistent / WAL-on measurements: comparable "per-op
+  durable to OS page cache, not fsync'd" semantics, with each
+  engine's in-process cache allowed to stay warm. They are not
+  cold data-file I/O measurements. Use `benches/cold_io.rs` for
+  reopen + file-cache-drop
+  persistent I/O probes.
 
 ## Headline numbers
 
 24 baseline benches across KV / objstore / fs shapes, memory +
-persistent variants at 20 k keys: **holt wins all 24** vs
+hot-persistent variants at 20 k keys: **holt wins all 24** vs
 RocksDB and SQLite. Margin range: 1.3× (in-memory fs_put vs
 SQLite — both short codepaths) to **467×** (`fs_list_dir`
 S3-style rollup vs RocksDB — fast-forward over `BlobNode`
@@ -82,9 +87,9 @@ tables are from the earlier v0.3 M3 Pro run):
 | **memory** get      |  **169**  |          684 |         567 |       4.0× |      3.4× |
 | **memory** put      |  **344**  |        1 201 |         629 |       3.5× |      1.8× |
 | **memory** mixed    |  **351**  |        2 138 |         663 |       6.1× |      1.9× |
-| **persist** get     |  **187**  |          637 |       1 508 |       3.4× |      8.1× |
-| **persist** put     |  **473**  |        3 470 |       2 310 |       7.3× |      4.9× |
-| **persist** mixed   |  **328**  |        3 294 |       1 951 |      10.0× |      5.9× |
+| **hot persist** get |  **187**  |          637 |       1 508 |       3.4× |      8.1× |
+| **hot persist** put |  **473**  |        3 470 |       2 310 |       7.3× |      4.9× |
+| **hot persist** mixed | **328** |        3 294 |       1 951 |      10.0× |      5.9× |
 
 ## Object-store workload (S3-shaped path keys + metadata values)
 
@@ -94,10 +99,10 @@ tables are from the earlier v0.3 M3 Pro run):
 | **memory** put              |  **481**  |        1 441 |         664 |       3.0× |      1.4× |
 | **memory** mixed            |  **377**  |        2 152 |         663 |       5.7× |      1.8× |
 | **memory** list             |  **10 808** |     16 815 |      16 637 |       1.6× |      1.5× |
-| **persist** get             |  **247**  |          740 |       1 508 |       3.0× |      6.1× |
-| **persist** put             |  **567**  |        3 499 |       2 319 |       6.2× |      4.1× |
-| **persist** mixed           |  **420**  |        3 264 |       1 954 |       7.8× |      4.7× |
-| **persist** list            |  **10 651** |     16 937 |      17 801 |       1.6× |      1.7× |
+| **hot persist** get         |  **247**  |          740 |       1 508 |       3.0× |      6.1× |
+| **hot persist** put         |  **567**  |        3 499 |       2 319 |       6.2× |      4.1× |
+| **hot persist** mixed       |  **420**  |        3 264 |       1 954 |       7.8× |      4.7× |
+| **hot persist** list        |  **10 651** |     16 937 |      17 801 |       1.6× |      1.7× |
 | **list_dir** (S3 rollup)    |  **2 463** |    624 672 |     436 204 |     **254×** |  **177×** |
 
 ## Filesystem-metadata workload (inode + dirent path keys)
@@ -108,10 +113,10 @@ tables are from the earlier v0.3 M3 Pro run):
 | **memory** put       |  **488**  |        1 452 |          660 |       3.0× |      1.4× |
 | **memory** mixed     |  **372**  |        2 469 |          668 |       6.6× |      1.8× |
 | **memory** list      |  **10 854** |    17 887 |       16 775 |       1.6× |      1.5× |
-| **persist** get      |  **251**  |          701 |        1 516 |       2.8× |      6.0× |
-| **persist** put      |  **555**  |        3 456 |        2 292 |       6.2× |      4.1× |
-| **persist** mixed    |  **411**  |        3 165 |        1 961 |       7.7× |      4.8× |
-| **persist** list     |  **11 111** |    17 842 |       17 727 |       1.6× |      1.6× |
+| **hot persist** get  |  **251**  |          701 |        1 516 |       2.8× |      6.0× |
+| **hot persist** put  |  **555**  |        3 456 |        2 292 |       6.2× |      4.1× |
+| **hot persist** mixed | **411**  |        3 165 |        1 961 |       7.7× |      4.8× |
+| **hot persist** list |  **11 111** |    17 842 |       17 727 |       1.6× |      1.6× |
 | **list_dir**         |  **2 812** |  1 317 457 |      917 245 |     **468×** |  **326×** |
 
 ## Note on `wal_sync_on_commit=true`
@@ -125,9 +130,10 @@ up measuring drive-cache flush latency for some engines and
 kernel-page-cache flushes for others. The numbers said more
 about the platform than the engines, so that bench group was
 removed. The numbers above (`*_persist_put`) are the honest
-"per-op durable to OS page cache, not fsync'd" tier, which
-all three engines actually do reach with comparable
-semantics.
+hot-WAL "per-op durable to OS page cache, not fsync'd" tier,
+which all three engines actually do reach with comparable
+semantics. They should not be quoted as cold data-file I/O
+numbers; use `cargo bench --bench cold_io` for that surface.
 
 ## Workload notes
 
@@ -390,64 +396,3 @@ get/list/list_dir and metadata-native mixes.
   sits there with heavy write skew, size the holt buffer pool to
   hold the hot set and benchmark the exact key shape before making
   a durability choice.
-
-## Group C — p95 / p99 latency under maintenance interference
-
-`tests/bench_contention_p95.rs` runs four `put` writers + a
-background checkpointer (5 ms cadence) + a compaction thread
-that periodically calls `tree.compact()` from a monotonic put
-counter — the worst-case "engine is doing maintenance while users
-keep writing" shape. Every `put` records its wall-clock latency
-to a `hdrhistogram` for percentile reporting.
-
-```bash
-cargo test --release --test bench_contention_p95 \
-    -- --ignored --nocapture
-```
-
-### Result (20-second window, 4 writers + bg checkpoint + compact)
-
-| Metric           | Value         |
-| ---------------- | ------------: |
-| ops              |  16 888 096   |
-| throughput       |   840 221 ops/s |
-| **mean**         |      4.61 µs  |
-| **p50**          |      1.29 µs  |
-| **p95**          |      2.08 µs  |
-| **p99**          |      4.58 µs  |
-| p99.9            |     144.00 µs |
-| max              | 154 664.96 µs |
-
-### Observations
-
-- **840 k ops/s sustained** with 4 writer threads + a
-  background checkpointer + concurrent `compact()`. A same-session
-  confirmation run reported 717 k ops/s, p95 = 2.33 µs, p99 =
-  5.25 µs, p99.9 = 158.72 µs.
-- **p50 ≈ 1.3 µs** — most puts hit only the common walker mutate
-  + dirty publish + WAL append path with no maintenance
-  interference.
-- **p95 ≈ 2.1 µs / p99 ≈ 4.6 µs** — the writer-shared
-  `CommitGate` and journal-worker group commit removed the old
-  writer-vs-writer commit mutex from the hot path; sharded
-  mutation bookkeeping and candidate-driven maintenance remove the
-  next dirty-map and maintenance-scan contention points.
-- **p99.9 ≈ 0.14 ms** with one scheduler-scale max outlier. The
-  normal tail is now low single-digit microseconds; the remaining
-  extreme tail is dominated by online maintenance and OS
-  scheduling, not by a persistent write serialization point.
-- Earlier Group C rows used a dirty-count compact trigger. This
-  row uses the current put-counter trigger, so `compact()` actually
-  fires at the intended write cadence instead of depending on a
-  checkpoint-cleared dirty count.
-- This run also exercises the dirty-snapshot / eviction interlock:
-  checkpoint-owned `flushing` entries stay protected until
-  `write_through` completes. Fresh spillover blobs keep a local
-  `Arc` pin alive until their dirty bit is visible, and
-  dirty/flushing/pending-delete bookkeeping is sharded by
-  `BlobGuid`. The run finishes without the previous `dirty entry
-  lost cache image` invariant failure.
-
-The mean-vs-p50 gap (4.6 µs mean vs 1.3 µs p50) reflects that the
-slow tail is real but bounded — the distribution is not long-tailed
-enough to perturb the median.

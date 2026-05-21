@@ -1382,7 +1382,7 @@ impl BufferManager {
             .iter()
             .map(|entry| (entry.guid, &entry.bytes))
             .collect();
-        self.backend.write_blobs(&writes)?;
+        self.backend.write_blobs_with_data_sync(&writes)?;
         for entry in entries {
             self.retire_write_through(entry.guid, entry.expected_seq);
         }

@@ -1,3 +1,5 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! Large-tree shape probe for holt's ART-over-blobs layout.
 //!
 //! This is not a comparator bench. It measures holt's own tree
@@ -5,18 +7,9 @@
 //! skewed prefixes, hot directories, delete-heavy churn, and a
 //! working set larger than a deliberately tiny buffer pool.
 //!
-//! Run explicitly:
-//!
-//! ```bash
-//! cargo test --release --test bench_large_tree_shape -- --ignored --nocapture
-//! ```
-//!
-//! For a short smoke run:
-//!
-//! ```bash
-//! HOLT_SHAPE_BENCH_KEYS=5000 \
-//! cargo test --release --test bench_large_tree_shape -- --ignored --nocapture
-//! ```
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target. `HOLT_SHAPE_BENCH_KEYS=5000` is a useful
+//! short smoke setting.
 
 use std::env;
 use std::time::{Duration, Instant};
@@ -98,7 +91,7 @@ struct ShapeReport {
 }
 
 #[test]
-#[ignore = "shape bench; use `cargo test --release --test bench_large_tree_shape -- --ignored --nocapture`"]
+#[ignore = "internal shape probe"]
 fn large_tree_shape_matrix() {
     let keys = env_usize("HOLT_SHAPE_BENCH_KEYS", DEFAULT_KEYS);
     let value_len = env_usize("HOLT_SHAPE_BENCH_VALUE_LEN", DEFAULT_VALUE_LEN);
@@ -116,7 +109,7 @@ fn large_tree_shape_matrix() {
 }
 
 #[test]
-#[ignore = "shape bench; use `cargo test --release --test bench_large_tree_shape -- --ignored --nocapture`"]
+#[ignore = "internal shape probe"]
 fn working_set_larger_than_buffer_pool_probe() {
     let keys = env_usize("HOLT_SHAPE_BENCH_BUFFER_KEYS", DEFAULT_BUFFER_POOL_KEYS);
     let value_len = env_usize("HOLT_SHAPE_BENCH_VALUE_LEN", DEFAULT_VALUE_LEN);

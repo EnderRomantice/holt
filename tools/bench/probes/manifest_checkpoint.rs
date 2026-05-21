@@ -1,3 +1,5 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! Manifest/checkpoint pressure probe for persistent holt trees.
 //!
 //! This is a holt-only benchmark for the metadata persistence path:
@@ -5,19 +7,10 @@
 //! plus `compact()` creates deferred manifest deletes, and explicit
 //! `checkpoint()` calls force the manifest to become durable.
 //!
-//! Run explicitly:
-//!
-//! ```bash
-//! cargo test --release --test bench_manifest_checkpoint -- --ignored --nocapture
-//! ```
-//!
-//! Short smoke:
-//!
-//! ```bash
-//! HOLT_MANIFEST_BENCH_ROUNDS=3 \
-//! HOLT_MANIFEST_BENCH_KEYS_PER_ROUND=1000 \
-//! cargo test --release --test bench_manifest_checkpoint -- --ignored --nocapture
-//! ```
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target. `HOLT_MANIFEST_BENCH_ROUNDS=3` and
+//! `HOLT_MANIFEST_BENCH_KEYS_PER_ROUND=1000` are useful short
+//! smoke settings.
 
 use std::env;
 use std::fs;
@@ -36,7 +29,7 @@ const DEFAULT_BUFFER_POOL: usize = 128;
 const HIST_MAX_NS: u64 = 60_000_000_000;
 
 #[test]
-#[ignore = "manifest/checkpoint pressure bench; use `cargo test --release --test bench_manifest_checkpoint -- --ignored --nocapture`"]
+#[ignore = "internal manifest/checkpoint pressure probe"]
 fn manifest_log_checkpoint_pressure() {
     let rounds = env_usize("HOLT_MANIFEST_BENCH_ROUNDS", DEFAULT_ROUNDS);
     let keys_per_round = env_usize("HOLT_MANIFEST_BENCH_KEYS_PER_ROUND", DEFAULT_KEYS_PER_ROUND);

@@ -1,3 +1,5 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! `put` latency distribution while a background checkpointer
 //! and periodic manual `compact()` runs interfere — the
 //! tail-latency story (p95 / p99 / p99.9) for a holt deployment
@@ -7,12 +9,8 @@
 //! not percentiles). Uses [`hdrhistogram`] to capture every
 //! sample latency and report mean / p50 / p95 / p99 / p99.9 / max.
 //!
-//! Wrapped in `#[ignore]` because the bench runs for ~30 s and
-//! shouldn't fire on every `cargo test`. Run explicitly:
-//!
-//! ```bash
-//! cargo test --release --test bench_contention_p95 -- --ignored --nocapture
-//! ```
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,7 +31,7 @@ const COMPACT_EVERY: u32 = 20_000;
 const PAYLOAD_LEN: usize = 256;
 
 #[test]
-#[ignore = "long-running bench; use `cargo test --release ... -- --ignored --nocapture`"]
+#[ignore = "internal long-running probe"]
 fn put_latency_under_bg_checkpoint_and_compact_interference() {
     let dir = tempdir().unwrap();
     let tree = Arc::new(

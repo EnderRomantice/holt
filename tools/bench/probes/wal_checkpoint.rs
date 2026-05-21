@@ -1,8 +1,10 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! WAL/checkpoint fast-path probe for persistent holt trees.
 //!
 //! This is a holt-only microprobe for the checkpoint path's WAL
 //! work, separate from the manifest/data-file pressure measured
-//! by `bench_manifest_checkpoint`.
+//! by `manifest_checkpoint.rs`.
 //!
 //! It isolates four paths:
 //!
@@ -15,19 +17,9 @@
 //! - background idle rounds must remain no-op rounds when nothing
 //!   is dirty and the WAL is already clean.
 //!
-//! Run explicitly:
-//!
-//! ```bash
-//! cargo test --release --test bench_wal_checkpoint -- --ignored --nocapture
-//! ```
-//!
-//! Short smoke:
-//!
-//! ```bash
-//! HOLT_WAL_BENCH_CLEAN_ITERS=50 \
-//! HOLT_WAL_BENCH_MUTATIONS=10 \
-//! cargo test --release --test bench_wal_checkpoint -- --ignored --nocapture
-//! ```
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target. `HOLT_WAL_BENCH_CLEAN_ITERS=50` and
+//! `HOLT_WAL_BENCH_MUTATIONS=10` are useful short smoke settings.
 
 use std::env;
 use std::fs;
@@ -47,7 +39,7 @@ const HIST_MAX_NS: u64 = 60_000_000_000;
 const WAL_HEADER_BYTES: u64 = 32;
 
 #[test]
-#[ignore = "WAL/checkpoint timing probe; use `cargo test --release --test bench_wal_checkpoint -- --ignored --nocapture`"]
+#[ignore = "internal WAL/checkpoint timing probe"]
 fn wal_checkpoint_fast_paths() {
     let clean_iters = env_usize("HOLT_WAL_BENCH_CLEAN_ITERS", DEFAULT_CLEAN_ITERS);
     let mutations = env_usize("HOLT_WAL_BENCH_MUTATIONS", DEFAULT_MUTATIONS);

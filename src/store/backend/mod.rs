@@ -86,6 +86,19 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Write a batch and, if the backend can do it cheaply, make
+    /// the data-file bytes durable before returning.
+    ///
+    /// This is deliberately narrower than [`Self::flush`]: callers
+    /// must still call `flush` to persist metadata/manifest changes.
+    /// The hook exists for Linux `io_uring`, where checkpoint
+    /// write batches can keep data writes and `fdatasync` on the
+    /// same ring turn, then let the later manifest flush skip the
+    /// data sync if no newer writes raced in.
+    fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        self.write_blobs(writes)
+    }
+
     /// Delete blob `guid`. No-op if it doesn't exist.
     fn delete_blob(&self, guid: BlobGuid) -> Result<()>;
 

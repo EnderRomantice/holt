@@ -1,3 +1,5 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! Multi-reader stress measurement of the `HybridLatch` wait-free
 //! read path.
 //!
@@ -13,11 +15,8 @@
 //! scaling with thread count = "wait-free read works in
 //! practice"; sub-linear = something is contended.
 //!
-//! Tagged `#[ignore]` because aggregate-throughput measurements
-//! are timing-sensitive and noisy on shared CI runners. Run with:
-//!
-//!     cargo test --release --test bench_multi_reader -- \
-//!         --ignored --nocapture
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target.
 //!
 //! For local tuning, run with `RUST_LOG=info` and the
 //! `tracing` feature on (`--features tracing`) to see per-blob

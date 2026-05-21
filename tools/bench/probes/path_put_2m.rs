@@ -1,3 +1,5 @@
+//! Internal engineering probe, not a Cargo target.
+//!
 //! Holt-only path-shaped put probe for the 2M-key regime.
 //!
 //! Criterion's `_scale_put` comparator answers "do we still beat
@@ -6,19 +8,9 @@
 //! large-tree tier? It prints update latency plus tree-shape
 //! counters before/after the update phase.
 //!
-//! Run explicitly:
-//!
-//! ```bash
-//! cargo test --release --test bench_path_put_2m -- --ignored --nocapture
-//! ```
-//!
-//! Short smoke:
-//!
-//! ```bash
-//! HOLT_PATH_PUT_KEYS=20000 \
-//! HOLT_PATH_PUT_UPDATES=5000 \
-//! cargo test --release --test bench_path_put_2m -- --ignored --nocapture
-//! ```
+//! To rerun it, first port this file into a temporary Cargo
+//! test/bench target. `HOLT_PATH_PUT_KEYS=20000` and
+//! `HOLT_PATH_PUT_UPDATES=5000` are useful short smoke settings.
 
 use std::env;
 use std::hint::black_box;
@@ -34,7 +26,7 @@ const HIST_MAX_NS: u64 = 60_000_000_000;
 const SEED: u64 = 0xA11C_E551_2BAD_F00D;
 
 #[test]
-#[ignore = "2M path-put probe; use `cargo test --release --test bench_path_put_2m -- --ignored --nocapture`"]
+#[ignore = "internal 2M path-put probe"]
 fn path_put_large_tree_probe() {
     let keys = env_usize("HOLT_PATH_PUT_KEYS", DEFAULT_KEYS);
     let updates = env_usize("HOLT_PATH_PUT_UPDATES", DEFAULT_UPDATES);

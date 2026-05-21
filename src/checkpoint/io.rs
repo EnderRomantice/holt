@@ -7,14 +7,14 @@
 //! Decouples I/O execution from planning so the planner can:
 //! 1. Snapshot bytes under a brief shared read guard, then move on.
 //! 2. Submit one batch flush task without serialising on each I/O.
-//! 3. Plan the next round's merge pass while the previous round's
-//!    Sync is still in flight on the I/O thread.
+//! 3. Keep checkpoint data writes and the pre-delete backend
+//!    flush on the same executor turn, so the planner pays one
+//!    completion handoff on the common path.
 //!
 //! For the current local-`pread`/`pwrite` backend the parallelism
-//! gain is modest (single thread, single FD). The architecture
-//! pays off once the io_uring backend lands (next commit) — the
-//! I/O thread becomes the SQE submitter + CQE poller, and the
-//! planner's submit-N-then-wait pattern naturally feeds the ring.
+//! gain is modest (single thread, single FD). On Linux with the
+//! `io-uring` feature, the I/O thread owns the SQ submit / CQ
+//! drain path and feeds the ring with whole checkpoint batches.
 //!
 //! ## Shutdown
 //!
@@ -36,26 +36,39 @@ use super::Shared;
 /// `Err(_)` on failure; the orchestrator receives once.
 pub(crate) type Completion = Sender<Result<()>>;
 
+/// Completion payload for the common checkpoint path: write dirty
+/// blob images, then run the pre-delete backend flush on the same
+/// I/O worker turn.
+///
+/// The two results stay separate because recovery differs:
+/// write failure restores the dirty snapshot; sync failure leaves
+/// already-retired writes retired but keeps pending deletes and
+/// WAL truncation blocked for the next round.
+pub(crate) struct FlushBatchAndSyncReport {
+    pub(crate) write_result: Result<()>,
+    pub(crate) sync_result: Result<()>,
+}
+
+pub(crate) type FlushBatchAndSyncCompletion = Sender<FlushBatchAndSyncReport>;
+
 /// Work item handed to the I/O thread via the bounded queue.
 pub(crate) enum IoTask {
-    /// Push a whole dirty snapshot to the inner backend. Bytes are
-    /// owned by the task (snapshotted from cache by the planner)
-    /// so the I/O thread doesn't touch BM read guards during the
-    /// write.
+    /// Common checkpoint fast path: push dirty blob bytes and
+    /// immediately run the pre-delete backend flush without a
+    /// second channel round trip.
     ///
     /// Each entry carries the dirty-map value observed when the
     /// planner drained the snapshot. The I/O worker retires those
     /// values only after the whole backend batch succeeds, guarding
     /// against racing writers and arbitrary-prefix partial backend
     /// failures.
-    FlushBatch {
+    FlushBatchAndSync {
         entries: Vec<WriteThroughEntry>,
-        on_done: Completion,
+        on_done: FlushBatchAndSyncCompletion,
     },
-    /// `fdatasync` (via `Backend::flush`). The orchestrator sends
-    /// this after a `FlushBatch` completes so every
-    /// blob's bytes are stable on disk before the WAL is
-    /// truncated.
+    /// `fdatasync` (via `Backend::flush`). Used when a round has
+    /// no dirty blob batch to combine with, and after pending
+    /// deletes mutate the manifest.
     Sync { on_done: Completion },
     /// Graceful stop signal. Sent once during `Checkpointer::Drop`
     /// after the planner has joined and the final round has run.
@@ -66,13 +79,13 @@ pub(crate) enum IoTask {
 pub(crate) fn run(shared: &Arc<Shared>, rx: Receiver<IoTask>) {
     while let Ok(task) = rx.recv() {
         match task {
-            IoTask::FlushBatch { entries, on_done } => {
-                let result = shared.bm.write_through_batch(&entries);
-                // `send` only fails if the orchestrator dropped
-                // the receiver — which only happens if the round
-                // aborted or the Tree is shutting down. Either
-                // way, no recovery action here; we just move on.
-                let _ = on_done.send(result);
+            IoTask::FlushBatchAndSync { entries, on_done } => {
+                let write_result = shared.bm.write_through_batch(&entries);
+                let sync_result = shared.bm.backend_flush();
+                let _ = on_done.send(FlushBatchAndSyncReport {
+                    write_result,
+                    sync_result,
+                });
             }
             IoTask::Sync { on_done } => {
                 let result = shared.bm.backend_flush();

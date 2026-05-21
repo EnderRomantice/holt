@@ -47,44 +47,18 @@ keys. The 500 k tier (~48 MB payload) already exceeds the
 default 32 MB buffer pool; the 2 M tier is the large-tree
 pressure case used to judge path-put scalability.
 
-A third group — **p95/p99 latency under maintenance interference**
-— lives in `tests/bench_contention_p95.rs` (not criterion;
-criterion measures means, not percentiles). Run via
-`cargo test --release --test bench_contention_p95 -- --ignored --nocapture`.
-It spins 4 writer threads + a 5 ms-cadence background
-checkpointer + concurrent `Tree::compact()` calls triggered by a
-put counter, and tracks every `put` latency via `hdrhistogram`.
+The second public executable benchmark is **persistent cold I/O**
+(`cargo bench --bench cold_io`). It closes each engine after
+preload, forces its checkpoint/flush boundary, drops file cache on
+Linux via `posix_fadvise(POSIX_FADV_DONTNEED)`, reopens, and then
+times random `cold_get` and same-key `cold_put`. Use this for
+`io_uring` / O_DIRECT / page-cache fairness questions; do not use
+the hot `*_persist_*` Criterion groups to make cold-I/O claims.
 
-A fourth probe — **large-tree shape quality** — lives in
-`tests/bench_large_tree_shape.rs`. It is a holt-only regression
-bench for skewed prefixes, hot directories, delete-heavy churn,
-and working sets larger than a tiny buffer pool. It prints
-`blob_count`, space/gap/tombstone totals, spillovers, merges, and
-average/max blob hops so split-policy changes can be judged before
-running the full RocksDB/SQLite comparator sweep.
-
-A fifth probe — **manifest/checkpoint pressure** — lives in
-`tests/bench_manifest_checkpoint.rs`. It repeatedly inserts
-path-shaped keys, deletes most of each round, compacts, and
-checkpoints. It reports checkpoint percentiles plus
-`manifest.bin`, `manifest.log`, WAL, and data-file sizes so the
-append-only manifest path can be tracked separately from point
-lookup/insert microbenches.
-
-A sixth probe — **WAL/checkpoint fast paths** — lives in
-`tests/bench_wal_checkpoint.rs`. It separates clean foreground
-checkpoints, durable group-commit reuse, default non-durable
-checkpoint barriers, and background idle rounds. The timing table
-is paired with journal `syncs` / checkpointer `truncates`
-counters, so regressions show up even when data-file flush cost
-dominates wall-clock latency.
-
-A seventh probe — **2M path-put shape** — lives in
-`tests/bench_path_put_2m.rs`. It is holt-only and focuses on the
-large-tree objstore/fs put path, printing update latency together
-with blob count, average/max blob hops, max cross-blob depth, and
-spillovers. Use it before/after CPU hot-path changes; use
-Criterion `_scale_put` for RocksDB/SQLite comparisons.
+Internal one-off tuning probes live under `tools/bench/probes/`.
+They are not Cargo targets and are not part of the public
+benchmark surface. Keep release claims in this directory focused
+on Holt vs RocksDB vs SQLite workload comparisons.
 
 ## Running
 
@@ -109,52 +83,17 @@ cargo bench --bench main -- _create_delete
 cargo bench --bench main -- _rename
 cargo bench --bench main -- _metadata_mix
 
-# p95/p99 under bg checkpoint + compact interference (Group C):
-cargo test --release --test bench_contention_p95 \
-    -- --ignored --nocapture
+# Persistent cold-I/O comparator:
+cargo bench --features io-uring --bench cold_io
 
-# Large-tree shape probe (holt only):
-cargo test --release --test bench_large_tree_shape \
-    -- --ignored --nocapture
-
-# Short shape smoke:
-HOLT_SHAPE_BENCH_KEYS=5000 \
-cargo test --release --test bench_large_tree_shape \
-    -- --ignored --nocapture
-
-# Manifest/checkpoint pressure:
-cargo test --release --test bench_manifest_checkpoint \
-    -- --ignored --nocapture
-
-# Short manifest/checkpoint smoke:
-HOLT_MANIFEST_BENCH_ROUNDS=3 \
-HOLT_MANIFEST_BENCH_KEYS_PER_ROUND=1000 \
-cargo test --release --test bench_manifest_checkpoint \
-    -- --ignored --nocapture
-
-# WAL/checkpoint fast paths:
-cargo test --release --test bench_wal_checkpoint \
-    -- --ignored --nocapture
-
-# Short WAL/checkpoint smoke:
-HOLT_WAL_BENCH_CLEAN_ITERS=50 \
-HOLT_WAL_BENCH_MUTATIONS=10 \
-cargo test --release --test bench_wal_checkpoint \
-    -- --ignored --nocapture
-
-# Holt-only 2M path-put shape probe:
-cargo test --release --test bench_path_put_2m \
-    -- --ignored --nocapture
-
-# Short 2M path-put smoke:
-HOLT_PATH_PUT_KEYS=20000 \
-HOLT_PATH_PUT_UPDATES=5000 \
-cargo test --release --test bench_path_put_2m \
-    -- --ignored --nocapture
+# Short persistent cold-I/O smoke:
+HOLT_COLD_IO_KEYS=20000 \
+HOLT_COLD_IO_OPS=2000 \
+cargo bench --features io-uring --bench cold_io
 ```
 
 HTML criterion reports land in `target/criterion/`. The
-percentile bench prints its histogram table to stdout.
+`cold_io` benchmark prints its comparison table to stdout.
 
 ## Methodology — apples-to-apples
 
@@ -172,11 +111,15 @@ Engine algorithm cost only — durability disabled across the board:
 - **SQLite**: `:memory:` DB, `journal_mode=MEMORY`,
   `synchronous=OFF`, 64 MB page cache, `WITHOUT ROWID` schema.
 
-### Persistent mode (`*_persist_get` / `*_persist_put` / `*_persist_mixed`)
+### Hot persistent mode (`*_persist_get` / `*_persist_put` / `*_persist_mixed`)
 
 All three engines disk-backed with WAL on, per-op durability to
 the OS page cache (not fsync) — the "you survive a process
-crash, not a power failure" mode high-throughput services target:
+crash, not a power failure" mode high-throughput services target.
+The service is warm: the Holt BufferManager, RocksDB cache/memtable,
+and SQLite page cache may all contain data touched during preload
+or Criterion warmup. This is a foreground WAL/cache benchmark, not
+a cold data-file I/O benchmark:
 
 - **holt**: `TreeConfig::new(tempdir)` (PersistentBackend with
   `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every mutation
@@ -191,6 +134,26 @@ crash, not a power failure" mode high-throughput services target:
 Shared settings: 20 000 unique keys preloaded; bench iterates a
 seeded permutation of that set; `cargo bench` builds with
 `lto="thin"`, `codegen-units=1`, `opt-level=3`; single-threaded.
+
+### Persistent cold-I/O mode (`cargo bench --bench cold_io`)
+
+All three engines are preloaded, forced through their flush/checkpoint
+boundary, closed, cache-dropped, and reopened before timing. On
+Linux the cache drop is best-effort `sync_all` +
+`posix_fadvise(POSIX_FADV_DONTNEED)` on every file under the temp
+directory; on other platforms the probe reports `sync_all only`.
+
+This mode answers a different question from hot persistent:
+
+- `cold_get` includes the cost of faulting storage pages back into
+  each engine after reopen.
+- `cold_put` includes any read-before-write path needed to locate
+  and update an existing key from a cold reopened state.
+- It is the right place to evaluate `io_uring`, O_DIRECT, page-cache
+  effects, and buffer-pool sizing.
+
+Do not compare hot persistent numbers against cold-I/O numbers in
+one table; they exercise different parts of the storage stack.
 
 ### Metadata-native groups
 
@@ -225,10 +188,10 @@ hierarchical, prefix-rich keys; if your keys are random bytes
 ### Sample numbers — Apple M-series, `cargo bench --quick`
 
 These are rough `--quick` numbers for orientation; **full-suite
-results — including the scale curve and the p95/p99 contention
-bench — live in [`RESULTS.md`](RESULTS.md)**, which is what to
-quote. Either way, re-run on your hardware before quoting; the
-**relative ordering** is what's load-bearing.
+comparison results — including the scale curve — live in
+[`RESULTS.md`](RESULTS.md)**, which is what to quote. Either way,
+re-run on your hardware before quoting; the **relative ordering**
+is what's load-bearing.
 
 **Point lookup (memory mode), N=20 000:**
 
@@ -281,12 +244,8 @@ to single µs.
 
 1. **Single-threaded latency, not throughput.** Per-blob
    `HybridLatch` makes reads wait-free; concurrent-read
-   throughput scales with cores, but the criterion bench measures
-   single-thread latency. For concurrent-read throughput see
-   `tests/bench_multi_reader.rs` (sample numbers on M-series:
-   1 → 5.67 M ops/s, 4 → 14.73 M ops/s, 16 → 19.06 M ops/s). For
-   tail-latency under maintenance interference see
-   `tests/bench_contention_p95.rs`.
+   throughput scales with cores, but the public benchmark surface
+   measures single-thread latency.
 2. **No fsync.** Both modes set `sync=off`-equivalent — durable
    to OS page cache only. A real `fsync`-per-op workload is
    fsync-bound (~1–3 ms on consumer SSD) and overwhelms every
