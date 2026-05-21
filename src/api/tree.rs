@@ -75,12 +75,16 @@ const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
 ///
 /// ## Concurrency
 ///
-/// - **Reads** (`get`, `range`, `scan_prefix`) take the shared
-///   maintenance gate, then run against
-///   `HybridLatch::read_optimistic` — they capture each blob's
-///   latch version, read the bytes, then `validate()`. Restarts
-///   from the root on a torn read. Never blocks foreground writers
-///   and never block each other.
+/// - **Point reads** (`get`) take the shared maintenance gate,
+///   then run against `HybridLatch::read_optimistic` — they capture
+///   each blob's latch version, read the bytes, then `validate()`.
+///   Restarts from the root on a torn read. Never blocks foreground
+///   writers and never block each other.
+/// - **Range reads** (`range`, `scan_prefix`) use a versioned
+///   cursor. Each cursor frame records the blob content version it
+///   was built from; if an interleaved writer changes a frame, the
+///   iterator discards its stack and performs a marker-aware seek
+///   from the last emitted key / delimiter lower bound.
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
 ///   exclusively for the blobs they touch. Persistent trees enter
 ///   the writer-shared `commit_gate` while publishing dirty state
@@ -875,17 +879,17 @@ impl Tree {
     /// start emitting [`RangeEntry`](crate::RangeEntry) items in
     /// lex key order.
     ///
-    /// Best-effort snapshot semantics: each iterator step
-    /// re-acquires the shared maintenance gate plus a shared read
-    /// guard on its current blob; the iterator does NOT hold a
-    /// write barrier across calls.
-    /// Concurrent mutations between steps may cause a leaf to be
-    /// skipped or visited twice (the path stack is raw
-    /// `(blob_guid, slot)` pairs, mirroring the upstream
-    /// `fa_iter`'s "invalid iterator(#1)" failure mode). For
-    /// strict snapshot iteration, pause writes externally
-    /// (e.g., call [`Tree::checkpoint`] and don't mutate during
-    /// traversal).
+    /// Restart-on-conflict cursor semantics: the iterator stores
+    /// blob content versions in its path frames. If a concurrent
+    /// writer invalidates the path through split / merge / compact
+    /// / normal mutation, the next step seeks directly from the
+    /// last emitted key or delimiter rollup boundary instead of
+    /// continuing through stale `(blob_guid, slot)` state.
+    ///
+    /// This is not an MVCC snapshot: a long scan can observe keys
+    /// committed after iterator creation if they sort after the
+    /// current cursor. It is, however, monotonic with respect to
+    /// already-emitted keys and rollups.
     pub fn range(&self) -> RangeBuilder {
         RangeBuilder::new(
             Arc::clone(&self.backend),
@@ -1294,6 +1298,7 @@ impl Tree {
         let bm_cache_hits = self.backend.cache_hits();
         let bm_cache_misses = self.backend.cache_misses();
         let bm_optimistic_restarts = self.backend.optimistic_restarts();
+        let bm_range_restarts = self.backend.range_restarts();
         let bm_walker_ops = self.backend.walker_ops();
         let bm_walker_blob_hops = self.backend.walker_blob_hops();
         let bm_max_blob_hops = self.backend.max_blob_hops();
@@ -1329,6 +1334,7 @@ impl Tree {
             bm_cache_hits,
             bm_cache_misses,
             bm_optimistic_restarts,
+            bm_range_restarts,
             bm_walker_ops,
             bm_walker_blob_hops,
             bm_max_blob_hops,
@@ -1358,10 +1364,9 @@ impl Tree {
     /// plus the candidate blob's latch; clean stale candidates are
     /// skipped after a shared-latch header check. Merge still uses the
     /// exclusive maintenance side, but only around the one parent
-    /// being folded/deleted. Range iterators remain best-effort
-    /// snapshots; if the caller needs strict full-iterator
-    /// stability, consume the iterator during an external quiescent
-    /// window.
+    /// being folded/deleted. Range iterators detect those rewrites
+    /// through their versioned cursor frames and restart from the
+    /// last emitted lower bound.
     ///
     /// Both phases stage their changes via `mark_dirty` /
     /// `mark_for_delete` on the internal `BufferManager`

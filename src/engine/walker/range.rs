@@ -1,6 +1,6 @@
 //! Stateful range iterator — walk leaves in lex key order across
-//! blobs with `prefix` anchoring, `start_after` skip, and S3-style
-//! `delimiter` rollup.
+//! blobs with marker-aware lower-bound seek, `prefix` filtering,
+//! and S3-style `delimiter` rollup.
 //!
 //! Modelled on the upstream `fa_iter` shape extracted from the
 //! original binary's log strings: `path` (parent-chain stack of
@@ -12,17 +12,21 @@
 //!
 //! ## Concurrency
 //!
-//! Best-effort snapshot semantics: each `next()` re-acquires the
-//! shared maintenance gate plus a shared read guard on the topmost
-//! frame's blob for the duration of one step, then drops them.
-//! Writers can interleave between steps; the iterator does NOT
-//! block writers across the whole traversal. A concurrent split
-//! that relocates a leaf the iterator was about to visit may cause
-//! the leaf to be skipped or visited twice (the path stack uses raw
-//! `(guid, slot)` pairs — see the upstream `invalid iterator(#1)`
-//! warning for the same failure mode). For workloads that need
-//! strong iteration semantics, consume the iterator during an
-//! external quiescent window.
+//! The cursor is restart-on-conflict. Each stack frame records the
+//! blob content version observed while the frame was pushed. Before
+//! using a frame — and again before emitting a leaf or
+//! `CommonPrefix` — the iterator verifies those versions. If an
+//! interleaved writer split, merged, compacted, or otherwise rewrote
+//! any blob on the cursor path, the stack is discarded and the walk
+//! seeks from the last emitted lower bound. This mirrors the
+//! upstream `fa_iter` invalidation/restart shape without exposing an
+//! unsafe "invalid iterator" state to callers.
+//!
+//! This is not MVCC: a long iterator may observe keys committed
+//! after it was created if they sort after the current cursor. The
+//! guarantee is that iteration never knowingly continues through a
+//! stale `(blob_guid, slot)` path and does not re-emit keys or
+//! rollups it has already returned.
 
 use std::sync::Arc;
 
@@ -130,9 +134,9 @@ impl IntoIterator for RangeBuilder {
             maintenance_gate: self.maintenance_gate,
             stack: Vec::new(),
             curr_key: Vec::new(),
-            anchor_depth: 0,
+            cursor_floor: 0,
             prefix: self.prefix,
-            start_after: self.start_after,
+            lower_bound: self.start_after.map(LowerBound::Exclusive),
             delimiter: self.delimiter,
             last_common_prefix: None,
             initialized: false,
@@ -152,14 +156,16 @@ pub struct RangeIter {
     /// Bytes contributed to the current path by every live frame.
     /// On pop, the bytes the frame pushed are truncated.
     curr_key: Vec<u8>,
-    /// Depth at which the prefix anchor sits. The iterator stops
-    /// as soon as the stack shrinks below this depth (= we'd
-    /// otherwise visit siblings outside the prefix subtree).
-    anchor_depth: usize,
-    /// Anchor filter (raw user bytes; no engine terminator).
+    /// Depth of the root lower-bound cursor. The iterator stops
+    /// once the cursor has exhausted the rooted search path.
+    cursor_floor: usize,
+    /// Prefix filter (raw user bytes; no engine terminator).
     prefix: Vec<u8>,
-    /// `start_after` filter (raw user bytes; strict-greater compare).
-    start_after: Option<Vec<u8>>,
+    /// Current restart lower bound. Starts as
+    /// `RangeBuilder::start_after`; advances after every emitted
+    /// key or delimiter rollup so a stale cursor can restart from a
+    /// monotonic position.
+    lower_bound: Option<LowerBound>,
     /// Delimiter byte applied to bytes past `prefix`.
     delimiter: Option<u8>,
     /// Most recent `CommonPrefix` emission, used to dedup further
@@ -175,6 +181,10 @@ struct Frame {
     blob_guid: BlobGuid,
     slot: u16,
     ntype: NodeType,
+    /// Blob content version captured while this frame was pushed.
+    /// Any mismatch means a writer has rewritten this blob and the
+    /// path must be rebuilt from the restart lower bound.
+    version: u64,
     /// Cursor inside this frame. Semantics depend on `ntype`:
     /// - `Prefix` / `Blob`: `0` = "descend child", `1` = "done".
     /// - `Node4` / `Node16`: index into the sorted keys array.
@@ -213,13 +223,20 @@ impl InlinePrefix {
     }
 }
 
-fn read_range_leaf_kv(frame: BlobFrameRef<'_>, slot: u16) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+fn project_range_leaf(
+    frame: BlobFrameRef<'_>,
+    slot: u16,
+    prefix: &[u8],
+    lower_bound: Option<&LowerBound>,
+    delimiter: Option<u8>,
+    last_common_prefix: Option<&[u8]>,
+) -> Result<LeafAction> {
     let body = frame
         .body_of_slot(slot)
-        .ok_or(Error::node_corrupt("read_range_leaf_kv: body"))?;
+        .ok_or(Error::node_corrupt("project_range_leaf: body"))?;
     let leaf = *cast::<Leaf>(body);
     if leaf.tombstone != 0 {
-        return Ok(None);
+        return Ok(LeafAction::Skip);
     }
 
     let (stored_key, value) = leaf_extent(frame, &leaf)?;
@@ -228,94 +245,146 @@ fn read_range_leaf_kv(frame: BlobFrameRef<'_>, slot: u16) -> Result<Option<(Vec<
     } else {
         stored_key
     };
-    Ok(Some((user_key.to_vec(), value.to_vec())))
+    if !user_key.starts_with(prefix) {
+        if !prefix.is_empty() && user_key >= prefix {
+            return Ok(LeafAction::Done);
+        }
+        return Ok(LeafAction::Skip);
+    }
+    if let Some(bound) = lower_bound {
+        if !bound.allows(user_key) {
+            return Ok(LeafAction::Skip);
+        }
+    }
+    if let Some(d) = delimiter {
+        let rest = &user_key[prefix.len()..];
+        if let Some(idx) = simd::find_byte(rest, d, 0) {
+            let common: Vec<u8> = user_key[..=prefix.len() + idx].to_vec();
+            if last_common_prefix == Some(common.as_slice()) {
+                return Ok(LeafAction::Skip);
+            }
+            return Ok(LeafAction::CommonPrefix(common));
+        }
+    }
+    Ok(LeafAction::Key {
+        key: user_key.to_vec(),
+        value: value.to_vec(),
+    })
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    for i in (0..out.len()).rev() {
+        if out[i] != u8::MAX {
+            out[i] += 1;
+            out.truncate(i + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LowerBound {
+    Exclusive(Vec<u8>),
+    Inclusive(Vec<u8>),
+}
+
+impl LowerBound {
+    #[inline]
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Exclusive(bound) | Self::Inclusive(bound) => bound,
+        }
+    }
+
+    #[inline]
+    fn allows(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Exclusive(bound) => key > bound.as_slice(),
+            Self::Inclusive(bound) => key >= bound.as_slice(),
+        }
+    }
+}
+
+enum InitResult {
+    Ready,
+    Empty,
+    Restart,
+}
+
+enum RangeAdvance {
+    Entry(RangeEntry),
+    Done,
+    Restart,
+}
+
+enum LeafAction {
+    Skip,
+    Done,
+    Key { key: Vec<u8>, value: Vec<u8> },
+    CommonPrefix(Vec<u8>),
+}
+
+enum SeekStart {
+    None,
+    Empty,
+    Key(Vec<u8>),
+}
+
+enum SeekRelation {
+    Seeking,
+    Min,
+    Skip,
+}
+
+enum SegmentRelation {
+    Continue,
+    Min,
+    Skip,
 }
 
 impl Iterator for RangeIter {
     type Item = Result<RangeEntry>;
 
     fn next(&mut self) -> Option<Result<RangeEntry>> {
-        if self.terminated {
-            return None;
-        }
-        let maintenance_gate = Arc::clone(&self.maintenance_gate);
-        let _maintenance = maintenance_gate.enter_shared();
-        if !self.initialized {
-            if let Err(e) = self.init_descent() {
-                self.terminated = true;
-                return Some(Err(e));
-            }
-            self.initialized = true;
-            if self.stack.is_empty() {
-                self.terminated = true;
+        'restart: loop {
+            if self.terminated {
                 return None;
             }
-        }
-        loop {
-            match self.advance_to_next_leaf() {
-                Ok(None) => {
+            let maintenance_gate = Arc::clone(&self.maintenance_gate);
+            let _maintenance = maintenance_gate.enter_shared();
+            if !self.initialized {
+                match self.init_descent() {
+                    Ok(InitResult::Ready) => {
+                        self.initialized = true;
+                    }
+                    Ok(InitResult::Empty) => {
+                        self.terminated = true;
+                        return None;
+                    }
+                    Ok(InitResult::Restart) => {
+                        self.restart_cursor();
+                        continue 'restart;
+                    }
+                    Err(e) => {
+                        self.terminated = true;
+                        return Some(Err(e));
+                    }
+                }
+            }
+            match self.advance_to_next_entry() {
+                Ok(RangeAdvance::Done) => {
                     self.terminated = true;
                     return None;
                 }
+                Ok(RangeAdvance::Restart) => {
+                    self.restart_cursor();
+                }
+                Ok(RangeAdvance::Entry(entry)) => return Some(Ok(entry)),
                 Err(e) => {
                     self.terminated = true;
                     return Some(Err(e));
-                }
-                Ok(Some((user_key, value))) => {
-                    // Defensive: the anchor descent guarantees this,
-                    // but a concurrent rename could in principle
-                    // surface a key outside our prefix; drop it.
-                    if !user_key.starts_with(&self.prefix) {
-                        continue;
-                    }
-                    if let Some(after) = &self.start_after {
-                        if user_key.as_slice() <= after.as_slice() {
-                            continue;
-                        }
-                    }
-                    if let Some(d) = self.delimiter {
-                        let rest = &user_key[self.prefix.len()..];
-                        if let Some(idx) = simd::find_byte(rest, d, 0) {
-                            let common: Vec<u8> = user_key[..=self.prefix.len() + idx].to_vec();
-                            if self.last_common_prefix.as_deref() == Some(common.as_slice()) {
-                                // Defensive dedup: fast-forward below
-                                // skips most repeats, but a `Prefix`
-                                // node whose bytes span the delimiter
-                                // can over-pop the ascent and re-enter
-                                // the same rollup. The dedup catches
-                                // those.
-                                continue;
-                            }
-                            self.last_common_prefix = Some(common.clone());
-                            // Fast-forward past `common`'s subtree.
-                            // Ascend the descent stack while
-                            // `curr_key` still extends into the
-                            // rolled-up region; each pop trims its
-                            // `pushed_bytes`. The top frame's cursor
-                            // is already positioned past the byte
-                            // that led into `common` (descend always
-                            // advances the parent cursor before
-                            // pushing a child), so the natural
-                            // advance loop on the next `next()` call
-                            // picks the next sibling and skips the
-                            // whole subtree — `O(leaves_under_rollup)`
-                            // dedup-scans collapse to `O(stack_pops)`.
-                            let common_len = common.len();
-                            while self.curr_key.len() > common_len
-                                && self.stack.len() > self.anchor_depth
-                            {
-                                self.pop_frame();
-                            }
-                            return Some(Ok(RangeEntry::CommonPrefix(common)));
-                        }
-                        // No delimiter in `rest` — emit as key and
-                        // reset the rollup dedup tracker.
-                        self.last_common_prefix = None;
-                    }
-                    return Some(Ok(RangeEntry::Key {
-                        key: user_key,
-                        value,
-                    }));
                 }
             }
         }
@@ -323,218 +392,260 @@ impl Iterator for RangeIter {
 }
 
 impl RangeIter {
-    fn init_descent(&mut self) -> Result<()> {
+    fn init_descent(&mut self) -> Result<InitResult> {
+        let seek_start = self.effective_seek_start();
+        if matches!(seek_start, SeekStart::Empty) {
+            return Ok(InitResult::Empty);
+        }
+
         // Seed the stack with the root blob's root slot.
         let root_pin = self.bm.pin(self.root_guid)?;
-        let (root_slot, root_ntype) = {
+        let (root_slot, root_ntype, root_version) = {
             let guard = root_pin.read();
+            let version = root_pin.content_version();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let slot = frame.header().root_slot;
-            (slot, ntype_of(frame, slot)?)
+            (slot, ntype_of(frame, slot)?, version)
         };
         self.stack.push(Frame {
             pin: root_pin,
             blob_guid: self.root_guid,
             slot: root_slot,
             ntype: root_ntype,
+            version: root_version,
             next: 0,
             pushed_bytes: 0,
         });
 
-        // Walk the prefix one byte / segment at a time.
-        while self.curr_key.len() < self.prefix.len() {
-            let top_ntype = self.stack.last().expect("stack non-empty").ntype;
-            match top_ntype {
-                NodeType::Prefix => {
-                    if !self.descend_prefix_for_anchor()? {
-                        self.stack.clear();
-                        return Ok(());
-                    }
-                }
-                NodeType::Blob => {
-                    if !self.descend_blob_for_anchor()? {
-                        self.stack.clear();
-                        return Ok(());
-                    }
-                }
-                NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-                    let need = self.prefix[self.curr_key.len()];
-                    if !self.descend_inner_for_anchor(need)? {
-                        self.stack.clear();
-                        return Ok(());
-                    }
-                }
-                NodeType::Leaf => {
-                    // Leaf reached mid-prefix: check if its full
-                    // key satisfies the user prefix; if yes, anchor
-                    // here, else empty result.
-                    let matches_prefix = {
-                        let top = self.stack.last().unwrap();
-                        let guard = top.pin.read();
-                        let frame = BlobFrameRef::wrap(guard.as_slice());
-                        let (stored_key, _leaf) = read_leaf_key_ref(frame, top.slot)?;
-                        let user_key: &[u8] = if stored_key.last() == Some(&0) {
-                            &stored_key[..stored_key.len() - 1]
-                        } else {
-                            stored_key
-                        };
-                        user_key.starts_with(&self.prefix)
-                    };
-                    if !matches_prefix {
-                        self.stack.clear();
-                        return Ok(());
-                    }
-                    break;
-                }
-                NodeType::EmptyRoot | NodeType::Invalid => {
-                    self.stack.clear();
-                    return Ok(());
-                }
+        // Full-tree lower-bound cursor. Prefix filtering happens at
+        // the leaf boundary and stops at the first key beyond the
+        // prefix range, so restarts can jump straight to the last
+        // emitted marker instead of re-walking the prefix subtree.
+        self.cursor_floor = self.stack.len();
+        match seek_start {
+            SeekStart::None => Ok(InitResult::Ready),
+            SeekStart::Empty => unreachable!("handled before root pin"),
+            SeekStart::Key(target) => self.seek_to_lower_bound(&target),
+        }
+    }
+
+    fn effective_seek_start(&self) -> SeekStart {
+        let Some(bound) = self.lower_bound.as_ref() else {
+            if self.prefix.is_empty() {
+                return SeekStart::None;
+            }
+            return SeekStart::Key(self.prefix.clone());
+        };
+        let bound_key = bound.key();
+        if self.prefix.is_empty() {
+            return SeekStart::Key(bound_key.to_vec());
+        }
+        if bound_key < self.prefix.as_slice() {
+            return SeekStart::Key(self.prefix.clone());
+        }
+        if let Some(upper) = prefix_successor(&self.prefix) {
+            if bound_key >= upper.as_slice() {
+                return SeekStart::Empty;
             }
         }
-        self.anchor_depth = self.stack.len();
-        Ok(())
+        SeekStart::Key(bound_key.to_vec())
     }
 
-    /// Descend a `Prefix` node during the anchor walk. Returns
-    /// `true` if descent succeeded (anchor walk continues), `false`
-    /// if the stored prefix bytes mismatch the user prefix
-    /// (iterator is empty).
-    fn descend_prefix_for_anchor(&mut self) -> Result<bool> {
-        let (child_slot, p_bytes) = {
-            let top = self.stack.last().expect("stack non-empty");
-            let guard = top.pin.read();
-            let frame = BlobFrameRef::wrap(guard.as_slice());
-            let p = read_prefix(frame, top.slot)?;
-            let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-            (p.child as u16, InlinePrefix::from_slice(&p.bytes[..plen]))
-        };
-        let p_bytes = p_bytes.as_slice();
-        let remaining = &self.prefix[self.curr_key.len()..];
-        let cmp_len = p_bytes.len().min(remaining.len());
-        if p_bytes[..cmp_len] != remaining[..cmp_len] {
-            return Ok(false);
-        }
-        let (top_pin, top_blob_guid) = {
-            let top = self.stack.last().expect("stack non-empty");
-            (top.pin.clone(), top.blob_guid)
-        };
-        self.stack.last_mut().unwrap().next = 1;
-        self.curr_key.extend_from_slice(p_bytes);
-        let child_ntype = {
-            let guard = top_pin.read();
-            ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
-        };
-        let pushed = p_bytes.len() as u16;
-        self.stack.push(Frame {
-            pin: top_pin,
-            blob_guid: top_blob_guid,
-            slot: child_slot,
-            ntype: child_ntype,
-            next: 0,
-            pushed_bytes: pushed,
-        });
-        Ok(true)
-    }
-
-    fn descend_blob_for_anchor(&mut self) -> Result<bool> {
-        let (child_guid, p_bytes) = {
-            let top = self.stack.last().expect("stack non-empty");
-            let guard = top.pin.read();
-            let frame = BlobFrameRef::wrap(guard.as_slice());
-            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt(
-                "range::descend_blob_for_anchor: body resolution",
-            ))?;
-            let b = cast::<BlobNode>(body);
-            let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
-            (
-                b.child_blob_guid,
-                InlinePrefix::from_slice(&b.bytes[..plen]),
-            )
-        };
-        let p_bytes = p_bytes.as_slice();
-        let remaining = &self.prefix[self.curr_key.len()..];
-        let cmp_len = p_bytes.len().min(remaining.len());
-        if !p_bytes.is_empty() && p_bytes[..cmp_len] != remaining[..cmp_len] {
-            return Ok(false);
-        }
-        self.stack.last_mut().unwrap().next = 1;
-        self.curr_key.extend_from_slice(p_bytes);
-        let child_pin = self.bm.pin(child_guid)?;
-        let (child_slot, child_ntype) = {
-            let guard = child_pin.read();
-            let frame = BlobFrameRef::wrap(guard.as_slice());
-            let child_slot = frame.header().root_slot;
-            (child_slot, ntype_of(frame, child_slot)?)
-        };
-        let pushed = p_bytes.len() as u16;
-        self.stack.push(Frame {
-            pin: child_pin,
-            blob_guid: child_guid,
-            slot: child_slot,
-            ntype: child_ntype,
-            next: 0,
-            pushed_bytes: pushed,
-        });
-        Ok(true)
-    }
-
-    fn descend_inner_for_anchor(&mut self, need: u8) -> Result<bool> {
-        // Find the child for `need`; if absent, anchor walk fails.
-        let (top_pin, top_blob_guid, top_slot, top_ntype, child_slot, cursor_after) = {
-            let top = self.stack.last().expect("stack non-empty");
-            let guard = top.pin.read();
-            let frame = BlobFrameRef::wrap(guard.as_slice());
-            let Some((slot, cursor)) =
-                find_inner_child_and_cursor(frame, top.slot, top.ntype, need)?
-            else {
-                return Ok(false);
-            };
-            (
-                top.pin.clone(),
-                top.blob_guid,
-                top.slot,
-                top.ntype,
-                slot,
-                cursor,
-            )
-        };
-        let _ = (top_slot, top_ntype); // for borrow-scope clarity
-        self.stack.last_mut().unwrap().next = cursor_after;
-        self.curr_key.push(need);
-        let child_ntype = {
-            let guard = top_pin.read();
-            ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
-        };
-        self.stack.push(Frame {
-            pin: top_pin,
-            blob_guid: top_blob_guid,
-            slot: child_slot,
-            ntype: child_ntype,
-            next: 0,
-            pushed_bytes: 1,
-        });
-        Ok(true)
-    }
-
-    #[allow(clippy::too_many_lines)] // single match over six NodeType variants — splitting hides the loop shape
-    fn advance_to_next_leaf(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    #[allow(clippy::too_many_lines)] // one cursor-state machine over every ART node kind
+    fn seek_to_lower_bound(&mut self, target: &[u8]) -> Result<InitResult> {
         loop {
-            // Anchor stop: dropping below the anchor depth means we
-            // would walk siblings outside the prefix subtree.
-            if self.stack.len() < self.anchor_depth {
-                return Ok(None);
+            if self.stack.len() < self.cursor_floor {
+                self.stack.clear();
+                return Ok(InitResult::Empty);
             }
-            let Some(top) = self.stack.last_mut() else {
-                return Ok(None);
+            let Some(top) = self.stack.last() else {
+                return Ok(InitResult::Empty);
             };
             let top_ntype = top.ntype;
             match top_ntype {
                 NodeType::Leaf => {
-                    if top.next == 0 {
-                        top.next = 1;
-                        let kv = {
+                    let idx = self.stack.len() - 1;
+                    if self.stack[idx].next == 0 {
+                        let is_candidate = {
+                            let top = &self.stack[idx];
                             let guard = top.pin.read();
+                            if top.pin.content_version() != top.version {
+                                return Ok(InitResult::Restart);
+                            }
+                            let frame = BlobFrameRef::wrap(guard.as_slice());
+                            let (stored_key, _leaf) = read_leaf_key_ref(frame, top.slot)?;
+                            let user_key: &[u8] = if stored_key.last() == Some(&0) {
+                                &stored_key[..stored_key.len() - 1]
+                            } else {
+                                stored_key
+                            };
+                            user_key >= target
+                        };
+                        if is_candidate {
+                            return Ok(InitResult::Ready);
+                        }
+                    }
+                    self.pop_frame();
+                }
+                NodeType::EmptyRoot | NodeType::Invalid => {
+                    self.pop_frame();
+                }
+                NodeType::Prefix => {
+                    let idx = self.stack.len() - 1;
+                    if self.stack[idx].next != 0 {
+                        self.pop_frame();
+                        continue;
+                    }
+                    let top_pin = self.stack[idx].pin.clone();
+                    let top_blob_guid = self.stack[idx].blob_guid;
+                    let (child_slot, child_ntype, p_bytes, version) = {
+                        let top = &self.stack[idx];
+                        let guard = top_pin.read();
+                        let version = top_pin.content_version();
+                        if version != top.version {
+                            return Ok(InitResult::Restart);
+                        }
+                        let frame = BlobFrameRef::wrap(guard.as_slice());
+                        let p = read_prefix(frame, top.slot)?;
+                        let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
+                        let child_slot = p.child as u16;
+                        (
+                            child_slot,
+                            ntype_of(frame, child_slot)?,
+                            InlinePrefix::from_slice(&p.bytes[..plen]),
+                            version,
+                        )
+                    };
+                    match segment_seek_relation(&self.curr_key, p_bytes.as_slice(), target) {
+                        SegmentRelation::Skip => {
+                            self.stack[idx].next = 1;
+                            self.pop_frame();
+                        }
+                        SegmentRelation::Continue | SegmentRelation::Min => {
+                            self.stack[idx].next = 1;
+                            self.push_within_blob(
+                                top_pin,
+                                top_blob_guid,
+                                child_slot,
+                                child_ntype,
+                                version,
+                                p_bytes.as_slice(),
+                            );
+                        }
+                    }
+                }
+                NodeType::Blob => {
+                    let idx = self.stack.len() - 1;
+                    if self.stack[idx].next != 0 {
+                        self.pop_frame();
+                        continue;
+                    }
+                    let (child_guid, p_bytes) = {
+                        let top = &self.stack[idx];
+                        let guard = top.pin.read();
+                        if top.pin.content_version() != top.version {
+                            return Ok(InitResult::Restart);
+                        }
+                        let frame = BlobFrameRef::wrap(guard.as_slice());
+                        let body = frame
+                            .body_of_slot(top.slot)
+                            .ok_or(Error::node_corrupt("range::seek: BlobNode body resolution"))?;
+                        let b = cast::<BlobNode>(body);
+                        let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
+                        (
+                            b.child_blob_guid,
+                            InlinePrefix::from_slice(&b.bytes[..plen]),
+                        )
+                    };
+                    match segment_seek_relation(&self.curr_key, p_bytes.as_slice(), target) {
+                        SegmentRelation::Skip => {
+                            self.stack[idx].next = 1;
+                            self.pop_frame();
+                        }
+                        SegmentRelation::Continue | SegmentRelation::Min => {
+                            self.stack[idx].next = 1;
+                            self.push_in_other_blob(child_guid, p_bytes.as_slice())?;
+                        }
+                    }
+                }
+                NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
+                    let idx = self.stack.len() - 1;
+                    let relation = path_seek_relation(&self.curr_key, target);
+                    let min_byte = match relation {
+                        SeekRelation::Skip => {
+                            self.pop_frame();
+                            continue;
+                        }
+                        SeekRelation::Min => None,
+                        SeekRelation::Seeking => Some(target[self.curr_key.len()]),
+                    };
+                    let top_pin = self.stack[idx].pin.clone();
+                    let top_blob_guid = self.stack[idx].blob_guid;
+                    let result = {
+                        let top = &self.stack[idx];
+                        let guard = top_pin.read();
+                        let version = top_pin.content_version();
+                        if version != top.version {
+                            return Ok(InitResult::Restart);
+                        }
+                        let frame = BlobFrameRef::wrap(guard.as_slice());
+                        let result =
+                            next_inner_child_ge(frame, top.slot, top_ntype, top.next, min_byte)?;
+                        match result {
+                            Some((byte, child_slot, next_cursor)) => Some((
+                                byte,
+                                child_slot,
+                                ntype_of(frame, child_slot)?,
+                                next_cursor,
+                                version,
+                            )),
+                            None => None,
+                        }
+                    };
+                    match result {
+                        None => self.pop_frame(),
+                        Some((byte, child_slot, child_ntype, next_cursor, version)) => {
+                            self.stack[idx].next = next_cursor;
+                            self.curr_key.push(byte);
+                            self.stack.push(Frame {
+                                pin: top_pin,
+                                blob_guid: top_blob_guid,
+                                slot: child_slot,
+                                ntype: child_ntype,
+                                version,
+                                next: 0,
+                                pushed_bytes: 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // single match over six NodeType variants — splitting hides the loop shape
+    fn advance_to_next_entry(&mut self) -> Result<RangeAdvance> {
+        loop {
+            // Cursor stop: dropping below the rooted cursor means
+            // the walk is exhausted.
+            if self.stack.len() < self.cursor_floor {
+                return Ok(RangeAdvance::Done);
+            }
+            let Some(top) = self.stack.last() else {
+                return Ok(RangeAdvance::Done);
+            };
+            let top_ntype = top.ntype;
+            match top_ntype {
+                NodeType::Leaf => {
+                    let idx = self.stack.len() - 1;
+                    if self.stack[idx].next == 0 {
+                        self.stack[idx].next = 1;
+                        let kv = {
+                            let top = &self.stack[idx];
+                            let guard = top.pin.read();
+                            if top.pin.content_version() != top.version {
+                                return Ok(RangeAdvance::Restart);
+                            }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
                             // Soft-deleted leaves stay physically in
                             // the slot table (and their key/value
@@ -543,10 +654,57 @@ impl RangeIter {
                             // iteration must skip them so a leaf
                             // that was erased between snapshot and
                             // iteration isn't emitted.
-                            read_range_leaf_kv(frame, top.slot)?
+                            project_range_leaf(
+                                frame,
+                                top.slot,
+                                &self.prefix,
+                                self.lower_bound.as_ref(),
+                                self.delimiter,
+                                self.last_common_prefix.as_deref(),
+                            )?
                         };
-                        if let Some((key, value)) = kv {
-                            return Ok(Some((key, value)));
+                        match kv {
+                            LeafAction::Skip => {}
+                            LeafAction::Done => return Ok(RangeAdvance::Done),
+                            LeafAction::Key { key, value } => {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                self.lower_bound = Some(LowerBound::Exclusive(key.clone()));
+                                self.last_common_prefix = None;
+                                return Ok(RangeAdvance::Entry(RangeEntry::Key { key, value }));
+                            }
+                            LeafAction::CommonPrefix(common) => {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                self.last_common_prefix = Some(common.clone());
+                                // Fast-forward past `common`'s subtree.
+                                // Ascend the descent stack while
+                                // `curr_key` still extends into the
+                                // rolled-up region; each pop trims its
+                                // `pushed_bytes`. The top frame's cursor
+                                // is already positioned past the byte
+                                // that led into `common` (descend always
+                                // advances the parent cursor before
+                                // pushing a child), so the natural
+                                // advance loop on the next `next()` call
+                                // picks the next sibling and skips the
+                                // whole subtree — `O(leaves_under_rollup)`
+                                // dedup-scans collapse to `O(stack_pops)`.
+                                let common_len = common.len();
+                                while self.curr_key.len() > common_len
+                                    && self.stack.len() > self.cursor_floor
+                                {
+                                    self.pop_frame();
+                                }
+                                if let Some(next) = prefix_successor(&common) {
+                                    self.lower_bound = Some(LowerBound::Inclusive(next));
+                                } else {
+                                    self.terminated = true;
+                                }
+                                return Ok(RangeAdvance::Entry(RangeEntry::CommonPrefix(common)));
+                            }
                         }
                         // Tombstoned — fall through to pop_frame and
                         // resume scanning.
@@ -557,31 +715,50 @@ impl RangeIter {
                     self.pop_frame();
                 }
                 NodeType::Prefix => {
-                    if top.next == 0 {
-                        top.next = 1;
-                        let (top_pin, top_blob_guid) = (top.pin.clone(), top.blob_guid);
-                        let (child_slot, p_bytes) = {
+                    let idx = self.stack.len() - 1;
+                    if self.stack[idx].next == 0 {
+                        let top_pin = self.stack[idx].pin.clone();
+                        let top_blob_guid = self.stack[idx].blob_guid;
+                        let (child_slot, child_ntype, p_bytes, version) = {
+                            let top = &self.stack[idx];
                             let guard = top_pin.read();
+                            let version = top_pin.content_version();
+                            if version != top.version {
+                                return Ok(RangeAdvance::Restart);
+                            }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
                             let p = read_prefix(frame, top.slot)?;
                             let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-                            (p.child as u16, InlinePrefix::from_slice(&p.bytes[..plen]))
+                            let child_slot = p.child as u16;
+                            (
+                                child_slot,
+                                ntype_of(frame, child_slot)?,
+                                InlinePrefix::from_slice(&p.bytes[..plen]),
+                                version,
+                            )
                         };
+                        self.stack[idx].next = 1;
                         self.push_within_blob(
                             top_pin,
                             top_blob_guid,
                             child_slot,
+                            child_ntype,
+                            version,
                             p_bytes.as_slice(),
-                        )?;
+                        );
                     } else {
                         self.pop_frame();
                     }
                 }
                 NodeType::Blob => {
-                    if top.next == 0 {
-                        top.next = 1;
+                    let idx = self.stack.len() - 1;
+                    if self.stack[idx].next == 0 {
                         let (child_guid, p_bytes) = {
+                            let top = &self.stack[idx];
                             let guard = top.pin.read();
+                            if top.pin.content_version() != top.version {
+                                return Ok(RangeAdvance::Restart);
+                            }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
                             let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt(
                                 "range::advance: BlobNode body resolution",
@@ -593,33 +770,47 @@ impl RangeIter {
                                 InlinePrefix::from_slice(&b.bytes[..plen]),
                             )
                         };
+                        self.stack[idx].next = 1;
                         self.push_in_other_blob(child_guid, p_bytes.as_slice())?;
                     } else {
                         self.pop_frame();
                     }
                 }
                 NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-                    let (top_pin, top_blob_guid, top_slot, cursor) =
-                        (top.pin.clone(), top.blob_guid, top.slot, top.next);
+                    let idx = self.stack.len() - 1;
+                    let top_pin = self.stack[idx].pin.clone();
+                    let top_blob_guid = self.stack[idx].blob_guid;
                     let result = {
+                        let top = &self.stack[idx];
                         let guard = top_pin.read();
+                        let version = top_pin.content_version();
+                        if version != top.version {
+                            return Ok(RangeAdvance::Restart);
+                        }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
-                        next_inner_child_from(frame, top_slot, top_ntype, cursor)?
+                        let result = next_inner_child_from(frame, top.slot, top_ntype, top.next)?;
+                        match result {
+                            Some((byte, child_slot, next_cursor)) => Some((
+                                byte,
+                                child_slot,
+                                ntype_of(frame, child_slot)?,
+                                next_cursor,
+                                version,
+                            )),
+                            None => None,
+                        }
                     };
                     match result {
                         None => self.pop_frame(),
-                        Some((byte, child_slot, next_cursor)) => {
-                            self.stack.last_mut().unwrap().next = next_cursor;
-                            let child_ntype = {
-                                let guard = top_pin.read();
-                                ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
-                            };
+                        Some((byte, child_slot, child_ntype, next_cursor, version)) => {
+                            self.stack[idx].next = next_cursor;
                             self.curr_key.push(byte);
                             self.stack.push(Frame {
                                 pin: top_pin,
                                 blob_guid: top_blob_guid,
                                 slot: child_slot,
                                 ntype: child_ntype,
+                                version,
                                 next: 0,
                                 pushed_bytes: 1,
                             });
@@ -635,31 +826,30 @@ impl RangeIter {
         pin: Arc<CachedBlob>,
         blob_guid: BlobGuid,
         child_slot: u16,
+        child_ntype: NodeType,
+        version: u64,
         prefix_bytes: &[u8],
-    ) -> Result<()> {
-        let child_ntype = {
-            let guard = pin.read();
-            ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
-        };
+    ) {
         self.curr_key.extend_from_slice(prefix_bytes);
         self.stack.push(Frame {
             pin,
             blob_guid,
             slot: child_slot,
             ntype: child_ntype,
+            version,
             next: 0,
             pushed_bytes: prefix_bytes.len() as u16,
         });
-        Ok(())
     }
 
     fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<()> {
         let child_pin = self.bm.pin(child_guid)?;
-        let (child_slot, child_ntype) = {
+        let (child_slot, child_ntype, child_version) = {
             let guard = child_pin.read();
+            let version = child_pin.content_version();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let child_slot = frame.header().root_slot;
-            (child_slot, ntype_of(frame, child_slot)?)
+            (child_slot, ntype_of(frame, child_slot)?, version)
         };
         self.curr_key.extend_from_slice(prefix_bytes);
         self.stack.push(Frame {
@@ -667,10 +857,27 @@ impl RangeIter {
             blob_guid: child_guid,
             slot: child_slot,
             ntype: child_ntype,
+            version: child_version,
             next: 0,
             pushed_bytes: prefix_bytes.len() as u16,
         });
         Ok(())
+    }
+
+    fn path_is_still_valid(&self) -> bool {
+        self.stack.iter().all(|frame| {
+            let _guard = frame.pin.read();
+            frame.pin.content_version() == frame.version
+        })
+    }
+
+    fn restart_cursor(&mut self) {
+        self.bm.note_range_restart();
+        self.stack.clear();
+        self.curr_key.clear();
+        self.cursor_floor = 0;
+        self.last_common_prefix = None;
+        self.initialized = false;
     }
 
     fn pop_frame(&mut self) {
@@ -680,64 +887,102 @@ impl RangeIter {
     }
 }
 
-/// Look up `byte` in the inner node at `slot`. Returns
-/// `Some((child_slot, cursor_after_byte))` if found — `cursor_after_byte`
-/// is the cursor value that, plugged back into `next_inner_child_from`,
-/// would skip past this child.
-fn find_inner_child_and_cursor(
+fn path_seek_relation(path: &[u8], target: &[u8]) -> SeekRelation {
+    if target.starts_with(path) && path.len() < target.len() {
+        SeekRelation::Seeking
+    } else if path >= target {
+        SeekRelation::Min
+    } else {
+        SeekRelation::Skip
+    }
+}
+
+fn segment_seek_relation(path: &[u8], segment: &[u8], target: &[u8]) -> SegmentRelation {
+    match path_seek_relation(path, target) {
+        SeekRelation::Skip => SegmentRelation::Skip,
+        SeekRelation::Min => SegmentRelation::Min,
+        SeekRelation::Seeking => {
+            let remaining = &target[path.len()..];
+            let common = segment.len().min(remaining.len());
+            for i in 0..common {
+                match segment[i].cmp(&remaining[i]) {
+                    std::cmp::Ordering::Less => return SegmentRelation::Skip,
+                    std::cmp::Ordering::Greater => return SegmentRelation::Min,
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            if segment.len() < remaining.len() {
+                SegmentRelation::Continue
+            } else {
+                SegmentRelation::Min
+            }
+        }
+    }
+}
+
+/// Given the inner node at `slot` and a cursor `from`, return the
+/// next `(byte, child_slot, cursor_after)` whose branch byte is at
+/// least `min_byte` when present. `None` means "the minimum child".
+fn next_inner_child_ge(
     frame: BlobFrameRef<'_>,
     slot: u16,
     ntype: NodeType,
-    byte: u8,
-) -> Result<Option<(u16, u16)>> {
+    from: u16,
+    min_byte: Option<u8>,
+) -> Result<Option<(u8, u16, u16)>> {
     match ntype {
         NodeType::Node4 => {
             let n = read_node4(frame, slot)?;
             let count = (n.count as usize).min(4);
-            for i in 0..count {
-                if n.keys[i] == byte {
-                    return Ok(Some((n.children[i] as u16, (i + 1) as u16)));
-                }
-                if n.keys[i] > byte {
-                    return Ok(None);
+            let start = (from as usize).min(count);
+            let min = min_byte.unwrap_or(0);
+            for i in start..count {
+                if n.keys[i] >= min {
+                    return Ok(Some((n.keys[i], n.children[i] as u16, (i + 1) as u16)));
                 }
             }
             Ok(None)
         }
         NodeType::Node16 => {
             let n = read_node16(frame, slot)?;
-            // SIMD lookup over the 16-key array; Node16 sorts its
-            // keys so a single positive hit replaces the
-            // scalar-loop + ordered-early-out idiom.
-            match simd::node16_find_byte(&n.keys, n.count, byte) {
-                Some(i) => Ok(Some((n.children[i as usize] as u16, u16::from(i) + 1))),
-                None => Ok(None),
+            let count = (n.count as usize).min(16);
+            let start = (from as usize).min(count);
+            let min = min_byte.unwrap_or(0);
+            for i in start..count {
+                if n.keys[i] >= min {
+                    return Ok(Some((n.keys[i], n.children[i] as u16, (i + 1) as u16)));
+                }
             }
+            Ok(None)
         }
         NodeType::Node48 => {
             let n = read_node48(frame, slot)?;
-            let idx = n.index[byte as usize];
-            if idx == 0 {
+            let min = min_byte.map_or(0, usize::from);
+            let start = (from as usize).max(min).min(256);
+            let Some(b) = simd::find_next_nonzero_byte(&n.index, start) else {
                 return Ok(None);
-            }
+            };
+            let idx = n.index[b];
             let ci = idx as usize - 1;
             if ci >= 48 {
                 return Err(Error::node_corrupt(
-                    "range::find_inner_child: Node48 index out of range",
+                    "range::next_inner_child_ge: Node48 index out of range",
                 ));
             }
-            Ok(Some((n.children[ci] as u16, u16::from(byte) + 1)))
+            Ok(Some((b as u8, n.children[ci] as u16, (b + 1) as u16)))
         }
         NodeType::Node256 => {
             let n = read_node256(frame, slot)?;
-            let s = n.children[byte as usize];
-            if s == 0 {
+            let min = min_byte.map_or(0, usize::from);
+            let start = (from as usize).max(min).min(256);
+            let Some(b) = simd::find_next_nonzero_u32(&n.children, start) else {
                 return Ok(None);
-            }
-            Ok(Some((s as u16, u16::from(byte) + 1)))
+            };
+            let s = n.children[b];
+            Ok(Some((b as u8, s as u16, (b + 1) as u16)))
         }
         _ => Err(Error::node_corrupt(
-            "range::find_inner_child: not an inner node",
+            "range::next_inner_child_ge: not an inner node",
         )),
     }
 }

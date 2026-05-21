@@ -37,6 +37,12 @@ operation stream.
   persistent / WAL-on measurements. They model "durable to OS page
   cache, not per-op fsync" semantics, with each engine's cache
   allowed to stay warm. They are not cold-reopen I/O numbers.
+- **Coverage**: the 20 k point-operation tables include both
+  memory/no-WAL and hot persistent/WAL-on rows. Plain prefix
+  `list` also has hot persistent rows. The current
+  `metadata_mix`, create/delete, rename, delimiter `list_dir`, and
+  20 k→2 M scale-curve groups are memory/no-WAL unless explicitly
+  labeled `hot persist`.
 
 ## Workloads
 
@@ -52,7 +58,10 @@ weighted metadata mix.
 
 ## Headline
 
-Holt is strongest where the workload is actually metadata-shaped:
+Holt is strongest where the workload is actually metadata-shaped.
+The headline metadata-native numbers below are memory/no-WAL
+operation-semantics measurements; hot persistent point-op and
+plain-list rows are reported in the tables that follow.
 
 - `objstore_metadata_mix`: **2.251 us** vs RocksDB **98.064 us**
   and SQLite **66.394 us**.

@@ -339,6 +339,7 @@ pub struct BufferManager {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     optimistic_restarts: AtomicU64,
+    range_restarts: AtomicU64,
     walker_ops: AtomicU64,
     walker_blob_hops: AtomicU64,
     max_blob_hops: AtomicU64,
@@ -596,6 +597,7 @@ impl BufferManager {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             optimistic_restarts: AtomicU64::new(0),
+            range_restarts: AtomicU64::new(0),
             walker_ops: AtomicU64::new(0),
             walker_blob_hops: AtomicU64::new(0),
             max_blob_hops: AtomicU64::new(0),
@@ -697,6 +699,19 @@ impl BufferManager {
     /// lookup walker on `validate()` failure.
     pub(crate) fn note_optimistic_restart(&self) {
         self.optimistic_restarts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative range-iterator cursor restarts. Bumped when a
+    /// versioned range cursor detects that a writer rewrote a blob
+    /// on its descent path and must rebuild from its monotonic
+    /// lower bound.
+    #[must_use]
+    pub fn range_restarts(&self) -> u64 {
+        self.range_restarts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_range_restart(&self) {
+        self.range_restarts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Cumulative mutation walker calls (`insert_multi` /

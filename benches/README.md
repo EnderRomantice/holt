@@ -23,7 +23,7 @@ The `objstore` + `fs` scenarios additionally run
 **metadata-native** operations — the common operations that a
 metadata engine actually serves beyond blind point overwrite:
 
-- `*_list` — prefix-anchored range scan, `take(100)` entries
+- `*_list` — marker-aware prefix range scan, `take(100)` entries
 - `*_list_dir` — S3-style delimiter rollup, take 8 distinct
   `CommonPrefix` entries (holt does the dedup in the engine;
   RocksDB + SQLite get the same logic done at the bench's app
@@ -143,72 +143,40 @@ Pick the engine that matches your **key shape**. holt is for
 hierarchical, prefix-rich keys; if your keys are random bytes
 (hashes, UUIDs without a path prefix), reach for RocksDB / SQLite.
 
-### Sample numbers — Linux v0.3 release run
+## Results
 
-These are from the v0.3 Linux release run (`c2-standard-8`,
-Rust 1.95.0, `--features io-uring`). **Full-suite comparison
-results, including the 2 M scale curve, live in
-[`RESULTS.md`](RESULTS.md)**. Re-run on your hardware before
-quoting absolute numbers; the relative ordering is the
-load-bearing observation.
+This README defines the workload surface and methodology only.
+Concrete release numbers live in [`RESULTS.md`](RESULTS.md), so
+there is one source of truth for quoted performance data.
 
-**Point lookup (memory mode), N=20 000:**
+When reading those results, keep the profiles separate:
 
-| Scenario | holt | RocksDB | SQLite | holt vs best other |
-|---|---:|---:|---:|---:|
-| `kv_get` (random key) | 272 ns | 749 ns | 920 ns | **2.8× faster** |
-| `objstore_get` (path) | 310 ns | 691 ns | 892 ns | **2.2× faster** |
-| `fs_get` (path) | 374 ns | 700 ns | 885 ns | **1.9× faster** |
+- Memory/no-WAL rows isolate ART/data-structure and
+  metadata-operation semantics.
+- Hot persistent rows use disk-backed engines with WAL enabled and
+  no per-op fsync.
+- The current public harness has persistent rows for point
+  get/put/mixed and plain prefix list. `metadata_mix`,
+  create/delete, rename, delimiter `list_dir`, and the scale curve
+  are memory/no-WAL unless the bench name says `persist`.
 
-**Range scan (memory mode), `take(100)` under an anchored prefix:**
-
-| Scenario | holt | RocksDB | SQLite | holt vs best other |
-|---|---|---|---|---|
-| `objstore_list` (`bucket-05/`, ~625 leaves) | 21.0 µs | 23.8 µs | 32.9 µs | **1.1× faster** |
-| `fs_list` (`/usr/local/share/category-5/`, ~1250 leaves) | 21.8 µs | 24.0 µs | 32.5 µs | **1.1× faster** |
-
-**S3-style delim rollup (memory mode), `take(8)` distinct
-`CommonPrefix` entries:**
-
-| Scenario | holt | RocksDB | SQLite | holt vs best other |
-|---|---|---|---|---|
-| `objstore_list_dir` (8 of 32 buckets) | **4.2 µs** | 638 µs | 584 µs | **139× faster** |
-| `fs_list_dir` (8 of 16 dirs) | **4.9 µs** | 1.316 ms | 1.197 ms | **244× faster** |
-
-**Metadata-native operation mix (memory mode, quick smoke):**
-
-| Scenario | holt | RocksDB | SQLite | holt vs best other |
-|---|---:|---:|---:|---:|
-| `objstore_create_delete` | 473 ns | 1.25 µs | 5.48 µs | **2.6× faster** |
-| `objstore_rename` | 1.96 µs | 4.67 µs | 24.87 µs | **2.4× faster** |
-| `objstore_metadata_mix` | 2.25 µs | 98.06 µs | 66.39 µs | **29× faster** |
-| `fs_create_delete` | 780 ns | 1.26 µs | 5.50 µs | **1.6× faster** |
-| `fs_rename` | 2.53 µs | 4.82 µs | 24.90 µs | **1.9× faster** |
-| `fs_metadata_mix` | 2.46 µs | 162.94 µs | 131.40 µs | **53× faster** |
-
-**Reading the LIST numbers:** plain prefix scans (`*_list`) are
-the bread-and-butter metadata workload — `readdir`, `ListObjects`
-with deep prefix — and holt wins those cleanly. The delimiter
-rollup (`*_list_dir`) is the load-bearing test for S3-style
-listings: holt's `Tree::range` does engine-level `CommonPrefix`
-dedup **and** fast-forwards past a rolled-up subtree once it's
-emitted, so the cost is `O(distinct_rollups)` rather than
-`O(leaves_under_prefix)`. RocksDB and SQLite have no equivalent
-API, so the bench rolls dedup at the app layer; even with a
-tight inner loop they still pay the full leaf-scan cost. v0.2
-fast-forward dropped `*_list_dir` from ~600 µs / ~1.3 ms down
-to single µs.
+Plain prefix scans (`*_list`) model `readdir` / `ListObjects` with
+a bounded prefix range. Delimiter rollup (`*_list_dir`) is the
+S3-style listing test: Holt's `Tree::range` emits
+`RangeEntry::CommonPrefix` inside the engine and fast-forwards past
+the rolled-up subtree; RocksDB and SQLite use generic ordered
+iteration plus app-layer dedup because neither exposes a native
+delimiter-list API.
 
 ## Caveats
 
-1. **Single-threaded latency, not throughput.** Per-blob
-   `HybridLatch` makes reads wait-free; concurrent-read
-   throughput scales with cores, but the public benchmark surface
-   measures single-thread latency.
+1. **Single-threaded latency, not throughput.** Point reads use
+   optimistic per-blob latching; range scans use shared guards plus
+   versioned cursor validation. The public benchmark surface
+   measures single-thread latency, not multi-core throughput.
 2. **No fsync.** Both modes set `sync=off`-equivalent — durable
    to OS page cache only. A real `fsync`-per-op workload is
-   fsync-bound (~1–3 ms on consumer SSD) and overwhelms every
-   engine's algorithm cost.
+   fsync-bound and overwhelms every engine's algorithm cost.
 3. **Delim rollup uses fast-forward in holt only.** Holt's
    `Tree::range` ascends the descent stack past a rolled-up
    subtree after emitting its `CommonPrefix`, so the cost is
@@ -222,6 +190,11 @@ to single µs.
    path-shaped point lookup, metadata-native mixes, and
    delimiter rollup; point put is a smaller win at large scale) is
    the load-bearing observation.
+5. **Range is restart-on-conflict, not MVCC.** `Tree::range`
+   stores blob versions in its cursor path and seeks from the last
+   emitted lower bound if a writer invalidates that path. A long
+   scan can still observe keys committed after iterator creation if
+   they sort after the current cursor.
 
 This bench is the right comparison for **metadata-engine
 workloads** with bounded per-tree dataset and hierarchical keys —

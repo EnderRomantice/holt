@@ -1177,6 +1177,90 @@ fn range_start_after_is_strict_lower_bound() {
 }
 
 #[test]
+fn range_prefix_start_after_before_prefix_seeks_to_prefix() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [
+        &b"doc/readme"[..],
+        b"img/01",
+        b"img/02",
+        b"img/03",
+        b"video/01",
+    ] {
+        tree.put(k, b"v").unwrap();
+    }
+
+    let got = collect_keys(tree.range().prefix(b"img/").start_after(b"aaa"));
+    assert_eq!(
+        got,
+        vec![b"img/01".to_vec(), b"img/02".to_vec(), b"img/03".to_vec()],
+    );
+}
+
+#[test]
+fn range_prefix_start_after_past_prefix_successor_is_empty() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [&b"img/01"[..], b"img/02", b"img/sub/file", b"video/01"] {
+        tree.put(k, b"v").unwrap();
+    }
+
+    let at_successor: Vec<_> = tree
+        .range()
+        .prefix(b"img/")
+        .start_after(b"img0")
+        .into_iter()
+        .collect();
+    assert!(at_successor.is_empty());
+
+    let after_successor: Vec<_> = tree
+        .range()
+        .prefix(b"img/")
+        .start_after(b"video/")
+        .into_iter()
+        .collect();
+    assert!(after_successor.is_empty());
+}
+
+#[test]
+fn range_prefix_start_after_inside_gap_resumes_at_next_key() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [&b"img/01"[..], b"img/02", b"img/03", b"img/04", b"video/1"] {
+        tree.put(k, b"v").unwrap();
+    }
+
+    let got = collect_keys(tree.range().prefix(b"img/").start_after(b"img/02a"));
+    assert_eq!(got, vec![b"img/03".to_vec(), b"img/04".to_vec()]);
+}
+
+#[test]
+fn range_restarts_after_interleaved_insert_without_missing_key() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [b"k00".as_slice(), b"k02", b"k03"] {
+        tree.put(k, b"v").unwrap();
+    }
+
+    let mut iter = tree.range().into_iter();
+    let first = match iter.next().unwrap().unwrap() {
+        RangeEntry::Key { key, .. } => key,
+        other => panic!("unexpected first range entry: {other:?}"),
+    };
+    assert_eq!(first, b"k00".to_vec());
+
+    // Mutates the same blob after the iterator has a live cursor.
+    // The next step must invalidate the old path and restart from
+    // the last emitted key, otherwise a newly inserted key between
+    // k00 and k02 can be skipped.
+    let restarts_before = tree.stats().unwrap().bm_range_restarts;
+    tree.put(b"k01", b"v").unwrap();
+
+    let rest = collect_keys(iter);
+    assert_eq!(
+        rest,
+        vec![b"k01".to_vec(), b"k02".to_vec(), b"k03".to_vec()]
+    );
+    assert!(tree.stats().unwrap().bm_range_restarts > restarts_before);
+}
+
+#[test]
 fn range_delimiter_rolls_up_common_prefixes_with_dedup() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     for k in [
@@ -1214,6 +1298,31 @@ fn range_delimiter_rolls_up_common_prefixes_with_dedup() {
 }
 
 #[test]
+fn range_delimiter_restart_does_not_skip_new_rollup() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"bucket-00/path/file.bin", b"v").unwrap();
+    tree.put(b"bucket-02/path/file.bin", b"v").unwrap();
+
+    let mut iter = tree.range().prefix(b"bucket-").delimiter(b'/').into_iter();
+    let first = match iter.next().unwrap().unwrap() {
+        RangeEntry::CommonPrefix(p) => p,
+        other => panic!("unexpected first range entry: {other:?}"),
+    };
+    assert_eq!(first, b"bucket-00/".to_vec());
+
+    // Insert a rollup that sorts after the emitted prefix but
+    // before the iterator's old cursor. Restart-on-conflict must
+    // rebuild from the prefix successor of bucket-00/ and still
+    // surface bucket-01/.
+    let restarts_before = tree.stats().unwrap().bm_range_restarts;
+    tree.put(b"bucket-01/path/file.bin", b"v").unwrap();
+
+    let rest = collect_keys(iter);
+    assert_eq!(rest, vec![b"bucket-01/".to_vec(), b"bucket-02/".to_vec()]);
+    assert!(tree.stats().unwrap().bm_range_restarts > restarts_before);
+}
+
+#[test]
 fn range_walks_across_blob_crossings() {
     // Force spillover so leaves are split across multiple blobs;
     // the iterator must descend through the BlobNode crossings
@@ -1234,6 +1343,29 @@ fn range_walks_across_blob_crossings() {
     let got = collect_keys(tree.range());
     assert_eq!(got.len(), 256);
     let expected: Vec<Vec<u8>> = (0..256u32)
+        .map(|i| format!("k{i:08}").into_bytes())
+        .collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn range_start_after_seeks_across_blob_crossings() {
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(16)
+        .open()
+        .unwrap();
+    let big = vec![0xCDu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "workload must spill into multiple blobs",
+    );
+
+    let got = collect_keys(tree.range().start_after(b"k00000127"));
+    let expected: Vec<Vec<u8>> = (128..256u32)
         .map(|i| format!("k{i:08}").into_bytes())
         .collect();
     assert_eq!(got, expected);

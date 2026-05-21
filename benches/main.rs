@@ -812,7 +812,7 @@ fn format_n(n: usize) -> String {
 // These are the load-bearing test for the metadata-engine claim:
 // `readdir(dir)` / S3 `LIST ?prefix=foo/&delimiter=/` is the
 // dominant access pattern beyond raw point lookup. holt's
-// `Tree::range` does an anchored descent + sequential leaf walk;
+// `Tree::range` does marker-aware lower-bound seek + sequential leaf walk;
 // RocksDB uses a seek + prefix-bounded iterator; SQLite uses a
 // `WHERE k >= ? AND k < ?` range scan over the B-tree primary key.
 // `kv` (random keys) has no prefix structure, so list benches are

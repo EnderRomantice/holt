@@ -85,6 +85,10 @@ pub struct TreeStats {
     /// snapshot and the lookup walked the tree from scratch.
     /// Spikes here indicate writer/reader contention.
     pub bm_optimistic_restarts: u64,
+    /// Cumulative range-iterator cursor restarts. Each one means a
+    /// range/list cursor detected a rewritten blob on its descent
+    /// path and rebuilt from its monotonic lower bound.
+    pub bm_range_restarts: u64,
     /// Cumulative mutation walker invocations (`insert_multi` /
     /// `erase_multi`). `rename` and `txn` count their inner walker
     /// calls separately.

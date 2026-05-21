@@ -300,10 +300,10 @@ shutdown doesn't get lost.
 
 `Tree::compact` is online with respect to point reads and
 foreground writers through `maintenance_gate`. Range iterators
-remain best-effort snapshots because they keep a traversal stack
-between `next()` calls; callers that need strict iterator
-stability should consume the iterator during an external
-quiescent window.
+keep a versioned traversal stack between `next()` calls. If a
+writer rewrites any blob on that path, the iterator invalidates the
+stack and seeks from the last emitted key / delimiter boundary
+instead of continuing through stale `(blob_guid, slot)` state.
 
 ## 7. Range iteration
 
@@ -311,8 +311,10 @@ quiescent window.
 `RangeBuilder` → `RangeIter` yielding `RangeEntry::{Key,
 CommonPrefix}` items in lex order. The builder chains:
 
-- `.prefix(p)` — anchored descent, no full-tree scan.
-- `.start_after(k)` — strict-greater lower bound (for pagination).
+- `.prefix(p)` — marker-aware lower-bound seek to the prefix range;
+  no full-tree scan.
+- `.start_after(k)` — strict-greater lower bound for pagination;
+  combined with `.prefix(p)` as `max(prefix, marker)`.
 - `.delimiter(b)` — S3-style rollup; folds every leaf under a
   common prefix into a single `CommonPrefix` emission and
   fast-forwards the descent stack past that subtree so the cost
@@ -322,10 +324,13 @@ Cross-blob descent is transparent — the same path stack used
 for in-blob traversal also crosses `BlobNode` boundaries via
 shared read guards on each child blob.
 
-Forward-only, best-effort snapshot — writers can interleave
-between `next()` calls (same failure mode as the upstream
-algorithm's "invalid iterator" warning); for a strict snapshot,
-pause writes externally.
+Forward-only, restart-on-conflict cursor — writers can interleave
+between `next()` calls, but any observed blob-version change on the
+cursor path forces a rebuild from the monotonic lower bound. This
+is stronger than the upstream-style "invalid iterator" surface
+because stale paths are handled internally. It is still not MVCC:
+a long scan can observe keys committed after iterator creation if
+they sort after the current cursor.
 
 ## 8. Backend abstraction
 

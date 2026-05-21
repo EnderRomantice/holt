@@ -41,6 +41,7 @@
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
 //! | `holt_bm_optimistic_restarts_total`     | counter | `TreeStats::bm_optimistic_restarts`    |
+//! | `holt_bm_range_restarts_total`          | counter | `TreeStats::bm_range_restarts`         |
 //! | `holt_bm_walker_ops_total`              | counter | `TreeStats::bm_walker_ops`             |
 //! | `holt_bm_walker_blob_hops_total`        | counter | `TreeStats::bm_walker_blob_hops`       |
 //! | `holt_bm_avg_blob_hops`                 | gauge   | `TreeStats::bm_avg_blob_hops()`        |
@@ -158,6 +159,13 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Cumulative wait-free read restarts (concurrent writer lapped snapshot).",
         "counter",
         stats.bm_optimistic_restarts,
+    );
+    metric(
+        &mut out,
+        "holt_bm_range_restarts_total",
+        "Cumulative range cursor restarts after versioned-path invalidation.",
+        "counter",
+        stats.bm_range_restarts,
     );
     metric(
         &mut out,
@@ -314,6 +322,7 @@ mod tests {
             bm_cache_hits: 1_000,
             bm_cache_misses: 25,
             bm_optimistic_restarts: 3,
+            bm_range_restarts: 2,
             bm_walker_ops: 4,
             bm_walker_blob_hops: 10,
             bm_max_blob_hops: 3,
@@ -345,6 +354,7 @@ mod tests {
         // Monotonic counters keep the `_total` suffix...
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
+        assert!(out.contains("holt_bm_range_restarts_total 2\n"));
         assert!(out.contains("holt_bm_walker_ops_total 4\n"));
         assert!(out.contains("holt_bm_avg_blob_hops 2.500000\n"));
         assert!(out.contains("holt_bm_spillovers_total 2\n"));
