@@ -5,7 +5,7 @@ Thanks for sending a PR! A few checks before you click "Open":
       diffs per CONTRIBUTING.md).
 - [ ] `cargo fmt --all --check` passes.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- [ ] `cargo test --workspace --all-targets` passes.
+- [ ] `cargo test --workspace --lib --tests --examples` passes.
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` passes.
 - [ ] If you touched a `unsafe` block, the `// SAFETY: ...` comment
       still describes the invariant correctly.

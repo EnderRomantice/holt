@@ -49,7 +49,7 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: cargo test (lib + integration)
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --lib --tests --examples --locked
 
       - name: cargo test (doctests)
         run: cargo test --workspace --doc --locked

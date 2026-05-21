@@ -284,7 +284,7 @@ impl BlobBufPool {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub(crate) fn iovecs(&self) -> Vec<libc::iovec> {
         (0..self.inner.slots)
             .map(|idx| libc::iovec {
