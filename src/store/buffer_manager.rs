@@ -472,6 +472,14 @@ impl CachedBlob {
         }
     }
 
+    /// Current blob content version. For route validation, read it
+    /// while holding a shared guard on the same blob so the version
+    /// and parent edge are stable until the child is pinned.
+    #[must_use]
+    pub(crate) fn content_version(&self) -> u64 {
+        self.latch.current_version()
+    }
+
     /// Exclusive write access — blocks until idle, then runs
     /// alone. Bumps the version on release so concurrent
     /// optimistic readers detect the change and restart.

@@ -13,10 +13,15 @@
 //!    32-byte packed inode bodies (size + mtime + mode + uid + gid).
 //!    Models a POSIX metadata server.
 //!
-//! Each scenario runs three operations:
+//! Each scenario runs point-access operations:
 //! - **get**: random lookup over a pre-loaded dataset.
 //! - **put**: random key replacement (in-place update).
 //! - **mixed**: 50% get / 50% put, key chosen at random.
+//!
+//! The objstore/fs scenarios add metadata-native operations:
+//! create+delete of a scratch entry, atomic rename round-trip,
+//! plain prefix list, delimiter list-dir, and a weighted metadata
+//! mix that combines stat/update/list/create/delete/rename.
 //!
 //! The dataset size is intentionally large enough
 //! (`N_KEYS = 20 000`) to spread across **multiple holt blobs**
@@ -50,7 +55,7 @@ use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
 use holt::{RangeEntry, Tree, TreeConfig};
-use rocksdb::{Direction, IteratorMode, Options, WriteOptions, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 
 // ---------------------------------------------------------------
 // Workload configuration
@@ -579,8 +584,8 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
 // SCALE-CURVE benches (Group B)
 // ---------------------------------------------------------------
 //
-// Runs `kv_get` + `kv_put` across three dataset sizes (20 k,
-// 100 k, 500 k) to expose how each engine's hot-path scales.
+// Runs get + put across four dataset sizes (20 k, 100 k, 500 k,
+// 2 M) to expose how each engine's hot-path scales.
 // The 500 k tier is intentionally chosen to exceed holt's
 // default 64-blob buffer pool (≈ 32 MB resident), so we see
 // real cache-miss + spillover behaviour rather than a
@@ -963,10 +968,11 @@ fn bench_list_plain_persistent(
 
 /// S3-style `LIST` with delimiter rollup. holt has the dedup in
 /// the engine via `RangeEntry::CommonPrefix`; RocksDB and SQLite
-/// have to do app-level dedup over the raw range scan. None of
-/// the three currently fast-forward past a rolled-up subtree
-/// (holt v0.2 backlog item), so all three scan every leaf to find
-/// the next distinct rollup — this is fair, just slow.
+/// have to do app-level dedup over the raw range scan. Holt also
+/// fast-forwards past the rolled-up subtree after emitting each
+/// `CommonPrefix`; RocksDB and SQLite deliberately stay on the
+/// generic iterator/query shape because they expose no native
+/// delimiter-list API.
 fn bench_list_delim(
     c: &mut Criterion,
     group_name: &str,
@@ -1060,6 +1066,433 @@ fn bench_list_delim(
     group.finish();
 }
 
+// ---------------------------------------------------------------
+// Metadata-native operation benches
+// ---------------------------------------------------------------
+//
+// Point `put` answers "how fast is a same-size value update?".
+// Objstore/fs metadata engines also live or die on create/unlink,
+// rename/move, prefix list, and S3/POSIX directory rollups. These
+// groups keep the comparison at the same no-WAL memory profile as
+// `*_get` / `*_put`, but exercise operations a KV baseline has to
+// synthesize at the application layer.
+
+#[derive(Clone, Copy)]
+struct MetadataBenchSpec<'a> {
+    list_prefix: &'a [u8],
+    dir_prefix: &'a [u8],
+    delimiter: u8,
+    list_take: usize,
+    dir_take: usize,
+    create_key: &'a [u8],
+    rename_dst: &'a [u8],
+}
+
+fn bench_metadata_ops(
+    c: &mut Criterion,
+    name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    spec: MetadataBenchSpec<'_>,
+) {
+    bench_metadata_create_delete(c, &format!("{name}_create_delete"), pairs, spec);
+    bench_metadata_rename(c, &format!("{name}_rename"), pairs, spec);
+    bench_metadata_mix(c, &format!("{name}_metadata_mix"), pairs, spec);
+}
+
+fn bench_metadata_create_delete(
+    c: &mut Criterion,
+    group_name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    spec: MetadataBenchSpec<'_>,
+) {
+    let value = &pairs[0].1;
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(1));
+
+    let holt = make_holt();
+    preload_holt(&holt, pairs);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            holt.put(black_box(spec.create_key), black_box(value))
+                .unwrap();
+            assert!(holt.delete(black_box(spec.create_key)).unwrap());
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    preload_rocksdb(&db, pairs);
+    let wo = rocksdb_write_opts();
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            db.put_opt(black_box(spec.create_key), black_box(value), &wo)
+                .unwrap();
+            db.delete_opt(black_box(spec.create_key), &wo).unwrap();
+        });
+    });
+
+    let conn = make_sqlite_memory();
+    preload_sqlite(&conn, pairs);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                params![spec.create_key, value.as_slice()],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM kv WHERE k = ?", params![spec.create_key])
+                .unwrap();
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_metadata_rename(
+    c: &mut Criterion,
+    group_name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    spec: MetadataBenchSpec<'_>,
+) {
+    let src = &pairs[pairs.len() / 3].0;
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(1));
+
+    let holt = make_holt();
+    preload_holt(&holt, pairs);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            holt.rename(black_box(src), black_box(spec.rename_dst), false)
+                .unwrap();
+            holt.rename(black_box(spec.rename_dst), black_box(src), false)
+                .unwrap();
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    preload_rocksdb(&db, pairs);
+    let wo = rocksdb_write_opts();
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            rocksdb_rename_roundtrip(&db, &wo, src, spec.rename_dst);
+        });
+    });
+
+    let conn = make_sqlite_memory();
+    preload_sqlite(&conn, pairs);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            sqlite_rename_roundtrip(&conn, src, spec.rename_dst);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_metadata_mix(
+    c: &mut Criterion,
+    group_name: &str,
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    spec: MetadataBenchSpec<'_>,
+) {
+    let key_count = pairs.len();
+    let rename_src = &pairs[pairs.len() / 3].0;
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(1));
+
+    let holt = make_holt();
+    preload_holt(&holt, pairs);
+    let mut rng = StdRng::seed_from_u64(SEED + 71);
+    group.bench_function("holt", |b| {
+        b.iter(|| {
+            let r = rng.next_u32();
+            let (k, v) = &pairs[(r as usize) % key_count];
+            match r % 100 {
+                0..=44 => {
+                    black_box(holt.get(black_box(k)).unwrap());
+                }
+                45..=64 => {
+                    holt.put(black_box(k), black_box(v)).unwrap();
+                }
+                65..=74 => {
+                    black_box(holt_list_plain(&holt, spec.list_prefix, spec.list_take));
+                }
+                75..=84 => {
+                    black_box(holt_list_dir(
+                        &holt,
+                        spec.dir_prefix,
+                        spec.delimiter,
+                        spec.dir_take,
+                    ));
+                }
+                85..=94 => {
+                    holt.put(black_box(spec.create_key), black_box(v)).unwrap();
+                    assert!(holt.delete(black_box(spec.create_key)).unwrap());
+                }
+                _ => {
+                    holt.rename(black_box(rename_src), black_box(spec.rename_dst), false)
+                        .unwrap();
+                    holt.rename(black_box(spec.rename_dst), black_box(rename_src), false)
+                        .unwrap();
+                }
+            }
+        });
+    });
+
+    let (db, _dir) = make_rocksdb();
+    preload_rocksdb(&db, pairs);
+    let wo = rocksdb_write_opts();
+    let mut rng = StdRng::seed_from_u64(SEED + 71);
+    group.bench_function("rocksdb", |b| {
+        b.iter(|| {
+            let r = rng.next_u32();
+            let (k, v) = &pairs[(r as usize) % key_count];
+            match r % 100 {
+                0..=44 => {
+                    black_box(db.get(black_box(k)).unwrap());
+                }
+                45..=64 => {
+                    db.put_opt(black_box(k), black_box(v), &wo).unwrap();
+                    black_box(());
+                }
+                65..=74 => {
+                    black_box(rocksdb_list_plain(&db, spec.list_prefix, spec.list_take));
+                }
+                75..=84 => {
+                    black_box(rocksdb_list_dir(
+                        &db,
+                        spec.dir_prefix,
+                        spec.delimiter,
+                        spec.dir_take,
+                    ));
+                }
+                85..=94 => {
+                    db.put_opt(black_box(spec.create_key), black_box(v), &wo)
+                        .unwrap();
+                    db.delete_opt(black_box(spec.create_key), &wo).unwrap();
+                }
+                _ => rocksdb_rename_roundtrip(&db, &wo, rename_src, spec.rename_dst),
+            }
+        });
+    });
+
+    let conn = make_sqlite_memory();
+    preload_sqlite(&conn, pairs);
+    let upper = prefix_upper(spec.list_prefix);
+    let dir_upper = prefix_upper(spec.dir_prefix);
+    let mut rng = StdRng::seed_from_u64(SEED + 71);
+    group.bench_function("sqlite", |b| {
+        b.iter(|| {
+            let r = rng.next_u32();
+            let (k, v) = &pairs[(r as usize) % key_count];
+            match r % 100 {
+                0..=44 => {
+                    let mut stmt = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                    let v: Vec<u8> = stmt
+                        .query_row(params![k.as_slice()], |row| row.get(0))
+                        .unwrap();
+                    black_box(v);
+                }
+                45..=64 => {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                        params![k.as_slice(), v.as_slice()],
+                    )
+                    .unwrap();
+                    black_box(());
+                }
+                65..=74 => {
+                    black_box(sqlite_list_plain(
+                        &conn,
+                        spec.list_prefix,
+                        &upper,
+                        spec.list_take,
+                    ));
+                }
+                75..=84 => {
+                    black_box(sqlite_list_dir(
+                        &conn,
+                        spec.dir_prefix,
+                        &dir_upper,
+                        spec.delimiter,
+                        spec.dir_take,
+                    ));
+                }
+                85..=94 => {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                        params![spec.create_key, v.as_slice()],
+                    )
+                    .unwrap();
+                    conn.execute("DELETE FROM kv WHERE k = ?", params![spec.create_key])
+                        .unwrap();
+                }
+                _ => sqlite_rename_roundtrip(&conn, rename_src, spec.rename_dst),
+            }
+        });
+    });
+
+    group.finish();
+}
+
+fn holt_list_plain(tree: &Tree, prefix: &[u8], take: usize) -> usize {
+    let mut seen = 0;
+    for entry in tree.range().prefix(prefix) {
+        match entry.unwrap() {
+            RangeEntry::Key { .. } => seen += 1,
+            RangeEntry::CommonPrefix(_) => unreachable!("no delimiter set"),
+            _ => unreachable!("RangeEntry got a new variant"),
+        }
+        if seen >= take {
+            break;
+        }
+    }
+    seen
+}
+
+fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
+    let mut seen = 0;
+    for entry in tree.range().prefix(prefix).delimiter(delim) {
+        match entry.unwrap() {
+            RangeEntry::CommonPrefix(_) | RangeEntry::Key { .. } => seen += 1,
+            _ => unreachable!("RangeEntry got a new variant"),
+        }
+        if seen >= take {
+            break;
+        }
+    }
+    seen
+}
+
+fn rocksdb_list_plain(db: &DB, prefix: &[u8], take: usize) -> usize {
+    let mut seen = 0;
+    for item in db.iterator(IteratorMode::From(prefix, Direction::Forward)) {
+        let (k, _v) = item.unwrap();
+        if !k.starts_with(prefix) {
+            break;
+        }
+        seen += 1;
+        if seen >= take {
+            break;
+        }
+    }
+    seen
+}
+
+fn rocksdb_list_dir(db: &DB, prefix: &[u8], delim: u8, take: usize) -> usize {
+    let mut seen = 0;
+    let mut last_common: Option<Vec<u8>> = None;
+    for item in db.iterator(IteratorMode::From(prefix, Direction::Forward)) {
+        let (k, _v) = item.unwrap();
+        if !k.starts_with(prefix) {
+            break;
+        }
+        let rest = &k[prefix.len()..];
+        let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
+            k[..=prefix.len() + idx].to_vec()
+        } else {
+            k.to_vec()
+        };
+        if last_common.as_deref() != Some(emit.as_slice()) {
+            last_common = Some(emit);
+            seen += 1;
+            if seen >= take {
+                break;
+            }
+        }
+    }
+    seen
+}
+
+fn sqlite_list_plain(conn: &Connection, prefix: &[u8], upper: &[u8], take: usize) -> usize {
+    let mut stmt = conn
+        .prepare_cached("SELECT k FROM kv WHERE k >= ? AND k < ? ORDER BY k LIMIT ?")
+        .unwrap();
+    let rows = stmt
+        .query_map(params![prefix, upper, take as i64], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .unwrap();
+    rows.count()
+}
+
+fn sqlite_list_dir(
+    conn: &Connection,
+    prefix: &[u8],
+    upper: &[u8],
+    delim: u8,
+    take: usize,
+) -> usize {
+    let mut stmt = conn
+        .prepare_cached("SELECT k FROM kv WHERE k >= ? AND k < ? ORDER BY k")
+        .unwrap();
+    let rows = stmt
+        .query_map(params![prefix, upper], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap();
+    let mut seen = 0;
+    let mut last_common: Option<Vec<u8>> = None;
+    for row in rows {
+        let k = row.unwrap();
+        let rest = &k[prefix.len()..];
+        let emit: Vec<u8> = if let Some(idx) = rest.iter().position(|b| *b == delim) {
+            k[..=prefix.len() + idx].to_vec()
+        } else {
+            k
+        };
+        if last_common.as_deref() != Some(emit.as_slice()) {
+            last_common = Some(emit);
+            seen += 1;
+            if seen >= take {
+                break;
+            }
+        }
+    }
+    seen
+}
+
+fn rocksdb_rename_roundtrip(db: &DB, wo: &WriteOptions, src: &[u8], dst: &[u8]) {
+    rocksdb_rename(db, wo, src, dst);
+    rocksdb_rename(db, wo, dst, src);
+}
+
+fn rocksdb_rename(db: &DB, wo: &WriteOptions, src: &[u8], dst: &[u8]) {
+    let value = db.get(src).unwrap().expect("rename source exists");
+    assert!(db.get(dst).unwrap().is_none(), "rename destination absent");
+    let mut batch = WriteBatch::default();
+    batch.delete(src);
+    batch.put(dst, value);
+    db.write_opt(batch, wo).unwrap();
+}
+
+fn sqlite_rename_roundtrip(conn: &Connection, src: &[u8], dst: &[u8]) {
+    sqlite_rename(conn, src, dst);
+    sqlite_rename(conn, dst, src);
+}
+
+fn sqlite_rename(conn: &Connection, src: &[u8], dst: &[u8]) {
+    let tx = conn.unchecked_transaction().unwrap();
+    let value: Vec<u8> = tx
+        .query_row("SELECT v FROM kv WHERE k = ?", params![src], |row| {
+            row.get(0)
+        })
+        .expect("rename source exists");
+    let dst_exists: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv WHERE k = ?)",
+            params![dst],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dst_exists, 0, "rename destination absent");
+    tx.execute("DELETE FROM kv WHERE k = ?", params![src])
+        .unwrap();
+    tx.execute(
+        "INSERT INTO kv (k, v) VALUES (?, ?)",
+        params![dst, value.as_slice()],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
 fn kv_benches(c: &mut Criterion) {
     let pairs = gen_kv_dataset();
     bench_scenario(c, "kv", &pairs);
@@ -1071,6 +1504,20 @@ fn objstore_benches(c: &mut Criterion) {
     let pairs = gen_objstore_dataset();
     bench_scenario(c, "objstore", &pairs);
     bench_scenario_persistent(c, "objstore", &pairs);
+    bench_metadata_ops(
+        c,
+        "objstore",
+        &pairs,
+        MetadataBenchSpec {
+            list_prefix: b"bucket-05/",
+            dir_prefix: b"bucket-",
+            delimiter: b'/',
+            list_take: 100,
+            dir_take: 8,
+            create_key: b"bucket-31/path/sub/__holt_create_delete__.bin",
+            rename_dst: b"bucket-31/path/sub/__holt_rename_dst__.bin",
+        },
+    );
     // Single-bucket listing: prefix narrows to ~625 files.
     bench_list_plain(c, "objstore_list", &pairs, b"bucket-05/", 100);
     bench_list_plain_persistent(c, "objstore_persist_list", &pairs, b"bucket-05/", 100);
@@ -1083,6 +1530,20 @@ fn fs_benches(c: &mut Criterion) {
     let pairs = gen_fs_dataset();
     bench_scenario(c, "fs", &pairs);
     bench_scenario_persistent(c, "fs", &pairs);
+    bench_metadata_ops(
+        c,
+        "fs",
+        &pairs,
+        MetadataBenchSpec {
+            list_prefix: b"/usr/local/share/category-5/",
+            dir_prefix: b"/usr/local/share/",
+            delimiter: b'/',
+            list_take: 100,
+            dir_take: 8,
+            create_key: b"/usr/local/share/category-15/__holt_create_delete__",
+            rename_dst: b"/usr/local/share/category-15/__holt_rename_dst__",
+        },
+    );
     // Single-dir listing: prefix narrows to ~1250 files.
     bench_list_plain(c, "fs_list", &pairs, b"/usr/local/share/category-5/", 100);
     bench_list_plain_persistent(

@@ -39,6 +39,20 @@ impl<'a> SearchKey<'a> {
     }
 
     #[inline]
+    pub(crate) fn user_prefix(self, len: usize) -> Option<&'a [u8]> {
+        if len <= self.bytes.len() {
+            Some(&self.bytes[..len])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn starts_with_user_prefix(self, prefix: &[u8]) -> bool {
+        self.bytes.starts_with(prefix)
+    }
+
+    #[inline]
     pub(crate) fn remaining_len(self, depth: usize) -> usize {
         self.len().saturating_sub(depth)
     }

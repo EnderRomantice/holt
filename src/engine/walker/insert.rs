@@ -5,9 +5,6 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
-use crate::store::buffer_manager::BlobWriteGuard;
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
-
 use super::cast;
 use super::lookup::lookup_at;
 use super::migrate::blob_needs_compaction;
@@ -20,6 +17,9 @@ use super::writers::{
 };
 use super::SearchKey;
 use super::MAX_SPILLOVER_ATTEMPTS;
+use crate::engine::RouteCache;
+use crate::store::buffer_manager::BlobWriteGuard;
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
 
@@ -79,6 +79,7 @@ pub(super) fn insert(
 pub fn insert_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
@@ -102,9 +103,46 @@ pub fn insert_multi(
     // making every cross-blob put take the root's exclusive latch.
     {
         let root_read = root_pin.read();
-        let frame = BlobFrameRef::wrap(root_read.as_slice());
-        let root_slot = frame.header().root_slot;
-        if let LookupResult::Crossing(crossing) = lookup_at(frame, root_slot, key, 0)? {
+        let root_version = root_pin.content_version();
+        if let Some(route) = route_cache.and_then(|cache| cache.lookup(key, root_version)) {
+            let child_pin = bm.pin(route.child_guid)?;
+            let child_guard = child_pin.write();
+            drop(root_read);
+
+            blob_hops = 1;
+            let outcome = lock_coupled_insert_in_blob(
+                bm,
+                child_guard,
+                child_pin.as_ref(),
+                route.child_guid,
+                false,
+                key,
+                value,
+                seq,
+                wants_prev,
+                route.child_depth,
+                &mut blob_hops,
+                &mut max_cross_blob_depth,
+            );
+            drop(child_pin);
+            if outcome.is_ok() {
+                bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+            }
+            return outcome;
+        }
+
+        let root_crossing = {
+            let frame = BlobFrameRef::wrap(root_read.as_slice());
+            let root_slot = frame.header().root_slot;
+            match lookup_at(frame, root_slot, key, 0)? {
+                LookupResult::Crossing(crossing) => Some(crossing),
+                LookupResult::Found(_) | LookupResult::NotFound => None,
+            }
+        };
+        if let Some(crossing) = root_crossing {
+            if let Some(cache) = route_cache {
+                cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+            }
             let child_pin = bm.pin(crossing.child_guid)?;
             let child_guard = child_pin.write();
             drop(root_read);

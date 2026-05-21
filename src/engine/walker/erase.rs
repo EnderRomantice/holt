@@ -5,14 +5,12 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
-use crate::store::buffer_manager::BlobWriteGuard;
-use crate::store::{BlobFrame, BufferManager, CachedBlob};
-
 use super::cast;
+use super::lookup::lookup_at;
 use super::readers::{
     ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
-use super::types::{EraseOutcome, EraseReturn, EraseSignal};
+use super::types::{EraseOutcome, EraseReturn, EraseSignal, LookupResult};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
     shrink_node16_to_node4, shrink_node256_to_node48, shrink_node48_to_node16, write_prefix_chain,
@@ -20,6 +18,9 @@ use super::writers::{
     SHRINK_NODE48_TO_NODE16_AT,
 };
 use super::SearchKey;
+use crate::engine::RouteCache;
+use crate::store::buffer_manager::BlobWriteGuard;
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
 
@@ -57,6 +58,7 @@ pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Re
 pub fn erase_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
     seq: u64,
     wants_prev: bool,
@@ -72,13 +74,89 @@ pub fn erase_multi(
     // every child blob the walker mutates gets a corresponding
     // `bm.mark_dirty(child_guid, seq)` so the checkpoint round
     // flushes WAL **before** the child bytes reach the backend.
+    let mut blob_hops = 0u64;
+    let mut max_cross_blob_depth = 0usize;
+
+    {
+        let root_read = root_pin.read();
+        let root_version = root_pin.content_version();
+        if let Some(route) = route_cache.and_then(|cache| cache.lookup(key, root_version)) {
+            let child_pin = bm.pin(route.child_guid)?;
+            let child_guard = child_pin.write();
+            drop(root_read);
+
+            blob_hops = 1;
+            let outcome = lock_coupled_erase_in_blob(
+                bm,
+                child_guard,
+                child_pin.as_ref(),
+                route.child_guid,
+                false,
+                key,
+                seq,
+                wants_prev,
+                route.child_depth,
+                &mut blob_hops,
+                &mut max_cross_blob_depth,
+            );
+            drop(child_pin);
+            if outcome.is_ok() {
+                bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+            }
+            return outcome;
+        }
+
+        let root_lookup = {
+            let frame = BlobFrameRef::wrap(root_read.as_slice());
+            let root_slot = frame.header().root_slot;
+            lookup_at(frame, root_slot, key, 0)?
+        };
+        match root_lookup {
+            LookupResult::Crossing(crossing) => {
+                if let Some(cache) = route_cache {
+                    cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                }
+                let child_pin = bm.pin(crossing.child_guid)?;
+                let child_guard = child_pin.write();
+                drop(root_read);
+
+                blob_hops = 1;
+                let outcome = lock_coupled_erase_in_blob(
+                    bm,
+                    child_guard,
+                    child_pin.as_ref(),
+                    crossing.child_guid,
+                    false,
+                    key,
+                    seq,
+                    wants_prev,
+                    crossing.child_depth,
+                    &mut blob_hops,
+                    &mut max_cross_blob_depth,
+                );
+                drop(child_pin);
+                if outcome.is_ok() {
+                    bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+                }
+                return outcome;
+            }
+            LookupResult::NotFound => {
+                bm.note_walker_blob_hops(1, 0);
+                return Ok(EraseOutcome {
+                    root_dirty: false,
+                    mutated: false,
+                    previous: None,
+                });
+            }
+            LookupResult::Found(_) => {}
+        }
+    }
+
     let mut guard = root_pin.write();
     let root_guid = {
         let frame = guard.frame();
         frame.header().blob_guid
     };
-    let mut blob_hops = 0u64;
-    let mut max_cross_blob_depth = 0usize;
     let outcome = lock_coupled_erase_in_blob(
         bm,
         guard,

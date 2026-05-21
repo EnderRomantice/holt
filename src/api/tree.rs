@@ -116,6 +116,11 @@ pub struct Tree {
     /// `get` never take this lock; they coordinate via the
     /// per-blob `HybridLatch` inside the BM.
     rename_lock: Arc<Mutex<()>>,
+    /// Root-to-first-child route cache for path-shaped large
+    /// trees. Entries are validated against the root blob's latch
+    /// version before use, so stale routes fall back to a normal
+    /// root descent.
+    route_cache: Arc<engine::RouteCache>,
     /// Tree-wide structural-maintenance gate.
     ///
     /// Foreground read and mutation paths enter the shared side
@@ -282,6 +287,7 @@ impl Tree {
             root_guid,
             root_pin,
             rename_lock: Arc::new(Mutex::new(())),
+            route_cache: Arc::new(engine::RouteCache::new()),
             maintenance_gate,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             commit_gate,
@@ -365,6 +371,7 @@ impl Tree {
             let outcome = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
+                Some(&self.route_cache),
                 search,
                 value,
                 seq,
@@ -386,6 +393,7 @@ impl Tree {
             let outcome = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
+                Some(&self.route_cache),
                 search,
                 value,
                 seq,
@@ -458,8 +466,14 @@ impl Tree {
 
         let (outcome, journal_ack) = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
-            let outcome =
-                engine::erase_multi(&self.backend, &self.root_pin, search, seq, wants_prev)?;
+            let outcome = engine::erase_multi(
+                &self.backend,
+                &self.root_pin,
+                Some(&self.route_cache),
+                search,
+                seq,
+                wants_prev,
+            )?;
             if outcome.mutated {
                 // Only mark the root if the root blob changed.
                 // Cross-blob erases mark their child blob inside
@@ -477,8 +491,14 @@ impl Tree {
             }
             // No-op delete (key wasn't there) is not logged.
         } else {
-            let outcome =
-                engine::erase_multi(&self.backend, &self.root_pin, search, seq, wants_prev)?;
+            let outcome = engine::erase_multi(
+                &self.backend,
+                &self.root_pin,
+                Some(&self.route_cache),
+                search,
+                seq,
+                wants_prev,
+            )?;
             if outcome.mutated && outcome.root_dirty {
                 self.backend
                     .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
@@ -556,11 +576,18 @@ impl Tree {
         // dropped on the floor.
         let journal_ack = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
-            let erase_out =
-                engine::erase_multi(&self.backend, &self.root_pin, src_search, seq, false)?;
+            let erase_out = engine::erase_multi(
+                &self.backend,
+                &self.root_pin,
+                Some(&self.route_cache),
+                src_search,
+                seq,
+                false,
+            )?;
             let insert_out = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
+                Some(&self.route_cache),
                 dst_search,
                 &value,
                 seq,
@@ -575,11 +602,18 @@ impl Tree {
             encode_rename_object_record(&mut record, seq, 0, src, dst, force);
             journal.submit(record, self.cfg.wal_sync_on_commit)?
         } else {
-            let erase_out =
-                engine::erase_multi(&self.backend, &self.root_pin, src_search, seq, false)?;
+            let erase_out = engine::erase_multi(
+                &self.backend,
+                &self.root_pin,
+                Some(&self.route_cache),
+                src_search,
+                seq,
+                false,
+            )?;
             let insert_out = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
+                Some(&self.route_cache),
                 dst_search,
                 &value,
                 seq,
@@ -723,6 +757,7 @@ impl Tree {
                     let outcome = engine::insert_multi(
                         &self.backend,
                         &self.root_pin,
+                        Some(&self.route_cache),
                         search,
                         &value,
                         seq,
@@ -738,8 +773,14 @@ impl Tree {
                 }
                 BatchOp::Delete { key } => {
                     let search = engine::SearchKey::user(&key);
-                    let outcome =
-                        engine::erase_multi(&self.backend, &self.root_pin, search, seq, false)?;
+                    let outcome = engine::erase_multi(
+                        &self.backend,
+                        &self.root_pin,
+                        Some(&self.route_cache),
+                        search,
+                        seq,
+                        false,
+                    )?;
                     if outcome.mutated {
                         if outcome.root_dirty {
                             self.backend.mark_dirty_cached(
@@ -756,57 +797,60 @@ impl Tree {
                     // matching `Tree::delete`'s contract.
                 }
                 BatchOp::Rename { src, dst, force } => {
-                    let src_search = engine::SearchKey::user(&src);
-                    let dst_search = engine::SearchKey::user(&dst);
-                    let Some(value) = engine::lookup_multi_with(
-                        &self.backend,
-                        &self.root_pin,
-                        src_search,
-                        <[u8]>::to_vec,
-                    )?
-                    else {
-                        return Err(Error::NotFound);
-                    };
-                    if src != dst {
-                        if !force
-                            && engine::lookup_multi_with(
-                                &self.backend,
-                                &self.root_pin,
-                                dst_search,
-                                |_| (),
-                            )?
-                            .is_some()
-                        {
-                            return Err(Error::DstExists);
-                        }
-                        let erase_out = engine::erase_multi(
-                            &self.backend,
-                            &self.root_pin,
-                            src_search,
-                            seq,
-                            false,
-                        )?;
-                        let insert_out = engine::insert_multi(
-                            &self.backend,
-                            &self.root_pin,
-                            dst_search,
-                            &value,
-                            seq,
-                            false,
-                        )?;
-                        if erase_out.root_dirty || insert_out.root_dirty {
-                            self.backend.mark_dirty_cached(
-                                self.root_guid,
-                                seq,
-                                self.root_pin.as_ref(),
-                            );
-                        }
-                    }
+                    self.apply_batch_rename_walker(&src, &dst, force, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {
                         enc.push_rename_object(0, &src, &dst, force);
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn apply_batch_rename_walker(
+        &self,
+        src: &[u8],
+        dst: &[u8],
+        force: bool,
+        seq: u64,
+    ) -> Result<()> {
+        let src_search = engine::SearchKey::user(src);
+        let dst_search = engine::SearchKey::user(dst);
+        let Some(value) =
+            engine::lookup_multi_with(&self.backend, &self.root_pin, src_search, <[u8]>::to_vec)?
+        else {
+            return Err(Error::NotFound);
+        };
+        if src == dst {
+            return Ok(());
+        }
+        if !force
+            && engine::lookup_multi_with(&self.backend, &self.root_pin, dst_search, |_| ())?
+                .is_some()
+        {
+            return Err(Error::DstExists);
+        }
+
+        let erase_out = engine::erase_multi(
+            &self.backend,
+            &self.root_pin,
+            Some(&self.route_cache),
+            src_search,
+            seq,
+            false,
+        )?;
+        let insert_out = engine::insert_multi(
+            &self.backend,
+            &self.root_pin,
+            Some(&self.route_cache),
+            dst_search,
+            &value,
+            seq,
+            false,
+        )?;
+        if erase_out.root_dirty || insert_out.root_dirty {
+            self.backend
+                .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
         }
         Ok(())
     }
@@ -1504,11 +1548,11 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         let root_dirty = match op {
             TxnOp::Insert { key, value, .. } => {
                 let search = engine::SearchKey::user(key);
-                engine::insert_multi(bm, &root_pin, search, value, seq, false)?.root_dirty
+                engine::insert_multi(bm, &root_pin, None, search, value, seq, false)?.root_dirty
             }
             TxnOp::Erase { key, .. } => {
                 let search = engine::SearchKey::user(key);
-                engine::erase_multi(bm, &root_pin, search, seq, false)?.root_dirty
+                engine::erase_multi(bm, &root_pin, None, search, seq, false)?.root_dirty
             }
             TxnOp::RenameObject {
                 src_key,
@@ -1533,9 +1577,9 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 }
                 let value = engine::lookup_multi_with(bm, &root_pin, src_search, <[u8]>::to_vec)?
                     .unwrap_or_default();
-                let erase_out = engine::erase_multi(bm, &root_pin, src_search, seq, false)?;
+                let erase_out = engine::erase_multi(bm, &root_pin, None, src_search, seq, false)?;
                 let insert_out =
-                    engine::insert_multi(bm, &root_pin, dst_search, &value, seq, false)?;
+                    engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq, false)?;
                 erase_out.root_dirty || insert_out.root_dirty
             }
             // Structural / multi-tenant / marker variants don't

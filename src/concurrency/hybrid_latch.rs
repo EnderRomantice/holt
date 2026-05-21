@@ -75,6 +75,14 @@ impl HybridLatch {
         self.version.load(Ordering::Acquire) == snapshot
     }
 
+    /// Current content version. Callers that need a stable value
+    /// should read this while holding shared/exclusive access, or
+    /// pair it with optimistic validation.
+    #[must_use]
+    pub fn current_version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
     // -- Shared --
 
     /// Acquire shared (reader) lock. Blocks if a writer holds
