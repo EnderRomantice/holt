@@ -46,10 +46,47 @@ jobs:
             exit 1
           fi
 
+      - name: Check crates.io version
+        id: crates_io
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STATUS=$(curl --silent --show-error --output /dev/null --write-out "%{http_code}" \
+            --header "User-Agent: feichai0017/holt release workflow" \
+            "https://crates.io/api/v1/crates/holt/$VERSION" || true)
+          case "$STATUS" in
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "holt $VERSION already exists on crates.io; skipping cargo publish."
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              echo "holt $VERSION is not on crates.io yet; cargo publish will run."
+              ;;
+            *)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              echo "crates.io lookup returned HTTP $STATUS; cargo publish will decide."
+              ;;
+          esac
+
       - name: Publish to crates.io
+        if: steps.crates_io.outputs.published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+        run: |
+          set +e
+          cargo publish --locked 2> publish.err
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ]; then
+            exit 0
+          fi
+          if grep -q "already exists on crates.io index" publish.err; then
+            cat publish.err
+            echo "holt ${GITHUB_REF_NAME#v} was published by another run; continuing."
+            exit 0
+          fi
+          cat publish.err >&2
+          exit "$STATUS"
 
       - name: Build release notes from CHANGELOG slice
         id: changelog
