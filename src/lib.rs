@@ -59,8 +59,9 @@
 //!   [`AlignedBlobBuf`]) is re-exported at the crate root for
 //!   users who want to plug in a custom store.
 //! - `engine` — recursive walker (insert / lookup / erase /
-//!   scan / rename / compact). Range iterator types are re-exported
-//!   at the crate root; stats live in [`api::stats`].
+//!   scan / rename / compact). Record and key-only range iterator
+//!   types are re-exported at the crate root; stats live in
+//!   [`api::stats`].
 //! - `concurrency` — `HybridLatch` 3-mode lock plus the
 //!   tree-wide maintenance gate.
 //! - `checkpoint` — 3-thread background checkpointer. Users opt
@@ -159,7 +160,9 @@ pub use api::errors::{Error, Result};
 pub use api::tree::Tree;
 
 // Range-scan iterator surface.
-pub use engine::{RangeBuilder, RangeEntry, RangeIter};
+pub use engine::{
+    KeyRangeBuilder, KeyRangeEntry, KeyRangeIter, RangeBuilder, RangeEntry, RangeIter,
+};
 
 // Stats snapshots returned by `Tree::stats`.
 pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};

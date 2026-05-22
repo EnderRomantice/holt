@@ -50,7 +50,7 @@ use super::errors::{Error, Result};
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::engine;
-use crate::engine::{RangeBuilder, RangeEntry};
+use crate::engine::{KeyRangeBuilder, KeyRangeEntry, RangeBuilder};
 use crate::journal::codec::{
     encode_erase_record, encode_insert_record, encode_rename_object_record,
     encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
@@ -1072,14 +1072,14 @@ impl Tree {
             return Ok(false);
         }
 
-        let mut iter = self.scan_prefix(prefix).into_iter();
+        let mut iter = self.scan_keys(prefix).into_iter();
         while let Some(entry) = iter.next_unlocked().transpose()? {
             match entry {
-                RangeEntry::Key { key, .. } => match overlay.get(&key) {
+                KeyRangeEntry::Key { key, .. } => match overlay.get(&key) {
                     Some(None) => {}
                     Some(Some(_)) | None => return Ok(false),
                 },
-                RangeEntry::CommonPrefix(_) => return Ok(false),
+                KeyRangeEntry::CommonPrefix(_) => return Ok(false),
             }
         }
         Ok(true)
@@ -1347,6 +1347,26 @@ impl Tree {
     /// before iterating.
     pub fn scan_prefix(&self, prefix: &[u8]) -> RangeBuilder {
         self.range().prefix(prefix)
+    }
+
+    /// Open a key-only range iterator anchored at this tree.
+    ///
+    /// This has the same ordering, `prefix`, `start_after`,
+    /// `delimiter`, and restart-on-conflict semantics as
+    /// [`Self::range`], but [`KeyRangeEntry::Key`] does not carry
+    /// value bytes. Use it for metadata listing paths that only
+    /// need names and compare-and-set versions.
+    pub fn range_keys(&self) -> KeyRangeBuilder {
+        KeyRangeBuilder::new(self.range())
+    }
+
+    /// Shorthand for `tree.range_keys().prefix(p)`.
+    ///
+    /// This is the fast path for filesystem `readdir` and
+    /// object-store `ListObjects` style workloads where values are
+    /// not needed for every emitted key.
+    pub fn scan_keys(&self, prefix: &[u8]) -> KeyRangeBuilder {
+        self.range_keys().prefix(prefix)
     }
 
     /// Return `true` if no live key starts with `prefix`.

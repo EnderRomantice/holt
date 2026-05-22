@@ -51,6 +51,16 @@ pub(super) fn leaf_extent<'a>(
     ))
 }
 
+pub(super) fn leaf_key_extent<'a>(frame: BlobFrameRef<'a>, leaf: &Leaf) -> Result<&'a [u8]> {
+    let hdr = frame
+        .bytes_at(leaf.key_offset, 2)
+        .ok_or(Error::node_corrupt("leaf key extent header out of range"))?;
+    let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
+    frame
+        .bytes_at(leaf.key_offset + 2, key_len)
+        .ok_or(Error::node_corrupt("leaf key extent body out of range"))
+}
+
 /// Borrow the key and copy only the small leaf header. Update and
 /// delete walkers can decide key equality without allocating; the
 /// returned key borrow must not cross a later frame mutation.
@@ -59,7 +69,7 @@ pub(super) fn read_leaf_key_ref(frame: BlobFrameRef<'_>, slot: u16) -> Result<(&
         .body_of_slot(slot)
         .ok_or(Error::node_corrupt("read_leaf_key_ref: body"))?;
     let leaf = *cast::<Leaf>(body);
-    let (k, _v) = leaf_extent(frame, &leaf)?;
+    let k = leaf_key_extent(frame, &leaf)?;
     Ok((k, leaf))
 }
 

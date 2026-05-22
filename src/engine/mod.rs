@@ -31,6 +31,7 @@ pub use walker::{
     blob_needs_compaction, collect_blob_guids, collect_blob_topology_silent, compact_blob,
     erase_multi, erase_multi_conditional, insert_multi, insert_multi_conditional,
     lookup_multi_with, try_merge_children, EraseCondition, EraseOutcome, InsertCondition,
-    InsertOutcome, RangeBuilder, RangeEntry, RangeIter,
+    InsertOutcome, KeyRangeBuilder, KeyRangeEntry, KeyRangeIter, RangeBuilder, RangeEntry,
+    RangeIter,
 };
 pub(crate) use walker::{insert_multi_batch_conditional, InsertBatchItem, SearchKey};

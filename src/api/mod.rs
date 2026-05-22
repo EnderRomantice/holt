@@ -1,6 +1,6 @@
 //! Public API surface — `Tree`, `AtomicBatch`, `Record`,
-//! `RecordVersion`,
-//! `TreeBuilder`, plus the curated [`stats`] module.
+//! `RecordVersion`, record/key range iterators, `TreeBuilder`,
+//! plus the curated [`stats`] module.
 //!
 //! This module is what users will write `use holt::{...}` for.
 

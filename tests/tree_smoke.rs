@@ -1449,7 +1449,7 @@ fn atomic_assert_version_observes_staged_updates() {
 // Tree::range
 // ----------------------------------------------------------------
 
-use holt::RangeEntry;
+use holt::{KeyRangeEntry, RangeEntry};
 
 fn collect_keys(iter: impl IntoIterator<Item = Result<RangeEntry, holt::Error>>) -> Vec<Vec<u8>> {
     iter.into_iter()
@@ -1457,6 +1457,18 @@ fn collect_keys(iter: impl IntoIterator<Item = Result<RangeEntry, holt::Error>>)
             RangeEntry::Key { key, .. } => key,
             RangeEntry::CommonPrefix(p) => p,
             _ => panic!("RangeEntry got a new variant"),
+        })
+        .collect()
+}
+
+fn collect_key_range(
+    iter: impl IntoIterator<Item = Result<KeyRangeEntry, holt::Error>>,
+) -> Vec<Vec<u8>> {
+    iter.into_iter()
+        .map(|r| match r.unwrap() {
+            KeyRangeEntry::Key { key, .. } => key,
+            KeyRangeEntry::CommonPrefix(p) => p,
+            _ => panic!("KeyRangeEntry got a new variant"),
         })
         .collect()
 }
@@ -1528,6 +1540,65 @@ fn range_key_entries_expose_live_versions() {
         vec![
             (b"img/a".to_vec(), b"v3".to_vec(), a.version),
             (b"img/b".to_vec(), b"v2".to_vec(), b.version),
+        ],
+    );
+}
+
+#[test]
+fn range_keys_returns_keys_and_versions_without_values() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"img/a", b"v1").unwrap();
+    tree.put(b"img/b", b"v2").unwrap();
+    tree.put(b"img/a", b"v3").unwrap();
+    let a = tree.get_record(b"img/a").unwrap().unwrap();
+    let b = tree.get_record(b"img/b").unwrap().unwrap();
+
+    let got: Vec<_> = tree
+        .scan_keys(b"img/")
+        .into_iter()
+        .map(|r| match r.unwrap() {
+            KeyRangeEntry::Key { key, version } => (key, version),
+            KeyRangeEntry::CommonPrefix(_) => panic!("no delimiter set"),
+            _ => panic!("KeyRangeEntry got a new variant"),
+        })
+        .collect();
+
+    assert_eq!(
+        got,
+        vec![
+            (b"img/a".to_vec(), a.version),
+            (b"img/b".to_vec(), b.version),
+        ],
+    );
+}
+
+#[test]
+fn range_keys_supports_start_after_and_delimiter_rollup() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [
+        &b"img/01.jpg"[..],
+        b"img/02.jpg",
+        b"img/other/x.jpg",
+        b"img/sub/a.jpg",
+        b"img/sub/b.jpg",
+        b"video/1.mp4",
+    ] {
+        tree.put(k, b"value-that-must-not-be-needed-for-listing")
+            .unwrap();
+    }
+
+    let got = collect_key_range(
+        tree.range_keys()
+            .prefix(b"img/")
+            .start_after(b"img/01.jpg")
+            .delimiter(b'/'),
+    );
+    assert_eq!(
+        got,
+        vec![
+            b"img/02.jpg".to_vec(),
+            b"img/other/".to_vec(),
+            b"img/sub/".to_vec(),
         ],
     );
 }
@@ -1766,6 +1837,29 @@ fn range_start_after_seeks_across_blob_crossings() {
     );
 
     let got = collect_keys(tree.range().start_after(b"k00000127"));
+    let expected: Vec<Vec<u8>> = (128..256u32)
+        .map(|i| format!("k{i:08}").into_bytes())
+        .collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn range_keys_walks_across_blob_crossings() {
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(16)
+        .open()
+        .unwrap();
+    let big = vec![0xEFu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "workload must spill into multiple blobs",
+    );
+
+    let got = collect_key_range(tree.range_keys().start_after(b"k00000127"));
     let expected: Vec<Vec<u8>> = (128..256u32)
         .map(|i| format!("k{i:08}").into_bytes())
         .collect();

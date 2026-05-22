@@ -38,8 +38,8 @@ use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{
-    leaf_extent, ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48,
-    read_prefix,
+    leaf_extent, leaf_key_extent, ntype_of, read_leaf_key_ref, read_node16, read_node256,
+    read_node4, read_node48, read_prefix,
 };
 use crate::engine::simd;
 
@@ -66,6 +66,57 @@ pub enum RangeEntry {
     /// delimiter byte (`b"img/subfolder/"` for `prefix=b"img/"`
     /// and `delimiter=b'/'`).
     CommonPrefix(Vec<u8>),
+}
+
+/// An entry yielded by [`KeyRangeIter`].
+///
+/// This is the key-only companion to [`RangeEntry`]. It uses the
+/// same cursor, prefix, marker, delimiter, and restart semantics as
+/// [`RangeIter`], but it does not materialise value bytes for leaf
+/// entries.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum KeyRangeEntry {
+    /// A leaf — user key + live record version (engine terminator
+    /// already stripped).
+    Key {
+        /// User-supplied key bytes (terminator byte stripped).
+        key: Vec<u8>,
+        /// Current compare-and-set token for this live leaf.
+        version: RecordVersion,
+    },
+    /// S3-style rollup — a common prefix collapsed because the
+    /// caller set a [`KeyRangeBuilder::delimiter`] and the iterator
+    /// crossed it within a leaf key. The byte string includes the
+    /// delimiter byte.
+    CommonPrefix(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeProjection {
+    Records,
+    KeysOnly,
+}
+
+enum ProjectedRangeEntry {
+    Record(RangeEntry),
+    Key(KeyRangeEntry),
+}
+
+impl ProjectedRangeEntry {
+    fn into_record(self) -> RangeEntry {
+        match self {
+            Self::Record(entry) => entry,
+            Self::Key(_) => unreachable!("key-only entry emitted from record range iterator"),
+        }
+    }
+
+    fn into_key(self) -> KeyRangeEntry {
+        match self {
+            Self::Key(entry) => entry,
+            Self::Record(_) => unreachable!("record entry emitted from key-only range iterator"),
+        }
+    }
 }
 
 /// Builder produced by [`crate::Tree::range`].
@@ -132,6 +183,12 @@ impl IntoIterator for RangeBuilder {
     type IntoIter = RangeIter;
 
     fn into_iter(self) -> RangeIter {
+        self.into_iter_with_projection(RangeProjection::Records)
+    }
+}
+
+impl RangeBuilder {
+    fn into_iter_with_projection(self, projection: RangeProjection) -> RangeIter {
         RangeIter {
             bm: self.bm,
             root_guid: self.root_guid,
@@ -143,9 +200,88 @@ impl IntoIterator for RangeBuilder {
             lower_bound: self.start_after.map(LowerBound::Exclusive),
             delimiter: self.delimiter,
             last_common_prefix: None,
+            projection,
             initialized: false,
             terminated: false,
         }
+    }
+}
+
+/// Builder produced by [`crate::Tree::range_keys`].
+///
+/// It mirrors [`RangeBuilder`] but yields [`KeyRangeEntry`] items
+/// and deliberately skips value materialisation.
+#[must_use = "KeyRangeBuilder is lazy — call `.into_iter()` or use it in a `for` loop"]
+pub struct KeyRangeBuilder {
+    inner: RangeBuilder,
+}
+
+impl KeyRangeBuilder {
+    /// Wrap a record range builder with key-only projection.
+    pub(crate) fn new(inner: RangeBuilder) -> Self {
+        Self { inner }
+    }
+
+    /// Restrict the scan to keys starting with `prefix`. Default:
+    /// empty (the whole tree).
+    pub fn prefix(mut self, prefix: &[u8]) -> Self {
+        self.inner = self.inner.prefix(prefix);
+        self
+    }
+
+    /// Strict-greater-than lower bound. Default: none (start at
+    /// the first matching leaf).
+    pub fn start_after(mut self, key: &[u8]) -> Self {
+        self.inner = self.inner.start_after(key);
+        self
+    }
+
+    /// S3-style delimiter byte. When set, leaves whose key (past
+    /// `prefix`) contains the delimiter are folded into a single
+    /// [`KeyRangeEntry::CommonPrefix`] emission per distinct
+    /// common prefix.
+    pub fn delimiter(mut self, byte: u8) -> Self {
+        self.inner = self.inner.delimiter(byte);
+        self
+    }
+}
+
+impl IntoIterator for KeyRangeBuilder {
+    type Item = Result<KeyRangeEntry>;
+    type IntoIter = KeyRangeIter;
+
+    fn into_iter(self) -> KeyRangeIter {
+        KeyRangeIter {
+            inner: self
+                .inner
+                .into_iter_with_projection(RangeProjection::KeysOnly),
+        }
+    }
+}
+
+/// Active key-only iteration state — see
+/// [`KeyRangeBuilder::into_iter`].
+pub struct KeyRangeIter {
+    inner: RangeIter,
+}
+
+impl Iterator for KeyRangeIter {
+    type Item = Result<KeyRangeEntry>;
+
+    fn next(&mut self) -> Option<Result<KeyRangeEntry>> {
+        self.inner
+            .next_projected_maybe_guarded(true)
+            .map(|entry| entry.map(ProjectedRangeEntry::into_key))
+    }
+}
+
+impl KeyRangeIter {
+    /// Advance without entering `maintenance_gate`.
+    /// Caller must already hold the tree's maintenance guard.
+    pub(crate) fn next_unlocked(&mut self) -> Option<Result<KeyRangeEntry>> {
+        self.inner
+            .next_projected_maybe_guarded(false)
+            .map(|entry| entry.map(ProjectedRangeEntry::into_key))
     }
 }
 
@@ -175,6 +311,7 @@ pub struct RangeIter {
     /// Most recent `CommonPrefix` emission, used to dedup further
     /// leaves under the same rollup.
     last_common_prefix: Option<Vec<u8>>,
+    projection: RangeProjection,
     initialized: bool,
     terminated: bool,
 }
@@ -234,6 +371,7 @@ fn project_range_leaf(
     lower_bound: Option<&LowerBound>,
     delimiter: Option<u8>,
     last_common_prefix: Option<&[u8]>,
+    projection: RangeProjection,
 ) -> Result<LeafAction> {
     let body = frame
         .body_of_slot(slot)
@@ -243,7 +381,13 @@ fn project_range_leaf(
         return Ok(LeafAction::Skip);
     }
 
-    let (stored_key, value) = leaf_extent(frame, &leaf)?;
+    let (stored_key, record_value) = match projection {
+        RangeProjection::Records => {
+            let (key, value) = leaf_extent(frame, &leaf)?;
+            (key, Some(value))
+        }
+        RangeProjection::KeysOnly => (leaf_key_extent(frame, &leaf)?, None),
+    };
     let user_key = if stored_key.last() == Some(&0) {
         &stored_key[..stored_key.len() - 1]
     } else {
@@ -269,10 +413,12 @@ fn project_range_leaf(
             return Ok(LeafAction::CommonPrefix(common));
         }
     }
+    let key = user_key.to_vec();
+    let version = RecordVersion::new(leaf.seq);
     Ok(LeafAction::Key {
-        key: user_key.to_vec(),
-        value: value.to_vec(),
-        version: RecordVersion::new(leaf.seq),
+        key,
+        value: record_value.map(<[u8]>::to_vec),
+        version,
     })
 }
 
@@ -318,7 +464,7 @@ enum InitResult {
 }
 
 enum RangeAdvance {
-    Entry(RangeEntry),
+    Entry(ProjectedRangeEntry),
     Done,
     Restart,
 }
@@ -328,7 +474,7 @@ enum LeafAction {
     Done,
     Key {
         key: Vec<u8>,
-        value: Vec<u8>,
+        value: Option<Vec<u8>>,
         version: RecordVersion,
     },
     CommonPrefix(Vec<u8>),
@@ -362,18 +508,16 @@ impl Iterator for RangeIter {
     type Item = Result<RangeEntry>;
 
     fn next(&mut self) -> Option<Result<RangeEntry>> {
-        self.next_maybe_guarded(true)
+        self.next_projected_maybe_guarded(true)
+            .map(|entry| entry.map(ProjectedRangeEntry::into_record))
     }
 }
 
 impl RangeIter {
-    /// Advance without entering `maintenance_gate`.
-    /// Caller must already hold the tree's maintenance guard.
-    pub(crate) fn next_unlocked(&mut self) -> Option<Result<RangeEntry>> {
-        self.next_maybe_guarded(false)
-    }
-
-    fn next_maybe_guarded(&mut self, enter_gate: bool) -> Option<Result<RangeEntry>> {
+    fn next_projected_maybe_guarded(
+        &mut self,
+        enter_gate: bool,
+    ) -> Option<Result<ProjectedRangeEntry>> {
         loop {
             if self.terminated {
                 return None;
@@ -684,6 +828,7 @@ impl RangeIter {
                                 self.lower_bound.as_ref(),
                                 self.delimiter,
                                 self.last_common_prefix.as_deref(),
+                                self.projection,
                             )?
                         };
                         match kv {
@@ -699,11 +844,22 @@ impl RangeIter {
                                 }
                                 self.lower_bound = Some(LowerBound::Exclusive(key.clone()));
                                 self.last_common_prefix = None;
-                                return Ok(RangeAdvance::Entry(RangeEntry::Key {
-                                    key,
-                                    value,
-                                    version,
-                                }));
+                                let entry = match self.projection {
+                                    RangeProjection::Records => {
+                                        ProjectedRangeEntry::Record(RangeEntry::Key {
+                                            key,
+                                            value: value.expect("record projection carries value"),
+                                            version,
+                                        })
+                                    }
+                                    RangeProjection::KeysOnly => {
+                                        ProjectedRangeEntry::Key(KeyRangeEntry::Key {
+                                            key,
+                                            version,
+                                        })
+                                    }
+                                };
+                                return Ok(RangeAdvance::Entry(entry));
                             }
                             LeafAction::CommonPrefix(common) => {
                                 if !self.path_is_still_valid() {
@@ -734,7 +890,15 @@ impl RangeIter {
                                 } else {
                                     self.terminated = true;
                                 }
-                                return Ok(RangeAdvance::Entry(RangeEntry::CommonPrefix(common)));
+                                let entry = match self.projection {
+                                    RangeProjection::Records => ProjectedRangeEntry::Record(
+                                        RangeEntry::CommonPrefix(common),
+                                    ),
+                                    RangeProjection::KeysOnly => ProjectedRangeEntry::Key(
+                                        KeyRangeEntry::CommonPrefix(common),
+                                    ),
+                                };
+                                return Ok(RangeAdvance::Entry(entry));
                             }
                         }
                         // Tombstoned — fall through to pop_frame and

@@ -21,9 +21,9 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use holt::{RangeEntry, Tree, TreeConfig, WalCommit};
+use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig, WalCommit};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use rusqlite::{params, Connection, OptionalExtension};
 use tempfile::TempDir;
 
@@ -222,7 +222,19 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
         "list",
         cfg.list_ops,
         time_repeated(cfg.list_ops, || {
-            black_box(holt_list_plain(
+            black_box(holt_list_keys(
+                &tree,
+                cfg.workload.list_prefix(),
+                cfg.list_take,
+            ));
+        }),
+    );
+    report(
+        "holt",
+        "list_records",
+        cfg.list_ops,
+        time_repeated(cfg.list_ops, || {
+            black_box(holt_list_records(
                 &tree,
                 cfg.workload.list_prefix(),
                 cfg.list_take,
@@ -534,7 +546,22 @@ fn time_repeated(n: usize, mut f: impl FnMut()) -> Duration {
     start.elapsed()
 }
 
-fn holt_list_plain(tree: &Tree, prefix: &[u8], take: usize) -> usize {
+fn holt_list_keys(tree: &Tree, prefix: &[u8], take: usize) -> usize {
+    let mut seen = 0usize;
+    for entry in tree.scan_keys(prefix) {
+        match entry.expect("holt list") {
+            KeyRangeEntry::Key { .. } => seen += 1,
+            KeyRangeEntry::CommonPrefix(_) => unreachable!("plain list has no delimiter"),
+            _ => unreachable!("KeyRangeEntry got a new variant"),
+        }
+        if seen >= take {
+            break;
+        }
+    }
+    seen
+}
+
+fn holt_list_records(tree: &Tree, prefix: &[u8], take: usize) -> usize {
     let mut seen = 0usize;
     for entry in tree.range().prefix(prefix) {
         match entry.expect("holt list") {
@@ -551,10 +578,10 @@ fn holt_list_plain(tree: &Tree, prefix: &[u8], take: usize) -> usize {
 
 fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0usize;
-    for entry in tree.range().prefix(prefix).delimiter(delim) {
+    for entry in tree.scan_keys(prefix).delimiter(delim) {
         match entry.expect("holt list_dir") {
-            RangeEntry::Key { .. } | RangeEntry::CommonPrefix(_) => seen += 1,
-            _ => unreachable!("RangeEntry got a new variant"),
+            KeyRangeEntry::Key { .. } | KeyRangeEntry::CommonPrefix(_) => seen += 1,
+            _ => unreachable!("KeyRangeEntry got a new variant"),
         }
         if seen >= take {
             break;
@@ -565,16 +592,19 @@ fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
 
 fn rocksdb_list_plain(db: &DB, prefix: &[u8], take: usize) -> usize {
     let mut seen = 0usize;
-    for item in db.iterator(IteratorMode::From(prefix, Direction::Forward)) {
-        let (k, _v) = item.expect("rocksdb list");
-        if !k.starts_with(prefix) {
+    let mut iter = db.raw_iterator();
+    iter.seek(prefix);
+    while let Some(key) = iter.key() {
+        if !key.starts_with(prefix) {
             break;
         }
         seen += 1;
         if seen >= take {
             break;
         }
+        iter.next();
     }
+    iter.status().expect("rocksdb list iterator status");
     seen
 }
 

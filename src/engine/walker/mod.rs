@@ -66,7 +66,9 @@ pub(crate) use key::SearchKey;
 pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;
 pub use migrate::{blob_needs_compaction, compact_blob};
-pub use range::{RangeBuilder, RangeEntry, RangeIter};
+pub use range::{
+    KeyRangeBuilder, KeyRangeEntry, KeyRangeIter, RangeBuilder, RangeEntry, RangeIter,
+};
 pub use scan::{collect_blob_guids, collect_blob_topology_silent};
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
