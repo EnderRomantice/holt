@@ -81,18 +81,20 @@ impl Workload {
         }
     }
 
-    fn value(self, idx: usize, salt: u64) -> Vec<u8> {
+    fn value(self, idx: usize, revision: u64) -> Vec<u8> {
         match self {
             Self::Objstore => {
-                let size = idx as u64 * 1024 + salt;
-                let etag = (idx as u64).wrapping_mul(0x9E37_79B9).wrapping_add(salt);
+                let size = idx as u64 * 1024 + revision;
+                let etag = (idx as u64)
+                    .wrapping_mul(0x9E37_79B9)
+                    .wrapping_add(revision);
                 format!("{{\"size\":{size:016},\"etag\":\"{etag:016x}\",\"class\":\"STD\"}}")
                     .into_bytes()
             }
             Self::Fs => {
                 let mut value = Vec::with_capacity(32);
-                value.extend_from_slice(&((idx as u64) * 4096 + salt).to_le_bytes());
-                value.extend_from_slice(&(1_700_000_000u64 + idx as u64 + salt).to_le_bytes());
+                value.extend_from_slice(&((idx as u64) * 4096 + revision).to_le_bytes());
+                value.extend_from_slice(&(1_700_000_000u64 + idx as u64 + revision).to_le_bytes());
                 value.extend_from_slice(&0o644u32.to_le_bytes());
                 value.extend_from_slice(&1000u32.to_le_bytes());
                 value.extend_from_slice(&1000u32.to_le_bytes());
