@@ -149,11 +149,13 @@ jobs:
 
       - name: cargo llvm-cov
         run: |
+          set -o pipefail
           cargo llvm-cov clean --workspace
           cargo llvm-cov \
             --workspace --all-features --lib --tests --examples --locked \
-            --no-report
-          cargo llvm-cov report > coverage.txt
+            2>&1 | tee coverage-full.txt
+          awk 'capture { print } /^Filename[[:space:]]/ { capture=1; print }' \
+            coverage-full.txt > coverage.txt
           python3 - <<'PY'
           from pathlib import Path
 
