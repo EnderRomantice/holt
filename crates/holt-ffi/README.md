@@ -22,6 +22,9 @@ The public header is:
 crates/holt-ffi/include/holt_ffi.h
 ```
 
+`crates/holt-ffi/examples/abi_smoke.c` is a minimal C caller that
+checks the header-level ABI surface.
+
 ## ABI Surface
 
 Tree lifecycle:

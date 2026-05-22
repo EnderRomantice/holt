@@ -593,6 +593,7 @@ mod tests {
     use super::*;
     use std::mem::MaybeUninit;
     use std::ptr;
+    use tempfile::tempdir;
 
     fn bytes(bytes: &HoltBytes) -> &[u8] {
         if bytes.ptr.is_null() {
@@ -766,6 +767,185 @@ mod tests {
             assert!(msg.contains("prefix"));
 
             holt_tree_close(tree);
+        }
+    }
+
+    #[test]
+    fn persistent_tree_reopens_checkpointed_data() {
+        unsafe {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("ffi.holt");
+            let path = CString::new(path.to_str().unwrap()).unwrap();
+
+            let key = b"bucket-a/year=2026/file.parquet";
+            let value = b"size=128;kind=file";
+
+            let mut tree = ptr::null_mut();
+            assert_eq!(
+                holt_tree_open_with_wal_commit(path.as_ptr(), HOLT_WAL_WRITE, &mut tree),
+                HOLT_OK
+            );
+            assert_eq!(
+                holt_tree_put(tree, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                HOLT_OK
+            );
+            assert_eq!(holt_tree_checkpoint(tree), HOLT_OK);
+            holt_tree_close(tree);
+
+            let mut reopened = ptr::null_mut();
+            assert_eq!(
+                holt_tree_open_with_wal_commit(path.as_ptr(), HOLT_WAL_ENQUEUE, &mut reopened),
+                HOLT_OK
+            );
+            let mut record = HoltRecord::default();
+            assert_eq!(
+                holt_tree_get(reopened, key.as_ptr(), key.len(), &mut record),
+                HOLT_OK
+            );
+            assert_eq!(record.found, 1);
+            assert_eq!(bytes(&record.value), value);
+            holt_record_free(&mut record);
+            holt_tree_close(reopened);
+        }
+    }
+
+    #[test]
+    fn scan_records_honors_start_after_and_delimiter_validation() {
+        unsafe {
+            let mut tree = ptr::null_mut();
+            assert_eq!(holt_tree_open_memory(&mut tree), HOLT_OK);
+
+            for key in [
+                &b"bucket-a/a.parquet"[..],
+                &b"bucket-a/b.parquet"[..],
+                &b"bucket-a/dir/c.parquet"[..],
+            ] {
+                assert_eq!(
+                    holt_tree_put(tree, key.as_ptr(), key.len(), b"x".as_ptr(), 1),
+                    HOLT_OK
+                );
+            }
+
+            let prefix = b"bucket-a/";
+            let start_after = b"bucket-a/a.parquet";
+            let mut iter = ptr::null_mut();
+            assert_eq!(
+                holt_tree_scan_records(
+                    tree,
+                    prefix.as_ptr(),
+                    prefix.len(),
+                    i32::from(b'/'),
+                    start_after.as_ptr(),
+                    start_after.len(),
+                    &mut iter
+                ),
+                HOLT_OK
+            );
+
+            let mut entry = HoltEntry::default();
+            assert_eq!(holt_iter_next(iter, &mut entry), HOLT_OK);
+            assert_eq!(entry.kind, HOLT_ENTRY_KEY);
+            assert_eq!(bytes(&entry.path), b"bucket-a/b.parquet");
+            assert_eq!(bytes(&entry.value), b"x");
+            holt_entry_free(&mut entry);
+
+            assert_eq!(holt_iter_next(iter, &mut entry), HOLT_OK);
+            assert_eq!(entry.kind, HOLT_ENTRY_COMMON_PREFIX);
+            assert_eq!(bytes(&entry.path), b"bucket-a/dir/");
+            holt_entry_free(&mut entry);
+            assert_eq!(holt_iter_next(iter, &mut entry), HOLT_ITER_END);
+            holt_iter_close(iter);
+
+            assert_eq!(
+                holt_tree_scan_keys(
+                    tree,
+                    prefix.as_ptr(),
+                    prefix.len(),
+                    256,
+                    ptr::null(),
+                    0,
+                    &mut iter
+                ),
+                HOLT_ERR
+            );
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("delimiter 256"));
+
+            holt_tree_close(tree);
+        }
+    }
+
+    #[test]
+    fn delete_missing_and_null_outputs_are_well_defined() {
+        unsafe {
+            assert_eq!(holt_tree_open_memory(ptr::null_mut()), HOLT_ERR);
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("tree"));
+
+            let mut tree = ptr::null_mut();
+            assert_eq!(holt_tree_open_memory(&mut tree), HOLT_OK);
+
+            let missing = b"missing";
+            let mut existed = 99;
+            assert_eq!(
+                holt_tree_delete(tree, missing.as_ptr(), missing.len(), &mut existed),
+                HOLT_OK
+            );
+            assert_eq!(existed, 0);
+            assert_eq!(
+                holt_tree_delete(tree, missing.as_ptr(), missing.len(), ptr::null_mut()),
+                HOLT_OK
+            );
+
+            let mut record = HoltRecord {
+                found: 1,
+                value: into_ffi_bytes(b"owned".to_vec()),
+                version: 42,
+            };
+            holt_record_free(&mut record);
+            assert_eq!(record.found, 0);
+            assert!(record.value.ptr.is_null());
+            assert_eq!(record.version, 0);
+
+            let mut entry = HoltEntry {
+                kind: HOLT_ENTRY_KEY,
+                path: into_ffi_bytes(b"path".to_vec()),
+                value: into_ffi_bytes(b"value".to_vec()),
+                version: 1,
+            };
+            holt_entry_free(&mut entry);
+            assert_eq!(entry.kind, 0);
+            assert!(entry.path.ptr.is_null());
+            assert!(entry.value.ptr.is_null());
+
+            holt_bytes_free(HoltBytes::default());
+            holt_record_free(ptr::null_mut());
+            holt_entry_free(ptr::null_mut());
+            holt_iter_close(ptr::null_mut());
+            holt_tree_close(ptr::null_mut());
+            holt_tree_close(tree);
+        }
+    }
+
+    #[test]
+    fn reports_invalid_open_mode_and_path() {
+        unsafe {
+            let mut tree = ptr::null_mut();
+            let path = CString::new("unused").unwrap();
+            assert_eq!(
+                holt_tree_open_with_wal_commit(path.as_ptr(), 99, &mut tree),
+                HOLT_ERR
+            );
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("unknown WAL commit mode 99"));
+
+            assert_eq!(
+                holt_tree_open_with_wal_commit(ptr::null(), HOLT_WAL_ENQUEUE, &mut tree),
+                HOLT_ERR
+            );
+            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
+            assert!(msg.contains("path"));
+            assert!(tree.is_null());
         }
     }
 }

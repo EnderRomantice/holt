@@ -1319,7 +1319,7 @@ impl Tree {
     /// Returns a [`RangeBuilder`] for chaining `prefix`,
     /// `start_after`, and `delimiter`. Call
     /// [`RangeBuilder::into_iter`] (or `for entry in builder`) to
-    /// start emitting [`RangeEntry`] items in lex key order.
+    /// start emitting [`crate::RangeEntry`] items in lex key order.
     ///
     /// Restart-on-conflict cursor semantics: the iterator stores
     /// blob content versions in its path frames. If a concurrent
