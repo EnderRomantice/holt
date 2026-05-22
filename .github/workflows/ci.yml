@@ -152,8 +152,22 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo llvm-cov \
             --workspace --all-features --lib --tests --examples --locked \
-            --fail-under-lines 88
-          cargo llvm-cov report --fail-under-lines 88 > coverage.txt
+            --no-report
+          cargo llvm-cov report > coverage.txt
+          python3 - <<'PY'
+          from pathlib import Path
+
+          threshold = 88.0
+          total = next(
+              line for line in Path("coverage.txt").read_text().splitlines()
+              if line.startswith("TOTAL")
+          )
+          line_coverage = float(total.split()[9].removesuffix("%"))
+          if line_coverage < threshold:
+              raise SystemExit(
+                  f"line coverage {line_coverage:.2f}% is below {threshold:.2f}%"
+              )
+          PY
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --html --output-dir coverage
           {
