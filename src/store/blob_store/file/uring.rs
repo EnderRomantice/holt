@@ -499,7 +499,7 @@ fn ordered_writes<'a>(writes: &'a [(u64, &'a AlignedBlobBuf)]) -> Vec<OrderedWri
         .enumerate()
         .map(|(order, (offset, buf))| OrderedWrite {
             offset: *offset,
-            buf: *buf,
+            buf,
             order,
         })
         .collect();
