@@ -318,8 +318,11 @@ instead of continuing through stale `(blob_guid, slot)` state.
 `Tree::range()` and `Tree::scan_prefix(p)` return a
 `RangeBuilder` → `RangeIter` yielding `RangeEntry::{Key,
 CommonPrefix}` items in lex order. `Key` entries carry key, value,
-and the live `RecordVersion` from the same leaf emit. The builder
-chains:
+and the live `RecordVersion` from the same leaf emit.
+`Tree::range_keys()` and `Tree::scan_keys(p)` return the key-only
+companion `KeyRangeBuilder` → `KeyRangeIter`; it uses the same
+cursor and delimiter machinery but emits `KeyRangeEntry` without
+materialising value bytes. The builders chain:
 
 - `.prefix(p)` — marker-aware lower-bound seek to the prefix range;
   no full-tree scan.
@@ -332,7 +335,9 @@ chains:
 
 Cross-blob descent is transparent — the same path stack used
 for in-blob traversal also crosses `BlobNode` boundaries via
-shared read guards on each child blob.
+shared read guards on each child blob. The projection is chosen at
+iterator construction time, so full-record and key-only scans share
+the same restart and delimiter correctness path.
 
 Forward-only, restart-on-conflict cursor — writers can interleave
 between `next()` calls, but any observed blob-version change on the

@@ -7,6 +7,10 @@ surface is intentionally small: one harness, three workload
 shapes, and operation mixes that reflect metadata engines rather
 than generic key/value stores.
 
+This file is the v0.3.0 release snapshot. Post-release
+`[Unreleased]` API work, such as key-only range scans, should be
+rerun before replacing the quoted release rows.
+
 ## Reproducing
 
 ```bash

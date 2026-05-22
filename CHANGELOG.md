@@ -25,6 +25,11 @@ fine-grained per-commit history is in `git log`.
   `AtomicBatch::assert_prefix_empty` for atomic batch preflight.
 - `RangeEntry::Key` now includes the live `RecordVersion` so
   list-then-CAS metadata workflows do not need a second lookup.
+- Added key-only range scans: `Tree::range_keys`,
+  `Tree::scan_keys`, `KeyRangeBuilder`, `KeyRangeEntry`, and
+  `KeyRangeIter`. They keep the same prefix, pagination,
+  delimiter, and restart semantics as full `RangeEntry` scans but
+  skip value materialisation for name-only metadata listing.
 - Added a `cargo-fuzz` harness (`fuzz/fuzz_targets/atomic_model.rs`)
   that checks persistent reopen/checkpoint, range scans,
   conditional writes, and atomic batches against a `BTreeMap`

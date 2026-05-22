@@ -36,6 +36,13 @@ metadata engine actually serves beyond blind point overwrite:
   45% stat/get, 20% metadata update, 10% plain list, 10%
   delimiter list-dir, 10% create+delete, 5% rename round-trip.
 
+The Criterion release harness keeps `*_list` as a full key/value
+prefix scan because that is the historical published metric. The
+large-tree stress harness additionally splits key-only `list` from
+full-record `list_records`, matching the public Holt API:
+`scan_keys` for name-only metadata listings and `range` when the
+caller needs value bytes.
+
 `N_KEYS = 20 000` for the baseline scenarios — large enough that
 the data spreads across **multiple holt blobs** (~6–8 × 512 KB),
 so the bench exercises `BlobNode` crossings + cross-blob
@@ -93,7 +100,9 @@ default, then runs high-pressure operation loops:
 - `get`: `HOLT_STRESS_POINT_OPS` random point reads
 - `put`: `HOLT_STRESS_POINT_OPS` same-size metadata updates
 - `mixed`: 50% get / 50% put over the same sampled key stream
-- `list`: `HOLT_STRESS_LIST_OPS` bounded prefix scans
+- `list`: `HOLT_STRESS_LIST_OPS` bounded key-only prefix scans
+- `list_records`: `HOLT_STRESS_LIST_OPS` bounded full key/value
+  prefix scans
 - `list_dir`: `HOLT_STRESS_LIST_OPS` delimiter rollups
 
 The stress harness prints `ns/op`, `Mops/s`, and Holt shape
@@ -221,10 +230,12 @@ When reading those results, keep the profiles separate:
   deployment shape.
 
 Plain prefix scans (`*_list`) model `readdir` / `ListObjects` with
-a bounded prefix range. Delimiter rollup (`*_list_dir`) is the
-S3-style listing test: Holt's `Tree::range` emits
-`RangeEntry::CommonPrefix` inside the engine and fast-forwards past
-the rolled-up subtree; RocksDB and SQLite use generic ordered
+a bounded prefix range. The Criterion release table reports the
+full key/value form; the stress harness reports key-only `list`
+and full-record `list_records` separately. Delimiter rollup
+(`*_list_dir`) is the S3-style listing test: Holt emits
+`CommonPrefix` inside the engine and fast-forwards past the
+rolled-up subtree; RocksDB and SQLite use generic ordered
 iteration plus app-layer dedup because neither exposes a native
 delimiter-list API.
 
@@ -251,11 +262,11 @@ delimiter-list API.
    path-shaped point lookup, metadata-native mixes, and
    delimiter rollup; point put is a smaller win at large scale) is
    the load-bearing observation.
-5. **Range is restart-on-conflict, not MVCC.** `Tree::range`
-   stores blob versions in its cursor path and seeks from the last
-   emitted lower bound if a writer invalidates that path. A long
-   scan can still observe keys committed after iterator creation if
-   they sort after the current cursor.
+5. **Range is restart-on-conflict, not MVCC.** `Tree::range` and
+   `Tree::range_keys` store blob versions in their cursor path and
+   seek from the last emitted lower bound if a writer invalidates
+   that path. A long scan can still observe keys committed after
+   iterator creation if they sort after the current cursor.
 
 This bench is the right comparison for **metadata-engine
 workloads** with bounded per-tree dataset and hierarchical keys —

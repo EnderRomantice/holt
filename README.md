@@ -90,9 +90,10 @@ Add holt to your `Cargo.toml`:
 holt = "=0.3.0"
 ```
 
-The supported 0.3 user surface is deliberately small:
+The supported user surface is deliberately small:
 `TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
-`RangeEntry`, `RangeIter`, `AtomicBatch`, `Record`, `RecordVersion`,
+`RangeEntry`, `RangeIter`, `KeyRangeBuilder`, `KeyRangeEntry`,
+`KeyRangeIter`, `AtomicBatch`, `Record`, `RecordVersion`,
 `CheckpointConfig`,
 `TreeStats` / related stats structs, `Error` / `Result`, and the
 custom-store surface (`BlobStore`, `MemoryBlobStore`,
@@ -198,17 +199,21 @@ let committed = tree.atomic(|batch| {
 assert!(committed);
 ```
 
-### Range scan with S3 delimiter rollup
+### Range scans and S3 delimiter rollup
 
-`Tree::range` is the load-bearing API for metadata workloads —
-`readdir`, `ListObjects`, AI artifact catalogs. Chain
-`.prefix()` to anchor the scan, `.start_after()` for paging,
-`.delimiter()` for S3-style `?delimiter=/` rollup.
+`Tree::range` yields full records: key, value, and
+`RecordVersion`. Use it when the list response needs metadata
+bytes. `Tree::range_keys` / `Tree::scan_keys` use the same cursor
+and delimiter semantics but skip value materialisation; use them
+for name-only directory and object listings. Chain `.prefix()` to
+anchor the scan, `.start_after()` for paging, and `.delimiter()`
+for S3-style `?delimiter=/` rollup.
 
 ```rust
-use holt::RangeEntry;
+use holt::{KeyRangeEntry, RangeEntry};
 
-// Simple prefix scan — `take(50)` for a paged "first 50" view.
+// Full prefix scan — `take(50)` for a paged "first 50" view
+// when the caller needs metadata bytes.
 let first_50: Vec<_> = tree
     .range()
     .prefix(b"users/")
@@ -220,14 +225,14 @@ let first_50: Vec<_> = tree
     }))
     .collect::<Result<_, _>>()?;
 
-// S3-style "list one level" — leaves under `/img/` get emitted
-// as Key; deeper paths roll up to a single `CommonPrefix` per
-// distinct subdir.
-for entry in tree.range().prefix(b"img/").delimiter(b'/') {
+// S3-style "list one level" without copying values — leaves under
+// `/img/` get emitted as Key; deeper paths roll up to a single
+// `CommonPrefix` per distinct subdir.
+for entry in tree.scan_keys(b"img/").delimiter(b'/') {
     match entry? {
-        RangeEntry::Key { key, .. }       => println!("file {key:?}"),
-        RangeEntry::CommonPrefix(prefix)  => println!("dir  {prefix:?}/"),
-        _ => {} // `RangeEntry` is `#[non_exhaustive]`
+        KeyRangeEntry::Key { key, .. }      => println!("file {key:?}"),
+        KeyRangeEntry::CommonPrefix(prefix) => println!("dir  {prefix:?}/"),
+        _ => {} // `KeyRangeEntry` is `#[non_exhaustive]`
     }
 }
 ```

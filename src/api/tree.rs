@@ -105,11 +105,12 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 ///   each blob's latch version, read the bytes, then `validate()`.
 ///   Restarts from the root on a torn read. Never blocks foreground
 ///   writers and never block each other.
-/// - **Range reads** (`range`, `scan_prefix`) use a versioned
-///   cursor. Each cursor frame records the blob content version it
-///   was built from; if an interleaved writer changes a frame, the
-///   iterator discards its stack and performs a marker-aware seek
-///   from the last emitted key / delimiter lower bound.
+/// - **Range reads** (`range`, `scan_prefix`, `range_keys`,
+///   `scan_keys`) use a versioned cursor. Each cursor frame
+///   records the blob content version it was built from; if an
+///   interleaved writer changes a frame, the iterator discards its
+///   stack and performs a marker-aware seek from the last emitted
+///   key / delimiter lower bound.
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
 ///   exclusively for the blobs they touch. Persistent trees enter
 ///   the writer-shared `commit_gate` while publishing dirty state
