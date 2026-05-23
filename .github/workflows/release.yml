@@ -66,19 +66,20 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          ERR_FILE="${RUNNER_TEMP:-/tmp}/holt-publish.err"
           set +e
-          cargo publish --locked 2> publish.err
+          cargo publish --locked 2> "$ERR_FILE"
           STATUS=$?
           set -e
           if [ "$STATUS" -eq 0 ]; then
             exit 0
           fi
-          if grep -q "already exists on crates.io index" publish.err; then
-            cat publish.err
+          if grep -q "already exists on crates.io index" "$ERR_FILE"; then
+            cat "$ERR_FILE"
             echo "holt ${GITHUB_REF_NAME#v} was published by another run; continuing."
             exit 0
           fi
-          cat publish.err >&2
+          cat "$ERR_FILE" >&2
           exit "$STATUS"
 
       - name: Build release notes from CHANGELOG slice
