@@ -37,7 +37,7 @@
 //! | Mode       | holt                                        | RocksDB                              | SQLite                                              | sled |
 //! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|------|
 //! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` | temp DB, high-throughput, no background flush |
-//! | persistent | `TreeConfig::new(dir)`, `WalCommit::Write` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed | temp-dir DB, high-throughput, no background flush |
+//! | persistent | `TreeConfig::new(dir)`, `WalCommit::Write` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed | temp-dir DB, high-throughput, background checkpoint |
 //!
 //! The `*_persist_*` groups are intentionally hot-service
 //! measurements. They do **not** claim to measure cold data-file
@@ -153,10 +153,9 @@ fn make_holt() -> Tree {
 
 /// Hot persistent holt on a temp dir. Each `put` lands in the
 /// WAL file (OS page cache, no fsync) + BufferManager cache; the
-/// persistent data file only gets a `pwrite` at spillover or
-/// checkpoint. Matches RocksDB's `WAL=on, sync=false` and SQLite's
-/// `WAL + synchronous=OFF` as a hot service profile, not as a cold
-/// data-file I/O profile.
+/// background checkpointer drains dirty blobs. Matches RocksDB's
+/// `WAL=on, sync=false` and SQLite's `WAL + synchronous=OFF` as a
+/// hot service profile, not as a cold data-file I/O profile.
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());

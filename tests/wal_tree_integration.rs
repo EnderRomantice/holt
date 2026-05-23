@@ -4,10 +4,10 @@
 //! - Persistent put/delete/rename round-trip through reopen with
 //!   `WalCommit::Sync` (verifies WAL replay reconstructs
 //!   the logical state on a crash-without-checkpoint).
-//! - "Default mode without checkpoint loses unflushed" — under
-//!   the default config (no durable per-op journal wait) a drop without
-//!   `checkpoint()` leaves the disk WAL empty and reopen sees
-//!   the pre-mutation state.
+//! - "Enqueue mode without background checkpoint loses unflushed" —
+//!   with manual checkpointing and no durable per-op journal wait, a
+//!   drop without `checkpoint()` leaves the disk WAL empty and reopen
+//!   sees the pre-mutation state.
 //! - `checkpoint()` flushes everything and truncates the WAL.
 
 use std::fs;
@@ -23,11 +23,17 @@ fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
 }
 
+fn manual_checkpoint_cfg(dir: &std::path::Path) -> TreeConfig {
+    let mut cfg = TreeConfig::new(dir);
+    cfg.checkpoint.enabled = false;
+    cfg
+}
+
 /// `TreeConfig::new(dir)` plus `WalCommit::Sync` — tests that
 /// simulate power-safe crash recovery without checkpoint need every
 /// record fsync'd before drop.
 fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
-    let mut cfg = TreeConfig::new(dir);
+    let mut cfg = manual_checkpoint_cfg(dir);
     cfg.wal_commit = WalCommit::Sync;
     cfg
 }
@@ -359,14 +365,13 @@ fn conditional_writes_replay_through_wal() {
 }
 
 #[test]
-fn default_mode_loses_writes_without_checkpoint_or_fsync() {
-    // Under the default config (`WalCommit::Enqueue`),
-    // the journal worker can still hold records in process memory
-    // and only drains/syncs them at checkpoint. A short workload +
-    // drop-without-checkpoint = nothing durable — exactly the
-    // high-throughput trade-off.
+fn enqueue_mode_loses_writes_without_checkpoint_or_fsync() {
+    // Under `WalCommit::Enqueue` with background checkpointing
+    // disabled, the journal worker can still hold records in process
+    // memory. A short workload + drop-without-checkpoint = nothing
+    // durable — exactly the high-throughput trade-off.
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    let cfg = manual_checkpoint_cfg(dir.path());
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -397,7 +402,7 @@ fn default_mode_loses_writes_without_checkpoint_or_fsync() {
 #[test]
 fn batched_mode_loses_writes_without_checkpoint() {
     let dir = tempdir().unwrap();
-    let mut cfg = TreeConfig::new(dir.path());
+    let mut cfg = manual_checkpoint_cfg(dir.path());
     cfg.memory_flush_on_write = false;
 
     {
@@ -809,14 +814,11 @@ fn failed_atomic_guard_does_not_append_wal_or_publish() {
 
 #[test]
 fn batch_crash_before_flush_loses_whole_batch() {
-    // Default mode (`WalCommit::Enqueue`): if we drop
-    // without checkpoint, the OS may not have flushed the batch
-    // record yet, so the whole batch is rolled back on reopen.
-    // We exercise the contract by skipping checkpoint and
-    // checking that the unflushed batch isn't visible after
-    // reopen.
+    // `WalCommit::Enqueue` with background checkpointing disabled:
+    // if we drop without checkpoint, the OS may not have flushed the
+    // batch record yet, so the whole batch is rolled back on reopen.
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path()); // default: WalCommit::Enqueue
+    let cfg = manual_checkpoint_cfg(dir.path()); // WalCommit::Enqueue
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();

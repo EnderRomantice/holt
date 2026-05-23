@@ -233,7 +233,7 @@ fn main() {
         cfg.ops.iter().map(|op| op.name()).collect::<Vec<_>>().join(","),
     );
     println!(
-        "profile=multi_thread,warm_service,persistent_wal,wal_commit=write,no_per_op_fsync,latency_sample_stride={LATENCY_SAMPLE_STRIDE}"
+        "profile=multi_thread,warm_service,persistent_wal,wal_commit=write,no_per_op_fsync,checkpoint=enabled,latency_sample_stride={LATENCY_SAMPLE_STRIDE}"
     );
 
     let samples = make_thread_samples(&cfg);

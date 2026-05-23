@@ -118,6 +118,11 @@ blob fill ratios, walker hop counters). Those shape metrics are
 the main signal for diagnosing whether 20M writes remain stable
 or start paying extra blob-hop / spillover cost.
 
+Holt runs one preload checkpoint barrier before timing. That keeps
+bulk-load checkpoint catch-up out of the hot-service numbers while
+leaving the default background planner/I/O/eviction threads running
+during the measured workload.
+
 For `list_dir`, the stress harness gives RocksDB and SQLite a
 fair app-layer fast-forward implementation: after emitting one
 rolled-up prefix, it seeks to that prefix's lexicographic
@@ -145,19 +150,28 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 HOLT_STRESS_LIST_TAKE=1000 \
 HOLT_STRESS_DIR_TAKE=32 \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
+
+# Exercise Holt's product-default WAL acknowledgement boundary.
+HOLT_STRESS_WAL_COMMIT=enqueue \
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 ```
 
 Profile: single-threaded, warm-service, file-backed persistent
 engines with WAL enabled and no per-op fsync. Holt uses
-`TreeConfig::new(tempdir)` with `WalCommit::Write`; RocksDB uses
-WAL on with `sync = false`; SQLite uses a file-backed WAL database
-with `synchronous = OFF`. This is the fair persistent hot path:
-WAL bytes are written before the operation returns, but power-loss
-durability is not forced per operation.
+`TreeConfig::new(tempdir)` with `WalCommit::Write` and the default
+background checkpointer; RocksDB uses WAL on with `sync = false`;
+SQLite uses a file-backed WAL database with `synchronous = OFF`.
+This is the fair persistent hot path: WAL bytes are written before
+the operation returns, but power-loss durability is not forced per
+operation.
 sled can be selected as an embedded-KV peer, but its flush controls
 do not map exactly to this WAL-on/no-fsync matrix; the harness runs
 it in high-throughput mode with background flush disabled during
 the timed section.
+
+Set `HOLT_STRESS_WAL_COMMIT=enqueue` to measure Holt's product
+default, where foreground writes return after the journal worker
+accepts the record.
 
 ## Concurrent Harness
 

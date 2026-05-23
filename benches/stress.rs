@@ -124,6 +124,23 @@ impl Workload {
     }
 }
 
+fn parse_wal_commit(s: &str) -> WalCommit {
+    match s {
+        "enqueue" | "async" | "default" => WalCommit::Enqueue,
+        "write" | "wal" => WalCommit::Write,
+        "sync" | "fsync" => WalCommit::Sync,
+        other => panic!("unknown HOLT_STRESS_WAL_COMMIT `{other}`; use enqueue, write, or sync"),
+    }
+}
+
+fn wal_commit_name(mode: WalCommit) -> &'static str {
+    match mode {
+        WalCommit::Enqueue => "enqueue",
+        WalCommit::Write => "write",
+        WalCommit::Sync => "sync",
+    }
+}
+
 #[derive(Debug)]
 struct StressConfig {
     workload: Workload,
@@ -133,6 +150,7 @@ struct StressConfig {
     list_take: usize,
     dir_take: usize,
     buffer_pool_size: usize,
+    wal_commit: WalCommit,
     engines: Vec<String>,
 }
 
@@ -159,6 +177,10 @@ impl StressConfig {
             list_take: env_usize("HOLT_STRESS_LIST_TAKE", DEFAULT_LIST_TAKE),
             dir_take: env_usize("HOLT_STRESS_DIR_TAKE", DEFAULT_DIR_TAKE),
             buffer_pool_size: env_usize("HOLT_STRESS_BUFFER_POOL", DEFAULT_BUFFER_POOL),
+            wal_commit: env::var("HOLT_STRESS_WAL_COMMIT")
+                .as_deref()
+                .map(parse_wal_commit)
+                .unwrap_or(WalCommit::Write),
             engines,
         }
     }
@@ -189,7 +211,10 @@ fn main() {
         cfg.buffer_pool_size,
         cfg.engines.join(","),
     );
-    println!("profile=single_thread,warm_service,persistent_wal,wal_commit=write,no_per_op_fsync");
+    println!(
+        "profile=single_thread,warm_service,persistent_wal,wal_commit={},no_per_op_fsync,checkpoint=enabled",
+        wal_commit_name(cfg.wal_commit)
+    );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
     if cfg.selected("holt") {
@@ -209,11 +234,13 @@ fn main() {
 fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     let dir = TempDir::new().expect("holt tempdir");
     let mut tree_cfg = TreeConfig::new(dir.path());
-    tree_cfg.wal_commit = WalCommit::Write;
+    tree_cfg.wal_commit = cfg.wal_commit;
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
     let tree = Tree::open(tree_cfg).expect("holt open");
     preload_holt(&tree, cfg.workload, cfg.n_keys);
     print_holt_shape("preload", &tree);
+    tree.checkpoint().expect("holt preload checkpoint");
+    print_holt_shape("ready", &tree);
 
     report("holt", "get", samples.len(), time_get_holt(&tree, samples));
     report("holt", "put", samples.len(), time_put_holt(&tree, samples));

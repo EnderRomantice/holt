@@ -81,10 +81,9 @@ pub struct TreeConfig {
     /// `Tree::checkpoint` call — useful in benches where the
     /// memcpy through `MemoryBlobStore` is uninteresting.
     pub memory_flush_on_write: bool,
-    /// Background checkpointer policy. Default disabled —
-    /// callers drive [`crate::Tree::checkpoint`] synchronously.
-    /// Enable via [`CheckpointConfig::enabled`] or
-    /// [`crate::TreeBuilder::checkpoint`].
+    /// Background checkpointer policy. Default enabled for
+    /// file-backed service use; set `enabled = false` when callers
+    /// want to drive [`crate::Tree::checkpoint`] manually.
     pub checkpoint: CheckpointConfig,
 }
 
@@ -111,7 +110,10 @@ impl TreeConfig {
             buffer_pool_size: 64,
             wal_commit: WalCommit::Enqueue,
             memory_flush_on_write: true,
-            checkpoint: CheckpointConfig::default(),
+            checkpoint: CheckpointConfig {
+                enabled: false,
+                ..CheckpointConfig::default()
+            },
         }
     }
 

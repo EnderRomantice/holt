@@ -1478,22 +1478,20 @@ impl Tree {
 
         let _maintenance = self.maintenance_gate.enter_shared();
 
-        // Phase 1: snapshot dirty/pending, force the journal
-        // durable, and clone the snapshotted bytes under
-        // `commit_gate`. This closes the subtle W2D hole where a
-        // foreground writer mutates a blob after the dirty snapshot
-        // but before `snapshot_bytes`: without the shared lock, the
-        // checkpoint could write bytes whose WAL record was not in
-        // the flushed snapshot.
-        let (_snap_dirty, snap_pending, snap_bytes) = if let Some(journal) = &self.journal {
+        // Phase 1: snapshot dirty/pending, clone bytes, and record
+        // the WAL watermark under `commit_gate`. This closes the
+        // subtle W2D hole where a foreground writer mutates a blob
+        // after the dirty snapshot but before `snapshot_bytes`: the
+        // checkpoint could otherwise write bytes whose WAL record was
+        // not part of the checkpoint snapshot. The WAL flush itself
+        // happens after releasing the gate so fsync does not block
+        // foreground writers.
+        let (snap_dirty, snap_pending, snap_bytes, wal_up_to) = if let Some(journal) = &self.journal
+        {
             let _commit = self.commit_gate.enter_checkpoint();
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
-            if let Err(e) = journal.flush() {
-                self.store.restore_pending_deletes(snap_pending);
-                self.store.restore_dirty(snap_dirty);
-                return Err(e);
-            }
+            let wal_up_to = journal.wal_work();
             let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
             for (guid, expected_seq) in &snap_dirty {
                 let Some(bytes) = self.store.snapshot_bytes(*guid) else {
@@ -1505,7 +1503,7 @@ impl Tree {
                 };
                 snap_bytes.push((*guid, *expected_seq, bytes));
             }
-            (snap_dirty, snap_pending, snap_bytes)
+            (snap_dirty, snap_pending, snap_bytes, Some(wal_up_to))
         } else {
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
@@ -1520,8 +1518,16 @@ impl Tree {
                 };
                 snap_bytes.push((*guid, *expected_seq, bytes));
             }
-            (snap_dirty, snap_pending, snap_bytes)
+            (snap_dirty, snap_pending, snap_bytes, None)
         };
+
+        if let (Some(journal), Some(up_to)) = (&self.journal, wal_up_to) {
+            if let Err(e) = journal.flush_up_to(up_to) {
+                self.store.restore_pending_deletes(snap_pending);
+                self.store.restore_dirty(snap_dirty);
+                return Err(e);
+            }
+        }
 
         // Phase 2: batch write-through with CAS-on-seq.
         //

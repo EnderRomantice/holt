@@ -91,16 +91,15 @@ use self::io::IoTask;
 
 /// Background checkpointer policy + cadence.
 ///
-/// The defaults leave the background thread group **disabled**
-/// (`enabled = false`); flip it on with [`CheckpointConfig::enabled`]
-/// or via [`crate::TreeBuilder::checkpoint`].
+/// The defaults enable the background thread group so file-backed
+/// trees bound WAL growth and drain dirty blobs without requiring
+/// callers to schedule [`crate::Tree::checkpoint`] manually.
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
-    /// Master switch. `false` (the default) leaves checkpointing
-    /// fully synchronous — callers drive it via
-    /// [`crate::Tree::checkpoint`]. `true` spawns the three
-    /// background threads on tree open and stops them on tree
-    /// drop.
+    /// Master switch. `true` (the default) spawns the planner, I/O,
+    /// and eviction threads on tree open and stops them on tree drop.
+    /// Set to `false` when callers want fully manual checkpointing
+    /// through [`crate::Tree::checkpoint`].
     pub enabled: bool,
     /// Maximum interval between planner rounds. Smaller values
     /// = lower checkpoint latency, more wake-ups per second.
@@ -162,7 +161,7 @@ pub struct CheckpointConfig {
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             idle_interval: Duration::from_millis(100),
             dirty_blob_threshold: 16,
             auto_merge: true,
@@ -177,10 +176,7 @@ impl CheckpointConfig {
     /// Convenience constructor: enabled with default cadence.
     #[must_use]
     pub fn enabled() -> Self {
-        Self {
-            enabled: true,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
@@ -518,7 +514,10 @@ mod tests {
     #[test]
     fn disabled_config_spawns_nothing() {
         let bm = make_bm();
-        let cfg = CheckpointConfig::default();
+        let cfg = CheckpointConfig {
+            enabled: false,
+            ..CheckpointConfig::default()
+        };
         assert!(!cfg.enabled);
         let ck = Checkpointer::spawn(bm, None, maintenance_gate(), commit_gate(), cfg);
         assert!(ck.is_none());

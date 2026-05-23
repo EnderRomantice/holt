@@ -160,7 +160,7 @@ pub(super) fn run_round_sync(shared: &Arc<Shared>) -> Result<()> {
 
 // The round is intentionally a single linear submission function:
 // it maps "what is durable enough to enqueue" without hiding the
-// WAL flush / dirty snapshot / byte clone interlock.
+// WAL watermark / dirty snapshot / byte clone interlock.
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result<()> {
     use std::sync::atomic::Ordering;
@@ -187,13 +187,13 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     #[cfg(feature = "tracing")]
     let round_start = std::time::Instant::now();
 
-    // 1+2+3. Snapshot dirty AND pending-deletes, flush the journal,
-    // then clone bytes under the same commit-publish gate used by
-    // foreground persistent writers. Holding the gate through the
-    // byte clone is load-bearing: a writer must not mutate a blob
-    // between our dirty snapshot and `snapshot_bytes`, otherwise
-    // the store flush could include bytes whose WAL record was
-    // not part of the durable snapshot.
+    // 1+2. Snapshot dirty + pending-deletes + cloned bytes + WAL
+    // watermark under the same commit-publish gate used by
+    // foreground persistent writers. Holding the gate through byte
+    // cloning is load-bearing: a writer must not mutate a blob
+    // between our dirty snapshot and `snapshot_bytes`, otherwise the
+    // store flush could include bytes whose WAL record was not part
+    // of the checkpoint snapshot.
     //
     // If `snapshot_pending_deletes` were taken outside this
     // commit-publish block, a writer could (a) enter its mutation,
@@ -206,17 +206,13 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     // WAL — exactly the W2D violation deferred-delete was
     // designed to prevent.
     //
-    // No-WAL trees (memory mode, user-supplied store) skip the
-    // journal flush but still clone immediately after draining.
-    let (snap, pending, snap_bytes) = if let Some(journal) = &shared.journal {
+    // No-WAL trees (memory mode, user-supplied store) skip the WAL
+    // watermark but still clone immediately after draining.
+    let (snap, pending, snap_bytes, wal_up_to) = if let Some(journal) = &shared.journal {
         let _commit = shared.commit_gate.enter_checkpoint();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
-        if let Err(e) = journal.flush() {
-            shared.bm.restore_pending_deletes(pending);
-            shared.bm.restore_dirty(snap);
-            return Err(e);
-        }
+        let wal_up_to = journal.wal_work();
         let mut snap_bytes = Vec::with_capacity(snap.len());
         for (guid, seq) in &snap {
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
@@ -228,7 +224,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
             };
             snap_bytes.push((*guid, *seq, bytes));
         }
-        (snap, pending, snap_bytes)
+        (snap, pending, snap_bytes, Some(wal_up_to))
     } else {
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
@@ -243,8 +239,21 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
             };
             snap_bytes.push((*guid, *seq, bytes));
         }
-        (snap, pending, snap_bytes)
+        (snap, pending, snap_bytes, None)
     };
+
+    // 3. Force the WAL watermark before data-file writes, but do
+    // not hold `commit_gate` across the fsync. Later writers may
+    // append more WAL records while this flush runs; that is safe
+    // because this epoch only writes the cloned dirty snapshot and
+    // write-through retirement keeps newer dirty entries alive.
+    if let (Some(journal), Some(up_to)) = (&shared.journal, wal_up_to) {
+        if let Err(e) = journal.flush_up_to(up_to) {
+            shared.bm.restore_pending_deletes(pending);
+            shared.bm.restore_dirty(snap);
+            return Err(e);
+        }
+    }
     let snap_count = snap.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
 

@@ -61,8 +61,8 @@
 //!   types and stats snapshots are re-exported at the crate root.
 //! - `concurrency` — `HybridLatch` 3-mode lock plus the
 //!   tree-wide maintenance gate.
-//! - `checkpoint` — 3-thread background checkpointer. Users opt
-//!   in via [`CheckpointConfig`].
+//! - `checkpoint` — 3-thread background checkpointer for dirty blob
+//!   drain, WAL flush/truncate, and cache eviction.
 //!
 //! ## Platform support
 //!
@@ -167,8 +167,8 @@ pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats
 // Single-record atomic batches.
 pub use api::atomic::{AtomicBatch, Record, RecordVersion};
 
-// Background checkpointer policy. The `Checkpointer` handle
-// itself is crate-internal; users opt in via this config.
+// Background checkpointer policy. The `Checkpointer` handle itself
+// is crate-internal; users tune or disable it via this config.
 pub use checkpoint::CheckpointConfig;
 
 // BlobStore trait + bundled stores + zero-copy blob buffer.

@@ -154,9 +154,8 @@ pub struct TreeStats {
     /// WAL/journal worker counters, or `None` for memory trees and
     /// caller-supplied stores opened without holt's WAL.
     pub journal: Option<JournalStats>,
-    /// Background checkpointer telemetry, or `None` if the bg
-    /// thread group isn't running (the default; opt in via
-    /// [`crate::CheckpointConfig::enabled`]).
+    /// Background checkpointer telemetry, or `None` if the caller
+    /// explicitly disabled the thread group.
     pub checkpointer: Option<CheckpointerStats>,
 }
 

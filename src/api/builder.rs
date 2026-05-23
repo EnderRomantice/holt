@@ -59,11 +59,9 @@ impl TreeBuilder {
 
     /// Background checkpointer policy.
     ///
-    /// Default is disabled — callers drive
-    /// [`Tree::checkpoint`] synchronously. Pass
-    /// [`CheckpointConfig::enabled`] (or any config with
-    /// `enabled = true`) to spawn the background thread that
-    /// drains the dirty set + truncates the WAL.
+    /// Persistent trees enable it by default so the dirty set and WAL
+    /// stay bounded. Pass a config with `enabled = false` to drive
+    /// [`Tree::checkpoint`] synchronously instead.
     pub fn checkpoint(mut self, cfg: CheckpointConfig) -> Self {
         self.cfg.checkpoint = cfg;
         self

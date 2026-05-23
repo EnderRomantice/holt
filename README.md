@@ -250,23 +250,25 @@ tree.view(b"img/", |view| {
 
 ### Durability
 
-Per-op writes land in the journal worker + BufferManager cache.
-The WAL acknowledgement boundary is explicit:
+Per-op writes update the BufferManager cache and append one WAL
+record. The WAL acknowledgement boundary is explicit:
 
 - **`WalCommit::Enqueue`** — default. Return after the journal
   worker queue accepts the encoded record.
 - **`WalCommit::Write`** — return after WAL bytes reach the OS
-  page cache, with no per-op `sync_data`. This is the benchmark
-  profile matching RocksDB `WAL on, sync=false`.
+  page cache, with no per-op `sync_data`. This direct append path is
+  the benchmark profile matching RocksDB `WAL on, sync=false`.
 - **`WalCommit::Sync`** — return after `sync_data`; concurrent
   writers can share one fsync through group commit.
 
 Disk-truth advances at:
 
-- **`Tree::checkpoint()`** — flush the journal (`sync_data`),
-  write dirty blobs through to the store, `fdatasync` the store,
-  truncate the WAL. Call this at your own application checkpoint
-  cadence.
+- **Background checkpoint** — enabled by default for file-backed
+  trees. It flushes the journal, writes dirty blobs through to the
+  store, syncs the store, applies pending deletes, and truncates the
+  WAL once the checkpoint pipeline is clean.
+- **`Tree::checkpoint()`** — the same protocol, run synchronously
+  when callers explicitly want a checkpoint boundary.
 - **WAL auto-flush** — once the WAL writer's pending buffer
   crosses 64 KB it drains to the OS page cache (no `sync_data`).
   Bounds in-memory buffering even if `checkpoint` is rare.

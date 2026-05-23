@@ -182,10 +182,13 @@ impl Journal {
         Ok(())
     }
 
-    /// Drain every append submitted before this call and force the
-    /// WAL file durable.
-    pub(crate) fn flush(&self) -> Result<()> {
-        let observed = self.wal_work.load(Ordering::Acquire);
+    /// Highest WAL work id published by append paths.
+    pub(crate) fn wal_work(&self) -> u64 {
+        self.wal_work.load(Ordering::Acquire)
+    }
+
+    /// Force all WAL records up to `observed` durable.
+    pub(crate) fn flush_up_to(&self, observed: u64) -> Result<()> {
         if observed <= self.durable_work.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -429,7 +432,7 @@ mod tests {
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
         assert!(!journal.needs_checkpoint());
-        journal.flush().unwrap();
+        journal.flush_up_to(journal.wal_work()).unwrap();
         journal.truncate().unwrap();
 
         let stats = journal.stats();
@@ -448,7 +451,7 @@ mod tests {
             .submit(vec![1, 2, 3, 4], WalCommit::Enqueue)
             .unwrap();
         assert!(journal.needs_checkpoint());
-        journal.flush().unwrap();
+        journal.flush_up_to(journal.wal_work()).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
 
         journal.truncate().unwrap();
@@ -459,7 +462,7 @@ mod tests {
         );
 
         let syncs_after_truncate = journal.stats().syncs;
-        journal.flush().unwrap();
+        journal.flush_up_to(journal.wal_work()).unwrap();
         journal.truncate().unwrap();
         assert_eq!(journal.stats().syncs, syncs_after_truncate);
     }
@@ -478,7 +481,7 @@ mod tests {
         assert!(journal.needs_checkpoint());
         assert!(!journal.needs_flush());
         let syncs_after_append = journal.stats().syncs;
-        journal.flush().unwrap();
+        journal.flush_up_to(journal.wal_work()).unwrap();
         assert_eq!(journal.stats().syncs, syncs_after_append);
 
         journal.truncate().unwrap();
@@ -510,14 +513,14 @@ mod tests {
             journal
                 .submit(vec![9, 8, 7, 6], WalCommit::Enqueue)
                 .unwrap();
-            journal.flush().unwrap();
+            journal.flush_up_to(journal.wal_work()).unwrap();
             assert!(journal.needs_checkpoint());
         }
 
         let journal = Journal::open_or_create(&path, 0).unwrap();
         assert!(journal.needs_checkpoint());
         assert!(journal.needs_flush());
-        journal.flush().unwrap();
+        journal.flush_up_to(journal.wal_work()).unwrap();
         assert!(!journal.needs_flush());
         journal.truncate().unwrap();
         assert!(!journal.needs_checkpoint());
