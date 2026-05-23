@@ -19,8 +19,8 @@ pub enum WalCommit {
     /// immediate process crash can lose queued records unless a
     /// checkpoint or later flush drains them first.
     Enqueue,
-    /// Return after the journal worker has written the WAL bytes to
-    /// the OS page cache. This matches the usual
+    /// Return after the WAL bytes have reached the OS page cache.
+    /// This matches the usual
     /// `WAL on, sync=false` benchmark/profile: process-crash
     /// recovery can replay the record, but power-loss durability is
     /// not forced per operation.
@@ -43,8 +43,9 @@ pub enum WalCommit {
 pub enum Storage {
     /// File-backed durable storage at `dir`. On Linux the
     /// [`crate::FileBlobStore`] opens the underlying file with
-    /// `O_DIRECT` and (with the `io-uring` feature enabled) drives
-    /// I/O through `io_uring`.
+    /// `O_DIRECT` and, with default features, uses `io_uring` for
+    /// data-file I/O. Non-Linux Unix targets use the normal file
+    /// backend; build Linux with `--no-default-features` to force it.
     File {
         /// Directory holding `blobs.dat`, `manifest.bin`,
         /// `manifest.log`, and `journal.wal`.

@@ -76,7 +76,7 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
     let mut i = 0;
 
     #[cfg(target_arch = "x86_64")]
-    if limit >= 64 && x86::avx2_available() {
+    if limit >= 32 && x86::avx2_available() {
         while i + 32 <= limit {
             let mask = unsafe { x86::cmp_32_bytes_bitmask(a[i..].as_ptr(), b[i..].as_ptr()) };
             if mask != u32::MAX {
@@ -109,10 +109,7 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
         i += 16;
     }
 
-    while i < limit && a[i] == b[i] {
-        i += 1;
-    }
-    i
+    longest_common_prefix_tail(a, b, i, limit)
 }
 
 /// Find the smallest index `i ∈ [start, bytes.len())` with
@@ -131,7 +128,7 @@ pub fn find_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     let mut i = start;
 
     #[cfg(target_arch = "x86_64")]
-    if len - i >= 64 && x86::avx2_available() {
+    if len - i >= 32 && x86::avx2_available() {
         while i + 32 <= len {
             let ptr = unsafe { bytes.as_ptr().add(i) };
             let mask = unsafe { x86::cmp_byte_eq_mask_32(ptr, needle) };
@@ -178,7 +175,7 @@ pub fn find_next_nonzero_byte(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
 
     #[cfg(target_arch = "x86_64")]
-    if len - i >= 64 && x86::avx2_available() {
+    if len - i >= 32 && x86::avx2_available() {
         while i + 32 <= len {
             let ptr = unsafe { bytes.as_ptr().add(i) };
             let mask = unsafe { x86::cmp_byte_neq_zero_mask_32(ptr) };
@@ -208,6 +205,43 @@ pub fn find_next_nonzero_byte(bytes: &[u8], start: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Hint the CPU that the cache line at `ptr` is likely to be read
+/// soon. This is intentionally best-effort and a no-op on targets
+/// where we do not have a stable cheap prefetch intrinsic.
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn prefetch_read_data(ptr: *const u8) {
+    unsafe {
+        x86::prefetch_read_data(ptr);
+    }
+}
+
+#[inline]
+fn longest_common_prefix_tail(a: &[u8], b: &[u8], mut i: usize, limit: usize) -> usize {
+    #[cfg(target_endian = "little")]
+    {
+        while i + 8 <= limit {
+            let x = unsafe { read_u64_unaligned(a.as_ptr().add(i)) }
+                ^ unsafe { read_u64_unaligned(b.as_ptr().add(i)) };
+            if x != 0 {
+                return i + (x.trailing_zeros() as usize / 8);
+            }
+            i += 8;
+        }
+    }
+
+    while i < limit && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+unsafe fn read_u64_unaligned(ptr: *const u8) -> u64 {
+    unsafe { std::ptr::read_unaligned(ptr.cast::<u64>()) }
 }
 
 /// Find the smallest index `i ∈ [start, words.len())` with
@@ -258,7 +292,7 @@ pub fn find_next_nonzero_u32(words: &[u32], start: usize) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------
-// arch-specific glue for the two new scans
+// arch-specific glue for byte/u32 scans
 // ---------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
@@ -309,7 +343,7 @@ mod x86 {
         __m128i, __m256i, _mm256_cmpeq_epi32, _mm256_cmpeq_epi8, _mm256_loadu_si256,
         _mm256_movemask_epi8, _mm256_movemask_ps, _mm256_set1_epi8, _mm256_setzero_si256,
         _mm_cmpeq_epi32, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_movemask_ps,
-        _mm_set1_epi8, _mm_setzero_si128,
+        _mm_prefetch, _mm_set1_epi8, _mm_setzero_si128, _MM_HINT_T0,
     };
 
     #[inline]
@@ -379,11 +413,7 @@ mod x86 {
             (1u32 << count) - 1
         };
         let masked = mask & count_mask;
-        if masked == 0 {
-            None
-        } else {
-            Some(masked.trailing_zeros() as u8)
-        }
+        std::num::NonZeroU32::new(masked).map(|m| m.get().trailing_zeros() as u8)
     }
 
     /// 16-bit mask where bit `i = 1` iff byte `i` of the 16-byte
@@ -447,6 +477,11 @@ mod x86 {
         let zero_mask = (_mm256_movemask_ps(as_ps) as u32) & 0xFF;
         (!zero_mask) & 0xFF
     }
+
+    #[inline]
+    pub(super) unsafe fn prefetch_read_data(ptr: *const u8) {
+        unsafe { _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T0) };
+    }
 }
 
 // ---------------------------------------------------------------
@@ -509,12 +544,8 @@ mod arm {
             (1u64 << count_bits) - 1
         };
         let masked = mask64 & count_mask;
-        if masked == 0 {
-            None
-        } else {
-            // First non-zero nibble's position / 4 = byte index.
-            Some((masked.trailing_zeros() / 4) as u8)
-        }
+        // First non-zero nibble's position / 4 = byte index.
+        std::num::NonZeroU64::new(masked).map(|m| (m.get().trailing_zeros() / 4) as u8)
     }
 
     /// 16-bit mask where bit `i = 1` iff byte `i` equals `needle`.

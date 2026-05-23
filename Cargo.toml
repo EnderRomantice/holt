@@ -59,13 +59,11 @@ tempfile = "3"
 proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
 
 [features]
-default = []
+default = ["io-uring"]
 # Linux-only fast path: route FileBlobStore reads + writes
 # through io_uring instead of pread/pwrite syscalls. On non-Linux
-# targets the feature is a no-op (the underlying `io-uring` crate
-# is gated to `cfg(target_os = "linux")`, so FileBlobStore
-# stays on the pread/pwrite path). Adds the `io-uring` crate as a
-# build dep.
+# targets this feature is a no-op because the dependency is cfg-gated.
+# Use `--no-default-features` on Linux to force the syscall path.
 io-uring = ["dep:io-uring"]
 # Enables `tracing` instrumentation on the rare-but-important
 # events: spillover, merge_blob, compact_blob, WAL flush /

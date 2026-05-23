@@ -102,6 +102,20 @@ impl CachedBlob {
         self.last_touched.load(Ordering::Relaxed)
     }
 
+    /// Best-effort prefetch for the blob header.
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn prefetch_header(&self) {
+        let ptr = unsafe { (&*self.buf.get()).as_ptr() };
+        crate::engine::prefetch_read_data(ptr);
+    }
+
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn prefetch_header(&self) {
+        let _ = self;
+    }
+
     /// Wait-free read snapshot. No real lock taken - the caller
     /// reads bytes through [`OptimisticGuard::as_slice`] and then
     /// calls [`OptimisticGuard::validate`] to confirm no writer

@@ -1113,15 +1113,16 @@ impl RangeIter {
         if !concat_starts_with(&self.curr_key, segment, &self.prefix) {
             return None;
         }
-        let mut i = self.prefix.len();
-        while i < total_len {
-            let byte = concat_byte(&self.curr_key, segment, i);
-            if byte == delimiter {
-                return Some(i + 1);
+
+        if self.prefix.len() < self.curr_key.len() {
+            if let Some(pos) = simd::find_byte(&self.curr_key, delimiter, self.prefix.len()) {
+                return Some(pos + 1);
             }
-            i += 1;
         }
-        None
+
+        let start_in_segment = self.prefix.len().saturating_sub(self.curr_key.len());
+        simd::find_byte(segment, delimiter, start_in_segment)
+            .map(|pos| self.curr_key.len() + pos + 1)
     }
 
     #[allow(clippy::too_many_lines)] // one cursor-state machine over every ART node kind
@@ -1533,6 +1534,7 @@ impl RangeIter {
                         };
                         self.stack[idx].next = 1;
                         let child_pin = self.bm.pin(child_guid)?;
+                        child_pin.prefetch_header();
                         let child_can_rollup = {
                             let guard = child_pin.read();
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1626,6 +1628,7 @@ impl RangeIter {
 
     fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<()> {
         let child_pin = self.bm.pin(child_guid)?;
+        child_pin.prefetch_header();
         self.push_pinned_other_blob(child_pin, child_guid, prefix_bytes)
     }
 

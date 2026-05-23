@@ -1116,7 +1116,8 @@ impl BufferManager {
     }
 
     /// Forward `flush` to the inner store without touching the
-    /// cache. Used by the I/O worker for `IoTask::Sync`.
+    /// cache. Used by the checkpoint I/O worker between epoch
+    /// phases.
     pub(crate) fn flush_inner(&self) -> Result<()> {
         self.store.flush()
     }

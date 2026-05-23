@@ -144,6 +144,7 @@ pub fn insert_multi_conditional(
                 cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
             }
             let child_pin = bm.pin(crossing.child_guid)?;
+            child_pin.prefetch_header();
             let child_guard = child_pin.write();
             drop(root_read);
 
@@ -222,6 +223,7 @@ fn try_insert_from_optimistic_route(
     };
 
     let child_pin = bm.pin(route.child_guid)?;
+    child_pin.prefetch_header();
     let child_guard = child_pin.write();
     if !root_pin.validate_content_version(root_version) {
         drop(child_guard);
@@ -349,6 +351,7 @@ fn try_insert_batch_from_first_blob(
         if let Some(route) = cache.lookup(first_key, root_version) {
             let run_len = same_child_prefix_run_len(items, route.child_depth);
             let child_pin = bm.pin(route.child_guid)?;
+            child_pin.prefetch_header();
             let child_guard = child_pin.write();
             if root_pin.validate_content_version(root_version) {
                 let outcome = insert_batch_in_pinned_blob(
@@ -391,6 +394,7 @@ fn try_insert_batch_from_first_blob(
             }
             let run_len = same_child_prefix_run_len(items, crossing.child_depth);
             let child_pin = bm.pin(crossing.child_guid)?;
+            child_pin.prefetch_header();
             let child_guard = child_pin.write();
             drop(root_read);
 
@@ -563,6 +567,7 @@ fn lock_coupled_insert_in_blob(
             }
             Ok(InsertStep::Crossing(crossing)) => {
                 let child_pin = bm.pin(crossing.child_guid)?;
+                child_pin.prefetch_header();
                 let child_guard = child_pin.write();
                 drop(guard);
 

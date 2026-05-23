@@ -26,6 +26,8 @@ mod walker;
 // Re-export only the items consumed outside the `walker` subtree.
 // Walker-internal types stay hidden behind `mod walker;`.
 pub(crate) use route_cache::RouteCache;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use simd::prefetch_read_data;
 pub use walker::{
     blob_needs_compaction, collect_blob_guids, collect_blob_topology_silent,
     collect_prefix_blob_topology_silent, compact_blob, erase_multi, erase_multi_conditional,

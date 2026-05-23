@@ -114,6 +114,7 @@ where
         let mut depth = crossing.child_depth;
         loop {
             let pin = bm.pin(current_guid)?;
+            pin.prefetch_header();
             let guard = pin.read_optimistic();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let start_slot = frame.header().root_slot;

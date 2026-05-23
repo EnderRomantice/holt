@@ -222,6 +222,7 @@ where
 /// `encode_record(&WalOp::Insert { ... }, seq, out)` but without
 /// the intermediate enum.
 pub fn encode_insert_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8], value: &[u8]) {
+    out.reserve(encoded_insert_record_len(key.len(), value.len()));
     write_record(out, seq, TY_INSERT, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
@@ -237,6 +238,7 @@ pub(crate) const fn encoded_insert_record_len(key_len: usize, value_len: usize) 
 /// Encode an `Erase` record directly from refs. Carries key only
 /// because replay redoes from `key` alone.
 pub fn encode_erase_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8]) {
+    out.reserve(encoded_erase_record_len(key.len()));
     write_record(out, seq, TY_ERASE, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
@@ -257,6 +259,10 @@ pub fn encode_rename_object_record(
     dst_key: &[u8],
     force: bool,
 ) {
+    out.reserve(encoded_rename_object_record_len(
+        src_key.len(),
+        dst_key.len(),
+    ));
     write_record(out, seq, TY_RENAME_OBJECT, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, src_key);
@@ -318,6 +324,7 @@ impl<'buf> BatchEncoder<'buf> {
     /// (tree_id, zero-placeholder count) are written immediately;
     /// subsequent `push_*` calls extend the body.
     pub fn begin(out: &'buf mut Vec<u8>, seq: u64, tree_id: u64) -> Self {
+        out.reserve(RECORD_HEADER_SIZE + 8 + 4 + RECORD_FOOTER_SIZE);
         let start = out.len();
         out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
         let len_pos = out.len();
@@ -343,6 +350,7 @@ impl<'buf> BatchEncoder<'buf> {
     /// `encode_body` writes for `WalOp::Insert` (sans the leading
     /// type tag, which we prepend here for batch framing).
     pub fn push_insert(&mut self, tree_id: u64, key: &[u8], value: &[u8]) {
+        self.out.reserve(1 + 8 + 4 + key.len() + 4 + value.len());
         self.out.push(TY_INSERT);
         self.out.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(self.out, key);
@@ -378,6 +386,8 @@ impl<'buf> BatchEncoder<'buf> {
         let count_u32 = u32::try_from(count).expect("insert run count fits in u32");
         let key_len_u32 = u32::try_from(key_len).expect("key length fits in u32");
         let value_len_u32 = u32::try_from(value_len).expect("value length fits in u32");
+        self.out
+            .reserve(1 + 8 + 4 + 4 + 4 + count.saturating_mul(key_len.saturating_add(value_len)));
 
         self.out.push(TY_BATCH_INSERT_RUN);
         self.out.extend_from_slice(&tree_id.to_le_bytes());
@@ -399,6 +409,7 @@ impl<'buf> BatchEncoder<'buf> {
 
     /// Append one `Erase` inner op.
     pub fn push_erase(&mut self, tree_id: u64, key: &[u8]) {
+        self.out.reserve(1 + 8 + 4 + key.len());
         self.out.push(TY_ERASE);
         self.out.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(self.out, key);
@@ -407,6 +418,7 @@ impl<'buf> BatchEncoder<'buf> {
 
     /// Append one `RenameObject` inner op.
     pub fn push_rename_object(&mut self, tree_id: u64, src: &[u8], dst: &[u8], force: bool) {
+        self.out.reserve(1 + 8 + 4 + src.len() + 4 + dst.len() + 1);
         self.out.push(TY_RENAME_OBJECT);
         self.out.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(self.out, src);

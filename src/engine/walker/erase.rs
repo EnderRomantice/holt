@@ -86,6 +86,7 @@ pub fn erase_multi_conditional(
         let root_version = root_pin.content_version();
         if let Some(route) = route_cache.and_then(|cache| cache.lookup(key, root_version)) {
             let child_pin = bm.pin(route.child_guid)?;
+            child_pin.prefetch_header();
             let child_guard = child_pin.write();
             drop(root_read);
 
@@ -121,6 +122,7 @@ pub fn erase_multi_conditional(
                     cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
                 }
                 let child_pin = bm.pin(crossing.child_guid)?;
+                child_pin.prefetch_header();
                 let child_guard = child_pin.write();
                 drop(root_read);
 
@@ -217,6 +219,7 @@ fn lock_coupled_erase_in_blob(
         EraseStep::Done(r) => r,
         EraseStep::Crossing(crossing) => {
             let child_pin = bm.pin(crossing.child_guid)?;
+            child_pin.prefetch_header();
             let child_guard = child_pin.write();
             drop(guard);
 
