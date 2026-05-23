@@ -23,11 +23,8 @@ pub enum WalOp {
     },
     /// Single-key erase.
     ///
-    /// Carries only the key — replay redoes the erase from `key`
-    /// alone. The prior value is not retained on disk: the blind
-    /// `Tree::delete` walker never reads it, and the returning
-    /// `Tree::remove` walker hands it straight to the caller
-    /// without round-tripping through the WAL.
+    /// Carries only the key because replay redoes the erase from
+    /// `key` alone.
     Erase {
         /// Key bytes.
         key: Vec<u8>,

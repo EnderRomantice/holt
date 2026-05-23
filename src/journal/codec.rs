@@ -58,11 +58,8 @@ pub const FILE_MAGIC: u32 = 0x414C_4157;
 /// from `WalOp::Insert` and the dead `value` field from
 /// `WalOp::Erase`. Both were "for replay reversibility" but
 /// replay never undoes — it's an idempotent forward redo that
-/// only consumes `key, value` (Insert) / `key` (Erase). Pure
-/// wire-format savings: returning `Tree::insert` / `Tree::remove`
-/// no longer serialise the prior value into the WAL (blind
-/// variants already wrote `None`); the trailing
-/// `optional_bytes` slot is gone from both record bodies.
+/// only consumes `key, value` (Insert) / `key` (Erase). The
+/// trailing `optional_bytes` slot is gone from both record bodies.
 ///
 /// Older internal v0.3 draft binaries that still wrote format `2`
 /// would mis-parse the absent slot as a length prefix; the
@@ -238,9 +235,7 @@ pub(crate) const fn encoded_insert_record_len(key_len: usize, value_len: usize) 
 }
 
 /// Encode an `Erase` record directly from refs. Carries key only
-/// — replay redoes from `key` alone, and the prior value (if any)
-/// is handed straight to the `Tree::remove` caller without
-/// round-tripping through the WAL.
+/// because replay redoes from `key` alone.
 pub fn encode_erase_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8]) {
     write_record(out, seq, TY_ERASE, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());

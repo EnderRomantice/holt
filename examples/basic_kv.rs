@@ -37,8 +37,8 @@ fn main() {
         }
     }
 
-    let prev = tree.remove(b"meta/owner").unwrap();
-    println!("\ndelete meta/owner returned previous = {prev:?}");
+    let existed = tree.delete(b"meta/owner").unwrap();
+    println!("\ndelete meta/owner existed = {existed}");
     println!("get meta/owner -> {:?}", tree.get(b"meta/owner").unwrap());
 
     // Direct config form (without the builder):

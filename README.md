@@ -66,7 +66,7 @@ without coordinating.
 ## Project status
 
 **Pre-1.0, actively maintained.** The v0.3 metadata-engine core is
-landed: insert / lookup / erase / rename / range / atomic / compact,
+landed: put / get / delete / rename / range / atomic / compact,
 multi-blob crossings, online maintenance gates, persistent store
 with `O_DIRECT` and optional Linux `io_uring`, logical WAL
 with group commit, sharded buffer manager, 3-thread background
@@ -122,16 +122,11 @@ let tree = TreeBuilder::new("scratch").memory().open()?;
 
 ### Single-key CRUD
 
-Bytes in, bytes out. `put` and `delete` are the **blind hot paths** —
-they write or tombstone without reading the existing leaf, and return
-`()` / `bool` respectively. `insert` and `remove` are the **explicit
-returning variants** that pay one extra leaf read to hand you the
-prior value. Use `put`/`delete` by default; reach for `insert`/`remove`
-only where you actually consume the previous bytes. `rename` is
-atomic and errors if `dst` exists unless `force = true`.
+Bytes in, bytes out. `put` and `delete` are the hot paths: they write
+or tombstone without reading the existing leaf. `rename` is atomic and
+errors if `dst` exists unless `force = true`.
 
 ```rust
-// Blind hot paths — recommended default.
 tree.put(b"img/01.jpg", b"rgb_data_blob_id_abc")?;
 
 let value: Option<Vec<u8>> = tree.get(b"img/01.jpg")?;
@@ -139,12 +134,6 @@ assert_eq!(value.as_deref(), Some(&b"rgb_data_blob_id_abc"[..]));
 
 let existed: bool = tree.delete(b"img/01.jpg")?;
 assert!(existed);
-
-// Returning variants — pay the read-back cost only when you need it.
-let prev: Option<Vec<u8>> = tree.insert(b"img/01.jpg", b"v2")?;
-assert!(prev.is_none()); // we just deleted it above
-let dropped: Option<Vec<u8>> = tree.remove(b"img/01.jpg")?;
-assert_eq!(dropped.as_deref(), Some(&b"v2"[..]));
 
 tree.put(b"old/path", b"v")?;
 tree.rename(b"old/path", b"new/path", /*force=*/ false)?;

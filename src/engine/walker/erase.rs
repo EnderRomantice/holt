@@ -28,21 +28,16 @@ use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 /// descent reaches a [`NodeType::Blob`] crossing — callers wanting
 /// cross-blob erase should use [`erase_multi`].
 ///
-/// Updates `header.root_slot` in place and returns the prior value
-/// if the key was present. If `key` was not in the tree,
-/// `previous` is `None` and the root slot is unchanged.
+/// Updates `header.root_slot` in place.
 #[cfg(test)]
 pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
-    // Single-blob `erase` is test-only today and always returns
-    // the prior value — preserves the existing test surface.
-    let r = erase_at(frame, root_slot, key, 0, true)?;
+    let r = erase_at(frame, root_slot, key, 0)?;
     let root_dirty = r.mutated || !matches!(r.signal, EraseSignal::Unchanged);
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
     frame.header_mut().root_slot = new_root;
     Ok(EraseOutcome {
         root_dirty,
         mutated: r.mutated,
-        previous: r.previous,
     })
 }
 
@@ -51,27 +46,14 @@ pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Re
 /// child path keeps parent BlobNodes stable and records child root
 /// changes in the child blob's own header.
 ///
-/// `wants_prev` mirrors `insert_multi`'s flag — `true` for
-/// [`crate::Tree::remove`] (returning API) and `false` for
-/// [`crate::Tree::delete`] (blind API, returns `bool`). The blind
-/// path saves a per-leaf `value_size`-byte read + clone.
 pub fn erase_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
     route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
     seq: u64,
-    wants_prev: bool,
 ) -> Result<EraseOutcome> {
-    erase_multi_conditional(
-        bm,
-        root_pin,
-        route_cache,
-        key,
-        seq,
-        wants_prev,
-        EraseCondition::Always,
-    )
+    erase_multi_conditional(bm, root_pin, route_cache, key, seq, EraseCondition::Always)
 }
 
 /// Conditional variant of [`erase_multi`]. Used by
@@ -83,7 +65,6 @@ pub fn erase_multi_conditional(
     route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
     seq: u64,
-    wants_prev: bool,
     condition: EraseCondition,
 ) -> Result<EraseOutcome> {
     // The caller (typically `Tree`) keeps `root_pin` alive across
@@ -117,7 +98,6 @@ pub fn erase_multi_conditional(
                 false,
                 key,
                 seq,
-                wants_prev,
                 condition,
                 route.child_depth,
                 &mut blob_hops,
@@ -153,7 +133,6 @@ pub fn erase_multi_conditional(
                     false,
                     key,
                     seq,
-                    wants_prev,
                     condition,
                     crossing.child_depth,
                     &mut blob_hops,
@@ -170,7 +149,6 @@ pub fn erase_multi_conditional(
                 return Ok(EraseOutcome {
                     root_dirty: false,
                     mutated: false,
-                    previous: None,
                 });
             }
             LookupResult::Found(_) => {}
@@ -190,7 +168,6 @@ pub fn erase_multi_conditional(
         true,
         key,
         seq,
-        wants_prev,
         condition,
         0,
         &mut blob_hops,
@@ -222,7 +199,6 @@ fn lock_coupled_erase_in_blob(
     is_top_blob: bool,
     key: SearchKey<'_>,
     seq: u64,
-    wants_prev: bool,
     condition: EraseCondition,
     depth: usize,
     blob_hops: &mut u64,
@@ -233,10 +209,8 @@ fn lock_coupled_erase_in_blob(
     let step = {
         let mut frame = guard.frame();
         let root_slot = frame.header().root_slot;
-        erase_at_step(
-            &mut frame, root_slot, key, depth, wants_prev, condition, true,
-        )
-        .map_err(|e| e.with_blob_guid(current_guid))?
+        erase_at_step(&mut frame, root_slot, key, depth, condition, true)
+            .map_err(|e| e.with_blob_guid(current_guid))?
     };
 
     let r = match step {
@@ -254,7 +228,6 @@ fn lock_coupled_erase_in_blob(
                 false,
                 key,
                 seq,
-                wants_prev,
                 condition,
                 crossing.child_depth,
                 blob_hops,
@@ -287,7 +260,6 @@ fn lock_coupled_erase_in_blob(
     Ok(EraseOutcome {
         root_dirty: is_top_blob && child_touched,
         mutated: r.mutated,
-        previous: r.previous,
     })
 }
 
@@ -312,20 +284,17 @@ fn resolve_new_root_after_erase(
 // ---------- recursive dispatch ----------
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 pub(super) fn erase_at(
     frame: &mut BlobFrame<'_>,
     slot: u16,
     key: &[u8],
     depth: usize,
-    wants_prev: bool,
 ) -> Result<EraseReturn> {
     match erase_at_step(
         frame,
         slot,
         SearchKey::exact(key),
         depth,
-        wants_prev,
         EraseCondition::Always,
         false,
     )? {
@@ -336,13 +305,12 @@ pub(super) fn erase_at(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
+#[allow(clippy::too_many_arguments)] // condition/crossing flags mirror every node arm
 fn erase_at_step(
     frame: &mut BlobFrame<'_>,
     slot: u16,
     key: SearchKey<'_>,
     depth: usize,
-    wants_prev: bool,
     condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
@@ -354,31 +322,13 @@ fn erase_at_step(
         NodeType::EmptyRoot => Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
-            previous: None,
         })),
-        NodeType::Leaf => {
-            erase_at_leaf(frame, slot, key, wants_prev, condition).map(EraseStep::Done)
+        NodeType::Leaf => erase_at_leaf(frame, slot, key, condition).map(EraseStep::Done),
+        NodeType::Prefix => {
+            erase_at_prefix_step(frame, slot, key, depth, condition, allow_crossing)
         }
-        NodeType::Prefix => erase_at_prefix_step(
-            frame,
-            slot,
-            key,
-            depth,
-            wants_prev,
-            condition,
-            allow_crossing,
-        ),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner_step(
-                frame,
-                slot,
-                ntype,
-                key,
-                depth,
-                wants_prev,
-                condition,
-                allow_crossing,
-            )
+            erase_at_inner_step(frame, slot, ntype, key, depth, condition, allow_crossing)
         }
         NodeType::Blob => {
             if allow_crossing {
@@ -412,7 +362,6 @@ fn blob_node_erase_step(
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
-            previous: None,
         }));
     }
     Ok(EraseStep::Crossing(EraseBlobCrossing {
@@ -431,28 +380,21 @@ fn blob_node_erase_step(
 /// responsibility.
 ///
 /// Replaying an erase against an already-tombstoned leaf is a
-/// no-op: `previous` returns `None` (the prior value was not
-/// visible to readers when this erase fired the second time) and
-/// the counter is not double-bumped.
+/// no-op and the counter is not double-bumped.
 fn erase_at_leaf(
     frame: &mut BlobFrame<'_>,
     leaf_slot: u16,
     key: SearchKey<'_>,
-    wants_prev: bool,
     condition: EraseCondition,
 ) -> Result<EraseReturn> {
-    // Always read the existing key (needed for the key-match
-    // check). Only materialise the prev value when the caller
-    // (`Tree::remove`) actually asks for it — `Tree::delete` (blind)
-    // sets `wants_prev = false` and saves the leaf-extent value
-    // clone per op.
+    // Always read the existing key; the value bytes are not needed
+    // for delete.
     let leaf = {
         let (existing_key, leaf) = read_leaf_key_ref(frame.as_ref(), leaf_slot)?;
         if !key.eq_slice(existing_key) {
             return Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: false,
-                previous: None,
             });
         }
         leaf
@@ -462,7 +404,6 @@ fn erase_at_leaf(
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
-            previous: None,
         });
     }
     if let EraseCondition::IfVersion(expected) = condition {
@@ -470,16 +411,9 @@ fn erase_at_leaf(
             return Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: false,
-                previous: None,
             });
         }
     }
-    let prev = if wants_prev {
-        let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &leaf)?;
-        Some(v.to_vec())
-    } else {
-        None
-    };
     let mut new_leaf = leaf;
     new_leaf.tombstone = 1;
     write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
@@ -488,17 +422,15 @@ fn erase_at_leaf(
     Ok(EraseReturn {
         signal: EraseSignal::Unchanged,
         mutated: true,
-        previous: prev,
     })
 }
 
-#[allow(clippy::too_many_arguments)] // wants_prev added by API split
+#[allow(clippy::too_many_arguments)] // mirrors erase_at_step's call shape
 fn erase_at_prefix_step(
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
     key: SearchKey<'_>,
     depth: usize,
-    wants_prev: bool,
     condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
@@ -515,7 +447,6 @@ fn erase_at_prefix_step(
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
-            previous: None,
         }));
     }
 
@@ -524,7 +455,6 @@ fn erase_at_prefix_step(
         child_slot,
         key,
         depth + plen,
-        wants_prev,
         condition,
         allow_crossing,
     )?;
@@ -535,14 +465,12 @@ fn erase_at_prefix_step(
         EraseSignal::Unchanged => Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: r.mutated,
-            previous: r.previous,
         })),
         EraseSignal::Replaced(new_child) => {
             set_prefix_child(frame, pfx_slot, u32::from(new_child))?;
             Ok(EraseStep::Done(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: r.mutated,
-                previous: r.previous,
             }))
         }
         EraseSignal::SubtreeGone => {
@@ -550,20 +478,18 @@ fn erase_at_prefix_step(
             Ok(EraseStep::Done(EraseReturn {
                 signal: EraseSignal::SubtreeGone,
                 mutated: r.mutated,
-                previous: r.previous,
             }))
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)] // wants_prev added by API split
+#[allow(clippy::too_many_arguments)] // mirrors erase_at_step's call shape
 fn erase_at_inner_step(
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
     ntype: NodeType,
     key: SearchKey<'_>,
     depth: usize,
-    wants_prev: bool,
     condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
@@ -571,26 +497,16 @@ fn erase_at_inner_step(
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
-            previous: None,
         }));
     };
     let Some(child) = inner_find_child(frame, inner_slot, ntype, byte)? else {
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
-            previous: None,
         }));
     };
 
-    let r = erase_at_step(
-        frame,
-        child,
-        key,
-        depth + 1,
-        wants_prev,
-        condition,
-        allow_crossing,
-    )?;
+    let r = erase_at_step(frame, child, key, depth + 1, condition, allow_crossing)?;
     let EraseStep::Done(r) = r else {
         return Ok(r);
     };
@@ -598,14 +514,12 @@ fn erase_at_inner_step(
         EraseSignal::Unchanged => Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: r.mutated,
-            previous: r.previous,
         })),
         EraseSignal::Replaced(new_child) => {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(new_child))?;
             Ok(EraseStep::Done(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: r.mutated,
-                previous: r.previous,
             }))
         }
         EraseSignal::SubtreeGone => {
@@ -613,7 +527,6 @@ fn erase_at_inner_step(
             Ok(EraseStep::Done(EraseReturn {
                 signal: sig,
                 mutated: r.mutated,
-                previous: r.previous,
             }))
         }
     }

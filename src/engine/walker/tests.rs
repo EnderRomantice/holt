@@ -71,13 +71,12 @@ fn single_insert_then_lookup() {
 }
 
 #[test]
-fn update_same_key_returns_previous() {
+fn update_same_key_replaces_value() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
     put(&mut frame, b"k", b"v1", 1);
     let root = frame.header().root_slot;
-    let r = insert(&mut frame, root, b"k", b"v2", 2).unwrap();
-    assert_eq!(r.previous.as_deref(), Some(&b"v1"[..]));
+    insert(&mut frame, root, b"k", b"v2", 2).unwrap();
     assert_eq!(get(&frame, b"k").as_deref(), Some(&b"v2"[..]));
 }
 
@@ -228,19 +227,19 @@ fn many_inserts_all_readable() {
 
 // -------- erase --------
 
-fn del(frame: &mut BlobFrame<'_>, k: &[u8]) -> Option<Vec<u8>> {
+fn del(frame: &mut BlobFrame<'_>, k: &[u8]) -> bool {
     let root = frame.header().root_slot;
     let r = erase(frame, root, k).unwrap();
-    r.previous
+    r.mutated
 }
 
 #[test]
-fn erase_only_leaf_returns_value_and_empties_tree() {
+fn erase_only_leaf_marks_tombstone_and_compacts_empty() {
     let (mut buf, _) = fresh_blob();
     {
         let mut frame = BlobFrame::wrap(&mut buf);
         put(&mut frame, b"k", b"v", 1);
-        assert_eq!(del(&mut frame, b"k").as_deref(), Some(&b"v"[..]));
+        assert!(del(&mut frame, b"k"));
         assert_eq!(get(&frame, b"k"), None);
         // Erase tombstones; the root is still a (tombstoned) leaf
         // until compact rebuilds.
@@ -256,11 +255,11 @@ fn erase_only_leaf_returns_value_and_empties_tree() {
 }
 
 #[test]
-fn erase_missing_key_is_noop_returns_none() {
+fn erase_missing_key_is_noop() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
     put(&mut frame, b"a", b"1", 1);
-    assert_eq!(del(&mut frame, b"b"), None);
+    assert!(!del(&mut frame, b"b"));
     assert_eq!(get(&frame, b"a").as_deref(), Some(&b"1"[..]));
 }
 
@@ -581,8 +580,8 @@ fn erase_all_returns_to_empty_root() {
         for (i, (k, v)) in pairs.iter().enumerate() {
             put(&mut frame, k, v, i as u64 + 1);
         }
-        for (k, v) in &pairs {
-            assert_eq!(del(&mut frame, k).as_deref(), Some(*v));
+        for (k, _) in &pairs {
+            assert!(del(&mut frame, k));
         }
         assert_eq!(frame.header().tombstone_leaf_cnt as usize, pairs.len());
     }
@@ -603,7 +602,7 @@ fn erase_through_prefix_keeps_other_branches() {
     put(&mut frame, b"img/01.jpg", b"a", 1);
     put(&mut frame, b"img/02.jpg", b"b", 2);
     put(&mut frame, b"img/03.jpg", b"c", 3);
-    assert_eq!(del(&mut frame, b"img/02.jpg").as_deref(), Some(&b"b"[..]));
+    assert!(del(&mut frame, b"img/02.jpg"));
     assert_eq!(get(&frame, b"img/01.jpg").as_deref(), Some(&b"a"[..]));
     assert_eq!(get(&frame, b"img/02.jpg"), None);
     assert_eq!(get(&frame, b"img/03.jpg").as_deref(), Some(&b"c"[..]));
@@ -635,8 +634,8 @@ fn churn_100_keys_inserted_then_all_erased() {
         for (i, (k, v)) in pairs.iter().enumerate() {
             put(&mut frame, k, v, i as u64 + 1);
         }
-        for (k, v) in &pairs {
-            assert_eq!(del(&mut frame, k).as_deref(), Some(&v[..]));
+        for (k, _) in &pairs {
+            assert!(del(&mut frame, k));
         }
         for (k, _) in &pairs {
             assert_eq!(get(&frame, k), None);
@@ -715,8 +714,7 @@ fn insert_splits_blob_node_inline_prefix_on_first_byte_divergence() {
     frame.header_mut().root_slot = out.slot;
 
     let root = frame.header().root_slot;
-    let r = insert(&mut frame, root, b"doc/page1.txt", b"meta", 7).unwrap();
-    assert_eq!(r.previous, None);
+    insert(&mut frame, root, b"doc/page1.txt", b"meta", 7).unwrap();
     assert_eq!(get(&frame, b"doc/page1.txt").as_deref(), Some(&b"meta"[..]));
 
     let root = frame.header().root_slot;

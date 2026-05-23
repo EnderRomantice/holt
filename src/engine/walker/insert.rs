@@ -31,8 +31,7 @@ use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 ///
 /// `seq` is the journal sequence number to stamp on the new leaf
 /// (callers should pass a monotonically-increasing value). Updates
-/// `header.root_slot` in place and returns the prior value if the
-/// key already existed.
+/// `header.root_slot` in place.
 #[cfg(test)]
 pub(super) fn insert(
     frame: &mut BlobFrame<'_>,
@@ -48,13 +47,10 @@ pub(super) fn insert(
     if value.len() > u16::MAX as usize {
         return Err(Error::ValueTooLong { len: value.len() });
     }
-    // Single-blob `insert` is test-only today and always returns
-    // the prior value — preserves the existing test surface.
-    let r = insert_at(frame, root_slot, key, value, 0, seq, true)?;
+    let r = insert_at(frame, root_slot, key, value, 0, seq)?;
     frame.header_mut().root_slot = r.slot_after;
     Ok(InsertOutcome {
         root_dirty: true,
-        previous: r.previous,
         mutated: true,
     })
 }
@@ -70,13 +66,6 @@ pub(super) fn insert(
 /// store write is the checkpoint round's job (and only happens
 /// after the WAL record for `seq` is durable — invariant W2D).
 ///
-/// `wants_prev` controls whether the walker reads + clones the
-/// existing leaf's value on a same-key update — set `true` for
-/// [`crate::Tree::insert`] (returning API) and `false` for
-/// [`crate::Tree::put`] (blind API). The blind path saves the
-/// `value_size`-byte allocation + clone + `Option<Vec<u8>>`
-/// plumbing per put; meaningful on path-shaped workloads where
-/// the leaf value is the dominant per-op heap traffic.
 pub fn insert_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
@@ -84,7 +73,6 @@ pub fn insert_multi(
     key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
-    wants_prev: bool,
 ) -> Result<InsertOutcome> {
     insert_multi_conditional(
         bm,
@@ -93,7 +81,6 @@ pub fn insert_multi(
         key,
         value,
         seq,
-        wants_prev,
         InsertCondition::Always,
     )
 }
@@ -109,7 +96,6 @@ pub fn insert_multi_conditional(
     key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
 ) -> Result<InsertOutcome> {
     if key.len() > u16::MAX as usize {
@@ -129,7 +115,6 @@ pub fn insert_multi_conditional(
         key,
         value,
         seq,
-        wants_prev,
         condition,
         &mut blob_hops,
         &mut max_cross_blob_depth,
@@ -172,7 +157,6 @@ pub fn insert_multi_conditional(
                 key,
                 value,
                 seq,
-                wants_prev,
                 condition,
                 crossing.child_depth,
                 &mut blob_hops,
@@ -202,7 +186,6 @@ pub fn insert_multi_conditional(
         key,
         value,
         seq,
-        wants_prev,
         condition,
         0,
         &mut blob_hops,
@@ -226,7 +209,6 @@ fn try_insert_from_optimistic_route(
     key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
     blob_hops: &mut u64,
     max_cross_blob_depth: &mut usize,
@@ -257,7 +239,6 @@ fn try_insert_from_optimistic_route(
         key,
         value,
         seq,
-        wants_prev,
         condition,
         route.child_depth,
         blob_hops,
@@ -342,7 +323,6 @@ pub(crate) fn insert_multi_batch_conditional(
         first.key,
         first.value,
         first.seq,
-        false,
         first.condition,
     )?;
     if !outcome.mutated {
@@ -478,7 +458,6 @@ fn insert_batch_in_pinned_blob(
                 item.value,
                 depth,
                 item.seq,
-                false,
                 item.condition,
                 true,
             )
@@ -541,7 +520,6 @@ fn lock_coupled_insert_in_blob(
     key: SearchKey<'_>,
     value: &[u8],
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
     depth: usize,
     blob_hops: &mut u64,
@@ -556,7 +534,7 @@ fn lock_coupled_insert_in_blob(
             let mut frame = guard.frame();
             let root_slot = frame.header().root_slot;
             insert_at_step(
-                &mut frame, root_slot, key, value, depth, seq, wants_prev, condition, true,
+                &mut frame, root_slot, key, value, depth, seq, condition, true,
             )
         };
         match r {
@@ -580,7 +558,6 @@ fn lock_coupled_insert_in_blob(
 
                 return Ok(InsertOutcome {
                     root_dirty: is_top_blob && out.mutated,
-                    previous: out.previous,
                     mutated: out.mutated,
                 });
             }
@@ -598,7 +575,6 @@ fn lock_coupled_insert_in_blob(
                     key,
                     value,
                     seq,
-                    wants_prev,
                     condition,
                     crossing.child_depth,
                     blob_hops,
@@ -637,7 +613,7 @@ fn lock_coupled_insert_in_blob(
 // ---------- recursive dispatch ----------
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
+#[allow(clippy::too_many_arguments)] // test-only helper mirrors insert_at_step
 pub(super) fn insert_at(
     frame: &mut BlobFrame<'_>,
     slot: u16,
@@ -645,7 +621,6 @@ pub(super) fn insert_at(
     value: &[u8],
     depth: usize,
     seq: u64,
-    wants_prev: bool,
 ) -> Result<InsertReturn> {
     match insert_at_step(
         frame,
@@ -654,7 +629,6 @@ pub(super) fn insert_at(
         value,
         depth,
         seq,
-        wants_prev,
         InsertCondition::Always,
         false,
     )? {
@@ -665,7 +639,7 @@ pub(super) fn insert_at(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
+#[allow(clippy::too_many_arguments)] // condition/crossing flags mirror every node arm
 fn insert_at_step(
     frame: &mut BlobFrame<'_>,
     slot: u16,
@@ -673,7 +647,6 @@ fn insert_at_step(
     value: &[u8],
     depth: usize,
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
@@ -686,8 +659,7 @@ fn insert_at_step(
             insert_into_empty_root(frame, slot, key, value, seq, condition).map(InsertStep::Done)
         }
         NodeType::Leaf => {
-            insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev, condition)
-                .map(InsertStep::Done)
+            insert_into_leaf(frame, slot, key, value, depth, seq, condition).map(InsertStep::Done)
         }
         NodeType::Prefix => insert_into_prefix_step(
             frame,
@@ -696,7 +668,6 @@ fn insert_at_step(
             value,
             depth,
             seq,
-            wants_prev,
             condition,
             allow_crossing,
         ),
@@ -709,7 +680,6 @@ fn insert_at_step(
                 value,
                 depth,
                 seq,
-                wants_prev,
                 condition,
                 allow_crossing,
             )
@@ -774,7 +744,6 @@ fn blob_node_insert_step(
     if matches!(condition, InsertCondition::IfVersion(_)) {
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: slot,
-            previous: None,
             mutated: false,
         }));
     }
@@ -803,7 +772,6 @@ fn blob_node_insert_step(
 
     Ok(InsertStep::Done(InsertReturn {
         slot_after: final_slot,
-        previous: None,
         mutated: true,
     }))
 }
@@ -819,7 +787,6 @@ fn insert_into_empty_root(
     if matches!(condition, InsertCondition::IfVersion(_)) {
         return Ok(InsertReturn {
             slot_after: empty_slot,
-            previous: None,
             mutated: false,
         });
     }
@@ -827,7 +794,6 @@ fn insert_into_empty_root(
     frame.free_node(empty_slot)?;
     Ok(InsertReturn {
         slot_after: new_slot,
-        previous: None,
         mutated: true,
     })
 }
@@ -846,7 +812,6 @@ fn insert_into_leaf(
     new_value: &[u8],
     depth: usize,
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
 ) -> Result<InsertReturn> {
     enum LeafInsertPlan {
@@ -891,7 +856,6 @@ fn insert_into_leaf(
                     InsertCondition::IfAbsent | InsertCondition::IfVersion(_) => {
                         return Ok(InsertReturn {
                             slot_after: leaf_slot,
-                            previous: None,
                             mutated: false,
                         });
                     }
@@ -899,7 +863,6 @@ fn insert_into_leaf(
             } else if matches!(condition, InsertCondition::IfVersion(_)) {
                 return Ok(InsertReturn {
                     slot_after: leaf_slot,
-                    previous: None,
                     mutated: false,
                 });
             }
@@ -912,15 +875,14 @@ fn insert_into_leaf(
             //    is `None`) and the blob's `tombstone_leaf_cnt` drops
             //    by one because the slot leaves the tombstone state.
             // 2. **Update**: the existing leaf is live — return the
-            //    prior value and overwrite (in place when extents fit;
-            //    fall back to alloc-fresh + free-old when the value
-            //    grew past the existing extent).
+            //    overwrite in place when extents fit; fall back to
+            //    alloc-fresh + free-old when the value grew past the
+            //    existing extent.
             //
             // `Leaf::live` always pins `tombstone = 0` so both write
             // paths naturally clear the bit in the new leaf body.
             let was_tombstoned = existing_leaf.tombstone != 0;
-            if !wants_prev
-                && !was_tombstoned
+            if !was_tombstoned
                 && matches!(condition, InsertCondition::Always)
                 && new_value.len() == usize::from(existing_leaf.value_size)
             {
@@ -936,19 +898,9 @@ fn insert_into_leaf(
                 write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
                 return Ok(InsertReturn {
                     slot_after: leaf_slot,
-                    previous: None,
                     mutated: true,
                 });
             }
-            // Only materialise the prev value on the returning API
-            // (`Tree::insert`). The blind `Tree::put` path skips the
-            // `leaf_extent` walk + `.to_vec()` entirely.
-            let prev = if wants_prev && !was_tombstoned {
-                let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &existing_leaf)?;
-                Some(v.to_vec())
-            } else {
-                None
-            };
             let key_off = existing_leaf.key_offset;
             let key_len_u32 = new_key.len() as u32;
             let old_extent_size =
@@ -976,7 +928,6 @@ fn insert_into_leaf(
                 }
                 return Ok(InsertReturn {
                     slot_after: leaf_slot,
-                    previous: prev,
                     mutated: true,
                 });
             }
@@ -993,7 +944,6 @@ fn insert_into_leaf(
             }
             return Ok(InsertReturn {
                 slot_after: new_slot,
-                previous: prev,
                 mutated: true,
             });
         }
@@ -1003,7 +953,6 @@ fn insert_into_leaf(
     if matches!(condition, InsertCondition::IfVersion(_)) {
         return Ok(InsertReturn {
             slot_after: leaf_slot,
-            previous: None,
             mutated: false,
         });
     }
@@ -1012,7 +961,6 @@ fn insert_into_leaf(
     let final_slot = write_leaf_split(frame, leaf_slot, new_key, new_value, seq, &split)?;
     Ok(InsertReturn {
         slot_after: final_slot,
-        previous: None,
         mutated: true,
     })
 }
@@ -1043,7 +991,7 @@ fn write_leaf_split(
     Ok(final_slot)
 }
 
-#[allow(clippy::too_many_arguments)] // wants_prev added by API split
+#[allow(clippy::too_many_arguments)] // mirrors insert_at_step's call shape
 fn insert_into_prefix_step(
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
@@ -1051,7 +999,6 @@ fn insert_into_prefix_step(
     value: &[u8],
     depth: usize,
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
@@ -1078,7 +1025,6 @@ fn insert_into_prefix_step(
             value,
             depth + plen,
             seq,
-            wants_prev,
             condition,
             allow_crossing,
         )?;
@@ -1090,7 +1036,6 @@ fn insert_into_prefix_step(
         }
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: pfx_slot,
-            previous: r.previous,
             mutated: r.mutated,
         }));
     }
@@ -1109,7 +1054,6 @@ fn insert_into_prefix_step(
     if matches!(condition, InsertCondition::IfVersion(_)) {
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: pfx_slot,
-            previous: None,
             mutated: false,
         }));
     }
@@ -1139,7 +1083,6 @@ fn insert_into_prefix_step(
 
     Ok(InsertStep::Done(InsertReturn {
         slot_after: final_slot,
-        previous: None,
         mutated: true,
     }))
 }
@@ -1153,7 +1096,6 @@ fn insert_into_inner_step(
     value: &[u8],
     depth: usize,
     seq: u64,
-    wants_prev: bool,
     condition: InsertCondition,
     allow_crossing: bool,
 ) -> Result<InsertStep> {
@@ -1171,7 +1113,6 @@ fn insert_into_inner_step(
             value,
             depth + 1,
             seq,
-            wants_prev,
             condition,
             allow_crossing,
         )?;
@@ -1183,7 +1124,6 @@ fn insert_into_inner_step(
         }
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: inner_slot,
-            previous: r.previous,
             mutated: r.mutated,
         }));
     }
@@ -1191,7 +1131,6 @@ fn insert_into_inner_step(
     if matches!(condition, InsertCondition::IfVersion(_)) {
         return Ok(InsertStep::Done(InsertReturn {
             slot_after: inner_slot,
-            previous: None,
             mutated: false,
         }));
     }
@@ -1199,7 +1138,6 @@ fn insert_into_inner_step(
     let possibly_grown = inner_add_child(frame, inner_slot, ntype, byte, u32::from(new_leaf))?;
     Ok(InsertStep::Done(InsertReturn {
         slot_after: possibly_grown,
-        previous: None,
         mutated: true,
     }))
 }

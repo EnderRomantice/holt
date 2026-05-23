@@ -406,9 +406,7 @@ impl Tree {
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
     ///
     /// Blind hot path: the walker does **not** read or clone the
-    /// existing leaf's value on a same-key update. Pair with
-    /// [`Tree::insert`] when the caller actually needs the prior
-    /// value back — that variant pays the read + clone.
+    /// existing leaf's value on a same-key update.
     ///
     /// Walks across `BlobNode` crossings. When any blob hits
     /// `AllocError::OutOfSpace`, the walker automatically migrates
@@ -425,13 +423,8 @@ impl Tree {
     /// Per-op `memory_flush_on_write` mode drains the dirty set
     /// inline after the WAL append.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_inner_conditional(
-            key,
-            value,
-            /*wants_prev=*/ false,
-            engine::InsertCondition::Always,
-        )
-        .map(|_| ())
+        self.put_inner_conditional(key, value, engine::InsertCondition::Always)
+            .map(|_| ())
     }
 
     /// Insert `(key, value)` only when `key` has no live record.
@@ -440,13 +433,8 @@ impl Tree {
     /// when a live value already existed. The existence check and
     /// insert happen under the target blob's exclusive latch.
     pub fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<bool> {
-        self.put_inner_conditional(
-            key,
-            value,
-            /*wants_prev=*/ false,
-            engine::InsertCondition::IfAbsent,
-        )
-        .map(|outcome| outcome.mutated)
+        self.put_inner_conditional(key, value, engine::InsertCondition::IfAbsent)
+            .map(|outcome| outcome.mutated)
     }
 
     /// Replace `(key, value)` only when the live record currently
@@ -463,35 +451,15 @@ impl Tree {
         self.put_inner_conditional(
             key,
             value,
-            /*wants_prev=*/ false,
             engine::InsertCondition::IfVersion(expected_version.as_u64()),
         )
         .map(|outcome| outcome.mutated)
-    }
-
-    /// Insert or replace `(key, value)`. Returns the previous value
-    /// if the key already existed (`None` on a fresh key or
-    /// resurrected tombstone).
-    ///
-    /// Pays the per-op cost of reading + cloning the existing
-    /// leaf's value on a same-key update. Use [`Tree::put`] when
-    /// you don't need the prior value — that's the blind hot
-    /// path and the right default for metadata workloads.
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.put_inner_conditional(
-            key,
-            value,
-            /*wants_prev=*/ true,
-            engine::InsertCondition::Always,
-        )
-        .map(|outcome| outcome.previous)
     }
 
     fn put_inner_conditional(
         &self,
         key: &[u8],
         value: &[u8],
-        wants_prev: bool,
         condition: engine::InsertCondition,
     ) -> Result<engine::InsertOutcome> {
         let _maintenance = self.maintenance_gate.enter_shared();
@@ -507,7 +475,6 @@ impl Tree {
                 search,
                 value,
                 seq,
-                wants_prev,
                 condition,
             )?;
             if outcome.mutated {
@@ -535,7 +502,6 @@ impl Tree {
                 search,
                 value,
                 seq,
-                wants_prev,
                 condition,
             )?;
             if outcome.root_dirty {
@@ -558,21 +524,15 @@ impl Tree {
     /// `Ok(false)` if no leaf matched.
     ///
     /// Blind hot path: the walker does **not** read or clone the
-    /// existing leaf's value before tombstoning it. Pair with
-    /// [`Tree::remove`] when the caller actually needs the prior
-    /// value back.
+    /// existing leaf's value before tombstoning it.
     ///
     /// Walks across `BlobNode` crossings. Child-local mutations
     /// are staged through the BM dirty set; any conservative
     /// fallback that unlinks a child blob queues the manifest
     /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        self.delete_inner_conditional(
-            key,
-            /*wants_prev=*/ false,
-            engine::EraseCondition::Always,
-        )
-        .map(|outcome| outcome.mutated)
+        self.delete_inner_conditional(key, engine::EraseCondition::Always)
+            .map(|outcome| outcome.mutated)
     }
 
     /// Remove `key` only when the live record currently carries
@@ -584,31 +544,14 @@ impl Tree {
     pub fn delete_if_version(&self, key: &[u8], expected_version: RecordVersion) -> Result<bool> {
         self.delete_inner_conditional(
             key,
-            /*wants_prev=*/ false,
             engine::EraseCondition::IfVersion(expected_version.as_u64()),
         )
         .map(|outcome| outcome.mutated)
     }
 
-    /// Remove `key` and return the value that was stored there
-    /// (`None` if no leaf matched).
-    ///
-    /// Pays the per-op cost of reading + cloning the existing
-    /// leaf's value before tombstoning it. Use [`Tree::delete`]
-    /// when you only need to know whether the key existed.
-    pub fn remove(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.delete_inner_conditional(
-            key,
-            /*wants_prev=*/ true,
-            engine::EraseCondition::Always,
-        )
-        .map(|outcome| outcome.previous)
-    }
-
     fn delete_inner_conditional(
         &self,
         key: &[u8],
-        wants_prev: bool,
         condition: engine::EraseCondition,
     ) -> Result<engine::EraseOutcome> {
         let _maintenance = self.maintenance_gate.enter_shared();
@@ -630,7 +573,6 @@ impl Tree {
                 Some(&self.route_cache),
                 search,
                 seq,
-                wants_prev,
                 condition,
             )?;
             if outcome.mutated {
@@ -656,7 +598,6 @@ impl Tree {
                 Some(&self.route_cache),
                 search,
                 seq,
-                wants_prev,
                 condition,
             )?;
             if outcome.mutated && outcome.root_dirty {
@@ -729,12 +670,6 @@ impl Tree {
         // atomic from the dirty-tracking perspective — failing
         // halfway leaves a coherent partial-dirty set rather than
         // two separately-staged ops.
-        //
-        // Both walker calls pass `wants_prev=false`: the rename
-        // already read the src value (above) and the dst existence
-        // check (or `force=true`) gates the insert side, so the
-        // walker-materialised previous values would just be
-        // dropped on the floor.
         let journal_ack = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_writer();
             let erase_out = engine::erase_multi(
@@ -743,7 +678,6 @@ impl Tree {
                 Some(&self.route_cache),
                 src_search,
                 seq,
-                false,
             )?;
             let insert_out = engine::insert_multi(
                 &self.store,
@@ -752,7 +686,6 @@ impl Tree {
                 dst_search,
                 &value,
                 seq,
-                false,
             )?;
             if erase_out.root_dirty || insert_out.root_dirty {
                 self.store
@@ -769,7 +702,6 @@ impl Tree {
                 Some(&self.route_cache),
                 src_search,
                 seq,
-                false,
             )?;
             let insert_out = engine::insert_multi(
                 &self.store,
@@ -778,7 +710,6 @@ impl Tree {
                 dst_search,
                 &value,
                 seq,
-                false,
             )?;
             if erase_out.root_dirty || insert_out.root_dirty {
                 self.store
@@ -1134,7 +1065,6 @@ impl Tree {
                         Some(&self.route_cache),
                         search,
                         seq,
-                        false,
                     )?;
                     if outcome.mutated && outcome.root_dirty {
                         self.store
@@ -1156,7 +1086,6 @@ impl Tree {
                         Some(&self.route_cache),
                         search,
                         seq,
-                        false,
                         engine::EraseCondition::IfVersion(expected.as_u64()),
                     )?;
                     if !outcome.mutated {
@@ -1271,7 +1200,6 @@ impl Tree {
             Some(&self.route_cache),
             src_search,
             seq,
-            false,
         )?;
         let insert_out = engine::insert_multi(
             &self.store,
@@ -1280,7 +1208,6 @@ impl Tree {
             dst_search,
             &value,
             seq,
-            false,
         )?;
         if erase_out.root_dirty || insert_out.root_dirty {
             self.store
@@ -2084,11 +2011,11 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         let root_dirty = match op {
             WalOp::Insert { key, value } => {
                 let search = engine::SearchKey::user(key);
-                engine::insert_multi(bm, &root_pin, None, search, value, seq, false)?.root_dirty
+                engine::insert_multi(bm, &root_pin, None, search, value, seq)?.root_dirty
             }
             WalOp::Erase { key } => {
                 let search = engine::SearchKey::user(key);
-                engine::erase_multi(bm, &root_pin, None, search, seq, false)?.root_dirty
+                engine::erase_multi(bm, &root_pin, None, search, seq)?.root_dirty
             }
             WalOp::RenameObject {
                 src_key,
@@ -2114,9 +2041,9 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 let value =
                     engine::lookup_multi_with(bm, &root_pin, src_search, |hit| hit.value.to_vec())?
                         .unwrap_or_default();
-                let erase_out = engine::erase_multi(bm, &root_pin, None, src_search, seq, false)?;
+                let erase_out = engine::erase_multi(bm, &root_pin, None, src_search, seq)?;
                 let insert_out =
-                    engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq, false)?;
+                    engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq)?;
                 erase_out.root_dirty || insert_out.root_dirty
             }
             // `Batch` is unpacked into per-inner callbacks inside

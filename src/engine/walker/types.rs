@@ -46,8 +46,6 @@ pub struct InsertOutcome {
     /// marks those children dirty itself, and the `Tree` caller
     /// should only mark the root when this flag is set.
     pub root_dirty: bool,
-    /// If the key already existed, the value it carried before.
-    pub previous: Option<Vec<u8>>,
     /// `true` iff the walker inserted or updated a leaf. Conditional
     /// insert paths use `false` for "guard did not pass".
     pub mutated: bool,
@@ -62,17 +60,10 @@ pub struct EraseOutcome {
     /// should only mark the root when this flag is set.
     pub root_dirty: bool,
     /// `true` iff the walker actually tombstoned a live leaf —
-    /// independent of whether the caller asked for the prior
-    /// value. `Tree::delete` (blind) uses this to decide
-    /// dirty-mark + WAL-append without paying for the prev-value
-    /// read. `false` means "key was not in the tree" / "leaf was
-    /// already tombstoned" — the call is then a no-op.
+    /// `Tree::delete` uses this to decide dirty-mark + WAL-append.
+    /// `false` means "key was not in the tree" / "leaf was already
+    /// tombstoned" — the call is then a no-op.
     pub mutated: bool,
-    /// If a matching leaf was removed **and** the caller asked
-    /// for the prior value (`wants_prev = true`), the value it
-    /// carried. `None` either means "no mutation" or "caller
-    /// didn't ask" — disambiguate via `mutated`.
-    pub previous: Option<Vec<u8>>,
 }
 
 /// Outcome of [`super::make_blob_from_node`] — a freshly-built blob
@@ -112,8 +103,6 @@ pub(super) struct InsertReturn {
     /// What slot the parent should now point at — may be the same
     /// as the input slot or may be a freshly-allocated promotion.
     pub(super) slot_after: u16,
-    /// Prior value if the key already existed.
-    pub(super) previous: Option<Vec<u8>>,
     /// `true` iff bytes changed in the blob.
     pub(super) mutated: bool,
 }
@@ -136,14 +125,7 @@ pub(super) enum EraseSignal {
 pub(super) struct EraseReturn {
     pub(super) signal: EraseSignal,
     /// `true` iff a live leaf was tombstoned during the descent.
-    /// Tracked separately from `previous` so the blind delete
-    /// path can drop the leaf-extent value read and still know
-    /// whether to mark dirty + emit a WAL Erase record.
     pub(super) mutated: bool,
-    /// `Some(bytes)` only when `mutated && wants_prev`. `None`
-    /// otherwise. The `mutated` flag is the authoritative
-    /// "did anything happen" signal.
-    pub(super) previous: Option<Vec<u8>>,
 }
 
 /// What kind of edge the parent of a victim subtree has.
