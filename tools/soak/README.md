@@ -63,6 +63,8 @@ normal/crash campaigns belong in nightly or release-gate runs.
   time, cache misses, WAL debt, and checkpoint debt can be compared
   across releases.
 
+The complete project-level matrix lives in `TESTING.md`.
+
 The crash verifier intentionally checks only acknowledged operations.
 The child writes a key, Holt returns success, then the child appends that
 key to `soak-ack.log` and fsyncs the ack log. After `SIGKILL`, the parent

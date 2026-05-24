@@ -52,10 +52,48 @@ jobs:
       - name: WAL integration
         run: cargo test --test wal_tree_integration --all-features --locked -- --nocapture
 
+  property-matrix:
+    name: property tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: proptest oracle suites
+        env:
+          PROPTEST_CASES: "512"
+        run: cargo test --test properties --all-features --locked -- --nocapture
+
   soak-normal:
-    name: normal soak
+    name: normal soak (${{ matrix.case }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: async-wal-default-cache
+            keys: 1000000
+            ops: 2000000
+            threads: 8
+            buffer_pool: 128
+            wal_sync: false
+          - case: async-wal-small-cache
+            keys: 1000000
+            ops: 1500000
+            threads: 8
+            buffer_pool: 16
+            wal_sync: false
+          - case: sync-wal-default-cache
+            keys: 200000
+            ops: 400000
+            threads: 4
+            buffer_pool: 128
+            wal_sync: true
     steps:
       - uses: actions/checkout@v6
 
@@ -67,14 +105,14 @@ jobs:
         run: |
           cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
             --mode normal \
-            --dir target/holt-soak-nightly \
+            --dir "target/holt-soak-nightly-${{ matrix.case }}" \
             --reset \
             --duration-secs "$SOAK_SECONDS" \
-            --keys 1000000 \
-            --ops 2000000 \
-            --threads 8 \
-            --buffer-pool 128 \
-            --wal-sync false
+            --keys "${{ matrix.keys }}" \
+            --ops "${{ matrix.ops }}" \
+            --threads "${{ matrix.threads }}" \
+            --buffer-pool "${{ matrix.buffer_pool }}" \
+            --wal-sync "${{ matrix.wal_sync }}"
 
   soak-crash:
     name: crash soak

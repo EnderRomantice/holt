@@ -319,6 +319,9 @@ The GitHub workflows are split by cost:
 - Verus is available as a manual `Nightly Validation` option because
   hosted runners do not ship a Verus binary.
 
+See [`TESTING.md`](TESTING.md) for the full test matrix and release-gate
+commands.
+
 See [`examples/`](examples/) for full programs:
 [`basic_kv`](examples/basic_kv.rs),
 [`filesystem_meta`](examples/filesystem_meta.rs),

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
-use holt::{RangeEntry, RecordVersion, Tree, TreeConfig};
+use holt::{KeyRangeEntry, KeyRangeEntryRef, RangeEntry, RecordVersion, Tree, TreeConfig};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_OPS: usize = 96;
@@ -20,6 +20,10 @@ enum Op {
     Delete { key: u8 },
     Get { key: u8 },
     RangePrefix { dir: u8 },
+    RangeDelimiter { dir: u8 },
+    KeyScanPrefix { dir: u8 },
+    KeyScanDelimiter { dir: u8 },
+    ViewPrefix { dir: u8 },
     Checkpoint,
     Reopen,
     Atomic(Vec<AtomicOp>),
@@ -58,7 +62,7 @@ impl<'a> Arbitrary<'a> for Ops {
 
 impl<'a> Arbitrary<'a> for Op {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        Ok(match u.int_in_range(0..=5u8)? {
+        Ok(match u.int_in_range(0..=9u8)? {
             0 => Self::Put {
                 key: key_id(u)?,
                 value: value_id(u)?,
@@ -66,7 +70,11 @@ impl<'a> Arbitrary<'a> for Op {
             1 => Self::Delete { key: key_id(u)? },
             2 => Self::Get { key: key_id(u)? },
             3 => Self::RangePrefix { dir: dir_id(u)? },
-            4 => {
+            4 => Self::RangeDelimiter { dir: dir_id(u)? },
+            5 => Self::KeyScanPrefix { dir: dir_id(u)? },
+            6 => Self::KeyScanDelimiter { dir: dir_id(u)? },
+            7 => Self::ViewPrefix { dir: dir_id(u)? },
+            8 => {
                 if bool::arbitrary(u)? {
                     Self::Checkpoint
                 } else {
@@ -307,6 +315,155 @@ fn assert_prefix_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, 
     assert_eq!(got, expected);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedKeyEntry {
+    Key(Vec<u8>),
+    CommonPrefix(Vec<u8>),
+}
+
+fn expected_key_entries(
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    dir: u8,
+    delimiter: Option<u8>,
+) -> Vec<ExpectedKeyEntry> {
+    let prefix = prefix(dir);
+    let mut emitted_prefixes = BTreeSet::new();
+    let mut expected = Vec::new();
+
+    for key in model.keys().filter(|key| key.starts_with(&prefix)) {
+        if let Some(delimiter) = delimiter {
+            if let Some(pos) = key[prefix.len()..].iter().position(|byte| *byte == delimiter) {
+                let common = key[..prefix.len() + pos + 1].to_vec();
+                if emitted_prefixes.insert(common.clone()) {
+                    expected.push(ExpectedKeyEntry::CommonPrefix(common));
+                }
+                continue;
+            }
+        }
+        expected.push(ExpectedKeyEntry::Key(key.clone()));
+    }
+    expected
+}
+
+fn assert_range_delimiter_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, dir: u8) {
+    let prefix = prefix(dir);
+    let expected = expected_key_entries(model, dir, Some(b'/'));
+    let got: Vec<_> = tree
+        .scan(&prefix)
+        .delimiter(b'/')
+        .into_iter()
+        .map(|entry| match entry.unwrap() {
+            RangeEntry::Key { key, version, .. } => {
+                assert_eq!(tree.get_record(&key).unwrap().unwrap().version, version);
+                ExpectedKeyEntry::Key(key)
+            }
+            RangeEntry::CommonPrefix(prefix) => ExpectedKeyEntry::CommonPrefix(prefix),
+            _ => panic!("RangeEntry got a new variant"),
+        })
+        .collect();
+    assert_eq!(got, expected);
+}
+
+fn assert_key_scan_matches_model(
+    tree: &Tree,
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    dir: u8,
+    delimiter: Option<u8>,
+) {
+    let prefix = prefix(dir);
+    let expected = expected_key_entries(model, dir, delimiter);
+    let mut builder = tree.scan_keys(&prefix);
+    if let Some(delimiter) = delimiter {
+        builder = builder.delimiter(delimiter);
+    }
+
+    let got: Vec<_> = builder
+        .into_iter()
+        .map(|entry| match entry.unwrap() {
+            KeyRangeEntry::Key { key, version } => {
+                assert_eq!(tree.get_record(&key).unwrap().unwrap().version, version);
+                ExpectedKeyEntry::Key(key)
+            }
+            KeyRangeEntry::CommonPrefix(prefix) => ExpectedKeyEntry::CommonPrefix(prefix),
+            _ => panic!("KeyRangeEntry got a new variant"),
+        })
+        .collect();
+    assert_eq!(got, expected);
+
+    let mut builder = tree.scan_keys(&prefix);
+    if let Some(delimiter) = delimiter {
+        builder = builder.delimiter(delimiter);
+    }
+    let mut visited = Vec::new();
+    builder
+        .visit(usize::MAX, |entry| {
+            visited.push(match entry {
+                KeyRangeEntryRef::Key { key, version } => {
+                    assert_eq!(tree.get_record(key)?.unwrap().version, version);
+                    ExpectedKeyEntry::Key(key.to_vec())
+                }
+                KeyRangeEntryRef::CommonPrefix(prefix) => {
+                    ExpectedKeyEntry::CommonPrefix(prefix.to_vec())
+                }
+                _ => panic!("KeyRangeEntryRef got a new variant"),
+            });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(visited, expected);
+}
+
+fn assert_view_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, dir: u8) {
+    let prefix = prefix(dir);
+    tree.view(&prefix, |view| {
+        assert_eq!(view.scope(), prefix.as_slice());
+        assert!(view.get(b"outside/scope").is_err());
+
+        let expected_records: Vec<_> = model
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let got_records: Vec<_> = view
+            .range()
+            .into_iter()
+            .map(|entry| match entry.unwrap() {
+                RangeEntry::Key {
+                    key,
+                    value,
+                    version,
+                } => {
+                    assert_eq!(view.get_record(&key).unwrap().unwrap().version, version);
+                    (key, value)
+                }
+                RangeEntry::CommonPrefix(prefix) => {
+                    panic!("view range without delimiter returned prefix {prefix:?}");
+                }
+                _ => panic!("RangeEntry got a new variant"),
+            })
+            .collect();
+        assert_eq!(got_records, expected_records);
+
+        let expected_keys = expected_key_entries(model, dir, Some(b'/'));
+        let got_keys: Vec<_> = view
+            .scan_keys(&prefix)?
+            .delimiter(b'/')
+            .into_iter()
+            .map(|entry| match entry.unwrap() {
+                KeyRangeEntry::Key { key, version } => {
+                    assert_eq!(view.get_record(&key).unwrap().unwrap().version, version);
+                    ExpectedKeyEntry::Key(key)
+                }
+                KeyRangeEntry::CommonPrefix(prefix) => ExpectedKeyEntry::CommonPrefix(prefix),
+                _ => panic!("KeyRangeEntry got a new variant"),
+            })
+            .collect();
+        assert_eq!(got_keys, expected_keys);
+        Ok(())
+    })
+    .unwrap();
+}
+
 fuzz_target!(|ops: Ops| {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
@@ -329,6 +486,12 @@ fuzz_target!(|ops: Ops| {
                 assert_eq!(tree.get(&key(id)).unwrap(), model.get(&key(id)).cloned());
             }
             Op::RangePrefix { dir } => assert_prefix_matches_model(&tree, &model, dir),
+            Op::RangeDelimiter { dir } => assert_range_delimiter_matches_model(&tree, &model, dir),
+            Op::KeyScanPrefix { dir } => assert_key_scan_matches_model(&tree, &model, dir, None),
+            Op::KeyScanDelimiter { dir } => {
+                assert_key_scan_matches_model(&tree, &model, dir, Some(b'/'));
+            }
+            Op::ViewPrefix { dir } => assert_view_matches_model(&tree, &model, dir),
             Op::Checkpoint => tree.checkpoint().unwrap(),
             Op::Reopen => {
                 drop(tree);
