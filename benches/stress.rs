@@ -141,6 +141,7 @@ struct StressConfig {
     buffer_pool_size: usize,
     wal_sync: bool,
     engines: Vec<String>,
+    ops: Vec<String>,
 }
 
 impl StressConfig {
@@ -152,6 +153,13 @@ impl StressConfig {
             .unwrap_or(Workload::Objstore);
         let engines = env::var("HOLT_STRESS_ENGINES")
             .unwrap_or_else(|_| "holt,rocksdb,sqlite".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let ops = env::var("HOLT_STRESS_OPS")
+            .unwrap_or_else(|_| "get,put,mixed,list,list_records,list_dir".to_string())
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -171,6 +179,7 @@ impl StressConfig {
                 .map(|s| parse_bool_env("HOLT_STRESS_WAL_SYNC", s))
                 .unwrap_or(false),
             engines,
+            ops,
         }
     }
 
@@ -178,6 +187,12 @@ impl StressConfig {
         self.engines
             .iter()
             .any(|s| s == "all" || s.eq_ignore_ascii_case(engine))
+    }
+
+    fn selected_op(&self, op: &str) -> bool {
+        self.ops
+            .iter()
+            .any(|s| s == "all" || s.eq_ignore_ascii_case(op))
     }
 }
 
@@ -190,7 +205,7 @@ struct OpSample {
 fn main() {
     let cfg = StressConfig::from_env();
     println!(
-        "stress workload={} n_keys={} point_ops={} list_ops={} list_take={} dir_take={} buffer_pool={} engines={}",
+        "stress workload={} n_keys={} point_ops={} list_ops={} list_take={} dir_take={} buffer_pool={} engines={} ops={}",
         cfg.workload.name(),
         cfg.n_keys,
         cfg.point_ops,
@@ -199,6 +214,7 @@ fn main() {
         cfg.dir_take,
         cfg.buffer_pool_size,
         cfg.engines.join(","),
+        cfg.ops.join(","),
     );
     println!(
         "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled",
@@ -231,51 +247,63 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     tree.checkpoint().expect("holt preload checkpoint");
     print_holt_shape("ready", &tree);
 
-    report("holt", "get", samples.len(), time_get_holt(&tree, samples));
-    report("holt", "put", samples.len(), time_put_holt(&tree, samples));
-    report(
-        "holt",
-        "mixed",
-        samples.len(),
-        time_mixed_holt(&tree, samples),
-    );
-    report(
-        "holt",
-        "list",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(holt_list_keys(
-                &tree,
-                cfg.workload.list_prefix(),
-                cfg.list_take,
-            ));
-        }),
-    );
-    report(
-        "holt",
-        "list_records",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(holt_list_records(
-                &tree,
-                cfg.workload.list_prefix(),
-                cfg.list_take,
-            ));
-        }),
-    );
-    report(
-        "holt",
-        "list_dir",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(holt_list_dir(
-                &tree,
-                cfg.workload.dir_prefix(),
-                cfg.workload.delimiter(),
-                cfg.dir_take,
-            ));
-        }),
-    );
+    if cfg.selected_op("get") {
+        report("holt", "get", samples.len(), time_get_holt(&tree, samples));
+    }
+    if cfg.selected_op("put") {
+        report("holt", "put", samples.len(), time_put_holt(&tree, samples));
+    }
+    if cfg.selected_op("mixed") {
+        report(
+            "holt",
+            "mixed",
+            samples.len(),
+            time_mixed_holt(&tree, samples),
+        );
+    }
+    if cfg.selected_op("list") {
+        report(
+            "holt",
+            "list",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(holt_list_keys(
+                    &tree,
+                    cfg.workload.list_prefix(),
+                    cfg.list_take,
+                ));
+            }),
+        );
+    }
+    if cfg.selected_op("list_records") {
+        report(
+            "holt",
+            "list_records",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(holt_list_records(
+                    &tree,
+                    cfg.workload.list_prefix(),
+                    cfg.list_take,
+                ));
+            }),
+        );
+    }
+    if cfg.selected_op("list_dir") {
+        report(
+            "holt",
+            "list_dir",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(holt_list_dir(
+                    &tree,
+                    cfg.workload.dir_prefix(),
+                    cfg.workload.delimiter(),
+                    cfg.dir_take,
+                ));
+            }),
+        );
+    }
     print_holt_shape("final", &tree);
 }
 
@@ -285,49 +313,59 @@ fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
     preload_rocksdb(&db, cfg.workload, cfg.n_keys);
     let wo = rocksdb_write_opts();
 
-    report(
-        "rocksdb",
-        "get",
-        samples.len(),
-        time_get_rocksdb(&db, samples),
-    );
-    report(
-        "rocksdb",
-        "put",
-        samples.len(),
-        time_put_rocksdb(&db, &wo, samples),
-    );
-    report(
-        "rocksdb",
-        "mixed",
-        samples.len(),
-        time_mixed_rocksdb(&db, &wo, samples),
-    );
-    report(
-        "rocksdb",
-        "list",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(rocksdb_list_plain(
-                &db,
-                cfg.workload.list_prefix(),
-                cfg.list_take,
-            ));
-        }),
-    );
-    report(
-        "rocksdb",
-        "list_dir",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(rocksdb_list_dir(
-                &db,
-                cfg.workload.dir_prefix(),
-                cfg.workload.delimiter(),
-                cfg.dir_take,
-            ));
-        }),
-    );
+    if cfg.selected_op("get") {
+        report(
+            "rocksdb",
+            "get",
+            samples.len(),
+            time_get_rocksdb(&db, samples),
+        );
+    }
+    if cfg.selected_op("put") {
+        report(
+            "rocksdb",
+            "put",
+            samples.len(),
+            time_put_rocksdb(&db, &wo, samples),
+        );
+    }
+    if cfg.selected_op("mixed") {
+        report(
+            "rocksdb",
+            "mixed",
+            samples.len(),
+            time_mixed_rocksdb(&db, &wo, samples),
+        );
+    }
+    if cfg.selected_op("list") {
+        report(
+            "rocksdb",
+            "list",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(rocksdb_list_plain(
+                    &db,
+                    cfg.workload.list_prefix(),
+                    cfg.list_take,
+                ));
+            }),
+        );
+    }
+    if cfg.selected_op("list_dir") {
+        report(
+            "rocksdb",
+            "list_dir",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(rocksdb_list_dir(
+                    &db,
+                    cfg.workload.dir_prefix(),
+                    cfg.workload.delimiter(),
+                    cfg.dir_take,
+                ));
+            }),
+        );
+    }
 }
 
 fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
@@ -335,51 +373,61 @@ fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
     let conn = make_sqlite_persistent(&sqlite_dir);
     preload_sqlite(&conn, cfg.workload, cfg.n_keys);
 
-    report(
-        "sqlite",
-        "get",
-        samples.len(),
-        time_get_sqlite(&conn, samples),
-    );
-    report(
-        "sqlite",
-        "put",
-        samples.len(),
-        time_put_sqlite(&conn, samples),
-    );
-    report(
-        "sqlite",
-        "mixed",
-        samples.len(),
-        time_mixed_sqlite(&conn, samples),
-    );
-    report(
-        "sqlite",
-        "list",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(sqlite_list_plain(
-                &conn,
-                cfg.workload.list_prefix(),
-                &prefix_upper(cfg.workload.list_prefix()),
-                cfg.list_take,
-            ));
-        }),
-    );
-    report(
-        "sqlite",
-        "list_dir",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(sqlite_list_dir(
-                &conn,
-                cfg.workload.dir_prefix(),
-                &prefix_upper(cfg.workload.dir_prefix()),
-                cfg.workload.delimiter(),
-                cfg.dir_take,
-            ));
-        }),
-    );
+    if cfg.selected_op("get") {
+        report(
+            "sqlite",
+            "get",
+            samples.len(),
+            time_get_sqlite(&conn, samples),
+        );
+    }
+    if cfg.selected_op("put") {
+        report(
+            "sqlite",
+            "put",
+            samples.len(),
+            time_put_sqlite(&conn, samples),
+        );
+    }
+    if cfg.selected_op("mixed") {
+        report(
+            "sqlite",
+            "mixed",
+            samples.len(),
+            time_mixed_sqlite(&conn, samples),
+        );
+    }
+    if cfg.selected_op("list") {
+        report(
+            "sqlite",
+            "list",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(sqlite_list_plain(
+                    &conn,
+                    cfg.workload.list_prefix(),
+                    &prefix_upper(cfg.workload.list_prefix()),
+                    cfg.list_take,
+                ));
+            }),
+        );
+    }
+    if cfg.selected_op("list_dir") {
+        report(
+            "sqlite",
+            "list_dir",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(sqlite_list_dir(
+                    &conn,
+                    cfg.workload.dir_prefix(),
+                    &prefix_upper(cfg.workload.dir_prefix()),
+                    cfg.workload.delimiter(),
+                    cfg.dir_take,
+                ));
+            }),
+        );
+    }
 }
 
 fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
@@ -387,39 +435,49 @@ fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
     let db = make_sled_persistent(&sled_dir);
     preload_sled(&db, cfg.workload, cfg.n_keys);
 
-    report("sled", "get", samples.len(), time_get_sled(&db, samples));
-    report("sled", "put", samples.len(), time_put_sled(&db, samples));
-    report(
-        "sled",
-        "mixed",
-        samples.len(),
-        time_mixed_sled(&db, samples),
-    );
-    report(
-        "sled",
-        "list",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(sled_list_plain(
-                &db,
-                cfg.workload.list_prefix(),
-                cfg.list_take,
-            ));
-        }),
-    );
-    report(
-        "sled",
-        "list_dir",
-        cfg.list_ops,
-        time_repeated(cfg.list_ops, || {
-            black_box(sled_list_dir(
-                &db,
-                cfg.workload.dir_prefix(),
-                cfg.workload.delimiter(),
-                cfg.dir_take,
-            ));
-        }),
-    );
+    if cfg.selected_op("get") {
+        report("sled", "get", samples.len(), time_get_sled(&db, samples));
+    }
+    if cfg.selected_op("put") {
+        report("sled", "put", samples.len(), time_put_sled(&db, samples));
+    }
+    if cfg.selected_op("mixed") {
+        report(
+            "sled",
+            "mixed",
+            samples.len(),
+            time_mixed_sled(&db, samples),
+        );
+    }
+    if cfg.selected_op("list") {
+        report(
+            "sled",
+            "list",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(sled_list_plain(
+                    &db,
+                    cfg.workload.list_prefix(),
+                    cfg.list_take,
+                ));
+            }),
+        );
+    }
+    if cfg.selected_op("list_dir") {
+        report(
+            "sled",
+            "list_dir",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(sled_list_dir(
+                    &db,
+                    cfg.workload.dir_prefix(),
+                    cfg.workload.delimiter(),
+                    cfg.dir_take,
+                ));
+            }),
+        );
+    }
 }
 
 fn make_samples(workload: Workload, n_keys: usize, ops: usize) -> Vec<OpSample> {
