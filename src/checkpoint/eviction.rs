@@ -1,19 +1,16 @@
-//! Eviction worker thread — periodically scans the BM cache and
-//! drops cold non-dirty entries.
+//! Eviction worker thread — trims cold non-dirty entries when the
+//! BM cache is above capacity.
 //!
 //! ## Why a separate thread
 //!
-//! The inline overflow LRU on `insert_into_cache` only runs when
-//! the cache is growing past `capacity`. Once the buffer pool
-//! stops growing, no eviction happens — every loaded blob would
-//! stay resident.
+//! Inline LRU runs on the insertion path. The eviction thread
+//! handles overflow that could not be reclaimed immediately, for
+//! example because entries were pinned at insert time.
 //!
-//! The eviction thread runs on its own cadence
-//! (`CheckpointConfig::eviction_interval`) and uses a
-//! `last_touched` tick per entry (stamped by
-//! `BufferManager::get_cached` / `pin`) to find genuinely cold
-//! entries — ones not accessed in the last
-//! `eviction_idle_ticks` operations on the BM.
+//! The thread runs on its own cadence and uses each entry's
+//! `last_touched` tick to pick old entries. It first checks cache
+//! pressure; cold entries are kept resident when the working set
+//! fits inside `capacity`.
 //!
 //! ## Safety
 //!
@@ -58,6 +55,10 @@ pub(super) fn run(shared: &Arc<Shared>) {
 }
 
 fn run_scan(shared: &Arc<Shared>) -> u64 {
+    let mut remaining = shared.bm.cache_excess();
+    if remaining == 0 {
+        return 0;
+    }
     let now = shared.bm.clock_tick();
     let threshold = shared.cfg.eviction_idle_ticks;
 
@@ -82,6 +83,10 @@ fn run_scan(shared: &Arc<Shared>) -> u64 {
         drop(entry);
         if shared.bm.try_evict_cold(guid) {
             evicted += 1;
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
         }
     }
     evicted

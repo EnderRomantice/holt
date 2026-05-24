@@ -654,15 +654,18 @@ mod tests {
     }
 
     #[test]
-    fn eviction_thread_drops_cold_entries() {
-        let bm = make_bm();
-        // Prime a cached entry and let it go cold.
+    fn eviction_thread_drops_cold_entries_only_under_capacity_pressure() {
+        let bm = Arc::new(BufferManager::new(Arc::new(MemoryBlobStore::new()), 1));
+        // Prime two cached entries and let the first go cold. With
+        // capacity=1, exactly one cold entry may be evicted.
         let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
         bm.write_blob([0xEE; 16], &scratch).unwrap();
-        let _ = bm.pin([0xEE; 16]).unwrap();
+        let cold = bm.pin([0xEE; 16]).unwrap();
+        bm.write_blob([0xEF; 16], &scratch).unwrap();
+        let _hot = bm.pin([0xEF; 16]).unwrap();
         // Drop the pin so try_evict_cold sees strong_count == 1.
-        // (The `_` binding drops at end of statement.)
-        assert_eq!(bm.cached_count(), 1);
+        drop(cold);
+        assert_eq!(bm.cached_count(), 2);
 
         // Bump the clock past the eviction threshold by hitting
         // get_cached for some other GUID a bunch of times.
@@ -697,6 +700,39 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+        drop(ck);
+    }
+
+    #[test]
+    fn eviction_thread_keeps_cold_entries_when_cache_fits() {
+        let bm = make_bm();
+        let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
+        bm.write_blob([0xEE; 16], &scratch).unwrap();
+        let _ = bm.pin([0xEE; 16]).unwrap();
+        assert_eq!(bm.cached_count(), 1);
+
+        for _ in 0..5 {
+            let _ = bm.pin([0xFF; 16]);
+            let _ = bm.cached_count();
+        }
+
+        let cfg = CheckpointConfig {
+            eviction_interval: Duration::from_millis(20),
+            eviction_idle_ticks: 1,
+            ..no_merge_cfg()
+        };
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            maintenance_gate(),
+            commit_gate(),
+            cfg,
+        )
+        .expect("spawn");
+
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(ck.evictions(), 0);
+        assert_eq!(bm.cached_count(), 1);
         drop(ck);
     }
 }

@@ -100,15 +100,12 @@
 //!   [`Self::insert_into_cache`] when the new entry pushes the
 //!   cache past `capacity`. Picks the entry with the oldest
 //!   `last_touched` tick whose `Arc::strong_count == 1` (no
-//!   outside pin). O(n) walk over the cache, called only on the
-//!   overflow path; the background eviction thread handles
-//!   steady-state reclaim cheaply.
+//!   outside pin).
 //! - **Background sweep** ([`crate::checkpoint`] eviction
-//!   thread) — periodic walk based on the same `last_touched`
-//!   tick + `eviction_idle_ticks` threshold. Snapshots the cache
-//!   under shard locks, then drops the snapshot's Arc clones
-//!   before calling `try_evict_cold` so the BM's `strong_count`
-//!   check sees only the shard's own reference.
+//!   thread) — periodic overflow trim for entries that were still
+//!   pinned during inline eviction. It uses the same
+//!   `last_touched` threshold but only runs while cache size is
+//!   above `capacity`.
 //!
 //! The cache may temporarily exceed `capacity` while every entry
 //! is pinned; it shrinks back as readers drop their handles or
@@ -265,6 +262,13 @@ impl BufferManager {
     /// entry" decisions, not for cross-thread synchronisation.
     pub(crate) fn clock_tick(&self) -> u64 {
         self.clock.load(Ordering::Relaxed)
+    }
+
+    /// Number of cache entries above the configured resident
+    /// capacity. Background eviction uses this as a pressure gate:
+    /// cold-but-resident entries are kept when the working set fits.
+    pub(crate) fn cache_excess(&self) -> usize {
+        self.cache.len().saturating_sub(self.capacity)
     }
 
     /// Iterate cached `(guid, entry)` pairs under a brief BM-state
