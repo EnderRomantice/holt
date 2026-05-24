@@ -13,7 +13,7 @@ use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
-    write_node4_with, write_prefix_chain, write_struct_to_slot,
+    write_leaf_seq, write_node4_with, write_prefix_chain, write_struct_to_slot,
 };
 use super::SearchKey;
 use super::MAX_SPILLOVER_ATTEMPTS;
@@ -889,10 +889,7 @@ fn insert_into_leaf(
             // `Leaf::live` always pins `tombstone = 0` so both write
             // paths naturally clear the bit in the new leaf body.
             let was_tombstoned = existing_leaf.tombstone != 0;
-            if !was_tombstoned
-                && matches!(condition, InsertCondition::Always)
-                && new_value.len() == usize::from(existing_leaf.value_size)
-            {
+            if !was_tombstoned && new_value.len() == usize::from(existing_leaf.value_size) {
                 let key_len_u32 = new_key.len() as u32;
                 let value_offset = existing_leaf.key_offset + 2 + key_len_u32;
                 let region = frame
@@ -901,8 +898,7 @@ fn insert_into_leaf(
                         "insert_into_leaf: same-size value range out of bounds",
                     ))?;
                 region.copy_from_slice(new_value);
-                let new_leaf = Leaf::live(existing_leaf.key_offset, existing_leaf.value_size, seq);
-                write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+                write_leaf_seq(frame, leaf_slot, seq)?;
                 return Ok(InsertReturn {
                     slot_after: leaf_slot,
                     mutated: true,

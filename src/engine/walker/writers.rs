@@ -4,7 +4,7 @@
 //! Everything here is `pub(super)`, scoped to walker submodules.
 //! Pure mutation; no recursion into the walker's descent logic.
 
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
@@ -53,6 +53,18 @@ pub(super) fn write_leaf(
     let leaf = Leaf::live(ext.byte_offset, value.len() as u16, seq);
     write_struct_to_slot(frame, leaf_out.slot, &leaf)?;
     Ok(leaf_out.slot)
+}
+
+pub(super) fn write_leaf_seq(frame: &mut BlobFrame<'_>, slot: u16, seq: u64) -> Result<()> {
+    let body = frame
+        .body_of_slot_mut(slot)
+        .ok_or(Error::node_corrupt("write_leaf_seq: body"))?;
+    if body.len() != size_of::<Leaf>() {
+        return Err(Error::node_corrupt("write_leaf_seq: non-leaf slot"));
+    }
+    let seq_off = offset_of!(Leaf, seq);
+    body[seq_off..seq_off + size_of::<u64>()].copy_from_slice(&seq.to_le_bytes());
+    Ok(())
 }
 
 /// Build a Prefix-node chain spanning `bytes`, ending at

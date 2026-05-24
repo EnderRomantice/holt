@@ -93,6 +93,26 @@ fn blind_same_size_put_updates_in_place() {
 }
 
 #[test]
+fn conditional_same_size_put_updates_in_place() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"k", b"aaaa").unwrap();
+    let before_record = tree.get_record(b"k").unwrap().unwrap();
+    let before_stats = tree.stats().unwrap();
+
+    assert!(tree
+        .compare_and_put(b"k", before_record.version, b"bbbb")
+        .unwrap());
+    let after_record = tree.get_record(b"k").unwrap().unwrap();
+    let after_stats = tree.stats().unwrap();
+
+    assert_eq!(after_record.value, b"bbbb");
+    assert!(after_record.version > before_record.version);
+    assert_eq!(after_stats.total_space_used, before_stats.total_space_used);
+    assert_eq!(after_stats.total_gap_space, before_stats.total_gap_space);
+    assert_eq!(after_stats.total_slots, before_stats.total_slots);
+}
+
+#[test]
 fn conditional_puts_use_record_versions() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     assert!(tree.get_version(b"k").unwrap().is_none());
