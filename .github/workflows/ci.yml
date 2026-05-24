@@ -178,8 +178,8 @@ jobs:
   # summary as a Markdown table; no failure thresholds — variance
   # on hosted runners is too high for hard SLOs, but eyeballing
   # the deltas tells us if a commit massively regressed
-  # something. Measurement window is short (`--warm-up-time 1
-  # --measurement-time 2`) so a full CI run stays under ~5 min.
+  # something. The CI window is intentionally small; full
+  # comparator runs stay in the standalone bench package.
   # --------------------------------------------------------------
   bench:
     name: bench (${{ matrix.os }})
@@ -203,7 +203,8 @@ jobs:
           set -o pipefail
           cargo bench --manifest-path benches/Cargo.toml \
             --bench regression --no-default-features --locked -- \
-            --warm-up-time 1 --measurement-time 2 \
+            --warm-up-time 1 --measurement-time 1 \
+            --sample-size 10 --nresamples 1000 --noplot \
             2>&1 | tee bench-default.txt
 
       - name: cargo bench (io-uring backend, Linux only)
@@ -212,7 +213,8 @@ jobs:
           set -o pipefail
           cargo bench --manifest-path benches/Cargo.toml \
             --bench regression --no-default-features --features io-uring --locked -- \
-            --warm-up-time 1 --measurement-time 2 \
+            --warm-up-time 1 --measurement-time 1 \
+            --sample-size 10 --nresamples 1000 --noplot \
             2>&1 | tee bench-uring.txt
 
       - name: Post results to job summary

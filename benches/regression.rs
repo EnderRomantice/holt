@@ -9,7 +9,7 @@ use holt::{Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tempfile::TempDir;
 
-const SEED: u64 = 0xC1_0A_D15E_A5ED;
+const SEED: u64 = 0xC10A_D15E_A5ED;
 const KEY_COUNT: usize = 20_000;
 
 fn gen_kv_dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -69,6 +69,7 @@ fn make_tree() -> (Tree, TempDir) {
     let mut cfg = TreeConfig::new(dir.path());
     cfg.wal_sync = false;
     cfg.buffer_pool_size = 32;
+    cfg.checkpoint.enabled = false;
     let tree = Tree::open(cfg).expect("holt open");
     (tree, dir)
 }
