@@ -1717,6 +1717,8 @@ impl Tree {
         let bm_max_cross_blob_depth = self.store.max_cross_blob_depth();
         let bm_spillovers = self.store.spillover_count();
         let bm_merges = self.store.merge_count();
+        let bm_route_resident_count = self.store.route_resident_count();
+        let bm_route_resident_demotions = self.store.route_resident_demotions();
         let route = self.route_cache.stats();
         let route_cache = RouteCacheStats {
             entries: route.entries,
@@ -1767,6 +1769,8 @@ impl Tree {
             bm_max_cross_blob_depth,
             bm_spillovers,
             bm_merges,
+            bm_route_resident_count,
+            bm_route_resident_demotions,
             route_cache,
             journal,
             checkpointer,

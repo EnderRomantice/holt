@@ -166,6 +166,7 @@ pub(crate) struct WriteThroughEntry {
 pub struct BufferManager {
     store: Arc<dyn BlobStore>,
     capacity: usize,
+    route_resident_budget: usize,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -173,6 +174,11 @@ pub struct BufferManager {
     /// `last_touched` tick give "approximate LRU" without needing
     /// an O(n) front-of-deque touch on every hit.
     cache: DashMap<BlobGuid, Arc<CachedBlob>>,
+    /// Small protected tier for route-anchor blobs learned from
+    /// the route cache. Dirty and pending-delete state still lives
+    /// in `mutation`; this tier only prevents ordinary clean-cache
+    /// pressure from evicting the top of a large path-shaped tree.
+    route_resident: DashMap<BlobGuid, u64>,
     /// Per-blob mutation bookkeeping, sharded by `BlobGuid`.
     ///
     /// Each shard owns the dirty, flushing, and pending-delete
@@ -213,6 +219,15 @@ pub struct BufferManager {
     max_cross_blob_depth: AtomicU64,
     spillover_count: AtomicU64,
     merge_count: AtomicU64,
+    route_resident_demotions: AtomicU64,
+}
+
+fn route_resident_budget(capacity: usize) -> usize {
+    if capacity < 4 {
+        0
+    } else {
+        (capacity / 4).min(4096)
+    }
 }
 
 #[inline]
@@ -232,10 +247,13 @@ impl BufferManager {
     /// clamped to 1.
     #[must_use]
     pub fn new(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             store,
-            capacity: capacity.max(1),
+            capacity,
+            route_resident_budget: route_resident_budget(capacity),
             cache: DashMap::new(),
+            route_resident: DashMap::new(),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
             pending_delete_total: AtomicUsize::new(0),
             compact_candidate_cursor: AtomicUsize::new(0),
@@ -253,6 +271,7 @@ impl BufferManager {
             max_cross_blob_depth: AtomicU64::new(0),
             spillover_count: AtomicU64::new(0),
             merge_count: AtomicU64::new(0),
+            route_resident_demotions: AtomicU64::new(0),
         }
     }
 
@@ -269,6 +288,55 @@ impl BufferManager {
     /// cold-but-resident entries are kept when the working set fits.
     pub(crate) fn cache_excess(&self) -> usize {
         self.cache.len().saturating_sub(self.capacity)
+    }
+
+    pub(crate) fn route_resident_count(&self) -> usize {
+        self.route_resident.len()
+    }
+
+    pub(crate) fn route_resident_demotions(&self) -> u64 {
+        self.route_resident_demotions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_route_resident(&self, guid: BlobGuid) {
+        if self.route_resident_budget == 0 {
+            return;
+        }
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut entry) = self.route_resident.get_mut(&guid) {
+            *entry = tick;
+            return;
+        }
+        self.route_resident.insert(guid, tick);
+        while self.route_resident.len() > self.route_resident_budget {
+            if !self.demote_oldest_route_resident() {
+                break;
+            }
+        }
+    }
+
+    fn demote_oldest_route_resident(&self) -> bool {
+        let mut victim: Option<(BlobGuid, u64)> = None;
+        for kv in &self.route_resident {
+            let guid = *kv.key();
+            let tick = *kv.value();
+            match victim {
+                None => victim = Some((guid, tick)),
+                Some((_, vmin)) if tick < vmin => victim = Some((guid, tick)),
+                _ => {}
+            }
+        }
+        if let Some((guid, _)) = victim {
+            self.route_resident.remove(&guid);
+            self.route_resident_demotions
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    fn is_route_resident(&self, guid: BlobGuid) -> bool {
+        self.route_resident.contains_key(&guid)
     }
 
     /// Iterate cached `(guid, entry)` pairs under a brief BM-state
@@ -299,6 +367,9 @@ impl BufferManager {
     ///
     /// Returns `true` if an entry was actually evicted.
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
+        if self.is_route_resident(guid) {
+            return false;
+        }
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected_or_pending(&guid) {
@@ -592,7 +663,7 @@ impl BufferManager {
                 continue;
             }
             let guid = *kv.key();
-            if protected_snap.contains(&guid) {
+            if protected_snap.contains(&guid) || self.is_route_resident(guid) {
                 continue;
             }
             let tick = kv.value().last_touched.load(Ordering::Relaxed);
@@ -632,6 +703,7 @@ impl BufferManager {
         if let Some((_, entry)) = self.cache.remove(&guid) {
             entry.clear_dirty_hint();
         }
+        self.route_resident.remove(&guid);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         state.remove_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
@@ -1323,6 +1395,52 @@ mod tests {
         g_first[0] = 0;
         assert!(bm.cache.contains_key(&g_last));
         assert!(!bm.cache.contains_key(&g_first));
+    }
+
+    #[test]
+    fn route_resident_anchor_survives_inline_lru() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..9u8 {
+            let mut g = [0u8; 16];
+            g[0] = i;
+            inner.write_blob(g, &make_buf(i)).unwrap();
+        }
+
+        let bm = BufferManager::new(inner, 8);
+        let anchor = [0u8; 16];
+        let mut dst = AlignedBlobBuf::zeroed();
+        bm.read_blob(anchor, &mut dst).unwrap();
+        bm.mark_route_resident(anchor);
+
+        for i in 1..9u8 {
+            let mut g = [0u8; 16];
+            g[0] = i;
+            bm.read_blob(g, &mut dst).unwrap();
+        }
+
+        assert_eq!(bm.cached_count(), 8);
+        assert!(bm.cache.contains_key(&anchor));
+        assert!(bm.is_route_resident(anchor));
+        let mut first_non_route = [0u8; 16];
+        first_non_route[0] = 1;
+        assert!(
+            !bm.cache.contains_key(&first_non_route),
+            "oldest non-route blob should be evicted first",
+        );
+    }
+
+    #[test]
+    fn route_resident_tier_demotes_old_anchors_at_budget() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 4);
+
+        bm.mark_route_resident([1; 16]);
+        bm.mark_route_resident([2; 16]);
+
+        assert_eq!(bm.route_resident_count(), 1);
+        assert_eq!(bm.route_resident_demotions(), 1);
+        assert!(!bm.is_route_resident([1; 16]));
+        assert!(bm.is_route_resident([2; 16]));
     }
 
     /// Regression: prior to the v0.2.1 fix, `try_evict_lru` only

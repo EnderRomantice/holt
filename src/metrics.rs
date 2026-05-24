@@ -62,6 +62,8 @@
 //! | `holt_route_cache_learns_total`         | counter | `TreeStats::route_cache.learns`        |
 //! | `holt_route_cache_evictions_total`      | counter | `TreeStats::route_cache.evictions`     |
 //! | `holt_route_cache_invalidations_total`  | counter | `TreeStats::route_cache.invalidations` |
+//! | `holt_bm_route_resident_count`          | gauge   | `TreeStats::bm_route_resident_count`   |
+//! | `holt_bm_route_resident_demotions_total`| counter | `TreeStats::bm_route_resident_demotions` |
 //! | `holt_journal_appends_total`             | counter | `JournalStats::appends`                |
 //! | `holt_journal_batches_total`             | counter | `JournalStats::batches`                |
 //! | `holt_journal_syncs_total`               | counter | `JournalStats::syncs`                  |
@@ -280,6 +282,20 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
+        "holt_bm_route_resident_count",
+        "Route-anchor blobs protected from ordinary LRU eviction.",
+        "gauge",
+        stats.bm_route_resident_count as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_route_resident_demotions_total",
+        "Route-anchor entries demoted after the protected tier filled.",
+        "counter",
+        stats.bm_route_resident_demotions,
+    );
+    metric(
+        &mut out,
         "holt_route_cache_entries",
         "Number of root route-cache entries currently resident.",
         "gauge",
@@ -438,6 +454,8 @@ mod tests {
             bm_max_cross_blob_depth: 17,
             bm_spillovers: 2,
             bm_merges: 1,
+            bm_route_resident_count: 3,
+            bm_route_resident_demotions: 4,
             route_cache: RouteCacheStats {
                 entries: 6,
                 hits: 70,

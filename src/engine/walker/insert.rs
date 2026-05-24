@@ -142,6 +142,7 @@ pub fn insert_multi_conditional(
         if let Some(crossing) = root_crossing {
             if let Some(cache) = route_cache {
                 cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                bm.mark_route_resident(crossing.child_guid);
             }
             let child_pin = bm.pin(crossing.child_guid)?;
             child_pin.prefetch_header();
@@ -391,6 +392,7 @@ fn try_insert_batch_from_first_blob(
                     crossing.child_guid,
                     crossing.child_depth,
                 );
+                bm.mark_route_resident(crossing.child_guid);
             }
             let run_len = same_child_prefix_run_len(items, crossing.child_depth);
             let child_pin = bm.pin(crossing.child_guid)?;

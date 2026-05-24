@@ -149,6 +149,15 @@ pub struct TreeStats {
     /// `BlobNode` children folded back into parents by manual
     /// compact or background merge passes.
     pub bm_merges: u64,
+    /// Number of route-anchor blobs protected from ordinary clean
+    /// cache eviction. These are upper-tree blobs learned by the
+    /// route cache so cold leaf misses do not evict the routing
+    /// layer of large path-shaped trees.
+    pub bm_route_resident_count: usize,
+    /// Route-anchor entries demoted from the protected tier after
+    /// its memory budget filled. This is a tier demotion counter,
+    /// not a cache eviction counter.
+    pub bm_route_resident_demotions: u64,
     /// Root route-cache counters for large path-shaped trees.
     pub route_cache: RouteCacheStats,
     /// WAL/journal worker counters, or `None` for memory trees and

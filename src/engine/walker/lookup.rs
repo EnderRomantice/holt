@@ -137,6 +137,7 @@ where
                 Ok(LookupResult::Crossing(crossing)) => {
                     if let Some(cache) = route_cache {
                         cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                        bm.mark_route_resident(crossing.child_guid);
                     }
                     crossing
                 }

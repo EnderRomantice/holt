@@ -120,6 +120,7 @@ pub fn erase_multi_conditional(
             LookupResult::Crossing(crossing) => {
                 if let Some(cache) = route_cache {
                     cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                    bm.mark_route_resident(crossing.child_guid);
                 }
                 let child_pin = bm.pin(crossing.child_guid)?;
                 child_pin.prefetch_header();

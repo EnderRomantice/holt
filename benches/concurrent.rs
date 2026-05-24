@@ -542,7 +542,7 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         .as_ref()
         .map_or((0, 0, 0), |j| (j.appends, j.batches, j.syncs));
     println!(
-        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} avg_hops={:.2} max_hops={} spillovers={} merges={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
+        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
         s.blob_count,
         s.total_blob_edges,
         s.leaf_blob_count,
@@ -554,6 +554,8 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         s.bm_max_blob_hops,
         s.bm_spillovers,
         s.bm_merges,
+        s.bm_route_resident_count,
+        s.bm_route_resident_demotions,
         s.route_cache.entries,
         s.route_cache.hits,
         s.route_cache.misses,
