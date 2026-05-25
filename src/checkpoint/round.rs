@@ -10,18 +10,19 @@
 //!    Merge mutations are staged through the same dirty /
 //!    pending-delete sets as foreground writes, then flushed by
 //!    this round after the WAL sync.
-//! 1. **Snapshot dirty + pending deletes** under the exclusive
-//!    side of the tree's commit-publish gate.
+//! 1. **Snapshot dirty + pending deletes + content versions** under
+//!    the exclusive side of the tree's commit-publish gate.
 //! 2. **Flush WAL** through the journal worker so every record that
 //!    mirrors a snapshotted seq is durable before we drop it.
-//! 3. **Clone snapshotted bytes** while still holding the same
-//!    commit-publish gate, then enqueue one checkpoint epoch to
-//!    the I/O worker.
-//! 4. **Retire completed epochs** on later planner turns in FIFO
+//! 3. **Clone version-matched bytes** outside the commit gate.
+//!    If a foreground writer changed a blob after step 1, restore
+//!    that dirty entry and retry it in a later round.
+//! 4. **Enqueue one checkpoint epoch** to the I/O worker.
+//! 5. **Retire completed epochs** on later planner turns in FIFO
 //!    order. This is the truncate watermark: a later epoch may not
 //!    advance WAL trimming before every older epoch is known to
 //!    have landed or restored.
-//! 5. **Truncate WAL** only when the pipeline is empty and
+//! 6. **Truncate WAL** only when the pipeline is empty and
 //!    `bm.dirty_count() == 0 && bm.pending_delete_count() == 0`
 //!    under the commit-publish gate.
 //!
@@ -251,7 +252,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         (snap, pending, versioned_snap, None)
     };
 
-    // 3. Force the WAL watermark before data-file writes, but do
+    // 2. Force the WAL watermark before data-file writes, but do
     // not hold `commit_gate` across the fsync. Later writers may
     // append more WAL records while this flush runs; that is safe
     // because this epoch only writes the cloned dirty snapshot and
@@ -321,7 +322,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         return Ok(());
     }
 
-    // 3. Hand the whole epoch to the I/O worker. The planner has
+    // 4. Hand the whole epoch to the I/O worker. The planner has
     // already snapshotted durable intent under the commit-publish
     // gate; the worker can now drive data writes, store sync, pending
     // manifest deletes, and trailing sync without holding up writers

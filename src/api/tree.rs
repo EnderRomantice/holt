@@ -32,8 +32,10 @@ use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::wal_op::WalOp;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
-use crate::store::blob_store::{BlobStore, FileBlobStore, MemoryBlobStore};
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob, WriteThroughEntry};
+use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
+use crate::store::{
+    BlobFrame, BlobFrameRef, BufferManager, CachedBlob, DirtySnapshotEntry, WriteThroughEntry,
+};
 
 use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
 
@@ -43,6 +45,19 @@ const SHAPE_UNDERFILLED_CHILD_FILL_PER_MILLE: u32 = 350;
 const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 
 type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
+type CheckpointMap = HashMap<BlobGuid, u64>;
+type CheckpointBytes = Vec<(BlobGuid, u64, AlignedBlobBuf)>;
+
+struct DirtyWriteOutcome {
+    wrote_any: bool,
+    failed: CheckpointMap,
+    first_err: Option<Error>,
+}
+
+struct PendingDeleteOutcome {
+    failed: CheckpointMap,
+    first_err: Option<Error>,
+}
 
 struct BlobStatsAggregate {
     blobs: Vec<BlobStats>,
@@ -120,8 +135,8 @@ pub struct Tree {
     /// the root hop. Cross-blob descents still pin children
     /// through the BM as normal.
     root_pin: Arc<CachedBlob>,
-    /// Serialises multi-key operations whose endpoint shards overlap. The
-    /// multi-step `lookup_multi_with(src)` + `erase_multi(src)` +
+    /// Serialises multi-key operations whose endpoint shards overlap.
+    /// The multi-step `lookup_multi_with(src)` + `erase_multi(src)` +
     /// `insert_multi(dst)` must not interleave with another rename
     /// touching either endpoint. Disjoint endpoint pairs can run
     /// concurrently and still coordinate through per-blob latches.
@@ -148,7 +163,7 @@ pub struct Tree {
     /// persistent mode. Foreground writers can mutate disjoint
     /// blobs concurrently, but checkpoint waits until every
     /// admitted writer has published its dirty state and journal
-    /// record before cloning bytes for store write-through.
+    /// record before the checkpoint captures versioned store bytes.
     commit_gate: Arc<CommitGate>,
     /// Group-commit WAL worker — `Some` for persistent trees,
     /// `None` for memory trees.
@@ -765,7 +780,7 @@ impl Tree {
     /// The closure builds a [`AtomicBatch`] by calling its `put` /
     /// conditional write / `delete` / `rename` methods; on return,
     /// holt first validates every logical precondition, then applies
-    /// the batch while holding the tree-wide mutation gate and emits
+    /// the batch while holding the exclusive maintenance gate and emits
     /// **one** WAL record (`WalOp::Batch`) covering the sequence.
     ///
     /// ## Atomicity contract
@@ -1473,112 +1488,176 @@ impl Tree {
     /// path restores any snapshot it drained so the next round
     /// retries.
     ///
-    /// 1. **Snapshot + journal flush** (under `commit_gate`):
-    ///    drain BM dirty + pending-delete sets, force the journal
-    ///    durable, and clone each snapshotted blob's bytes before
-    ///    releasing the lock. Journal flush failure → restore both
-    ///    snapshots, return.
-    /// 2. **Per-blob write-through** with CAS-on-seq. The CAS
+    /// 1. **Snapshot intent**: drain BM dirty + pending-delete sets
+    ///    under `commit_gate` and capture each dirty blob's content
+    ///    version. WAL flush failure → restore both snapshots,
+    ///    return.
+    /// 2. **Clone bytes outside `commit_gate`**: if any blob changed
+    ///    after intent capture, restore the whole snapshot and retry
+    ///    so manual checkpoint remains a durability barrier.
+    /// 3. **Per-blob write-through** with CAS-on-seq. The CAS
     ///    retires the dirty entry only if no racing writer bumped
     ///    it; failures stay in `dirty` for the next round.
     ///    If the snapshot had neither dirty blobs nor pending
     ///    deletes and the store reports no outstanding flush
     ///    work, skip the store Sync path entirely.
-    /// 3. **Pre-delete sync** — `store.flush` (`sync_data` on
-    ///    the data file + persist the manifest) so step 2's
+    /// 4. **Pre-delete sync** — `store.flush` (`sync_data` on
+    ///    the data file + persist the manifest) so step 3's
     ///    writes hit stable storage *before* any manifest delete
     ///    runs. Sync failure → restore pending, return.
-    /// 4. **Abort-on-dirty-failure gate**. If any write-through
-    ///    at step 2 failed, the round must NOT apply pending
+    /// 5. **Abort-on-dirty-failure gate**. If any write-through
+    ///    at step 3 failed, the round must NOT apply pending
     ///    deletes: a parent that didn't flush might still
     ///    reference a child that's about to be removed from the
     ///    manifest, leaving the on-disk parent pointing into a
     ///    deleted slot. Restore pending and return the dirty
     ///    error. The next round will retry the parent write and
     ///    only then process its child's deletion.
-    /// 5. **Apply pending deletes** (manifest mutation
+    /// 6. **Apply pending deletes** (manifest mutation
     ///    in-memory). Each `execute_pending_delete` is idempotent
     ///    against a missing entry; failures are restored.
-    /// 6. **Post-delete sync** — re-`store.flush` iff any delete
+    /// 7. **Post-delete sync** — re-`store.flush` iff any delete
     ///    actually applied. Failure → restore the
     ///    already-applied entries so the truncate gate stays
     ///    closed and the next round retries the sync (the manifest
     ///    delete is idempotent on the second pass).
-    /// 7. **Conditional WAL truncate** — only if
+    /// 8. **Conditional WAL truncate** — only if
     ///    `dirty_count == 0` AND `pending_delete_count == 0`
     ///    *now*. A racing writer or a restored failure must keep
     ///    the WAL alive until a future flush.
     ///
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
-    #[allow(clippy::too_many_lines)]
     pub fn checkpoint(&self) -> Result<()> {
-        use std::collections::HashMap;
-
         let _maintenance = self.maintenance_gate.enter_shared();
 
-        // Phase 1: snapshot dirty/pending, clone bytes, and record
-        // the WAL watermark under `commit_gate`. This closes the
-        // subtle W2D hole where a foreground writer mutates a blob
-        // after the dirty snapshot but before `snapshot_bytes`: the
-        // checkpoint could otherwise write bytes whose WAL record was
-        // not part of the checkpoint snapshot. The WAL flush itself
-        // happens after releasing the gate so fsync does not block
-        // foreground writers.
-        let (snap_dirty, snap_pending, snap_bytes, wal_up_to) = if let Some(journal) = &self.journal
-        {
+        loop {
+            let (snap_dirty, snap_pending, versioned_snap, wal_up_to) =
+                self.capture_checkpoint_intent()?;
+
+            if let (Some(journal), Some(up_to)) = (&self.journal, wal_up_to) {
+                if let Err(e) = journal.flush_up_to(up_to) {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
+                    return Err(e);
+                }
+            }
+
+            let snap_bytes = match self.clone_checkpoint_bytes(&versioned_snap) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
+                    continue;
+                }
+                Err(e) => {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
+                    return Err(e);
+                }
+            };
+
+            return self.finish_checkpoint_snapshot(snap_pending, snap_bytes);
+        }
+    }
+
+    fn clone_checkpoint_bytes(
+        &self,
+        versioned_snap: &[DirtySnapshotEntry],
+    ) -> Result<Option<CheckpointBytes>> {
+        let mut snap_bytes = Vec::with_capacity(versioned_snap.len());
+        for entry in versioned_snap {
+            match self
+                .store
+                .snapshot_bytes_if_version(entry.guid, entry.content_version)?
+            {
+                Some(bytes) => snap_bytes.push((entry.guid, entry.expected_seq, bytes)),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(snap_bytes))
+    }
+
+    fn capture_checkpoint_intent(
+        &self,
+    ) -> Result<(
+        CheckpointMap,
+        CheckpointMap,
+        Vec<DirtySnapshotEntry>,
+        Option<u64>,
+    )> {
+        let (snap_dirty, snap_pending, wal_up_to) = if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_checkpoint();
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
             let wal_up_to = journal.wal_work();
-            let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
-            for (guid, expected_seq) in &snap_dirty {
-                let Some(bytes) = self.store.snapshot_bytes(*guid) else {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
-                    return Err(Error::Internal(
-                        "checkpoint: dirty entry lost cache image — invariant I1 violated",
-                    ));
-                };
-                snap_bytes.push((*guid, *expected_seq, bytes));
-            }
-            (snap_dirty, snap_pending, snap_bytes, Some(wal_up_to))
+            (snap_dirty, snap_pending, Some(wal_up_to))
         } else {
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
-            let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
-            for (guid, expected_seq) in &snap_dirty {
-                let Some(bytes) = self.store.snapshot_bytes(*guid) else {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
-                    return Err(Error::Internal(
-                        "checkpoint: dirty entry lost cache image — invariant I1 violated",
-                    ));
-                };
-                snap_bytes.push((*guid, *expected_seq, bytes));
-            }
-            (snap_dirty, snap_pending, snap_bytes, None)
+            (snap_dirty, snap_pending, None)
         };
 
-        if let (Some(journal), Some(up_to)) = (&self.journal, wal_up_to) {
-            if let Err(e) = journal.flush_up_to(up_to) {
+        let versioned_snap = match self.store.snapshot_dirty_versions(&snap_dirty) {
+            Ok(versioned) => versioned,
+            Err(e) => {
                 self.store.restore_pending_deletes(snap_pending);
                 self.store.restore_dirty(snap_dirty);
                 return Err(e);
             }
+        };
+        Ok((snap_dirty, snap_pending, versioned_snap, wal_up_to))
+    }
+
+    fn finish_checkpoint_snapshot(
+        &self,
+        snap_pending: CheckpointMap,
+        snap_bytes: CheckpointBytes,
+    ) -> Result<()> {
+        let DirtyWriteOutcome {
+            wrote_any,
+            failed: dirty_failed,
+            first_err: first_dirty_err,
+        } = self.write_checkpoint_bytes(snap_bytes);
+        let had_dirty_failure = !dirty_failed.is_empty();
+        if had_dirty_failure {
+            self.store.restore_dirty(dirty_failed);
         }
 
-        // Phase 2: batch write-through with CAS-on-seq.
-        //
-        // A drained dirty entry **must** have a cache image —
-        // invariant I1 (dirty ⟺ cache newer than store). If
-        // `snapshot_bytes` returns `None`, the BM's eviction
-        // policy regressed and dropped a dirty cache image; that
-        // would otherwise be a silent data-loss path (the next
-        // checkpoint sees `dirty == 0` and truncates the WAL).
-        // Restore both snapshots and bail loud.
-        let mut dirty_failed: HashMap<BlobGuid, u64> = HashMap::new();
-        let mut first_dirty_err: Option<Error> = None;
+        if !wrote_any && snap_pending.is_empty() && !self.store.needs_flush() {
+            self.maybe_truncate_journal()?;
+            return Ok(());
+        }
+
+        // Successful write-throughs already retired their dirty
+        // entries; sync them before any manifest delete can land.
+        if let Err(e) = self.store.flush() {
+            self.store.restore_pending_deletes(snap_pending);
+            return Err(e);
+        }
+
+        if had_dirty_failure {
+            self.store.restore_pending_deletes(snap_pending);
+            return Err(first_dirty_err.expect("had_dirty_failure ⇒ first_dirty_err set"));
+        }
+
+        let PendingDeleteOutcome {
+            failed: pending_failed,
+            first_err: first_pending_err,
+        } = self.apply_pending_deletes(&snap_pending);
+        if !pending_failed.is_empty() {
+            self.store.restore_pending_deletes(pending_failed.clone());
+        }
+        self.sync_applied_deletes(&snap_pending, &pending_failed)?;
+
+        if let Some(e) = first_pending_err {
+            return Err(e);
+        }
+
+        self.maybe_truncate_journal()
+    }
+
+    fn write_checkpoint_bytes(&self, snap_bytes: CheckpointBytes) -> DirtyWriteOutcome {
         let entries: Vec<_> = snap_bytes
             .into_iter()
             .map(|(guid, expected_seq, bytes)| WriteThroughEntry {
@@ -1587,6 +1666,8 @@ impl Tree {
                 expected_seq,
             })
             .collect();
+        let mut failed = CheckpointMap::new();
+        let mut first_err = None;
         if !entries.is_empty() {
             let expected: Vec<_> = entries
                 .iter()
@@ -1596,80 +1677,39 @@ impl Tree {
                 // BlobStore batch failure may have landed any prefix;
                 // retry the whole snapshot next round.
                 for (guid, expected_seq) in expected {
-                    dirty_failed.insert(guid, expected_seq);
+                    failed.insert(guid, expected_seq);
                 }
-                if first_dirty_err.is_none() {
-                    first_dirty_err = Some(e);
-                }
+                first_err = Some(e);
             }
         }
-        let had_dirty_failure = !dirty_failed.is_empty();
-        if had_dirty_failure {
-            self.store.restore_dirty(dirty_failed);
+        DirtyWriteOutcome {
+            wrote_any: !entries.is_empty(),
+            failed,
+            first_err,
         }
+    }
 
-        if entries.is_empty() && snap_pending.is_empty() && !self.store.needs_flush() {
-            if let Some(journal) = &self.journal {
-                if journal.needs_checkpoint() {
-                    let _commit = self.commit_gate.enter_checkpoint();
-                    if self.store.dirty_count() == 0 && self.store.pending_delete_count() == 0 {
-                        journal.truncate()?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        // Phase 3: pre-delete sync. Even when some writes failed at
-        // phase 2, the successful ones already retired their dirty
-        // entries via the write-through CAS — we must still fsync
-        // so those bytes are stable on disk. On sync failure,
-        // pending deletes haven't been applied yet, so restore them
-        // and bail.
-        if let Err(e) = self.store.flush() {
-            self.store.restore_pending_deletes(snap_pending);
-            return Err(e);
-        }
-
-        // Phase 4: abort-on-dirty-failure gate. A failed parent
-        // write-through must NOT propagate to a manifest delete of
-        // its dependent child — that would orphan the parent's
-        // BlobNode pointer (parent on-disk still has the child
-        // pointer; manifest no longer has the child entry; WAL
-        // replay's walker descent would fail to read the deleted
-        // child). Restore the entire pending snapshot and surface
-        // the dirty error.
-        if had_dirty_failure {
-            self.store.restore_pending_deletes(snap_pending);
-            return Err(first_dirty_err.expect("had_dirty_failure ⇒ first_dirty_err set"));
-        }
-
-        // Phase 5: apply pending deletes (manifest mutation).
-        let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
-        let mut first_pending_err: Option<Error> = None;
-        for (guid, seq) in &snap_pending {
+    fn apply_pending_deletes(&self, snap_pending: &CheckpointMap) -> PendingDeleteOutcome {
+        let mut failed = CheckpointMap::new();
+        let mut first_err = None;
+        for (guid, seq) in snap_pending {
             if let Err(e) = self.store.execute_pending_delete(*guid) {
-                pending_failed.insert(*guid, *seq);
-                if first_pending_err.is_none() {
-                    first_pending_err = Some(e);
-                }
+                failed.insert(*guid, *seq);
+                first_err.get_or_insert(e);
             }
         }
-        if !pending_failed.is_empty() {
-            self.store.restore_pending_deletes(pending_failed.clone());
-        }
+        PendingDeleteOutcome { failed, first_err }
+    }
 
-        // Phase 6: post-delete sync iff any delete actually applied.
-        // On sync failure, restore the already-applied entries to
-        // pending — the manifest mutation we did at phase 5 is
-        // stuck in-memory until the next sync succeeds, so the
-        // truncate gate at phase 7 must stay closed. Re-executing
-        // `execute_pending_delete` on the restored entries is a
-        // no-op (HashMap::remove on a missing key).
+    fn sync_applied_deletes(
+        &self,
+        snap_pending: &CheckpointMap,
+        pending_failed: &CheckpointMap,
+    ) -> Result<()> {
         let applied_deletes = snap_pending.len() - pending_failed.len();
         if applied_deletes > 0 {
             if let Err(e) = self.store.flush() {
-                let restore_applied: HashMap<BlobGuid, u64> = snap_pending
+                let restore_applied: CheckpointMap = snap_pending
                     .iter()
                     .filter(|(g, _)| !pending_failed.contains_key(*g))
                     .map(|(g, s)| (*g, *s))
@@ -1678,18 +1718,10 @@ impl Tree {
                 return Err(e);
             }
         }
+        Ok(())
+    }
 
-        if let Some(e) = first_pending_err {
-            return Err(e);
-        }
-
-        // 6. Conditional truncate. A writer that landed a
-        //    mark_dirty between our snapshot and here has its
-        //    entry still in `dirty` (write-through CAS won't
-        //    retire newer-seq entries, and snapshot only drained
-        //    what we observed at step 1); leave the WAL alone so
-        //    that entry's WAL record stays recoverable. Same
-        //    logic for pending_delete_count.
+    fn maybe_truncate_journal(&self) -> Result<()> {
         if let Some(journal) = &self.journal {
             if journal.needs_checkpoint() {
                 let _commit = self.commit_gate.enter_checkpoint();

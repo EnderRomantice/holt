@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
 
-const RENAME_LOCK_SHARDS: usize = 256;
+const ENDPOINT_LOCK_SHARDS: usize = 256;
 
 /// Fixed-shard locks for multi-key operation endpoints.
 ///
@@ -11,7 +11,7 @@ const RENAME_LOCK_SHARDS: usize = 256;
 /// concurrent, while canonical shard ordering prevents AB/BA
 /// deadlock.
 pub(crate) struct EndpointLocks {
-    shards: [Mutex<()>; RENAME_LOCK_SHARDS],
+    shards: [Mutex<()>; ENDPOINT_LOCK_SHARDS],
 }
 
 impl EndpointLocks {
@@ -53,7 +53,7 @@ pub(crate) struct EndpointLockGuard<'a> {
 fn shard_index(key: &[u8]) -> usize {
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
-    (h.finish() as usize) & (RENAME_LOCK_SHARDS - 1)
+    (h.finish() as usize) & (ENDPOINT_LOCK_SHARDS - 1)
 }
 
 #[cfg(test)]

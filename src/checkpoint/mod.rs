@@ -48,8 +48,9 @@
 //! Three threads (rather than a single one) buy:
 //!
 //! 1. **Writers don't sit behind checkpoint I/O** — the planner
-//!    snapshots dirty state, flushes WAL, clones bytes, then releases
-//!    the commit gate while epoch I/O continues in the worker.
+//!    captures dirty intent under the commit gate, flushes the WAL
+//!    watermark, then clones version-matched bytes after releasing
+//!    the gate while epoch I/O continues in the worker.
 //! 2. **io_uring fit** — the I/O thread is the natural home for
 //!    the SQE submit + CQE poll loop on the Linux fast path.
 //! 3. **Eviction is decoupled** — runs on its own cadence
@@ -171,10 +172,10 @@ pub(super) struct Shared {
     pub(super) bm: Arc<BufferManager>,
     pub(super) journal: Option<Arc<Journal>>,
     /// Same writer-shared / checkpoint-exclusive publish barrier
-    /// used by foreground persistent writers. Checkpoint rounds
-    /// hold its exclusive side while draining dirty entries and
-    /// cloning bytes so store writes never include unjournaled
-    /// mutations.
+    /// used by foreground persistent writers. Checkpoint rounds hold
+    /// its exclusive side only while draining dirty intent and
+    /// capturing blob content versions. Byte cloning and store I/O
+    /// happen after the gate is released.
     pub(super) commit_gate: Arc<CommitGate>,
     /// Shared structural gate with `Tree`: the merge pass enters
     /// the exclusive side so it cannot fold/delete a child blob
