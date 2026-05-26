@@ -72,6 +72,7 @@ pub use range::{
     KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder, RangeEntry,
     RangeIter,
 };
+pub(crate) use scan::collect_blob_children_from_frame;
 pub use scan::{
     collect_blob_guids, collect_blob_topology_silent, collect_prefix_blob_topology_silent,
 };

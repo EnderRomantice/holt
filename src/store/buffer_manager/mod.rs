@@ -1176,6 +1176,23 @@ impl BufferManager {
         self.store.delete_blob(guid)
     }
 
+    /// `true` iff the inner store currently knows `guid`.
+    ///
+    /// This deliberately bypasses the cache: checkpoint dependency
+    /// ordering needs to know whether a child blob has reached the
+    /// store manifest, not whether the child is merely staged in
+    /// memory.
+    pub(crate) fn store_has_blob(&self, guid: BlobGuid) -> Result<bool> {
+        self.store.has_blob(guid)
+    }
+
+    /// `true` iff `guid` still has dirty or in-flight checkpoint
+    /// state owned by the buffer manager.
+    pub(crate) fn has_unflushed_blob(&self, guid: BlobGuid) -> bool {
+        let state = self.mutation_shard(guid).lock().unwrap();
+        state.dirty.contains_key(&guid) || state.flushing.contains_key(&guid)
+    }
+
     /// Snapshot the cached bytes for `guid` into a freshly allocated
     /// `AlignedBlobBuf`. Returns `None` if the blob isn't cached.
     ///

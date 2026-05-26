@@ -444,11 +444,18 @@ mod tests {
     use crate::api::errors::Result;
     use crate::layout::BlobGuid;
     use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
+    use crate::store::BlobFrame;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Instant;
 
     fn make_bm() -> Arc<BufferManager> {
         Arc::new(BufferManager::new(Arc::new(MemoryBlobStore::new()), 8))
+    }
+
+    fn test_blob(guid: BlobGuid) -> AlignedBlobBuf {
+        let mut buf = AlignedBlobBuf::zeroed();
+        let _frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
+        buf
     }
 
     fn maintenance_gate() -> Arc<Gate> {
@@ -557,7 +564,7 @@ mod tests {
     fn round_drains_dirty_set_via_io_queue() {
         let bm = make_bm();
         // Prime a cached entry so snapshot_bytes returns Some.
-        let mut scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
+        let mut scratch = test_blob([0x42; 16]);
         scratch.as_mut_slice()[100] = 0xAB;
         bm.write_blob([0x42; 16], &scratch).unwrap();
         let _pin = bm.pin([0x42; 16]).unwrap();
@@ -602,7 +609,7 @@ mod tests {
         .expect("spawn");
 
         // Need a cached blob so snapshot_bytes finds it.
-        let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
+        let scratch = test_blob([0x01; 16]);
         bm.write_blob([0x01; 16], &scratch).unwrap();
         let _pin = bm.pin([0x01; 16]).unwrap();
         bm.mark_dirty([0x01; 16], 1);
@@ -625,9 +632,8 @@ mod tests {
     fn planner_queues_second_epoch_while_first_io_is_blocked() {
         let store = Arc::new(BlockingBatchStore::new());
         let bm = Arc::new(BufferManager::new(store.clone(), 8));
-        let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
-        bm.write_blob([0x21; 16], &scratch).unwrap();
-        bm.write_blob([0x22; 16], &scratch).unwrap();
+        bm.write_blob([0x21; 16], &test_blob([0x21; 16])).unwrap();
+        bm.write_blob([0x22; 16], &test_blob([0x22; 16])).unwrap();
         let _pin1 = bm.pin([0x21; 16]).unwrap();
         let _pin2 = bm.pin([0x22; 16]).unwrap();
         bm.mark_dirty([0x21; 16], 1);

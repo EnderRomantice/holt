@@ -49,6 +49,13 @@ pub fn collect_blob_guids(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec
         .map(|entries| entries.into_iter().map(|entry| entry.guid).collect())
 }
 
+/// Return every `BlobNode` child referenced inside a single blob frame.
+pub(crate) fn collect_blob_children_from_frame(frame: BlobFrameRef<'_>) -> Result<Vec<BlobGuid>> {
+    let mut found = Vec::new();
+    scan_subtree(frame, frame.header().root_slot, &mut found)?;
+    Ok(found)
+}
+
 /// Return every reachable blob plus its blob-graph depth from
 /// `root_guid`, in BFS order.
 fn collect_blob_topology(
