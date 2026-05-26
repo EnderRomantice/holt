@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use super::atomic::{BatchOp, RecordVersion};
 use super::config::TreeConfig;
 use super::errors::Result;
-use super::stats::OpenStats;
+use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
@@ -167,6 +167,99 @@ impl DB {
             DBView { trees }
         };
         read(&view)
+    }
+
+    /// Force one DB-wide checkpoint round.
+    ///
+    /// This flushes the shared BufferManager, applies pending
+    /// deletes, and truncates the shared WAL when it is safe. It is
+    /// not tied to any one named tree.
+    pub fn checkpoint(&self) -> Result<()> {
+        Tree::checkpoint_shared_parts(
+            &self.store,
+            self.journal.as_ref(),
+            &self.maintenance_gate,
+            &self.commit_gate,
+        )
+    }
+
+    /// Run one online maintenance pass for every tree opened by
+    /// this process.
+    ///
+    /// Without a durable tree catalog, `DB` can only enumerate
+    /// trees that have been opened through this handle. The pass
+    /// still stages all rewrites through the shared DB checkpoint
+    /// protocol.
+    pub fn compact(&self) -> Result<()> {
+        let trees: Vec<_> = self
+            .trees
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(tree_id, open)| (*tree_id, open.clone()))
+            .collect();
+        for (tree_id, open) in trees {
+            self.tree_from_state(tree_id, open)?.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot shared DB resource counters.
+    ///
+    /// Shape counters remain available from each [`Tree::stats`]
+    /// because blob topology is root-specific. `DBStats` reports
+    /// the shared WAL, checkpoint, and BufferManager counters.
+    pub fn stats(&self) -> DBStats {
+        let journal = self.journal.as_ref().map(|j| {
+            let s = j.stats();
+            JournalStats {
+                appends: s.appends,
+                batches: s.batches,
+                syncs: s.syncs,
+                queued_work: s.queued_work,
+                written_work: s.written_work,
+                flushed_work: s.flushed_work,
+                checkpointed_work: s.checkpointed_work,
+                pending_work: s.pending_work,
+                checkpoint_debt: s.checkpoint_debt,
+            }
+        });
+        let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
+            rounds_attempted: ck.rounds_attempted(),
+            rounds_succeeded: ck.rounds_succeeded(),
+            rounds_failed: ck.rounds_failed(),
+            blobs_flushed: ck.blobs_flushed(),
+            merges_total: ck.merges_total(),
+            truncates: ck.truncates(),
+            evictions: ck.evictions(),
+            last_dirty_count: ck.last_dirty_count(),
+            last_pending_delete_count: ck.last_pending_delete_count(),
+            last_round_micros: ck.last_round_micros(),
+        });
+        DBStats {
+            open_tree_count: self.trees.lock().unwrap().len(),
+            bm_dirty_count: self.store.dirty_count(),
+            bm_pending_delete_count: self.store.pending_delete_count(),
+            bm_cache_hits: self.store.cache_hits(),
+            bm_cache_misses: self.store.cache_misses(),
+            bm_optimistic_restarts: self.store.optimistic_restarts(),
+            bm_range_restarts: self.store.range_restarts(),
+            bm_walker_ops: self.store.walker_ops(),
+            bm_walker_blob_hops: self.store.walker_blob_hops(),
+            bm_max_blob_hops: self.store.max_blob_hops(),
+            bm_max_cross_blob_depth: self.store.max_cross_blob_depth(),
+            bm_spillovers: self.store.spillover_count(),
+            bm_merges: self.store.merge_count(),
+            bm_route_resident_count: self.store.route_resident_count(),
+            bm_route_resident_demotions: self.store.route_resident_demotions(),
+            bm_cache_evictions: self.store.cache_evictions(),
+            bm_eviction_skips_protected: self.store.eviction_skips_protected(),
+            bm_eviction_skips_route_resident: self.store.eviction_skips_route_resident(),
+            bm_admission_protects: self.store.admission_protects(),
+            open: self.open_stats,
+            journal,
+            checkpointer,
+        }
     }
 
     fn open_tree_state(&self, tree_id: u64) -> Result<OpenTree> {

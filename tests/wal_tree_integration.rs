@@ -81,6 +81,40 @@ fn db_named_trees_replay_from_one_wal() {
 }
 
 #[test]
+fn db_checkpoint_flushes_replayed_multi_tree_without_tree_handles() {
+    let dir = tempdir().unwrap();
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        assert!(db
+            .atomic(|batch| {
+                batch.put("objects", b"bucket/a.jpg", b"etag-a");
+                batch.put("inodes", b"42", b"mode=0644");
+            })
+            .unwrap());
+    }
+
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        let objects = db.open_tree("objects").unwrap();
+        let inodes = db.open_tree("inodes").unwrap();
+
+        assert_eq!(
+            objects.get(b"bucket/a.jpg").unwrap().as_deref(),
+            Some(&b"etag-a"[..])
+        );
+        assert_eq!(
+            inodes.get(b"42").unwrap().as_deref(),
+            Some(&b"mode=0644"[..])
+        );
+    }
+}
+
+#[test]
 fn view_snapshots_uncheckpointed_persistent_bytes() {
     let dir = tempdir().unwrap();
     let tree = Tree::open(durable_cfg(dir.path())).unwrap();

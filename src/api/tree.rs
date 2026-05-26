@@ -1609,48 +1609,65 @@ impl Tree {
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
-        let _maintenance = self.maintenance_gate.enter_shared();
+        Self::checkpoint_shared_parts(
+            &self.store,
+            self.journal.as_ref(),
+            &self.maintenance_gate,
+            &self.commit_gate,
+        )
+    }
+
+    pub(crate) fn checkpoint_shared_parts(
+        store: &Arc<BufferManager>,
+        journal: Option<&Arc<Journal>>,
+        maintenance_gate: &Arc<Gate>,
+        commit_gate: &Arc<CommitGate>,
+    ) -> Result<()> {
+        let _maintenance = maintenance_gate.enter_shared();
 
         loop {
             let (snap_dirty, snap_pending, versioned_snap, wal_up_to) =
-                self.capture_checkpoint_intent()?;
+                Self::capture_checkpoint_intent_shared(store, journal, commit_gate)?;
 
-            if let (Some(journal), Some(up_to)) = (&self.journal, wal_up_to) {
+            if let (Some(journal), Some(up_to)) = (journal, wal_up_to) {
                 if let Err(e) = journal.flush_up_to(up_to) {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
+                    store.restore_pending_deletes(snap_pending);
+                    store.restore_dirty(snap_dirty);
                     return Err(e);
                 }
             }
 
-            let snap_bytes = match self.clone_checkpoint_bytes(&versioned_snap) {
+            let snap_bytes = match Self::clone_checkpoint_bytes_shared(store, &versioned_snap) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
+                    store.restore_pending_deletes(snap_pending);
+                    store.restore_dirty(snap_dirty);
                     continue;
                 }
                 Err(e) => {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
+                    store.restore_pending_deletes(snap_pending);
+                    store.restore_dirty(snap_dirty);
                     return Err(e);
                 }
             };
 
-            return self.finish_checkpoint_snapshot(snap_pending, snap_bytes);
+            return Self::finish_checkpoint_snapshot_shared(
+                store,
+                journal,
+                commit_gate,
+                snap_pending,
+                snap_bytes,
+            );
         }
     }
 
-    fn clone_checkpoint_bytes(
-        &self,
+    fn clone_checkpoint_bytes_shared(
+        store: &Arc<BufferManager>,
         versioned_snap: &[DirtySnapshotEntry],
     ) -> Result<Option<CheckpointBytes>> {
         let mut snap_bytes = Vec::with_capacity(versioned_snap.len());
         for entry in versioned_snap {
-            match self
-                .store
-                .snapshot_bytes_if_version(entry.guid, entry.content_version)?
-            {
+            match store.snapshot_bytes_if_version(entry.guid, entry.content_version)? {
                 Some(bytes) => {
                     snap_bytes.push((entry.guid, entry.expected_seq, entry.content_version, bytes));
                 }
@@ -1660,45 +1677,49 @@ impl Tree {
         Ok(Some(snap_bytes))
     }
 
-    fn capture_checkpoint_intent(
-        &self,
+    fn capture_checkpoint_intent_shared(
+        store: &Arc<BufferManager>,
+        journal: Option<&Arc<Journal>>,
+        commit_gate: &Arc<CommitGate>,
     ) -> Result<(
         CheckpointMap,
         CheckpointMap,
         Vec<DirtySnapshotEntry>,
         Option<u64>,
     )> {
-        if let Some(journal) = &self.journal {
-            let _commit = self.commit_gate.enter_checkpoint();
-            let snap_dirty = self.store.snapshot_dirty();
-            let snap_pending = self.store.snapshot_pending_deletes();
+        if let Some(journal) = journal {
+            let _commit = commit_gate.enter_checkpoint();
+            let snap_dirty = store.snapshot_dirty();
+            let snap_pending = store.snapshot_pending_deletes();
             let wal_up_to = journal.queued_work();
-            match self.store.snapshot_dirty_versions(&snap_dirty) {
+            match store.snapshot_dirty_versions(&snap_dirty) {
                 Ok(versioned_snap) => {
                     Ok((snap_dirty, snap_pending, versioned_snap, Some(wal_up_to)))
                 }
                 Err(e) => {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
+                    store.restore_pending_deletes(snap_pending);
+                    store.restore_dirty(snap_dirty);
                     Err(e)
                 }
             }
         } else {
-            let snap_dirty = self.store.snapshot_dirty();
-            let snap_pending = self.store.snapshot_pending_deletes();
-            match self.store.snapshot_dirty_versions(&snap_dirty) {
+            let snap_dirty = store.snapshot_dirty();
+            let snap_pending = store.snapshot_pending_deletes();
+            match store.snapshot_dirty_versions(&snap_dirty) {
                 Ok(versioned_snap) => Ok((snap_dirty, snap_pending, versioned_snap, None)),
                 Err(e) => {
-                    self.store.restore_pending_deletes(snap_pending);
-                    self.store.restore_dirty(snap_dirty);
+                    store.restore_pending_deletes(snap_pending);
+                    store.restore_dirty(snap_dirty);
                     Err(e)
                 }
             }
         }
     }
 
-    fn finish_checkpoint_snapshot(
-        &self,
+    fn finish_checkpoint_snapshot_shared(
+        store: &Arc<BufferManager>,
+        journal: Option<&Arc<Journal>>,
+        commit_gate: &Arc<CommitGate>,
         snap_pending: CheckpointMap,
         snap_bytes: CheckpointBytes,
     ) -> Result<()> {
@@ -1706,46 +1727,49 @@ impl Tree {
             wrote_any,
             failed: dirty_failed,
             first_err: first_dirty_err,
-        } = self.write_checkpoint_bytes(snap_bytes);
+        } = Self::write_checkpoint_bytes_shared(store, snap_bytes);
         let had_dirty_failure = !dirty_failed.is_empty();
         if had_dirty_failure {
-            self.store.restore_dirty(dirty_failed);
+            store.restore_dirty(dirty_failed);
         }
 
-        if !wrote_any && snap_pending.is_empty() && !self.store.needs_flush() {
-            self.maybe_truncate_journal()?;
+        if !wrote_any && snap_pending.is_empty() && !store.needs_flush() {
+            Self::maybe_truncate_journal_shared(store, journal, commit_gate)?;
             return Ok(());
         }
 
         // Successful write-throughs already retired their dirty
         // entries; sync them before any manifest delete can land.
-        if let Err(e) = self.store.flush() {
-            self.store.restore_pending_deletes(snap_pending);
+        if let Err(e) = store.flush() {
+            store.restore_pending_deletes(snap_pending);
             return Err(e);
         }
 
         if had_dirty_failure {
-            self.store.restore_pending_deletes(snap_pending);
+            store.restore_pending_deletes(snap_pending);
             return Err(first_dirty_err.expect("had_dirty_failure ⇒ first_dirty_err set"));
         }
 
         let PendingDeleteOutcome {
             failed: pending_failed,
             first_err: first_pending_err,
-        } = self.apply_pending_deletes(&snap_pending);
+        } = Self::apply_pending_deletes_shared(store, &snap_pending);
         if !pending_failed.is_empty() {
-            self.store.restore_pending_deletes(pending_failed.clone());
+            store.restore_pending_deletes(pending_failed.clone());
         }
-        self.sync_applied_deletes(&snap_pending, &pending_failed)?;
+        Self::sync_applied_deletes_shared(store, &snap_pending, &pending_failed)?;
 
         if let Some(e) = first_pending_err {
             return Err(e);
         }
 
-        self.maybe_truncate_journal()
+        Self::maybe_truncate_journal_shared(store, journal, commit_gate)
     }
 
-    fn write_checkpoint_bytes(&self, snap_bytes: CheckpointBytes) -> DirtyWriteOutcome {
+    fn write_checkpoint_bytes_shared(
+        store: &Arc<BufferManager>,
+        snap_bytes: CheckpointBytes,
+    ) -> DirtyWriteOutcome {
         let entries: Vec<_> = snap_bytes
             .into_iter()
             .map(
@@ -1764,7 +1788,7 @@ impl Tree {
                 .iter()
                 .map(|entry| (entry.guid, entry.expected_seq))
                 .collect();
-            if let Err(e) = self.store.write_through_batch(&entries) {
+            if let Err(e) = store.write_through_batch(&entries) {
                 // BlobStore batch failure may have landed any prefix;
                 // retry the whole snapshot next round.
                 for (guid, expected_seq) in expected {
@@ -1780,11 +1804,14 @@ impl Tree {
         }
     }
 
-    fn apply_pending_deletes(&self, snap_pending: &CheckpointMap) -> PendingDeleteOutcome {
+    fn apply_pending_deletes_shared(
+        store: &Arc<BufferManager>,
+        snap_pending: &CheckpointMap,
+    ) -> PendingDeleteOutcome {
         let mut failed = CheckpointMap::new();
         let mut first_err = None;
         for (guid, seq) in snap_pending {
-            if let Err(e) = self.store.execute_pending_delete(*guid) {
+            if let Err(e) = store.execute_pending_delete(*guid) {
                 failed.insert(*guid, *seq);
                 first_err.get_or_insert(e);
             }
@@ -1792,33 +1819,37 @@ impl Tree {
         PendingDeleteOutcome { failed, first_err }
     }
 
-    fn sync_applied_deletes(
-        &self,
+    fn sync_applied_deletes_shared(
+        store: &Arc<BufferManager>,
         snap_pending: &CheckpointMap,
         pending_failed: &CheckpointMap,
     ) -> Result<()> {
         let applied_deletes = snap_pending.len() - pending_failed.len();
         if applied_deletes > 0 {
-            if let Err(e) = self.store.flush() {
+            if let Err(e) = store.flush() {
                 let restore_applied: CheckpointMap = snap_pending
                     .iter()
                     .filter(|(g, _)| !pending_failed.contains_key(*g))
                     .map(|(g, s)| (*g, *s))
                     .collect();
-                self.store.restore_pending_deletes(restore_applied);
+                store.restore_pending_deletes(restore_applied);
                 return Err(e);
             }
         }
         Ok(())
     }
 
-    fn maybe_truncate_journal(&self) -> Result<()> {
-        if let Some(journal) = &self.journal {
+    fn maybe_truncate_journal_shared(
+        store: &Arc<BufferManager>,
+        journal: Option<&Arc<Journal>>,
+        commit_gate: &Arc<CommitGate>,
+    ) -> Result<()> {
+        if let Some(journal) = journal {
             if journal.needs_checkpoint() {
-                let _commit = self.commit_gate.enter_checkpoint();
-                if self.store.dirty_count() == 0
-                    && self.store.flushing_count() == 0
-                    && self.store.pending_delete_count() == 0
+                let _commit = commit_gate.enter_checkpoint();
+                if store.dirty_count() == 0
+                    && store.flushing_count() == 0
+                    && store.pending_delete_count() == 0
                 {
                     journal.truncate()?;
                 }

@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use holt::{
-    BlobStore, MemoryBlobStore, RecordVersion, Tree, TreeBuilder, TreeConfig, TreeStats, DB,
+    BlobStore, DBStats, MemoryBlobStore, RecordVersion, Tree, TreeBuilder, TreeConfig, TreeStats,
+    DB,
 };
 
 #[test]
@@ -147,6 +148,25 @@ fn db_view_captures_explicit_tree_scopes() {
         Ok(())
     })
     .unwrap();
+}
+
+#[test]
+fn db_stats_reports_shared_resources() {
+    let db = DB::open(TreeConfig::memory()).unwrap();
+    assert_eq!(db.stats().open_tree_count, 0);
+
+    let objects = db.open_tree("objects").unwrap();
+    let inodes = db.open_tree("inodes").unwrap();
+    objects.put(b"bucket/a", b"etag").unwrap();
+    inodes.put(b"42", b"mode").unwrap();
+
+    let stats: DBStats = db.stats();
+    assert_eq!(stats.open_tree_count, 2);
+    assert!(
+        stats.bm_walker_ops >= 2,
+        "shared DB stats should include writes from every named tree"
+    );
+    assert!(stats.journal.is_none());
 }
 
 // ----------------------------------------------------------------

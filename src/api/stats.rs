@@ -1,5 +1,5 @@
-//! Per-blob and tree-wide counter snapshots returned by
-//! [`Tree::stats`](crate::Tree::stats).
+//! DB, tree, and per-blob counter snapshots returned by public
+//! stats APIs.
 //!
 //! These mirror the `BlobHeader`
 //! counter fields and are read in a single shared-guard pass
@@ -242,6 +242,75 @@ impl TreeStats {
     #[must_use]
     pub fn max_blob_fill_ratio(&self) -> f64 {
         f64::from(self.max_blob_fill_per_mille) / 1000.0
+    }
+}
+
+/// DB-wide resource counters from [`DB::stats`](crate::DB::stats).
+///
+/// These counters describe shared resources owned by a multi-tree
+/// `DB`, not any one ART root. Per-tree shape counters still live in
+/// [`TreeStats`] because shape is root-specific until a durable tree
+/// catalog exists.
+#[derive(Debug, Clone)]
+pub struct DBStats {
+    /// Number of named trees opened by this process.
+    pub open_tree_count: usize,
+    /// Number of dirty blobs across every tree in the shared
+    /// BufferManager.
+    pub bm_dirty_count: usize,
+    /// Number of deferred deletes across every tree.
+    pub bm_pending_delete_count: usize,
+    /// Shared BufferManager cache hits.
+    pub bm_cache_hits: u64,
+    /// Shared BufferManager cache misses.
+    pub bm_cache_misses: u64,
+    /// Shared optimistic point-read restarts.
+    pub bm_optimistic_restarts: u64,
+    /// Shared range cursor restarts.
+    pub bm_range_restarts: u64,
+    /// Shared mutation walker invocations.
+    pub bm_walker_ops: u64,
+    /// Shared mutation walker blob hops.
+    pub bm_walker_blob_hops: u64,
+    /// Maximum blob hops observed by a shared mutation walker.
+    pub bm_max_blob_hops: u64,
+    /// Maximum cross-blob key depth observed by a shared walker.
+    pub bm_max_cross_blob_depth: u64,
+    /// Shared foreground spillover count.
+    pub bm_spillovers: u64,
+    /// Shared merge count.
+    pub bm_merges: u64,
+    /// Route-resident blobs protected in the shared cache.
+    pub bm_route_resident_count: usize,
+    /// Route-resident demotions in the shared cache.
+    pub bm_route_resident_demotions: u64,
+    /// Shared clean cache evictions.
+    pub bm_cache_evictions: u64,
+    /// Eviction candidates skipped because they were protected.
+    pub bm_eviction_skips_protected: u64,
+    /// Eviction candidates skipped because they were route anchors.
+    pub bm_eviction_skips_route_resident: u64,
+    /// TinyLFU admission rejections in the shared cache.
+    pub bm_admission_protects: u64,
+    /// WAL replay telemetry captured while opening the DB.
+    pub open: OpenStats,
+    /// Shared WAL/journal counters, or `None` for memory DBs.
+    pub journal: Option<JournalStats>,
+    /// Shared background checkpointer counters, or `None` when
+    /// checkpointing is disabled.
+    pub checkpointer: Option<CheckpointerStats>,
+}
+
+impl DBStats {
+    /// Average blob hops per mutation walker invocation.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn bm_avg_blob_hops(&self) -> f64 {
+        if self.bm_walker_ops == 0 {
+            0.0
+        } else {
+            self.bm_walker_blob_hops as f64 / self.bm_walker_ops as f64
+        }
     }
 }
 

@@ -164,9 +164,9 @@ pub use engine::{
     RangeIter,
 };
 
-// Stats snapshots returned by `Tree::stats`.
+// Stats snapshots returned by `Tree::stats` and `DB::stats`.
 pub use api::stats::{
-    BlobStats, CheckpointerStats, JournalStats, OpenStats, RouteCacheStats, TreeStats,
+    BlobStats, CheckpointerStats, DBStats, JournalStats, OpenStats, RouteCacheStats, TreeStats,
 };
 
 // Single-record atomic batches.
