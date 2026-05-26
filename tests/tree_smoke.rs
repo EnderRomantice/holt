@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use holt::{BlobStore, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, TreeStats};
+use holt::{
+    BlobStore, MemoryBlobStore, RecordVersion, Tree, TreeBuilder, TreeConfig, TreeStats, DB,
+};
 
 #[test]
 fn open_memory_get_on_empty_tree_returns_none() {
@@ -49,6 +51,65 @@ fn checkpoint_is_idempotent_on_memory_store() {
     tree.checkpoint().unwrap();
     tree.checkpoint().unwrap();
     assert!(tree.get(b"k").unwrap().is_none());
+}
+
+#[test]
+fn db_named_trees_are_isolated_but_share_handles() {
+    let db = DB::open(TreeConfig::memory()).unwrap();
+    let objects = db.open_tree("objects").unwrap();
+    let inodes = db.open_tree("inodes").unwrap();
+
+    objects.put(b"same/key", b"object").unwrap();
+    inodes.put(b"same/key", b"inode").unwrap();
+
+    assert_eq!(
+        objects.get(b"same/key").unwrap().as_deref(),
+        Some(&b"object"[..])
+    );
+    assert_eq!(
+        inodes.get(b"same/key").unwrap().as_deref(),
+        Some(&b"inode"[..])
+    );
+
+    let objects_again = db.open_tree("objects").unwrap();
+    assert_eq!(
+        objects_again.get(b"same/key").unwrap().as_deref(),
+        Some(&b"object"[..])
+    );
+}
+
+#[test]
+fn db_atomic_commits_and_aborts_across_trees() {
+    let db = DB::open(TreeConfig::memory()).unwrap();
+    let default = db.open_tree("mvcc/default").unwrap();
+    let lock = db.open_tree("mvcc/lock").unwrap();
+
+    assert!(db
+        .atomic(|batch| {
+            batch.put("mvcc/default", b"user-key", b"value");
+            batch.put("mvcc/lock", b"user-key", b"lock");
+        })
+        .unwrap());
+    assert_eq!(
+        default.get(b"user-key").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    assert_eq!(
+        lock.get(b"user-key").unwrap().as_deref(),
+        Some(&b"lock"[..])
+    );
+
+    assert!(!db
+        .atomic(|batch| {
+            batch.assert_version(
+                "mvcc/default",
+                b"user-key",
+                RecordVersion::from_raw(u64::MAX),
+            );
+            batch.put("mvcc/lock", b"should-not-appear", b"x");
+        })
+        .unwrap());
+    assert!(lock.get(b"should-not-appear").unwrap().is_none());
 }
 
 // ----------------------------------------------------------------

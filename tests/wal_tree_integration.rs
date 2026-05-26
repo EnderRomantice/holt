@@ -17,7 +17,7 @@ use std::thread;
 
 use tempfile::tempdir;
 
-use holt::{Tree, TreeConfig};
+use holt::{Tree, TreeConfig, DB};
 
 fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
@@ -36,6 +36,48 @@ fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
     let mut cfg = manual_checkpoint_cfg(dir);
     cfg.wal_sync = true;
     cfg
+}
+
+#[test]
+fn db_named_trees_replay_from_one_wal() {
+    let dir = tempdir().unwrap();
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        let objects = db.open_tree("objects").unwrap();
+        let inodes = db.open_tree("inodes").unwrap();
+
+        objects.put(b"same/key", b"object").unwrap();
+        inodes.put(b"same/key", b"inode").unwrap();
+        assert!(db
+            .atomic(|batch| {
+                batch.put("objects", b"bucket/a.jpg", b"etag-a");
+                batch.put("inodes", b"42", b"mode=0644");
+            })
+            .unwrap());
+    }
+
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        let objects = db.open_tree("objects").unwrap();
+        let inodes = db.open_tree("inodes").unwrap();
+
+        assert_eq!(
+            objects.get(b"same/key").unwrap().as_deref(),
+            Some(&b"object"[..])
+        );
+        assert_eq!(
+            inodes.get(b"same/key").unwrap().as_deref(),
+            Some(&b"inode"[..])
+        );
+        assert_eq!(
+            objects.get(b"bucket/a.jpg").unwrap().as_deref(),
+            Some(&b"etag-a"[..])
+        );
+        assert_eq!(
+            inodes.get(b"42").unwrap().as_deref(),
+            Some(&b"mode=0644"[..])
+        );
+    }
 }
 
 #[test]

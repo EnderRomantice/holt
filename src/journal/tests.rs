@@ -34,17 +34,21 @@ fn append_raw_record(out: &mut Vec<u8>, seq: u64, ty: u8, body: &[u8]) {
 fn sample_ops() -> Vec<WalOp> {
     vec![
         WalOp::Insert {
+            tree_id: 0,
             key: b"img/01.jpg".to_vec(),
             value: vec![0xAA; 64],
         },
         WalOp::Insert {
+            tree_id: 0,
             key: b"img/02.jpg".to_vec(),
             value: vec![0xBB; 64],
         },
         WalOp::Erase {
+            tree_id: 0,
             key: b"img/01.jpg".to_vec(),
         },
         WalOp::RenameObject {
+            tree_id: 0,
             src_key: b"img/02.jpg".to_vec(),
             dst_key: b"img/02-renamed.jpg".to_vec(),
             force: false,
@@ -122,6 +126,7 @@ fn open_existing_resumes_append_position() {
         let mut w = WalWriter::create(&path, 7).unwrap();
         w.append(
             &WalOp::Insert {
+                tree_id: 0,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             },
@@ -137,6 +142,7 @@ fn open_existing_resumes_append_position() {
         assert_eq!(w.header().tree_id, 7);
         w.append(
             &WalOp::Erase {
+                tree_id: 0,
                 key: b"k1".to_vec(),
             },
             2,
@@ -190,6 +196,7 @@ fn unflushed_records_are_lost_after_drop() {
         let mut w = WalWriter::create(&path, 0).unwrap();
         w.append(
             &WalOp::Insert {
+                tree_id: 0,
                 key: b"transient".to_vec(),
                 value: b"never-persisted".to_vec(),
             },
@@ -307,6 +314,7 @@ fn replay_callback_can_short_circuit() {
     for i in 0..10 {
         w.append(
             &WalOp::Insert {
+                tree_id: 0,
                 key: format!("k{i}").into_bytes(),
                 value: vec![i as u8],
             },
@@ -375,6 +383,7 @@ fn discard_pending_keeps_already_flushed_records() {
 
     w.append(
         &WalOp::Insert {
+            tree_id: 0,
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
         },
@@ -385,6 +394,7 @@ fn discard_pending_keeps_already_flushed_records() {
 
     w.append(
         &WalOp::Insert {
+            tree_id: 0,
             key: b"k2".to_vec(),
             value: b"v2".to_vec(),
         },
@@ -421,6 +431,7 @@ fn truncate_reuses_live_wal_file_in_place() {
     let mut w = WalWriter::create(&path, 0).unwrap();
     w.append(
         &WalOp::Insert {
+            tree_id: 0,
             key: b"before-truncate".to_vec(),
             value: b"v".to_vec(),
         },
@@ -436,6 +447,7 @@ fn truncate_reuses_live_wal_file_in_place() {
 
     w.append(
         &WalOp::Insert {
+            tree_id: 0,
             key: b"after-truncate".to_vec(),
             value: b"v2".to_vec(),
         },
@@ -470,6 +482,7 @@ fn many_records_stream_round_trip() {
         for i in 1..=N {
             w.append(
                 &WalOp::Insert {
+                    tree_id: 0,
                     key: format!("k{i:04}").into_bytes(),
                     value: format!("v{i}").into_bytes(),
                 },
@@ -509,6 +522,7 @@ fn auto_flush_keeps_user_space_buffer_bounded() {
     for i in 0..target_records as u64 {
         w.append(
             &WalOp::Insert {
+                tree_id: 0,
                 key: format!("k{i:06}").into_bytes(),
                 value: vec![0xAB; 32],
             },
@@ -567,6 +581,7 @@ fn appending_after_external_truncate_grows_file_again() {
     let mut w = WalWriter::create(&path, 0).unwrap();
     w.append(
         &WalOp::Insert {
+            tree_id: 0,
             key: b"keep".to_vec(),
             value: b"v".to_vec(),
         },
@@ -587,6 +602,7 @@ fn appending_after_external_truncate_grows_file_again() {
     // The writer still appends successfully.
     w.append(
         &WalOp::Insert {
+            tree_id: 0,
             key: b"after-truncate".to_vec(),
             value: b"v".to_vec(),
         },

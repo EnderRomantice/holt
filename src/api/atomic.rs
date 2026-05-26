@@ -63,7 +63,7 @@ pub struct AtomicBatch {
     pub(crate) pending: Vec<BatchOp>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum BatchOp {
     Put {
         key: Vec<u8>,

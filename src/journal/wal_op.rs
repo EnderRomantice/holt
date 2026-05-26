@@ -16,6 +16,8 @@ pub enum WalOp {
     /// idempotent forward redo) and holt does not provide a
     /// journal-scan audit surface.
     Insert {
+        /// Logical tree owner.
+        tree_id: u64,
         /// Key bytes.
         key: Vec<u8>,
         /// New value bytes.
@@ -26,11 +28,15 @@ pub enum WalOp {
     /// Carries only the key because replay redoes the erase from
     /// `key` alone.
     Erase {
+        /// Logical tree owner.
+        tree_id: u64,
         /// Key bytes.
         key: Vec<u8>,
     },
     /// Atomic in-tree rename.
     RenameObject {
+        /// Logical tree owner.
+        tree_id: u64,
         /// Source key.
         src_key: Vec<u8>,
         /// Destination key.
@@ -50,4 +56,21 @@ pub enum WalOp {
         /// Inner ops, applied in order.
         ops: Vec<WalOp>,
     },
+}
+
+impl WalOp {
+    /// Tree id carried by primitive WAL ops.
+    ///
+    /// `Batch` does not have one owner: each inner op carries its
+    /// own tree id so a future DB-level atomic record can cover
+    /// multiple named trees.
+    #[must_use]
+    pub const fn tree_id(&self) -> Option<u64> {
+        match self {
+            Self::Insert { tree_id, .. }
+            | Self::Erase { tree_id, .. }
+            | Self::RenameObject { tree_id, .. } => Some(*tree_id),
+            Self::Batch { .. } => None,
+        }
+    }
 }

@@ -36,7 +36,7 @@
 //! ## Module map
 //!
 //! The supported import surface is the flat crate root:
-//! [`Tree`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
+//! [`Tree`], [`DB`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
 //! [`RecordVersion`], [`View`], [`KeyPathBuf`], [`KeyPrefixBuf`],
 //! range iterator types, stats snapshots, and the optional
 //! `metrics` renderer.
@@ -152,6 +152,7 @@ pub mod metrics;
 // Core handle + configuration.
 pub use api::builder::TreeBuilder;
 pub use api::config::{Storage, TreeConfig};
+pub use api::db::{DBAtomicBatch, DB};
 pub use api::errors::{Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::tree::Tree;

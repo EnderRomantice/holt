@@ -48,6 +48,23 @@ type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 type CheckpointMap = HashMap<BlobGuid, u64>;
 type CheckpointBytes = Vec<(BlobGuid, u64, u64, AlignedBlobBuf)>;
 
+#[derive(Clone)]
+pub(crate) struct TreeRuntime {
+    endpoint_locks: Arc<EndpointLocks>,
+    route_cache: Arc<engine::RouteCache>,
+    prefix_list_cache: Arc<engine::PrefixListCache>,
+}
+
+impl TreeRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            endpoint_locks: Arc::new(EndpointLocks::new()),
+            route_cache: Arc::new(engine::RouteCache::new()),
+            prefix_list_cache: Arc::new(engine::PrefixListCache::new()),
+        }
+    }
+}
+
 struct DirtyWriteOutcome {
     wrote_any: bool,
     failed: CheckpointMap,
@@ -127,9 +144,9 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 pub struct Tree {
     cfg: TreeConfig,
     store: Arc<BufferManager>,
-    /// GUID of the blob holding the tree root. Currently a fixed
-    /// sentinel; a multi-tenant manifest could allocate per-tree
-    /// root GUIDs in the future.
+    /// Logical tree id carried by WAL records.
+    tree_id: u64,
+    /// GUID of the blob holding this tree's root.
     root_guid: BlobGuid,
     /// Cached pin on the root blob — held for the life of this
     /// `Tree` handle so every `get` / `put` / `delete` / `rename`
@@ -186,6 +203,7 @@ impl std::fmt::Debug for Tree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tree")
             .field("storage", &self.cfg.storage)
+            .field("tree_id", &self.tree_id)
             .field("root_guid", &self.root_guid)
             .finish_non_exhaustive()
     }
@@ -262,6 +280,35 @@ impl Tree {
     /// Windows fails at compile time (see the platform stance in
     /// `ROADMAP.md`).
     pub fn open(cfg: TreeConfig) -> Result<Self> {
+        let bm = Self::open_buffer_manager(&cfg)?;
+        // The auto-managed store earns automatic WAL coverage.
+        Self::open_inner(cfg, bm, /*attach_wal=*/ true)
+    }
+
+    /// Open a tree with a caller-supplied [`BlobStore`].
+    ///
+    /// **No WAL is attached.** The caller's store has its own
+    /// notion of durability (or is intentionally volatile —
+    /// e.g. a `MemoryBlobStore` standing in for a real one in a
+    /// test); holt stays out of that decision. If you want a
+    /// WAL'd file-backed tree, use [`Tree::open`] with a
+    /// `Storage::File` config.
+    ///
+    /// The supplied store is **transparently wrapped** with a
+    /// `BufferManager` of `cfg.buffer_pool_size` blobs.
+    /// `BufferManager` owns the in-memory blob cache; the walker
+    /// pins blobs from it for both reads and writes — no separate
+    /// root buffer in `Tree`.
+    ///
+    /// If the store doesn't yet contain a root blob, initialises
+    /// an empty one and writes it through, flushing before
+    /// returning.
+    pub fn open_with_blob_store(cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
+        let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
+        Self::open_inner(cfg, bm, /*attach_wal=*/ false)
+    }
+
+    pub(crate) fn open_buffer_manager(cfg: &TreeConfig) -> Result<Arc<BufferManager>> {
         let bm = match &cfg.storage {
             Storage::Memory => {
                 let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
@@ -293,42 +340,12 @@ impl Tree {
                 }
             }
         };
-        // The auto-managed store earns automatic WAL coverage.
-        Self::open_inner(cfg, bm, /*attach_wal=*/ true)
-    }
-
-    /// Open a tree with a caller-supplied [`BlobStore`].
-    ///
-    /// **No WAL is attached.** The caller's store has its own
-    /// notion of durability (or is intentionally volatile —
-    /// e.g. a `MemoryBlobStore` standing in for a real one in a
-    /// test); holt stays out of that decision. If you want a
-    /// WAL'd file-backed tree, use [`Tree::open`] with a
-    /// `Storage::File` config.
-    ///
-    /// The supplied store is **transparently wrapped** with a
-    /// `BufferManager` of `cfg.buffer_pool_size` blobs.
-    /// `BufferManager` owns the in-memory blob cache; the walker
-    /// pins blobs from it for both reads and writes — no separate
-    /// root buffer in `Tree`.
-    ///
-    /// If the store doesn't yet contain a root blob, initialises
-    /// an empty one and writes it through, flushing before
-    /// returning.
-    pub fn open_with_blob_store(cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
-        let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
-        Self::open_inner(cfg, bm, /*attach_wal=*/ false)
+        Ok(bm)
     }
 
     fn open_inner(cfg: TreeConfig, bm: Arc<BufferManager>, attach_wal: bool) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
-        if !bm.has_blob(root_guid)? {
-            // Seed an empty root blob and write it through.
-            let mut scratch = bm.alloc_blob_buf_zeroed();
-            BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
-            bm.write_blob(root_guid, &scratch)?;
-            bm.flush()?;
-        }
+        ensure_root_blob(&bm, root_guid)?;
 
         // File-backed trees keep a WAL alongside the data file.
         // Replay every durable record onto the BM-cached blob
@@ -343,7 +360,16 @@ impl Tree {
                 Some(path) => {
                     let next_seq = if path.exists() {
                         let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) = replay_wal(&path, &bm, root_guid)?;
+                        let (next_seq, replay_stats) = replay_wal(&path, &bm, |tree_id| {
+                            if tree_id == 0 {
+                                Ok(root_guid)
+                            } else {
+                                Err(Error::ReplaySanityFailed {
+                                    context: "WAL record tree_id does not belong to this Tree",
+                                    record_offset: 0,
+                                })
+                            }
+                        })?;
                         open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                         open_stats.wal_replay_records = replay_stats.records_seen;
                         open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -362,13 +388,6 @@ impl Tree {
             (None, 1u64)
         };
 
-        // Hot-path: pin the root blob once for the lifetime of
-        // this `Tree` handle so every subsequent `get` / `put` /
-        // `delete` / `rename` skips the BufferManager's per-pin
-        // `Mutex<HashMap>` lookup on the root hop. `Tree::clone`
-        // shares the pin via `Arc::clone`.
-        let root_pin = bm.pin(root_guid)?;
-
         // Shared structural gate for foreground writers, manual
         // compact, and the background merge pass.
         let maintenance_gate = Arc::new(Gate::new());
@@ -386,18 +405,49 @@ impl Tree {
         )
         .map(Arc::new);
 
+        Self::from_shared(
+            cfg,
+            root_guid,
+            0,
+            bm,
+            TreeRuntime::new(),
+            maintenance_gate,
+            Arc::new(AtomicU64::new(next_seq)),
+            commit_gate,
+            journal,
+            checkpointer,
+            open_stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_shared(
+        cfg: TreeConfig,
+        root_guid: BlobGuid,
+        tree_id: u64,
+        bm: Arc<BufferManager>,
+        runtime: TreeRuntime,
+        maintenance_gate: Arc<Gate>,
+        next_seq: Arc<AtomicU64>,
+        commit_gate: Arc<CommitGate>,
+        journal: Option<Arc<Journal>>,
+        checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
+        open_stats: OpenStats,
+    ) -> Result<Self> {
+        let root_pin = bm.pin(root_guid)?;
         Ok(Self {
             cfg,
             store: bm,
+            tree_id,
             root_guid,
             root_pin,
-            endpoint_locks: Arc::new(EndpointLocks::new()),
-            route_cache: Arc::new(engine::RouteCache::new()),
+            endpoint_locks: runtime.endpoint_locks,
+            route_cache: runtime.route_cache,
             maintenance_gate,
-            next_seq: Arc::new(AtomicU64::new(next_seq)),
+            next_seq,
             commit_gate,
             journal,
-            prefix_list_cache: Arc::new(engine::PrefixListCache::new()),
+            prefix_list_cache: runtime.prefix_list_cache,
             checkpointer,
             open_stats,
         })
@@ -540,7 +590,7 @@ impl Tree {
                     }
                     let mut record =
                         journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
-                    encode_insert_record(&mut record, seq, 0, key, value);
+                    encode_insert_record(&mut record, seq, self.tree_id, key, value);
                     let ack = journal.submit(record, self.cfg.wal_sync)?;
                     (outcome, ack)
                 } else {
@@ -644,7 +694,7 @@ impl Tree {
                             .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
                     let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
-                    encode_erase_record(&mut record, seq, 0, key);
+                    encode_erase_record(&mut record, seq, self.tree_id, key);
                     let ack = journal.submit(record, self.cfg.wal_sync)?;
                     (outcome, ack)
                 } else {
@@ -762,7 +812,7 @@ impl Tree {
                 }
                 let mut record =
                     journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
-                encode_rename_object_record(&mut record, seq, 0, src, dst, force);
+                encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
                 journal.submit(record, self.cfg.wal_sync)?
             } else {
                 let erase_out = engine::erase_multi(
@@ -852,7 +902,7 @@ impl Tree {
         self.apply_batch(batch.pending)
     }
 
-    fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
+    pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_exclusive();
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
@@ -877,7 +927,7 @@ impl Tree {
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
                 let mut record = journal.record_buffer(encoded_batch_record_len(&pending));
-                let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
+                let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
                 self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
                 journal.submit(record, self.cfg.wal_sync)?
@@ -899,7 +949,7 @@ impl Tree {
         Ok(true)
     }
 
-    fn preflight_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<bool> {
+    pub(crate) fn preflight_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<bool> {
         if Self::batch_is_guard_free(pending) {
             Self::preflight_guard_free_batch(pending)?;
             return Ok(true);
@@ -1085,7 +1135,7 @@ impl Tree {
     /// loop out keeps the two batch paths from drifting and makes
     /// the per-variant arms readable without macro tricks.
     #[allow(clippy::too_many_lines)] // one explicit match keeps batch apply order auditable
-    fn apply_batch_walker_inline(
+    pub(crate) fn apply_batch_walker_inline(
         &self,
         pending: &[BatchOp],
         base_seq: u64,
@@ -1103,7 +1153,7 @@ impl Tree {
                     let (key, value) = batch_insert_parts(&pending[i])
                         .expect("insert run begins with insert-like op");
                     enc.push_insert_run(
-                        0,
+                        self.tree_id,
                         run_len,
                         key.len(),
                         value.len(),
@@ -1148,7 +1198,7 @@ impl Tree {
                     // to keep later record versions stable across
                     // crash/replay.
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_erase(0, key);
+                        enc.push_erase(self.tree_id, key);
                     }
                 }
                 BatchOp::DeleteIfVersion { key, expected } => {
@@ -1171,14 +1221,14 @@ impl Tree {
                             .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_erase(0, key);
+                        enc.push_erase(self.tree_id, key);
                     }
                 }
                 BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => {}
                 BatchOp::Rename { src, dst, force } => {
                     self.apply_batch_rename_walker(src, dst, *force, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_rename_object(0, src, dst, *force);
+                        enc.push_rename_object(self.tree_id, src, dst, *force);
                     }
                 }
             }
@@ -1424,7 +1474,7 @@ impl Tree {
     /// tracked for the next round. Write-through with `expected_seq`
     /// matches checkpoint: retire only the entry captured by this
     /// snapshot, leaving any racing newer seq for a later flush.
-    fn flush_dirty_inline(&self) -> Result<()> {
+    pub(crate) fn flush_dirty_inline(&self) -> Result<()> {
         let snap = self.store.snapshot_dirty();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
@@ -1486,7 +1536,7 @@ impl Tree {
     /// `store.flush` (which persists the manifest deletion).
     /// Restoration is automatic on individual failures — the
     /// remaining entries stay queued for the next attempt.
-    fn flush_pending_deletes_inline(&self) -> Result<()> {
+    pub(crate) fn flush_pending_deletes_inline(&self) -> Result<()> {
         let pending = self.store.snapshot_pending_deletes();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
@@ -2157,16 +2207,40 @@ impl Tree {
 /// a `Tree::open` → `Tree::checkpoint` immediately after replay
 /// could find an empty dirty set, write nothing to store, then
 /// truncate the WAL — silently losing every replayed record.
-fn replay_wal(
+pub(crate) fn ensure_root_blob(bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<()> {
+    if !bm.has_blob(root_guid)? {
+        let mut scratch = bm.alloc_blob_buf_zeroed();
+        BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
+        bm.write_blob(root_guid, &scratch)?;
+        bm.flush()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn replay_wal<F>(
     path: &std::path::Path,
     bm: &Arc<BufferManager>,
-    root_guid: BlobGuid,
-) -> Result<(u64, crate::journal::reader::ReplayStats)> {
-    // Pin the root once for the entire replay loop; saves a
-    // BM-Mutex per op (replays can be thousands of ops on a
-    // dirty WAL).
-    let root_pin = bm.pin(root_guid)?;
+    mut root_for_tree_id: F,
+) -> Result<(u64, crate::journal::reader::ReplayStats)>
+where
+    F: FnMut(u64) -> Result<BlobGuid>,
+{
+    let mut root_pins: HashMap<u64, (BlobGuid, Arc<CachedBlob>)> = HashMap::new();
     let (_header, stats) = replay(path, |op, seq, _off| {
+        let tree_id = op.tree_id().unwrap_or(0);
+        let (root_guid, root_pin) = match root_pins.entry(tree_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (guid, pin) = entry.get();
+                (*guid, Arc::clone(pin))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let guid = root_for_tree_id(tree_id)?;
+                ensure_root_blob(bm, guid)?;
+                let pin = bm.pin(guid)?;
+                let (guid, pin) = entry.insert((guid, pin));
+                (*guid, Arc::clone(pin))
+            }
+        };
         // `root_dirty` tracks whether this op actually mutated
         // the BM-cached root image. No-op replays (e.g. an erase
         // for a key already absent because a prior replay pass
@@ -2174,11 +2248,11 @@ fn replay_wal(
         // store — skipping `mark_dirty` for those is a small
         // win and matches `Tree::delete`'s same-shape branch.
         let root_dirty = match op {
-            WalOp::Insert { key, value } => {
+            WalOp::Insert { key, value, .. } => {
                 let search = engine::SearchKey::user(key);
                 engine::insert_multi(bm, &root_pin, None, search, value, seq)?.root_dirty
             }
-            WalOp::Erase { key } => {
+            WalOp::Erase { key, .. } => {
                 let search = engine::SearchKey::user(key);
                 engine::erase_multi(bm, &root_pin, None, search, seq)?.root_dirty
             }

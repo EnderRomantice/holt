@@ -1,4 +1,4 @@
-//! Public API surface — `Tree`, `AtomicBatch`, `Record`,
+//! Public API surface — `Tree`, `DB`, atomic batches, `Record`,
 //! `RecordVersion`, scoped read [`view`]s, path-shaped key helpers,
 //! record/key range iterators, `TreeBuilder`, plus the curated
 //! [`stats`] module.
@@ -8,6 +8,7 @@
 pub mod atomic;
 pub mod builder;
 pub mod config;
+pub mod db;
 pub mod errors;
 pub mod key;
 pub mod stats;
