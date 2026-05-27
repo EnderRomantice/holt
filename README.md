@@ -8,10 +8,10 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.4.0 released).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.4.1 released).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
-> published version in your `Cargo.toml` (`holt = "=0.4.0"`) until 1.0
+> published version in your `Cargo.toml` (`holt = "=0.4.1"`) until 1.0
 > stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
@@ -73,7 +73,7 @@ with group commit, sharded buffer manager, 3-thread background
 checkpointer, SIMD CRC32 + node scans, and stateful `Tree::range`
 with prefix, `start_after`, and S3 delimiter rollup.
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the v0.3 release notes and
+See [`CHANGELOG.md`](CHANGELOG.md) for the release notes and
 [`ROADMAP.md`](ROADMAP.md) for post-0.3 direction.
 
 `cargo bench --manifest-path benches/Cargo.toml --bench main`
@@ -88,15 +88,15 @@ Add holt to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-holt = "=0.4.0"
+holt = "=0.4.1"
 ```
 
 The supported user surface is deliberately small:
-`TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
+`DB`, `DBAtomicBatch`, `DBView`, `TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
 `RangeEntry`, `RangeIter`, `KeyRangeBuilder`, `KeyRangeEntry`,
 `KeyRangeIter`, `AtomicBatch`, `Record`, `RecordVersion`,
 `KeyPathBuf`, `KeyPrefixBuf`, `KeyPathError`, `CheckpointConfig`,
-`TreeStats` / related stats structs, `Error` / `Result`, and the
+`TreeStats` / `DBStats` / related stats structs, `Error` / `Result`, and the
 custom-store surface (`BlobStore`, `MemoryBlobStore`,
 `FileBlobStore`, `AlignedBlobBuf`, `BlobGuid`). Internal
 layout, WAL, walker, and buffer-manager modules are not public API.

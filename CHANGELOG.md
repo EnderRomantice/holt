@@ -9,6 +9,8 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-27
+
 ### Added
 
 - Added DB-specific crash soak coverage. The new `holt-soak
