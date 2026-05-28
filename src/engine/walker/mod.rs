@@ -73,9 +73,7 @@ pub use range::{
     RangeIter,
 };
 pub(crate) use scan::collect_blob_children_from_frame;
-pub use scan::{
-    collect_blob_guids, collect_blob_topology_silent, collect_prefix_blob_topology_silent,
-};
+pub use scan::{collect_blob_guids, collect_blob_topology_silent};
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
 // ---------- shared internals ----------

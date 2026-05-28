@@ -1453,13 +1453,13 @@ impl Tree {
 
     /// Run a read-only transaction over a prefix snapshot.
     ///
-    /// The tree captures the blob frames reachable for `prefix`
-    /// under a short exclusive maintenance gate, releases the live
-    /// tree, then invokes `read` with an immutable [`View`]. Writes
-    /// committed after the capture are invisible to all reads made
-    /// through that view. The implementation copies blob frames, not
-    /// decoded entries, so point lookup and range/list operations
-    /// keep using the ART walker.
+    /// The tree captures the current blob graph while holding this
+    /// tree's exclusive mutation gate, releases the live tree, then
+    /// invokes `read` with an immutable [`View`]. Writes committed
+    /// after the capture are invisible to all reads made through
+    /// that view. The implementation copies blob frames, not decoded
+    /// entries, so point lookup and range/list operations keep using
+    /// the ART walker.
     ///
     /// A view is scoped: reads outside `prefix` return
     /// [`Error::OutsideViewScope`]. Use `prefix = b""` only when a
@@ -1481,8 +1481,7 @@ impl Tree {
 
     pub(crate) fn capture_view_unlocked(&self, prefix: &[u8]) -> Result<View> {
         let scope = prefix.to_vec();
-        let topology =
-            engine::collect_prefix_blob_topology_silent(&self.store, self.root_guid, prefix)?;
+        let topology = engine::collect_blob_topology_silent(&self.store, self.root_guid)?;
         let snapshot_store = Arc::new(MemoryBlobStore::new());
         for entry in &topology {
             let bytes = self.store.snapshot_blob_image(entry.guid)?;

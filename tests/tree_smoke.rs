@@ -2149,6 +2149,16 @@ fn view_prefix_snapshot_spans_child_blobs() {
             let key = format!("tenant-a/dir-{i:04}/file");
             assert_eq!(view.get(key.as_bytes())?.as_deref(), Some(&value[..]));
         }
+        let rolled = collect_key_range(view.range_keys().delimiter(b'/'));
+        assert_eq!(rolled.len(), 1800);
+        assert_eq!(
+            rolled.first().map(Vec::as_slice),
+            Some(b"tenant-a/dir-0000/".as_slice())
+        );
+        assert_eq!(
+            rolled.last().map(Vec::as_slice),
+            Some(b"tenant-a/dir-1799/".as_slice())
+        );
         assert!(view.get(b"tenant-a/new-after-view")?.is_none());
         Ok(())
     })

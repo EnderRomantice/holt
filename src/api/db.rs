@@ -291,10 +291,10 @@ impl DB {
 
     /// Run a read-only transaction over explicit tree/prefix scopes.
     ///
-    /// Holt captures every listed scope under one DB-wide
-    /// maintenance gate, releases the live DB, then invokes `read`
-    /// with an immutable [`DBView`]. Writes committed after the
-    /// capture are invisible to every captured tree view.
+    /// Holt captures every listed scope while holding each touched
+    /// tree's exclusive mutation gate, releases the live DB, then
+    /// invokes `read` with an immutable [`DBView`]. Writes committed
+    /// after the capture are invisible to every captured tree view.
     ///
     /// Scopes are explicit so callers choose exactly which catalog
     /// trees participate in the consistent read view.

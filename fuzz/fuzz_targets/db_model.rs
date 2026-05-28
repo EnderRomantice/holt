@@ -65,6 +65,18 @@ enum AtomicOp {
     },
 }
 
+impl AtomicOp {
+    fn tree(&self) -> u8 {
+        match *self {
+            Self::Put { tree, .. }
+            | Self::Delete { tree, .. }
+            | Self::PutIfAbsent { tree, .. }
+            | Self::AssertPrefixEmpty { tree, .. }
+            | Self::Rename { tree, .. } => tree,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelErr {
     GuardFailed,
@@ -193,6 +205,10 @@ fn value(id: u8) -> Vec<u8> {
 
 fn model_atomic(model: &[TreeModel], ops: &[AtomicOp]) -> Result<Vec<TreeModel>, ModelErr> {
     let mut staged = model.to_vec();
+
+    for op in ops {
+        live_tree(&staged, op.tree())?;
+    }
 
     for op in ops {
         match *op {

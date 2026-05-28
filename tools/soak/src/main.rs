@@ -218,16 +218,38 @@ fn run_db_normal(cfg: &Config) -> Result<()> {
                     let rev = make_revision(tid, done);
                     let key = key(idx);
                     let value = value(idx, rev);
-                    db.atomic(|batch| batch.put(DB_SOAK_TREES[tree_slot], &key, &value))?;
+                    db.atomic(|batch| batch.put(DB_SOAK_TREES[tree_slot], &key, &value))
+                        .map_err(|e| {
+                            format!(
+                                "db-normal put tree={} idx={idx} done={done}: {e}",
+                                DB_SOAK_TREES[tree_slot]
+                            )
+                        })?;
                     oracle[tree_slot][idx].store(rev, Ordering::Release);
                 } else if roll < 65 {
-                    verify_db_one(&db, &oracle, tree_slot, idx)?;
+                    verify_db_one(&db, &oracle, tree_slot, idx).map_err(|e| {
+                        format!(
+                            "db-normal get tree={} idx={idx} done={done}: {e}",
+                            DB_SOAK_TREES[tree_slot]
+                        )
+                    })?;
                 } else if roll < 75 {
                     let key = key(idx);
-                    db.atomic(|batch| batch.delete(DB_SOAK_TREES[tree_slot], &key))?;
+                    db.atomic(|batch| batch.delete(DB_SOAK_TREES[tree_slot], &key))
+                        .map_err(|e| {
+                            format!(
+                                "db-normal delete tree={} idx={idx} done={done}: {e}",
+                                DB_SOAK_TREES[tree_slot]
+                            )
+                        })?;
                     oracle[tree_slot][idx].store(0, Ordering::Release);
                 } else if roll < 88 {
-                    scan_db_small_prefix(&db, tree_slot, idx)?;
+                    scan_db_small_prefix(&db, tree_slot, idx).map_err(|e| {
+                        format!(
+                            "db-normal scan tree={} idx={idx} done={done}: {e}",
+                            DB_SOAK_TREES[tree_slot]
+                        )
+                    })?;
                 } else if roll < 96 {
                     let other =
                         (tree_slot + 1 + (rng.next_u64() as usize % (DB_SOAK_TREES.len() - 1)))
@@ -240,11 +262,22 @@ fn run_db_normal(cfg: &Config) -> Result<()> {
                     db.atomic(|batch| {
                         batch.put(DB_SOAK_TREES[tree_slot], &key, &primary_value);
                         batch.put(DB_SOAK_TREES[other], &key, &other_value);
+                    })
+                    .map_err(|e| {
+                        format!(
+                            "db-normal cross-put tree={} other={} idx={idx} done={done}: {e}",
+                            DB_SOAK_TREES[tree_slot], DB_SOAK_TREES[other]
+                        )
                     })?;
                     oracle[tree_slot][idx].store(rev, Ordering::Release);
                     oracle[other][idx].store(other_rev, Ordering::Release);
                 } else {
-                    view_db_prefix(&db, tree_slot, idx)?;
+                    view_db_prefix(&db, tree_slot, idx).map_err(|e| {
+                        format!(
+                            "db-normal view tree={} idx={idx} done={done}: {e}",
+                            DB_SOAK_TREES[tree_slot]
+                        )
+                    })?;
                 }
                 done += 1;
             }
