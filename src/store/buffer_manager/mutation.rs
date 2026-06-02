@@ -45,6 +45,10 @@ impl MutationState {
         self.flushing.remove(guid);
     }
 
+    pub(super) fn remove_unclaimed_dirty(&mut self, guid: &BlobGuid) {
+        self.dirty.remove(guid);
+    }
+
     pub(super) fn add_flushing(&mut self, guid: BlobGuid) {
         *self.flushing.entry(guid).or_insert(0) += 1;
     }

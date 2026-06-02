@@ -1064,11 +1064,17 @@ impl BufferManager {
                 self.pending_delete_total.fetch_add(1, Ordering::AcqRel);
             }
         }
-        state.remove_dirty(&guid);
+        let keep_cached_for_flushing = state.flushing.contains_key(&guid);
+        state.remove_unclaimed_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
+        self.route_resident.remove(guid);
         self.decrement_candidate_totals(removed);
-        if let Some((_, entry)) = self.cache.remove(&guid) {
+        if keep_cached_for_flushing {
+            if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
+                entry.clear_dirty_hint();
+            }
+        } else if let Some((_, entry)) = self.cache.remove(&guid) {
             entry.clear_dirty_hint();
         }
     }
@@ -1191,7 +1197,12 @@ impl BufferManager {
     /// makes it durable. Failure is the caller's restoration
     /// concern.
     pub(crate) fn execute_pending_delete(&self, guid: BlobGuid) -> Result<()> {
-        self.store.delete_blob(guid)
+        self.store.delete_blob(guid)?;
+        if let Some((_, entry)) = self.cache.remove(&guid) {
+            entry.clear_dirty_hint();
+        }
+        self.route_resident.remove(guid);
+        Ok(())
     }
 
     /// `true` iff the inner store currently knows `guid`.
@@ -2366,6 +2377,64 @@ mod tests {
             "last in-flight epoch can release eviction protection",
         );
         assert_eq!(bm.flushing_count(), 0);
+    }
+
+    #[test]
+    fn pending_delete_preserves_in_flight_checkpoint_image() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x59; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x33;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, version)
+            .unwrap()
+            .unwrap();
+        drop(pin);
+
+        bm.mark_for_delete(guid, 20);
+
+        assert_eq!(
+            bm.flushing_count(),
+            1,
+            "a pending delete must not retire an in-flight checkpoint epoch",
+        );
+        assert!(
+            bm.cache.contains_key(&guid),
+            "a pending delete must keep the cache image needed by write-through validation",
+        );
+
+        let report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 10,
+                content_version: Some(version),
+            }])
+            .unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Written]);
+        assert_eq!(bm.flushing_count(), 0);
+        assert_eq!(bm.pending_delete_count(), 1);
+        assert!(
+            bm.pin(guid).is_err(),
+            "pending delete must still hide the blob"
+        );
+
+        let mut stored = AlignedBlobBuf::zeroed();
+        inner.read_blob(guid, &mut stored).unwrap();
+        assert_eq!(
+            stored.as_slice()[123],
+            0x33,
+            "checkpoint write-through must preserve the durable image until delete applies",
+        );
     }
 
     #[test]
