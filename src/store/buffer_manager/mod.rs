@@ -1086,9 +1086,10 @@ impl BufferManager {
             if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
                 entry.clear_dirty_hint();
             }
-        } else if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
-            Arc::strong_count(entry) == 1
-        }) {
+        } else if let Some((_, entry)) = self
+            .cache
+            .remove_if(&guid, |_, entry| Arc::strong_count(entry) == 1)
+        {
             entry.clear_dirty_hint();
         } else if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
             entry.clear_dirty_hint();
@@ -1232,9 +1233,10 @@ impl BufferManager {
                 return Ok(false);
             }
         }
-        if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
-            Arc::strong_count(entry) == 1
-        }) {
+        if let Some((_, entry)) = self
+            .cache
+            .remove_if(&guid, |_, entry| Arc::strong_count(entry) == 1)
+        {
             entry.clear_dirty_hint();
         } else if self.cache.contains_key(&guid) {
             return Ok(false);
