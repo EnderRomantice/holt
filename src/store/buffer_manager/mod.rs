@@ -130,7 +130,7 @@ mod mutation;
 mod residency;
 mod telemetry;
 
-use std::collections::{hash_map::Entry, BTreeMap, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -412,6 +412,33 @@ impl BufferManager {
     fn reclaim_blob(&self, guid: BlobGuid) {
         self.evict_from_cache(guid);
         let _ = self.store.delete_blob(guid);
+    }
+
+    /// GUIDs of every live snapshot's frozen root frame.
+    pub(crate) fn snapshot_roots(&self) -> Vec<BlobGuid> {
+        self.snapshots
+            .lock()
+            .expect("snapshot registry poisoned")
+            .live
+            .values()
+            .copied()
+            .collect()
+    }
+
+    /// Free every persisted frame not in `reachable`, returning the count
+    /// reclaimed. The recovery-time sweep for copy-on-write frames
+    /// orphaned by a crash that lost the in-memory orphan list. The
+    /// caller must hold the tree quiescent and pass the full reachable
+    /// set (live root ∪ every live snapshot root).
+    pub(crate) fn gc_sweep_unreachable(&self, reachable: &HashSet<BlobGuid>) -> Result<usize> {
+        let mut freed = 0;
+        for guid in self.list_blobs()? {
+            if !reachable.contains(&guid) {
+                self.reclaim_blob(guid);
+                freed += 1;
+            }
+        }
+        Ok(freed)
     }
 }
 

@@ -11,7 +11,7 @@
 //! descent and is materialised only when a new leaf key is written.
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -1501,6 +1501,35 @@ impl Tree {
         // frame at the instant the fork barrier rises.
         let _freeze = self.mutation_gate.enter_exclusive();
         self.snapshot_unlocked(prefix)
+    }
+
+    /// Reclaim copy-on-write frames left unreachable by a crash that
+    /// happened while a snapshot was live: the in-memory orphan list is
+    /// lost on restart, so those forked-away frames would otherwise leak
+    /// in the store forever. Sweeps every persisted frame not reachable
+    /// from the live root or a live snapshot root, returning the count
+    /// freed. Idempotent.
+    ///
+    /// Only supported on standalone trees — trees opened through a `DB`
+    /// share one buffer manager, so a safe sweep needs a DB-wide pass and
+    /// this returns [`Error::GcRequiresStandaloneTree`].
+    pub fn gc(&self) -> Result<usize> {
+        if self.tree_id != 0 {
+            return Err(Error::GcRequiresStandaloneTree);
+        }
+        let _maintenance = self.maintenance_gate.enter_shared();
+        self.ensure_live()?;
+        // Freeze writers so the reachable set is stable across the walk.
+        let _freeze = self.mutation_gate.enter_exclusive();
+
+        let mut reachable: HashSet<BlobGuid> = HashSet::new();
+        reachable.insert(self.root_guid);
+        reachable.extend(engine::collect_blob_guids(&self.store, self.root_guid)?);
+        for snap_root in self.store.snapshot_roots() {
+            reachable.insert(snap_root);
+            reachable.extend(engine::collect_blob_guids(&self.store, snap_root)?);
+        }
+        self.store.gc_sweep_unreachable(&reachable)
     }
 
     /// [`Self::snapshot`] without taking this tree's maintenance/mutation

@@ -109,6 +109,10 @@ pub enum Error {
         /// Length of the view's captured prefix.
         scope_len: usize,
     },
+    /// [`crate::Tree::gc`] was called on a tree opened through a `DB`.
+    /// DB trees share one buffer manager, so reclaiming unreachable
+    /// frames safely needs a DB-wide pass rather than a single tree's.
+    GcRequiresStandaloneTree,
 }
 
 impl Error {
@@ -205,6 +209,10 @@ impl std::fmt::Display for Error {
             } => write!(
                 f,
                 "view access outside captured scope (requested {requested_len} bytes, scope {scope_len} bytes)"
+            ),
+            Self::GcRequiresStandaloneTree => write!(
+                f,
+                "gc is only supported on standalone trees; trees opened through a DB share a buffer manager"
             ),
         }
     }

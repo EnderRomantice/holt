@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use holt::{BlobStore, Error, MemoryBlobStore, Tree, TreeBuilder, TreeConfig};
+use holt::{BlobStore, Error, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, DB};
 use tempfile::tempdir;
 
 #[test]
@@ -489,4 +489,73 @@ fn snapshot_correct_after_reopen() {
             "post-reopen live key {i}",
         );
     }
+}
+
+#[test]
+fn gc_reclaims_crash_leaked_snapshot_frames() {
+    let dir = tempdir().unwrap();
+    let cfg = || {
+        let mut c = TreeConfig::new(dir.path());
+        c.checkpoint.enabled = false;
+        c.wal_sync = true;
+        c
+    };
+
+    const N: u32 = 2000;
+    let v = vec![0xAB_u8; 200];
+
+    // Session 1: snapshot + fork, checkpoint so the forks/orphans/snapshot
+    // root persist, then "crash" — forget the snapshot so it never retires
+    // and its in-memory orphan list dies with the process.
+    {
+        let tree = Tree::open(cfg()).unwrap();
+        for i in 0..N {
+            tree.put(format!("k{i:06}").as_bytes(), &v).unwrap();
+        }
+        tree.checkpoint().unwrap();
+        let snap = tree.snapshot(b"").unwrap();
+        for i in 0..N {
+            tree.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
+        }
+        tree.checkpoint().unwrap();
+        std::mem::forget(snap);
+    }
+
+    // Reopen: the store still carries the leaked orphan frames + the
+    // forgotten snapshot's root, unreachable from the live tree.
+    let tree = Tree::open(cfg()).unwrap();
+    for i in 0..N {
+        assert_eq!(
+            tree.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&b"new"[..]),
+            "reopened live key {i}",
+        );
+    }
+
+    let freed = tree.gc().unwrap();
+    assert!(
+        freed > 0,
+        "gc should reclaim crash-leaked snapshot frames, freed {freed}",
+    );
+    // Idempotent: nothing unreachable remains.
+    assert_eq!(tree.gc().unwrap(), 0, "second gc must be a no-op");
+    // gc must not have touched live data.
+    for i in 0..N {
+        assert_eq!(
+            tree.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&b"new"[..]),
+            "live key {i} after gc",
+        );
+    }
+}
+
+#[test]
+fn gc_rejects_db_trees() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(TreeConfig::new(dir.path())).unwrap();
+    let tree = db.create_tree("t").unwrap();
+    assert!(
+        matches!(tree.gc(), Err(Error::GcRequiresStandaloneTree)),
+        "gc on a DB tree must be rejected",
+    );
 }
