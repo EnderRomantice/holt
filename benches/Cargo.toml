@@ -27,6 +27,11 @@ harness = false
 path = "regression.rs"
 
 [[bench]]
+name = "cow_snapshot"
+harness = false
+path = "cow_snapshot.rs"
+
+[[bench]]
 name = "main"
 harness = false
 path = "main.rs"
