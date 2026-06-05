@@ -46,12 +46,14 @@ pub(super) fn child_is_snapshot_shared(bm: &BufferManager, child: &CachedBlob) -
 pub(super) fn fork_child_if_shared(
     bm: &BufferManager,
     parent: &mut BlobWriteGuard<'_>,
+    child_guid: BlobGuid,
     child_bytes: &[u8],
     parent_slot: u16,
     seq: u64,
 ) -> Result<Option<(BlobGuid, Arc<CachedBlob>)>> {
     let barrier = bm.fork_barrier();
-    if barrier == 0 || frame_created_epoch(child_bytes) > barrier {
+    let child_epoch = frame_created_epoch(child_bytes);
+    if barrier == 0 || child_epoch > barrier {
         return Ok(None);
     }
     let fork_guid = fresh_blob_guid();
@@ -60,5 +62,8 @@ pub(super) fn fork_child_if_shared(
         let mut frame = parent.frame();
         repoint_blob_node(&mut frame, parent_slot, fork_guid)?;
     }
+    // The old child is now forked away from the live tree; record it so
+    // retire reclaims it once no live snapshot can reference it.
+    bm.record_orphan(child_guid, child_epoch);
     Ok(Some((fork_guid, fork_pin)))
 }

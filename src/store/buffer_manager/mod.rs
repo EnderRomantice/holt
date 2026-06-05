@@ -159,6 +159,19 @@ use telemetry::Telemetry;
 /// the truncate gate already refuses to fire).
 pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 
+/// Live copy-on-write snapshot bookkeeping, behind one mutex so epoch
+/// registration, retirement, and orphan recording stay consistent.
+#[derive(Default)]
+struct SnapshotState {
+    /// Epoch → snapshot root GUID for every live snapshot.
+    live: BTreeMap<u64, BlobGuid>,
+    /// Frames forked away from the live tree, tagged with the
+    /// `created_epoch` of the forked-away version. Safe to free once the
+    /// fork barrier drops below the tag (no live snapshot can reference
+    /// it). One entry per fork.
+    orphans: Vec<(BlobGuid, u64)>,
+}
+
 /// One pre-snapshotted blob image ready for checkpoint write-through.
 ///
 /// The bytes are owned by the checkpoint round / I/O task so the
@@ -266,10 +279,9 @@ pub struct BufferManager {
     /// may be visible to a snapshot and so must be forked before an
     /// in-place overwrite; `0` (no live snapshot) disables forking.
     fork_barrier: AtomicU64,
-    /// Live CoW snapshots, keyed by epoch → snapshot root GUID. Drives
-    /// fork-barrier recomputation on retire and (later) orphan reclaim.
-    /// One entry per outstanding snapshot, so it stays tiny.
-    snapshots: Mutex<BTreeMap<u64, BlobGuid>>,
+    /// Live CoW snapshot registry + forked-away orphan list. Drives
+    /// fork-barrier recomputation and orphan reclaim on retire.
+    snapshots: Mutex<SnapshotState>,
 }
 
 impl BufferManager {
@@ -328,24 +340,64 @@ impl BufferManager {
     /// tree), raises the fork barrier to the snapshot's epoch, and
     /// returns that epoch.
     pub(crate) fn register_snapshot(&self, root_guid: BlobGuid) -> u64 {
-        let mut live = self.snapshots.lock().expect("snapshot registry poisoned");
+        let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
         // `fetch_add` returns the pre-bump value: that is this snapshot's
         // epoch and, because `current_epoch` only ever increases, the
         // largest key in the registry — hence the new barrier.
         let epoch = self.current_epoch.fetch_add(1, Ordering::AcqRel);
-        live.insert(epoch, root_guid);
+        snaps.live.insert(epoch, root_guid);
         self.fork_barrier.store(epoch, Ordering::Release);
         epoch
     }
 
-    /// Retire the snapshot at `epoch`, lowering the fork barrier to the
-    /// highest remaining live snapshot epoch (or `0` when none remain).
-    /// Idempotent: retiring an unknown epoch only recomputes the barrier.
+    /// Record a frame forked away from the live tree so it can be freed
+    /// once no live snapshot can reference it. `created_epoch` is the
+    /// epoch of the forked-away version (≤ the barrier at fork time).
+    pub(crate) fn record_orphan(&self, guid: BlobGuid, created_epoch: u64) {
+        self.snapshots
+            .lock()
+            .expect("snapshot registry poisoned")
+            .orphans
+            .push((guid, created_epoch));
+    }
+
+    /// Retire the snapshot at `epoch`: lower the fork barrier to the
+    /// highest remaining live snapshot epoch (or `0`), free the
+    /// snapshot's root frame, and reclaim every orphan whose forked-away
+    /// version is now newer than the barrier — no live snapshot can
+    /// reference it. Idempotent for an unknown epoch.
     pub(crate) fn retire_snapshot(&self, epoch: u64) {
-        let mut live = self.snapshots.lock().expect("snapshot registry poisoned");
-        live.remove(&epoch);
-        let barrier = live.keys().next_back().copied().unwrap_or(0);
-        self.fork_barrier.store(barrier, Ordering::Release);
+        let (root, to_free) = {
+            let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
+            let root = snaps.live.remove(&epoch);
+            let barrier = snaps.live.keys().next_back().copied().unwrap_or(0);
+            self.fork_barrier.store(barrier, Ordering::Release);
+            let mut to_free = Vec::new();
+            snaps.orphans.retain(|&(guid, created_epoch)| {
+                let still_referenced = created_epoch <= barrier;
+                if !still_referenced {
+                    to_free.push(guid);
+                }
+                still_referenced
+            });
+            (root, to_free)
+        };
+        if let Some(root) = root {
+            self.reclaim_blob(root);
+        }
+        for guid in to_free {
+            self.reclaim_blob(guid);
+        }
+    }
+
+    /// Free a copy-on-write frame no longer referenced by the live tree
+    /// or any live snapshot: drop it from cache (and its dirty
+    /// bookkeeping) and from the inner store. Best-effort on the store —
+    /// a frame forked but never checkpointed is cache-only, so its store
+    /// delete is a `NotFound` we ignore.
+    fn reclaim_blob(&self, guid: BlobGuid) {
+        self.evict_from_cache(guid);
+        let _ = self.store.delete_blob(guid);
     }
 }
 
@@ -394,7 +446,7 @@ impl BufferManager {
             telemetry: Telemetry::default(),
             current_epoch: AtomicU64::new(1),
             fork_barrier: AtomicU64::new(0),
-            snapshots: Mutex::new(BTreeMap::new()),
+            snapshots: Mutex::new(SnapshotState::default()),
         }
     }
 

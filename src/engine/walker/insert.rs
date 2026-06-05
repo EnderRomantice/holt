@@ -726,6 +726,7 @@ fn cross_and_insert(
     let mut outcome = if let Some((fork_guid, fork_pin)) = fork_child_if_shared(
         bm,
         &mut parent_guard,
+        crossing.child_guid,
         child_guard.as_slice(),
         crossing.parent_slot,
         seq,

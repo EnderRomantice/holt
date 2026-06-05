@@ -314,3 +314,110 @@ fn snapshot_stable_under_randomized_churn() {
         );
     }
 }
+
+#[test]
+fn retire_reclaims_forked_frames() {
+    // Retiring a snapshot must free the frames it kept alive (the
+    // forked-away originals + the snapshot root), returning the blob
+    // count to the live working set — no leak.
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_blob_store(store.clone())
+        .unwrap();
+
+    const N: u32 = 2000;
+    let orig = vec![0xAB_u8; 200];
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), &orig).unwrap();
+    }
+    tree.checkpoint().unwrap();
+    let baseline = store.list_blobs().unwrap().len();
+    assert!(baseline >= 2, "need a multi-blob tree");
+
+    {
+        let snap = tree.snapshot(b"").unwrap();
+        // Overwrite a spread of keys → forks the shared child frames
+        // (same key set, smaller value, so no spillover: forks are 1:1
+        // replacements of the originals).
+        for i in (0..N).step_by(3) {
+            tree.put(format!("k{i:08}").as_bytes(), b"x").unwrap();
+        }
+        tree.checkpoint().unwrap();
+        let during = store.list_blobs().unwrap().len();
+        assert!(
+            during > baseline,
+            "snapshot + forks should add blobs: {during} vs {baseline}",
+        );
+        assert_eq!(snap.get(b"k00000000").unwrap().as_deref(), Some(&orig[..]));
+    } // snapshot dropped → retire → reclaim
+
+    tree.checkpoint().unwrap();
+    let after = store.list_blobs().unwrap().len();
+    assert_eq!(
+        after, baseline,
+        "retire must reclaim every snapshot frame: {after} vs {baseline}",
+    );
+
+    // Live tree intact.
+    for i in 0..N {
+        let want: &[u8] = if i % 3 == 0 { b"x" } else { &orig };
+        assert_eq!(
+            tree.get(format!("k{i:08}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(want),
+            "live key {i}",
+        );
+    }
+}
+
+#[test]
+fn overlapping_snapshots_reclaim_after_last_retires() {
+    // Two overlapping snapshots accumulate forked-away frames; the full
+    // working set is reclaimed once the last one retires.
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_blob_store(store.clone())
+        .unwrap();
+
+    const N: u32 = 2000;
+    let v = vec![0xAB_u8; 200];
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), &v).unwrap();
+    }
+    tree.checkpoint().unwrap();
+    let baseline = store.list_blobs().unwrap().len();
+    assert!(baseline >= 2);
+
+    let s1 = tree.snapshot(b"").unwrap();
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), b"a").unwrap();
+    }
+    let s2 = tree.snapshot(b"").unwrap();
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), b"b").unwrap();
+    }
+    tree.checkpoint().unwrap();
+    assert!(store.list_blobs().unwrap().len() > baseline);
+
+    // Retiring the older snapshot first, then the newer one.
+    drop(s1);
+    tree.checkpoint().unwrap();
+    drop(s2);
+    tree.checkpoint().unwrap();
+
+    let after = store.list_blobs().unwrap().len();
+    assert_eq!(
+        after, baseline,
+        "all snapshot frames reclaimed after the last retire: {after} vs {baseline}",
+    );
+    for i in 0..N {
+        assert_eq!(
+            tree.get(format!("k{i:08}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(&b"b"[..]),
+            "live key {i}",
+        );
+    }
+}

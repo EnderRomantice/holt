@@ -310,6 +310,7 @@ fn lock_coupled_erase_in_blob(
             if let Some((fork_guid, fork_pin)) = fork_child_if_shared(
                 bm,
                 &mut guard,
+                crossing.child_guid,
                 child_guard.as_slice(),
                 crossing.parent_slot,
                 seq,
