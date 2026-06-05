@@ -9,6 +9,24 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Added
+
+- Copy-on-write snapshots. `Tree::snapshot` returns a stable
+  point-in-time `Snapshot` handle in O(1) — only the root frame is
+  copied; the rest is shared with the live tree and forked
+  copy-on-write only when a live write would overwrite a frame the
+  snapshot still references. Reads have 1× amplification and there is no
+  write overhead while no snapshot is live.
+- `Tree::gc` / `DB::gc` reclaim snapshot frames that a crash left
+  orphaned because it occurred while a snapshot was still live.
+
+### Changed
+
+- `Tree::view` / `DB::view` are reimplemented on copy-on-write
+  snapshots: same API and point-in-time semantics, but capture is now
+  O(1) instead of eagerly copying every reachable blob frame, and holds
+  no second in-memory copy of the captured subtree.
+
 ## [0.4.2] — 2026-06-02
 
 ### Fixed

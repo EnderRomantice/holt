@@ -37,7 +37,7 @@
 //!
 //! The supported import surface is the flat crate root:
 //! [`Tree`], [`DB`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
-//! [`RecordVersion`], [`View`], [`KeyPathBuf`], [`KeyPrefixBuf`],
+//! [`RecordVersion`], [`View`], [`Snapshot`], [`KeyPathBuf`], [`KeyPrefixBuf`],
 //! range iterator types, stats snapshots, and the optional
 //! `metrics` renderer.
 //!
