@@ -7,7 +7,7 @@
 //! DB-level atomic batch can commit mutations across trees in one
 //! WAL record.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -335,6 +335,46 @@ impl DB {
             DBView { trees }
         };
         read(&view)
+    }
+
+    /// Reclaim copy-on-write frames left unreachable by a crash that
+    /// happened while a snapshot was live — the DB-wide analog of
+    /// [`crate::Tree::gc`]. Marks every frame reachable from the catalog,
+    /// each live tree's root, and each live snapshot root, then frees the
+    /// rest from the shared buffer manager. Returns the count reclaimed.
+    /// Idempotent. Callers must not create or drop trees concurrently.
+    pub fn gc(&self) -> Result<usize> {
+        // Read the live tree set gate-free (`catalog_entries` runs a range
+        // scan that manages its own shared maintenance gate — holding the
+        // gate here would deadlock against it). Then freeze every tree's
+        // writers via their mutation gates, taken in tree-id order to
+        // match `DB::view`/`apply_atomic` and avoid deadlock. Callers must
+        // not create or drop trees concurrently with gc.
+        let mut scoped: Vec<(u64, Tree)> = Vec::new();
+        for (_, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Live {
+                let open = self.open_tree_state(entry.tree_id)?;
+                scoped.push((entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
+            }
+        }
+        let mut gates: Vec<(u64, Arc<Gate>)> =
+            scoped.iter().map(|(id, t)| (*id, t.mutation_gate())).collect();
+        gates.sort_by_key(|(id, _)| *id);
+        gates.dedup_by_key(|(id, _)| *id);
+        let _guards: Vec<_> = gates.iter().map(|(_, gate)| gate.enter_exclusive()).collect();
+
+        let mut reachable: HashSet<BlobGuid> = HashSet::new();
+        reachable.insert(root_guid_for_tree_id(DB_CATALOG_TREE_ID));
+        reachable.extend(self.collect_tree_guids(DB_CATALOG_TREE_ID)?);
+        for (tree_id, _) in &scoped {
+            reachable.insert(root_guid_for_tree_id(*tree_id));
+            reachable.extend(self.collect_tree_guids(*tree_id)?);
+        }
+        for snap_root in self.store.snapshot_roots() {
+            reachable.insert(snap_root);
+            reachable.extend(crate::engine::collect_blob_guids(&self.store, snap_root)?);
+        }
+        self.store.gc_sweep_unreachable(&reachable)
     }
 
     /// Force one DB-wide checkpoint round.

@@ -550,6 +550,62 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
 }
 
 #[test]
+fn db_gc_reclaims_leak_and_preserves_all_trees() {
+    let dir = tempdir().unwrap();
+    let cfg = || {
+        let mut c = TreeConfig::new(dir.path());
+        c.checkpoint.enabled = false;
+        c.wal_sync = true;
+        c
+    };
+
+    const N: u32 = 2000;
+    let v = vec![0xAB_u8; 200];
+
+    // Session 1: two trees; snapshot + fork + crash on t1.
+    {
+        let db = DB::open(cfg()).unwrap();
+        let t1 = db.create_tree("t1").unwrap();
+        let t2 = db.create_tree("t2").unwrap();
+        for i in 0..N {
+            t1.put(format!("k{i:06}").as_bytes(), &v).unwrap();
+            t2.put(format!("k{i:06}").as_bytes(), &v).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let snap = t1.snapshot(b"").unwrap();
+        for i in 0..N {
+            t1.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
+        }
+        db.checkpoint().unwrap();
+        std::mem::forget(snap); // crash: t1's forked-away frames leak
+    }
+
+    let db = DB::open(cfg()).unwrap();
+    let freed = db.gc().unwrap();
+    assert!(
+        freed > 0,
+        "db gc should reclaim crash-leaked frames, freed {freed}",
+    );
+    assert_eq!(db.gc().unwrap(), 0, "second db gc must be a no-op");
+
+    // gc marked every tree's root, so both trees survive intact.
+    let t1 = db.open_tree("t1").unwrap();
+    let t2 = db.open_tree("t2").unwrap();
+    for i in 0..N {
+        assert_eq!(
+            t1.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&b"new"[..]),
+            "t1 key {i}",
+        );
+        assert_eq!(
+            t2.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&v[..]),
+            "t2 key {i}",
+        );
+    }
+}
+
+#[test]
 fn gc_rejects_db_trees() {
     let dir = tempdir().unwrap();
     let db = DB::open(TreeConfig::new(dir.path())).unwrap();
