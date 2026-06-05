@@ -106,6 +106,19 @@ const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);
 const _: () = assert!(offset_of!(BlobHeader, created_epoch) == 0x80);
 const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
 
+/// Byte offset of [`BlobHeader::created_epoch`] within a frame buffer.
+pub const CREATED_EPOCH_OFFSET: usize = offset_of!(BlobHeader, created_epoch);
+
+/// Stamp the per-frame creation epoch into an already-formatted frame
+/// buffer. Written in native byte order to match the `#[repr(C)]`
+/// [`BlobHeader`] field read elsewhere. The caller guarantees `buf` is
+/// at least [`HEADER_SIZE`] bytes.
+#[inline]
+pub fn set_frame_created_epoch(buf: &mut [u8], epoch: u64) {
+    buf[CREATED_EPOCH_OFFSET..CREATED_EPOCH_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&epoch.to_ne_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +135,17 @@ mod tests {
         assert_eq!(offset_of!(BlobHeader, free_list_head), 0x70);
         assert_eq!(offset_of!(BlobHeader, created_epoch), 0x80);
         assert_eq!(offset_of!(BlobHeader, blob_guid), 0xa0);
+    }
+
+    #[test]
+    fn created_epoch_round_trips_through_buffer() {
+        let mut buf = vec![0u8; PAGE_SIZE as usize];
+        let span = CREATED_EPOCH_OFFSET..CREATED_EPOCH_OFFSET + 8;
+        assert_eq!(&buf[span.clone()], &[0u8; 8]);
+        set_frame_created_epoch(&mut buf, 0x1234_5678_9abc_def0);
+        assert_eq!(&buf[span], &0x1234_5678_9abc_def0_u64.to_ne_bytes());
+        // Stamping must not disturb the adjacent guid field at 0xa0.
+        assert_eq!(&buf[0xa0..0xb0], &[0u8; 16]);
     }
 
     #[test]

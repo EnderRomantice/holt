@@ -255,6 +255,12 @@ pub struct BufferManager {
     /// Hot-path observability counters. These are approximate
     /// metrics, not synchronization aids.
     telemetry: Telemetry,
+    /// Monotonic global epoch driving copy-on-write snapshots. Bumped
+    /// when a snapshot is taken; stamped into every newly-installed
+    /// frame's `created_epoch` so a later mutation under a live
+    /// snapshot knows whether it must fork the frame instead of
+    /// overwriting it in place.
+    current_epoch: AtomicU64,
 }
 
 impl BufferManager {
@@ -300,6 +306,7 @@ impl BufferManager {
             merge_candidate_total: AtomicUsize::new(0),
             clock: AtomicU64::new(1),
             telemetry: Telemetry::default(),
+            current_epoch: AtomicU64::new(1),
         }
     }
 
@@ -1454,7 +1461,14 @@ impl BufferManager {
     /// store). Inline overflow eviction is therefore skipped
     /// here; the background eviction thread or the next round's
     /// flush will catch up.
-    pub(crate) fn install_new_blob(&self, guid: BlobGuid, bytes: AlignedBlobBuf, seq: u64) {
+    pub(crate) fn install_new_blob(&self, guid: BlobGuid, mut bytes: AlignedBlobBuf, seq: u64) {
+        // Stamp the creation epoch so copy-on-write snapshots can tell
+        // whether a later mutation must fork this frame rather than
+        // overwrite it in place.
+        crate::layout::set_frame_created_epoch(
+            bytes.as_mut_slice(),
+            self.current_epoch.load(Ordering::Acquire),
+        );
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(CachedBlob::new(bytes));
         entry.last_touched.store(tick, Ordering::Relaxed);
