@@ -78,7 +78,15 @@ pub struct BlobHeader {
     /// index 1 = ntype 2 (Prefix), …, index 7 = ntype 8 (EmptyRoot).
     /// Value `0` means the list is empty.
     pub free_list_head: [u16; 8],
-    _pad_80: [u8; 0x20],
+    /// Monotonic global epoch at which this frame version was
+    /// created. Drives copy-on-write snapshots: a frame may be
+    /// visible to a snapshot taken at epoch `E` only if
+    /// `created_epoch <= E`. `0` means "older than any snapshot" —
+    /// the conservative default for frames written before this field
+    /// existed, which forces a copy-on-write on first mutation under
+    /// any live snapshot (safe, just not maximally lazy).
+    pub created_epoch: u64,
+    _pad_88: [u8; 0x18],
     /// 128-bit blob identifier.
     pub blob_guid: BlobGuid,
     _pad_b0: [u8; (HEADER_SIZE as usize) - 0xb0],
@@ -95,6 +103,7 @@ const _: () = assert!(offset_of!(BlobHeader, compact_times) == 0x60);
 const _: () = assert!(offset_of!(BlobHeader, gap_space) == 0x68);
 const _: () = assert!(offset_of!(BlobHeader, tombstone_leaf_cnt) == 0x6c);
 const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);
+const _: () = assert!(offset_of!(BlobHeader, created_epoch) == 0x80);
 const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
 
 #[cfg(test)]
@@ -111,6 +120,7 @@ mod tests {
         assert_eq!(offset_of!(BlobHeader, gap_space), 0x68);
         assert_eq!(offset_of!(BlobHeader, tombstone_leaf_cnt), 0x6c);
         assert_eq!(offset_of!(BlobHeader, free_list_head), 0x70);
+        assert_eq!(offset_of!(BlobHeader, created_epoch), 0x80);
         assert_eq!(offset_of!(BlobHeader, blob_guid), 0xa0);
     }
 
