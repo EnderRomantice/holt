@@ -237,13 +237,6 @@ fn try_insert_from_optimistic_route(
     let Some(cache) = route_cache else {
         return Ok(None);
     };
-    // Copy-on-write: the route-cache shortcut jumps straight to a deep
-    // child and mutates it in place. Under a live snapshot that child
-    // may be shared, so fall back to the full root descent, which forks
-    // shared frames at each crossing.
-    if bm.fork_barrier() != 0 {
-        return Ok(None);
-    }
     let Some(route) = cache.lookup(key) else {
         return Ok(None);
     };
@@ -276,6 +269,15 @@ fn try_insert_from_optimistic_route(
         }
         Err(e) => return Err(e),
     };
+    // Copy-on-write: a snapshot-shared child must be forked, which needs
+    // the parent's exclusive latch — bail to the full root descent (it
+    // forks at the crossing). Already-private children take this fast
+    // path normally, so a held snapshot only slows the first write per
+    // forked region, not every write.
+    if child_is_snapshot_shared(bm, child_pin.as_ref()) {
+        drop(parent_guard);
+        return Ok(None);
+    }
     child_pin.prefetch_header();
     let child_guard = child_pin.write();
     drop(parent_guard);
