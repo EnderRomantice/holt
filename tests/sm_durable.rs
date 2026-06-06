@@ -7,13 +7,19 @@
 
 use std::path::Path;
 
-use holt::{Durability, Error, TreeConfig, DB};
+use holt::{Durability, Error, Tree, TreeConfig, DB};
 use tempfile::tempdir;
 
 fn sm_file_db(dir: &Path) -> DB {
     let mut cfg = TreeConfig::new(dir);
     cfg.durability = Durability::StateMachine;
     DB::open(cfg).expect("open state-machine file DB")
+}
+
+fn sm_file_tree(dir: &Path) -> Tree {
+    let mut cfg = TreeConfig::new(dir);
+    cfg.durability = Durability::StateMachine;
+    Tree::open(cfg).expect("open state-machine file tree")
 }
 
 #[test]
@@ -136,4 +142,40 @@ fn fresh_state_machine_db_has_no_durable_index() {
     let dir = tempdir().unwrap();
     let db = sm_file_db(dir.path());
     assert_eq!(db.durable_applied_index().unwrap(), 0);
+}
+
+#[test]
+fn standalone_tree_commit_durable_recovers_and_rolls_back() {
+    let dir = tempdir().unwrap();
+    {
+        let tree = sm_file_tree(dir.path());
+        for i in 0..150u32 {
+            tree.put(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        tree.commit_durable(17).unwrap();
+        tree.put(b"uncommitted", b"x").unwrap(); // past the durable point
+    }
+    let tree = sm_file_tree(dir.path());
+    assert_eq!(tree.durable_applied_index().unwrap(), 17);
+    for i in 0..150u32 {
+        assert_eq!(
+            tree.get(format!("k{i:04}").as_bytes()).unwrap(),
+            Some(format!("v{i}").into_bytes()),
+            "key {i}",
+        );
+    }
+    assert_eq!(tree.get(b"uncommitted").unwrap(), None);
+}
+
+#[test]
+fn standalone_tree_commit_durable_requires_state_machine() {
+    let dir = tempdir().unwrap();
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.durability = Durability::Wal { sync: false };
+    let tree = Tree::open(cfg).unwrap();
+    assert!(matches!(
+        tree.commit_durable(1),
+        Err(Error::CommitDurableRequiresStateMachine),
+    ));
 }

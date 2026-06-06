@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
@@ -33,7 +33,9 @@ use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::wal_op::WalOp;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
-use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
+use crate::store::blob_store::{
+    AlignedBlobBuf, BlobStore, DurableManifest, FileBlobStore, MemoryBlobStore,
+};
 use crate::store::{
     BlobFrame, BlobFrameRef, BufferManager, CachedBlob, DirtySnapshotEntry, WriteThroughEntry,
 };
@@ -223,6 +225,11 @@ pub struct Tree {
     checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
     /// Reopen-time recovery telemetry captured once at open.
     open_stats: OpenStats,
+    /// StateMachine durable recovery point held live (single root): a CoW
+    /// snapshot so writes fork past the on-disk durable image instead of
+    /// overwriting it. Swapped on each `commit_durable`, established at
+    /// reopen. `None` outside StateMachine durability.
+    durable_snapshot: Arc<Mutex<Option<Snapshot>>>,
 }
 
 impl std::fmt::Debug for Tree {
@@ -373,54 +380,68 @@ impl Tree {
         let root_guid = ROOT_BLOB_GUID;
         ensure_root_blob(&bm, root_guid)?;
 
-        // Restore the CoW epoch above every persisted frame's
-        // `created_epoch` (the high-water is stamped on the live root at
-        // each snapshot) so snapshots taken after this reopen are correct.
-        {
-            let root = bm.pin(root_guid)?;
-            let high_water = crate::layout::frame_epoch_high_water(root.read().as_slice());
-            bm.set_current_epoch(high_water);
-        }
-
-        // File-backed trees keep a WAL alongside the data file.
-        // Replay every durable record onto the BM-cached blob
-        // image before exposing the tree to callers: the on-disk
-        // blob lags the WAL between the last `Tree::checkpoint`
-        // and now, so the WAL is the source of truth for any op
-        // committed via `memory_flush_on_write = true`.
-        let mut open_stats = OpenStats::default();
-        let (journal, next_seq) = if attach_wal {
-            match cfg.wal_path() {
-                None => (None, 1u64),
-                Some(path) => {
-                    let next_seq = if path.exists() {
-                        let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) = replay_wal(&path, &bm, |tree_id| {
-                            if tree_id == 0 {
-                                Ok(root_guid)
-                            } else {
-                                Err(Error::ReplaySanityFailed {
-                                    context: "WAL record tree_id does not belong to this Tree",
-                                    record_offset: 0,
-                                })
-                            }
-                        })?;
-                        open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
-                        open_stats.wal_replay_records = replay_stats.records_seen;
-                        open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            open_stats.wal_replay_bytes = meta.len();
-                        }
-                        next_seq
-                    } else {
-                        1
-                    };
-                    let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
-                    (Some(Arc::new(journal)), next_seq)
-                }
-            }
+        // StateMachine + file storage: recover from the durable manifest,
+        // not a WAL. Rehydrate the fixed root from its durable snapshot
+        // root, then resume the epoch + seq above the durable point.
+        let durable = if cfg.durability.is_state_machine() {
+            bm.load_durable_manifest()?
         } else {
-            (None, 1u64)
+            None
+        };
+
+        let mut open_stats = OpenStats::default();
+        let (journal, next_seq) = if let Some(meta) = &durable {
+            if let Some(&(_, durable_root)) = meta.roots.first() {
+                bm.reopen_install_root(root_guid, durable_root)?;
+                bm.flush_inner()?;
+            }
+            bm.set_current_epoch(meta.durable_epoch);
+            (None, meta.next_seq.max(1))
+        } else {
+            // Restore the CoW epoch above every persisted frame's
+            // `created_epoch` (the high-water is stamped on the live root
+            // at each snapshot) so snapshots taken after reopen are correct.
+            {
+                let root = bm.pin(root_guid)?;
+                let high_water = crate::layout::frame_epoch_high_water(root.read().as_slice());
+                bm.set_current_epoch(high_water);
+            }
+            // File-backed WAL trees replay every durable record onto the
+            // BM-cached blob image: the on-disk blob lags the WAL between
+            // the last `Tree::checkpoint` and now.
+            if attach_wal {
+                match cfg.wal_path() {
+                    None => (None, 1u64),
+                    Some(path) => {
+                        let next_seq = if path.exists() {
+                            let start = std::time::Instant::now();
+                            let (next_seq, replay_stats) = replay_wal(&path, &bm, |tree_id| {
+                                if tree_id == 0 {
+                                    Ok(root_guid)
+                                } else {
+                                    Err(Error::ReplaySanityFailed {
+                                        context: "WAL record tree_id does not belong to this Tree",
+                                        record_offset: 0,
+                                    })
+                                }
+                            })?;
+                            open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
+                            open_stats.wal_replay_records = replay_stats.records_seen;
+                            open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
+                            if let Ok(meta) = std::fs::metadata(&path) {
+                                open_stats.wal_replay_bytes = meta.len();
+                            }
+                            next_seq
+                        } else {
+                            1
+                        };
+                        let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
+                        (Some(Arc::new(journal)), next_seq)
+                    }
+                }
+            } else {
+                (None, 1u64)
+            }
         };
 
         // Shared structural gate for foreground writers, manual
@@ -440,7 +461,7 @@ impl Tree {
         )
         .map(Arc::new);
 
-        Self::from_shared(
+        let tree = Self::from_shared(
             cfg,
             root_guid,
             0,
@@ -452,7 +473,14 @@ impl Tree {
             journal,
             checkpointer,
             open_stats,
-        )
+        )?;
+        // Hold a live snapshot at the durable image so the first
+        // post-reopen writes fork past it rather than overwriting durable
+        // frames in place (Risk R1).
+        if durable.is_some() {
+            tree.hold_durable_snapshot()?;
+        }
+        Ok(tree)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -487,6 +515,7 @@ impl Tree {
             dropped: runtime.dropped,
             checkpointer,
             open_stats,
+            durable_snapshot: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1805,6 +1834,81 @@ impl Tree {
             &self.maintenance_gate,
             &self.commit_gate,
         )
+    }
+
+    /// Commit a crash-consistent durable checkpoint reflecting external
+    /// log index `applied_index` (StateMachine durability only).
+    ///
+    /// The standalone-`Tree` analogue of [`crate::DB::commit_durable`]:
+    /// take a copy-on-write snapshot, persist its closure to disk, then
+    /// atomically commit a manifest naming that root plus `applied_index`
+    /// and the resume `next_seq`. The manifest rename is the commit point;
+    /// a crash before it reopens at the previous `applied_index`, after it
+    /// at this one. Writes past the last `commit_durable` are lost on
+    /// reopen — an external log replays them.
+    ///
+    /// Returns [`Error::CommitDurableRequiresStateMachine`] under
+    /// [`crate::Durability::Wal`] and [`Error::DurableManifestUnsupported`]
+    /// on memory storage.
+    pub fn commit_durable(&self, applied_index: u64) -> Result<()> {
+        if !self.cfg.durability.is_state_machine() {
+            return Err(Error::CommitDurableRequiresStateMachine);
+        }
+        let (snap, durable_epoch, next_seq) = {
+            let _maintenance = self.maintenance_gate.enter_shared();
+            self.ensure_live()?;
+            let _mutation = self.mutation_gate.enter_exclusive();
+            let snap = self.snapshot_unlocked(b"")?;
+            (
+                snap,
+                self.store.current_epoch(),
+                self.next_seq.load(Ordering::Acquire),
+            )
+        };
+
+        // Persist the snapshot closure (root + referenced children) to the
+        // data file and fsync it.
+        Self::checkpoint_shared_parts(
+            &self.store,
+            self.journal.as_ref(),
+            &self.maintenance_gate,
+            &self.commit_gate,
+        )?;
+
+        // Atomic manifest commit — the tmp+rename is the durable point.
+        self.store.commit_durable_manifest(&DurableManifest {
+            applied_index,
+            next_seq,
+            durable_epoch,
+            roots: vec![(self.tree_id, snap.root_guid())],
+        })?;
+
+        // Swap the held snapshot; retire the previous one only AFTER the
+        // rename so its frames stay live until the new manifest is durable.
+        let prev = self.durable_snapshot.lock().unwrap().replace(snap);
+        if let Some(prev) = prev {
+            prev.retire();
+        }
+        Ok(())
+    }
+
+    /// The external log index the last committed durable checkpoint
+    /// reflects, or `0` if none. After reopen, the index to replay past.
+    pub fn durable_applied_index(&self) -> Result<u64> {
+        Ok(self
+            .store
+            .load_durable_manifest()?
+            .map_or(0, |m| m.applied_index))
+    }
+
+    /// Establish the held durable snapshot at reopen so the first
+    /// post-reopen writes fork past the durable image (Risk R1).
+    fn hold_durable_snapshot(&self) -> Result<()> {
+        let _maintenance = self.maintenance_gate.enter_shared();
+        let _mutation = self.mutation_gate.enter_exclusive();
+        let snap = self.snapshot_unlocked(b"")?;
+        *self.durable_snapshot.lock().unwrap() = Some(snap);
+        Ok(())
     }
 
     pub(crate) fn checkpoint_shared_parts(
