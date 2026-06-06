@@ -292,6 +292,72 @@ impl DB {
         self.apply_atomic(batch.pending)
     }
 
+    /// Apply independent single-key conditional writes across families
+    /// **without** a cross-family atomic barrier, returning one `applied`
+    /// flag per buffered op (in buffer order).
+    ///
+    /// Each op runs on its own tree's per-key concurrent path — the same
+    /// `mutation_gate`-shared + endpoint-lock discipline as
+    /// [`Tree::put_if_absent`] / [`Tree::compare_and_put`] — so unrelated
+    /// keys never serialize against each other or against the coarse
+    /// [`Self::atomic`] gate. This is the create-heavy metadata path: a
+    /// logical op spanning several families (e.g. a dentry plus its
+    /// inode) decomposes into independent CAS that fan out concurrently.
+    ///
+    /// # Durability contract
+    ///
+    /// Only valid when durability is [`crate::Durability::StateMachine`];
+    /// otherwise returns [`Error::ScatterRequiresStateMachine`]. The fan-out
+    /// is non-atomic, so an external log must own the atomic + replay unit:
+    /// a crash mid-`scatter` is healed by replaying the owning log entry,
+    /// which re-runs the whole call. Each op is individually idempotent on
+    /// replay — `put_if_absent` of a present key, `compare_and_put` of a
+    /// superseded version, or `delete` of an absent key all report
+    /// `applied = false` rather than erroring, so the caller treats a
+    /// `false` on replay as "already applied". Under a local WAL, use
+    /// [`Self::atomic`] for multi-family writes.
+    pub fn scatter<F>(&self, build: F) -> Result<Vec<bool>>
+    where
+        F: FnOnce(&mut Scatter),
+    {
+        if !self.cfg.durability.is_state_machine() {
+            return Err(Error::ScatterRequiresStateMachine);
+        }
+        let mut scatter = Scatter::default();
+        build(&mut scatter);
+
+        let mut applied = Vec::with_capacity(scatter.ops.len());
+        let mut handles: HashMap<String, Tree> = HashMap::new();
+        for (name, op) in &scatter.ops {
+            if !handles.contains_key(name) {
+                let name_bytes = validate_tree_name(name)?;
+                let tree_id = self
+                    .catalog_lookup_live(name_bytes)?
+                    .ok_or_else(|| Error::TreeNotFound { name: name.clone() })?;
+                let open = self.open_tree_state(tree_id)?;
+                handles.insert(name.clone(), self.tree_from_state(tree_id, open)?);
+            }
+            let tree = &handles[name];
+            applied.push(match op {
+                ScatterOp::Put { key, value } => {
+                    tree.put(key, value)?;
+                    true
+                }
+                ScatterOp::PutIfAbsent { key, value } => tree.put_if_absent(key, value)?,
+                ScatterOp::CompareAndPut {
+                    key,
+                    expected,
+                    value,
+                } => tree.compare_and_put(key, *expected, value)?,
+                ScatterOp::Delete { key } => tree.delete(key)?,
+                ScatterOp::DeleteIfVersion { key, expected } => {
+                    tree.delete_if_version(key, *expected)?
+                }
+            });
+        }
+        Ok(applied)
+    }
+
     /// Run a read-only transaction over explicit tree/prefix scopes.
     ///
     /// Holt captures every listed scope while holding each touched
@@ -1003,6 +1069,98 @@ impl DBAtomicBatch {
             tree_name: tree.to_owned(),
             op,
         });
+    }
+}
+
+/// One buffered op in a [`Scatter`]. Only the genuinely-independent
+/// single-key conditional writes are representable — rename and the
+/// `assert_*` guards need real atomicity and live on [`DBAtomicBatch`].
+#[derive(Debug)]
+enum ScatterOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    PutIfAbsent { key: Vec<u8>, value: Vec<u8> },
+    CompareAndPut {
+        key: Vec<u8>,
+        expected: RecordVersion,
+        value: Vec<u8>,
+    },
+    Delete { key: Vec<u8> },
+    DeleteIfVersion { key: Vec<u8>, expected: RecordVersion },
+}
+
+/// Builder for [`DB::scatter`] — buffers independent single-key
+/// conditional writes that fan out across families with no atomic
+/// barrier. The `(tree, op)` order is preserved; `DB::scatter` returns
+/// one `applied` flag per buffered op in this order.
+#[derive(Debug, Default)]
+pub struct Scatter {
+    ops: Vec<(String, ScatterOp)>,
+}
+
+impl Scatter {
+    /// Buffer an unconditional put in `tree` (always `applied`).
+    pub fn put(&mut self, tree: &str, key: &[u8], value: &[u8]) {
+        self.ops.push((
+            tree.to_owned(),
+            ScatterOp::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+        ));
+    }
+
+    /// Buffer a create-only put in `tree` (`applied = false` if a live
+    /// record already exists).
+    pub fn put_if_absent(&mut self, tree: &str, key: &[u8], value: &[u8]) {
+        self.ops.push((
+            tree.to_owned(),
+            ScatterOp::PutIfAbsent {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+        ));
+    }
+
+    /// Buffer a version-guarded update in `tree` (`applied = false` if the
+    /// live version no longer matches `expected`).
+    pub fn compare_and_put(&mut self, tree: &str, key: &[u8], expected: RecordVersion, value: &[u8]) {
+        self.ops.push((
+            tree.to_owned(),
+            ScatterOp::CompareAndPut {
+                key: key.to_vec(),
+                expected,
+                value: value.to_vec(),
+            },
+        ));
+    }
+
+    /// Buffer a delete in `tree` (`applied = false` if the key was
+    /// already absent).
+    pub fn delete(&mut self, tree: &str, key: &[u8]) {
+        self.ops
+            .push((tree.to_owned(), ScatterOp::Delete { key: key.to_vec() }));
+    }
+
+    /// Buffer a version-guarded delete in `tree` (`applied = false` if the
+    /// live version no longer matches `expected`).
+    pub fn delete_if_version(&mut self, tree: &str, key: &[u8], expected: RecordVersion) {
+        self.ops.push((
+            tree.to_owned(),
+            ScatterOp::DeleteIfVersion {
+                key: key.to_vec(),
+                expected,
+            },
+        ));
+    }
+
+    /// Number of buffered operations.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// `true` when no operations have been buffered.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 }
 

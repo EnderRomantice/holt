@@ -113,6 +113,12 @@ pub enum Error {
     /// DB trees share one buffer manager, so reclaiming unreachable
     /// frames safely needs a DB-wide pass rather than a single tree's.
     GcRequiresStandaloneTree,
+    /// [`crate::DB::scatter`] was called under [`crate::Durability::Wal`].
+    /// The non-atomic multi-family fast path is only sound when an
+    /// external log owns durability and replay (`StateMachine`); under a
+    /// local WAL a torn multi-family write has no replay to heal it, so
+    /// use [`crate::DB::atomic`] there.
+    ScatterRequiresStateMachine,
 }
 
 impl Error {
@@ -213,6 +219,10 @@ impl std::fmt::Display for Error {
             Self::GcRequiresStandaloneTree => write!(
                 f,
                 "gc is only supported on standalone trees; trees opened through a DB share a buffer manager"
+            ),
+            Self::ScatterRequiresStateMachine => write!(
+                f,
+                "scatter requires StateMachine durability; use atomic under a local WAL"
             ),
         }
     }
