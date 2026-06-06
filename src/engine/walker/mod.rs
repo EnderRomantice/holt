@@ -74,8 +74,8 @@ pub use range::{
     RangeIter, ScanStats,
 };
 pub(crate) use scan::collect_blob_children_from_frame;
-pub(crate) use spillover::fresh_blob_guid;
 pub use scan::{collect_blob_guids, collect_blob_topology_silent};
+pub(crate) use spillover::fresh_blob_guid;
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
 // ---------- shared internals ----------
