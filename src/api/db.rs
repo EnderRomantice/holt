@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::atomic::{BatchOp, RecordVersion};
+use super::checkpoint::{self, CheckpointImage};
 use super::config::TreeConfig;
 use super::errors::{Error, Result};
-use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
-use super::checkpoint::{self, CheckpointImage};
 use super::snapshot::Snapshot;
+use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
@@ -24,7 +24,7 @@ use crate::engine::RangeEntry;
 use crate::journal::codec::BatchEncoder;
 use crate::journal::group_commit::Journal;
 use crate::layout::BlobGuid;
-use crate::store::blob_store::BlobStore;
+use crate::store::blob_store::{BlobStore, DurableManifest};
 use crate::store::BufferManager;
 
 const DB_ROOT_TAG: u8 = 0xDB;
@@ -56,6 +56,10 @@ struct CatalogEntry {
     state: CatalogState,
 }
 
+/// A captured durable snapshot set: `(tree_id, snapshot)` per family,
+/// plus the CoW epoch and `next_seq` observed under the capture freeze.
+type DurableCapture = (Vec<(u64, Snapshot)>, u64, u64);
+
 /// A storage instance containing multiple named [`Tree`] roots.
 ///
 /// Use `Tree` directly when one ART namespace is enough. Use `DB`
@@ -74,6 +78,11 @@ pub struct DB {
     open_stats: OpenStats,
     trees: Arc<Mutex<HashMap<u64, OpenTree>>>,
     catalog_cache: Arc<Mutex<HashMap<String, CatalogEntry>>>,
+    /// StateMachine durable recovery point held live: one CoW snapshot
+    /// per family (+ catalog) so writes fork past the on-disk durable
+    /// image instead of overwriting it. Swapped on each `commit_durable`,
+    /// established at reopen. `None` outside StateMachine durability.
+    durable_snapshot: Arc<Mutex<Option<Vec<Snapshot>>>>,
 }
 
 impl std::fmt::Debug for DB {
@@ -89,26 +98,48 @@ impl DB {
     pub fn open(cfg: TreeConfig) -> Result<Self> {
         let bm = Tree::open_buffer_manager(&cfg)?;
         let mut open_stats = OpenStats::default();
-        let (journal, next_seq) = match cfg.wal_path() {
-            Some(path) => {
-                let next_seq = if path.exists() {
-                    let start = std::time::Instant::now();
-                    let (next_seq, replay_stats) =
-                        replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
-                    open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
-                    open_stats.wal_replay_records = replay_stats.records_seen;
-                    open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        open_stats.wal_replay_bytes = meta.len();
-                    }
-                    next_seq
-                } else {
-                    1
-                };
-                let journal = Journal::open_or_create(&path, 0)?;
-                (Some(Arc::new(journal)), next_seq)
+
+        // StateMachine + file storage: recover from the durable manifest,
+        // not a WAL. Rehydrate each tree's fixed root from its durable
+        // snapshot root, then resume the epoch + seq above the durable
+        // point. An external log replays everything past `applied_index`.
+        let durable = if cfg.durability.is_state_machine() {
+            bm.load_durable_manifest()?
+        } else {
+            None
+        };
+
+        let (journal, next_seq) = if let Some(meta) = &durable {
+            for &(tree_id, durable_root) in &meta.roots {
+                bm.reopen_install_root(root_guid_for_tree_id(tree_id), durable_root)?;
             }
-            None => (None, 1),
+            bm.flush_inner()?;
+            bm.set_current_epoch(meta.durable_epoch);
+            (None, meta.next_seq.max(1))
+        } else {
+            // WAL durability attaches a journal and replays it; StateMachine
+            // with no durable manifest yet (or memory storage) starts empty.
+            match cfg.wal_path() {
+                Some(path) if cfg.durability.attach_wal() => {
+                    let next_seq = if path.exists() {
+                        let start = std::time::Instant::now();
+                        let (next_seq, replay_stats) =
+                            replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
+                        open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
+                        open_stats.wal_replay_records = replay_stats.records_seen;
+                        open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            open_stats.wal_replay_bytes = meta.len();
+                        }
+                        next_seq
+                    } else {
+                        1
+                    };
+                    let journal = Journal::open_or_create(&path, 0)?;
+                    (Some(Arc::new(journal)), next_seq)
+                }
+                _ => (None, 1),
+            }
         };
 
         let maintenance_gate = Arc::new(Gate::new());
@@ -133,7 +164,14 @@ impl DB {
             open_stats,
             trees: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
+            durable_snapshot: Arc::new(Mutex::new(None)),
         };
+        // Hold a live snapshot at the durable image so the first post-reopen
+        // writes fork past it rather than overwriting durable frames in
+        // place (which a crash before the next commit_durable would not heal).
+        if durable.is_some() {
+            db.hold_durable_snapshot()?;
+        }
         db.stage_dropped_trees()?;
         Ok(db)
     }
@@ -424,11 +462,16 @@ impl DB {
                 scoped.push((entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
             }
         }
-        let mut gates: Vec<(u64, Arc<Gate>)> =
-            scoped.iter().map(|(id, t)| (*id, t.mutation_gate())).collect();
+        let mut gates: Vec<(u64, Arc<Gate>)> = scoped
+            .iter()
+            .map(|(id, t)| (*id, t.mutation_gate()))
+            .collect();
         gates.sort_by_key(|(id, _)| *id);
         gates.dedup_by_key(|(id, _)| *id);
-        let _guards: Vec<_> = gates.iter().map(|(_, gate)| gate.enter_exclusive()).collect();
+        let _guards: Vec<_> = gates
+            .iter()
+            .map(|(_, gate)| gate.enter_exclusive())
+            .collect();
 
         let mut reachable: HashSet<BlobGuid> = HashSet::new();
         reachable.insert(root_guid_for_tree_id(DB_CATALOG_TREE_ID));
@@ -464,18 +507,27 @@ impl DB {
         for (name, entry) in self.catalog_entries()? {
             if entry.state == CatalogState::Live {
                 let open = self.open_tree_state(entry.tree_id)?;
-                families.push((name, entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
+                families.push((
+                    name,
+                    entry.tree_id,
+                    self.tree_from_state(entry.tree_id, open)?,
+                ));
             }
         }
 
         // Freeze every family's writers (tree-id order, matching
         // DB::view/apply_atomic) and snapshot each — O(1) per snapshot.
         let snaps: Vec<(Vec<u8>, Snapshot)> = {
-            let mut gates: Vec<(u64, Arc<Gate>)> =
-                families.iter().map(|(_, id, t)| (*id, t.mutation_gate())).collect();
+            let mut gates: Vec<(u64, Arc<Gate>)> = families
+                .iter()
+                .map(|(_, id, t)| (*id, t.mutation_gate()))
+                .collect();
             gates.sort_by_key(|(id, _)| *id);
             gates.dedup_by_key(|(id, _)| *id);
-            let _guards: Vec<_> = gates.iter().map(|(_, gate)| gate.enter_exclusive()).collect();
+            let _guards: Vec<_> = gates
+                .iter()
+                .map(|(_, gate)| gate.enter_exclusive())
+                .collect();
 
             let mut snaps = Vec::with_capacity(families.len());
             for (name, _, tree) in &families {
@@ -517,6 +569,122 @@ impl DB {
             }
         }
         Ok(decoded.applied_index)
+    }
+
+    /// Commit a crash-consistent durable checkpoint reflecting external
+    /// log index `applied_index` (StateMachine durability only).
+    ///
+    /// Captures a copy-on-write snapshot of every family under a brief
+    /// all-families freeze, persists the snapshot closure to disk, then
+    /// atomically commits a manifest naming those roots plus
+    /// `applied_index` and the resume `next_seq`. The manifest rename is
+    /// the commit point: a crash before it reopens at the previous
+    /// `applied_index`, a crash after it at this one — never a torn state.
+    /// On reopen the caller replays its external log past `applied_index`.
+    ///
+    /// The caller must hold its apply loop quiescent so the captured state
+    /// matches `applied_index`, and must not create/drop trees
+    /// concurrently. Returns [`Error::CommitDurableRequiresStateMachine`]
+    /// under [`crate::Durability::Wal`] (the WAL is the durable point
+    /// there) and [`Error::DurableManifestUnsupported`] on memory storage.
+    pub fn commit_durable(&self, applied_index: u64) -> Result<()> {
+        if !self.cfg.durability.is_state_machine() {
+            return Err(Error::CommitDurableRequiresStateMachine);
+        }
+        let families = self.durable_families()?;
+        let (snaps, durable_epoch, next_seq) = self.freeze_and_snapshot(&families)?;
+
+        // Persist every frame in the durable closure (snapshot roots + the
+        // children they reference) to the data file and fsync it.
+        Tree::checkpoint_shared_parts(
+            &self.store,
+            self.journal.as_ref(),
+            &self.maintenance_gate,
+            &self.commit_gate,
+        )?;
+
+        // Atomic manifest commit — the tmp+rename is the durable point.
+        let roots: Vec<(u64, BlobGuid)> =
+            snaps.iter().map(|(id, s)| (*id, s.root_guid())).collect();
+        self.store.commit_durable_manifest(&DurableManifest {
+            applied_index,
+            next_seq,
+            durable_epoch,
+            roots,
+        })?;
+
+        // Swap the held snapshot; retire the previous one only AFTER the
+        // rename, so its frames stay live until the new manifest is durable.
+        let prev = self
+            .durable_snapshot
+            .lock()
+            .unwrap()
+            .replace(snaps.into_iter().map(|(_, s)| s).collect());
+        if let Some(prev) = prev {
+            for snap in prev {
+                snap.retire();
+            }
+        }
+        Ok(())
+    }
+
+    /// The external log index the last committed durable checkpoint
+    /// reflects, or `0` if none was ever committed. After reopen this is
+    /// the index an external log replays past.
+    pub fn durable_applied_index(&self) -> Result<u64> {
+        Ok(self
+            .store
+            .load_durable_manifest()?
+            .map_or(0, |m| m.applied_index))
+    }
+
+    /// Live families (+ the catalog) as `(tree_id, Tree)` for a durable
+    /// snapshot. Gate-free — the catalog range scan manages its own gate.
+    fn durable_families(&self) -> Result<Vec<(u64, Tree)>> {
+        let mut families = Vec::new();
+        for (_, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Live {
+                let open = self.open_tree_state(entry.tree_id)?;
+                families.push((entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
+            }
+        }
+        families.push((DB_CATALOG_TREE_ID, self.catalog_tree()?));
+        Ok(families)
+    }
+
+    /// Freeze every family's writers (tree-id order, matching
+    /// `apply_atomic`/`export_checkpoint`) and snapshot each — one
+    /// consistent multi-tree instant. Returns the snapshots plus the CoW
+    /// epoch and `next_seq` captured under the freeze.
+    fn freeze_and_snapshot(&self, families: &[(u64, Tree)]) -> Result<DurableCapture> {
+        let mut gates: Vec<(u64, Arc<Gate>)> = families
+            .iter()
+            .map(|(id, t)| (*id, t.mutation_gate()))
+            .collect();
+        gates.sort_by_key(|(id, _)| *id);
+        gates.dedup_by_key(|(id, _)| *id);
+        let _guards: Vec<_> = gates
+            .iter()
+            .map(|(_, gate)| gate.enter_exclusive())
+            .collect();
+
+        let mut snaps = Vec::with_capacity(families.len());
+        for (tree_id, tree) in families {
+            snaps.push((*tree_id, tree.snapshot_unlocked(b"")?));
+        }
+        let epoch = self.store.current_epoch();
+        let next_seq = self.next_seq.load(Ordering::Acquire);
+        Ok((snaps, epoch, next_seq))
+    }
+
+    /// Establish the held durable snapshot at reopen so the first
+    /// post-reopen writes fork past the durable image (see the
+    /// `durable_snapshot` field).
+    fn hold_durable_snapshot(&self) -> Result<()> {
+        let families = self.durable_families()?;
+        let (snaps, _, _) = self.freeze_and_snapshot(&families)?;
+        *self.durable_snapshot.lock().unwrap() = Some(snaps.into_iter().map(|(_, s)| s).collect());
+        Ok(())
     }
 
     /// Force one DB-wide checkpoint round.
@@ -1082,15 +1250,26 @@ impl DBAtomicBatch {
 /// `assert_*` guards need real atomicity and live on [`DBAtomicBatch`].
 #[derive(Debug)]
 enum ScatterOp {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    PutIfAbsent { key: Vec<u8>, value: Vec<u8> },
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    PutIfAbsent {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     CompareAndPut {
         key: Vec<u8>,
         expected: RecordVersion,
         value: Vec<u8>,
     },
-    Delete { key: Vec<u8> },
-    DeleteIfVersion { key: Vec<u8>, expected: RecordVersion },
+    Delete {
+        key: Vec<u8>,
+    },
+    DeleteIfVersion {
+        key: Vec<u8>,
+        expected: RecordVersion,
+    },
 }
 
 /// Builder for [`DB::scatter`] — buffers independent single-key
@@ -1128,7 +1307,13 @@ impl Scatter {
 
     /// Buffer a version-guarded update in `tree` (`applied = false` if the
     /// live version no longer matches `expected`).
-    pub fn compare_and_put(&mut self, tree: &str, key: &[u8], expected: RecordVersion, value: &[u8]) {
+    pub fn compare_and_put(
+        &mut self,
+        tree: &str,
+        key: &[u8],
+        expected: RecordVersion,
+        value: &[u8],
+    ) {
         self.ops.push((
             tree.to_owned(),
             ScatterOp::CompareAndPut {

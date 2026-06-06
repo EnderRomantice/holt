@@ -182,4 +182,6 @@ pub use checkpoint::CheckpointConfig;
 // Users implementing a custom `BlobStore` need `BlobGuid` to name
 // the blob they're storing.
 pub use layout::BlobGuid;
-pub use store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
+pub use store::blob_store::{
+    AlignedBlobBuf, BlobStore, DurableManifest, FileBlobStore, MemoryBlobStore,
+};

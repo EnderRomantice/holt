@@ -119,6 +119,15 @@ pub enum Error {
     /// local WAL a torn multi-family write has no replay to heal it, so
     /// use [`crate::DB::atomic`] there.
     ScatterRequiresStateMachine,
+    /// [`crate::DB::commit_durable`] was called under
+    /// [`crate::Durability::Wal`]. The durable recovery point is the WAL
+    /// in that mode; `commit_durable` only applies when an external log
+    /// owns durability (`StateMachine`).
+    CommitDurableRequiresStateMachine,
+    /// A durable state-machine checkpoint was requested on a store that
+    /// cannot persist one (an in-memory store). `StateMachine` durable
+    /// recovery requires file-backed storage.
+    DurableManifestUnsupported,
 }
 
 impl Error {
@@ -223,6 +232,14 @@ impl std::fmt::Display for Error {
             Self::ScatterRequiresStateMachine => write!(
                 f,
                 "scatter requires StateMachine durability; use atomic under a local WAL"
+            ),
+            Self::CommitDurableRequiresStateMachine => write!(
+                f,
+                "commit_durable requires StateMachine durability; the WAL is the durable point under a local WAL"
+            ),
+            Self::DurableManifestUnsupported => write!(
+                f,
+                "durable state-machine checkpoint requires file-backed storage"
             ),
         }
     }
