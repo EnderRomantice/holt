@@ -244,7 +244,7 @@ fn main() {
 fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     let dir = TempDir::new().expect("holt tempdir");
     let mut tree_cfg = TreeConfig::new(dir.path());
-    tree_cfg.wal_sync = cfg.wal_sync;
+    tree_cfg.durability = holt::Durability::Wal { sync: cfg.wal_sync };
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
     let mut tree = Tree::open(tree_cfg.clone()).expect("holt open");
     preload_holt(&tree, cfg.workload, cfg.n_keys);

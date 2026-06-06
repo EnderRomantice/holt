@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use holt::{RangeEntry, Tree, TreeConfig};
+use holt::{Durability, RangeEntry, Tree, TreeConfig};
 
 /// Drain a `RangeIter` into a `Vec<(key, value)>`. Panics on any
 /// `Err` (proptest harness reports the panic up). `CommonPrefix`
@@ -213,7 +213,7 @@ proptest! {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = TreeConfig::new(dir.path());
-        cfg.wal_sync = true;
+        cfg.durability = Durability::Wal { sync: true };
 
         let oracle = {
             let tree = Tree::open(cfg.clone()).unwrap();

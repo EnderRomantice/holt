@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::config::{Storage, TreeConfig};
+use super::config::{Durability, Storage, TreeConfig};
 use super::tree::Tree;
 use crate::api::errors::Result;
 use crate::checkpoint::CheckpointConfig;
@@ -15,7 +15,7 @@ use crate::store::blob_store::BlobStore;
 /// // Persistent (the default):
 /// let tree = holt::TreeBuilder::new("/var/lib/myapp")
 ///     .buffer_pool_size(512)
-///     .wal_sync(true)
+///     .durability(holt::Durability::Wal { sync: true })
 ///     .open()?;
 ///
 /// // In-memory (volatile, for tests / scratch):
@@ -51,9 +51,9 @@ impl TreeBuilder {
         self
     }
 
-    /// Set per-operation WAL `sync_data`.
-    pub fn wal_sync(mut self, enabled: bool) -> Self {
-        self.cfg.wal_sync = enabled;
+    /// Set the durability policy (WAL vs materialized state machine).
+    pub fn durability(mut self, durability: Durability) -> Self {
+        self.cfg.durability = durability;
         self
     }
 

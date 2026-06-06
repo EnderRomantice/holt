@@ -38,6 +38,48 @@ pub enum Storage {
     Memory,
 }
 
+/// Who owns the durable log, and how Holt recovers.
+///
+/// Orthogonal to [`Storage`]: `Storage` is *where* blob frames live;
+/// `Durability` is *who* is the source of truth and how restart works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// Holt's write-ahead log is the source of truth (single node).
+    /// Recovery replays the WAL. `sync = true` fsyncs each write before
+    /// acking; `false` uses group commit (ack once the journal worker
+    /// queue accepts the record; fsync is batched).
+    Wal {
+        /// Per-write fsync before ack.
+        sync: bool,
+    },
+    /// An external log (e.g. Raft) is the source of truth and Holt is a
+    /// materialized state machine. No WAL is kept — recovery loads a
+    /// checkpoint via [`crate::DB::install_checkpoint`] and the owner
+    /// replays its log from there.
+    StateMachine,
+}
+
+impl Durability {
+    /// Whether a write must fsync before its ack.
+    #[must_use]
+    pub fn wal_sync(self) -> bool {
+        matches!(self, Self::Wal { sync: true })
+    }
+
+    /// Whether the open path attaches and replays a Holt WAL.
+    #[must_use]
+    pub fn attach_wal(self) -> bool {
+        matches!(self, Self::Wal { .. })
+    }
+
+    /// Whether Holt is a materialized state machine — an external log
+    /// owns durability and recovery is checkpoint + caller replay.
+    #[must_use]
+    pub fn is_state_machine(self) -> bool {
+        matches!(self, Self::StateMachine)
+    }
+}
+
 /// Configuration passed to [`crate::Tree::open`].
 #[derive(Debug, Clone)]
 pub struct TreeConfig {
@@ -47,11 +89,9 @@ pub struct TreeConfig {
     /// buffer pool. File-backed trees default to 256 (= 128 MiB);
     /// memory trees default to 64 (= 32 MiB).
     pub buffer_pool_size: usize,
-    /// If `true`, each file-backed mutation waits until the
-    /// journal worker calls `sync_data`. The default `false`
-    /// returns after the journal worker queue accepts the encoded
-    /// WAL record.
-    pub wal_sync: bool,
+    /// Who owns durability and how recovery works. Defaults to
+    /// `Durability::Wal { sync: false }` (group-commit WAL).
+    pub durability: Durability,
     /// **Memory-only** BM-commit toggle (no effect on
     /// file-backed trees — the WAL + `Tree::checkpoint` is the
     /// durability path there; see [`Self::wal_sync`]).
@@ -79,7 +119,7 @@ impl TreeConfig {
         Self {
             storage: Storage::File { dir: dir.into() },
             buffer_pool_size: DEFAULT_FILE_BUFFER_POOL_SIZE,
-            wal_sync: false,
+            durability: Durability::Wal { sync: false },
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
         }
@@ -91,7 +131,7 @@ impl TreeConfig {
         Self {
             storage: Storage::Memory,
             buffer_pool_size: DEFAULT_MEMORY_BUFFER_POOL_SIZE,
-            wal_sync: false,
+            durability: Durability::Wal { sync: false },
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig {
                 enabled: false,

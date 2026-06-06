@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use holt::{BlobStore, Error, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, DB};
+use holt::{BlobStore, Durability, Error, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, DB};
 use tempfile::tempdir;
 
 #[test]
@@ -429,7 +429,7 @@ fn snapshot_correct_after_reopen() {
     let cfg = || {
         let mut c = TreeConfig::new(dir.path());
         c.checkpoint.enabled = false;
-        c.wal_sync = true;
+        c.durability = Durability::Wal { sync: true };
         c
     };
 
@@ -497,7 +497,7 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
     let cfg = || {
         let mut c = TreeConfig::new(dir.path());
         c.checkpoint.enabled = false;
-        c.wal_sync = true;
+        c.durability = Durability::Wal { sync: true };
         c
     };
 
@@ -555,7 +555,7 @@ fn db_gc_reclaims_leak_and_preserves_all_trees() {
     let cfg = || {
         let mut c = TreeConfig::new(dir.path());
         c.checkpoint.enabled = false;
-        c.wal_sync = true;
+        c.durability = Durability::Wal { sync: true };
         c
     };
 

@@ -17,7 +17,7 @@ use std::thread;
 
 use tempfile::tempdir;
 
-use holt::{Tree, TreeConfig, DB};
+use holt::{Durability, Tree, TreeConfig, DB};
 
 fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
@@ -34,8 +34,27 @@ fn manual_checkpoint_cfg(dir: &std::path::Path) -> TreeConfig {
 /// record fsync'd before drop.
 fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
     let mut cfg = manual_checkpoint_cfg(dir);
-    cfg.wal_sync = true;
+    cfg.durability = Durability::Wal { sync: true };
     cfg
+}
+
+#[test]
+fn state_machine_mode_attaches_no_wal() {
+    // In state-machine mode the owner's log (e.g. Raft) is the source of
+    // truth: Holt attaches no WAL, so writes are served from memory and
+    // recovery is checkpoint + caller replay (not WAL replay).
+    let dir = tempdir().unwrap();
+    let mut cfg = TreeConfig::new(dir.path());
+    cfg.durability = Durability::StateMachine;
+    cfg.checkpoint.enabled = false;
+
+    let tree = Tree::open(cfg).unwrap();
+    tree.put(b"a", b"1").unwrap();
+    assert_eq!(tree.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert!(
+        !wal_path(dir.path()).exists(),
+        "state-machine mode must not write a WAL",
+    );
 }
 
 #[test]
@@ -1549,7 +1568,7 @@ fn concurrent_writers_and_bg_checkpoint_preserve_acked_ops() {
     {
         let tree = Arc::new(
             TreeBuilder::new(dir.path())
-                .wal_sync(true) // per-op durable
+                .durability(holt::Durability::Wal { sync: true }) // per-op durable
                 .checkpoint(CheckpointConfig {
                     enabled: true,
                     idle_interval: Duration::from_millis(5),
@@ -1693,7 +1712,7 @@ fn concurrent_writers_with_deletes_and_bg_checkpoint() {
     {
         let tree = Arc::new(
             TreeBuilder::new(dir.path())
-                .wal_sync(true)
+                .durability(holt::Durability::Wal { sync: true })
                 .checkpoint(CheckpointConfig {
                     enabled: true,
                     idle_interval: Duration::from_millis(5),

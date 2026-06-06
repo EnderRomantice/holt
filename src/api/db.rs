@@ -714,7 +714,7 @@ impl DB {
                 group_base += count_group_wal_ops(group);
             }
             let _n = enc.finish();
-            journal.submit(record, self.cfg.wal_sync)?
+            journal.submit(record, self.cfg.durability.wal_sync())?
         };
         if let Some(ack) = ack {
             ack.wait()?;

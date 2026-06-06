@@ -159,7 +159,7 @@ fn make_holt() -> Tree {
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_sync = false;
+    cfg.durability = holt::Durability::Wal { sync: false };
     let tree = Tree::open(cfg).expect("holt persistent open");
     (tree, dir)
 }

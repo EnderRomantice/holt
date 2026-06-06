@@ -298,8 +298,8 @@ impl Tree {
     /// `ROADMAP.md`).
     pub fn open(cfg: TreeConfig) -> Result<Self> {
         let bm = Self::open_buffer_manager(&cfg)?;
-        // The auto-managed store earns automatic WAL coverage.
-        Self::open_inner(cfg, bm, /*attach_wal=*/ true)
+        let attach_wal = cfg.durability.attach_wal();
+        Self::open_inner(cfg, bm, attach_wal)
     }
 
     /// Open a tree with a caller-supplied [`BlobStore`].
@@ -636,7 +636,7 @@ impl Tree {
                     let mut record =
                         journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
                     encode_insert_record(&mut record, seq, self.tree_id, key, value);
-                    let ack = journal.submit(record, self.cfg.wal_sync)?;
+                    let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
                     (outcome, ack)
                 } else {
                     (outcome, None)
@@ -742,7 +742,7 @@ impl Tree {
                     }
                     let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
                     encode_erase_record(&mut record, seq, self.tree_id, key);
-                    let ack = journal.submit(record, self.cfg.wal_sync)?;
+                    let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
                     (outcome, ack)
                 } else {
                     (outcome, None)
@@ -862,7 +862,7 @@ impl Tree {
                 let mut record =
                     journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
                 encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
-                journal.submit(record, self.cfg.wal_sync)?
+                journal.submit(record, self.cfg.durability.wal_sync())?
             } else {
                 let erase_out = engine::erase_multi(
                     &self.store,
@@ -981,7 +981,7 @@ impl Tree {
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
                 self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
-                journal.submit(record, self.cfg.wal_sync)?
+                journal.submit(record, self.cfg.durability.wal_sync())?
             };
             if let Some(ack) = ack {
                 ack.wait()?;

@@ -37,7 +37,7 @@ fn dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
 fn make_tree() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_sync = false;
+    cfg.durability = holt::Durability::Wal { sync: false };
     cfg.buffer_pool_size = 256;
     cfg.checkpoint.enabled = false;
     let tree = Tree::open(cfg).expect("holt open");
