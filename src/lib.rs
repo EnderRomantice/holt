@@ -157,7 +157,7 @@ pub use api::db::{DBAtomicBatch, DBView, DB};
 pub use api::errors::{Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::snapshot::Snapshot;
-pub use api::tree::Tree;
+pub use api::tree::{PutOutcome, Tree};
 pub use api::view::{View, ViewKeyRangeBuilder, ViewRangeBuilder};
 
 // Range-scan iterator surface.

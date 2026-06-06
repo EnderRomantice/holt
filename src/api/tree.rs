@@ -49,6 +49,15 @@ type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 type CheckpointMap = HashMap<BlobGuid, u64>;
 type CheckpointBytes = Vec<(BlobGuid, u64, u64, AlignedBlobBuf)>;
 
+/// Per-key result of [`Tree::put_many_if_absent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// The key was absent and is now created.
+    Created,
+    /// A live record already existed; nothing was written.
+    AlreadyExists,
+}
+
 #[derive(Clone)]
 pub(crate) struct TreeRuntime {
     endpoint_locks: Arc<EndpointLocks>,
@@ -583,6 +592,47 @@ impl Tree {
             .map(|outcome| outcome.mutated)
     }
 
+    /// Insert every entry whose key is currently absent, as one atomic
+    /// batch, reporting per key whether it was [`PutOutcome::Created`] or
+    /// already present.
+    ///
+    /// Same per-key semantics as [`Self::put_if_absent`], but the
+    /// genuinely-new keys commit under a single WAL record (crash-atomic)
+    /// and a same-parent run lands in one frame under one latch — the
+    /// "create N entries under one directory" metadata path. Duplicate
+    /// keys within `entries` create once; later copies report
+    /// `AlreadyExists`.
+    pub fn put_many_if_absent(&self, entries: &[(&[u8], &[u8])]) -> Result<Vec<PutOutcome>> {
+        let _maintenance = self.maintenance_gate.enter_shared();
+        self.ensure_live()?;
+        let _mutation = self.mutation_gate.enter_exclusive();
+
+        // Preflight existence (under the mutation gate, so it stays
+        // consistent with the apply): present in the tree OR seen earlier
+        // in this batch ⇒ `AlreadyExists`; otherwise queue the insert.
+        let mut results = Vec::with_capacity(entries.len());
+        let mut new_ops: Vec<BatchOp> = Vec::new();
+        let mut creating: HashSet<&[u8]> = HashSet::new();
+        for &(key, value) in entries {
+            let fresh = creating.insert(key) && self.get_version(key)?.is_none();
+            if fresh {
+                results.push(PutOutcome::Created);
+                new_ops.push(BatchOp::PutIfAbsent {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                });
+            } else {
+                results.push(PutOutcome::AlreadyExists);
+            }
+        }
+
+        if !new_ops.is_empty() {
+            let base_seq = self.next_seq.fetch_add(new_ops.len() as u64, Ordering::Relaxed);
+            self.commit_batch(&new_ops, base_seq)?;
+        }
+        Ok(results)
+    }
+
     /// Replace `(key, value)` only when the live record currently
     /// carries `expected_version`.
     ///
@@ -967,19 +1017,25 @@ impl Tree {
         if !self.preflight_batch(&pending, base_seq)? {
             return Ok(false);
         }
-        if count == 0 {
-            return Ok(true);
+        if count != 0 {
+            self.commit_batch(&pending, base_seq)?;
         }
+        Ok(true)
+    }
 
+    /// Commit a pre-validated batch under one WAL record. The caller
+    /// holds the maintenance + mutation gates and has reserved the
+    /// `base_seq` range; every inner op applies via the run walker.
+    fn commit_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<()> {
         // W2D-strict protocol: all inner ops' walker mutations +
-        // `mark_dirty` calls, plus the single envelope WAL submit,
-        // happen under `commit_gate` — see `Tree::put_inner_conditional`.
+        // `mark_dirty` calls, plus the single envelope WAL submit, happen
+        // under `commit_gate` — see `Tree::put_inner_conditional`.
         if let Some(journal) = &self.journal {
             let ack = {
                 let _commit = self.commit_gate.enter_writer();
-                let mut record = journal.record_buffer(encoded_batch_record_len(&pending));
+                let mut record = journal.record_buffer(encoded_batch_record_len(pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, self.tree_id);
-                self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
+                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
                 journal.submit(record, self.cfg.durability.wal_sync())?
             };
@@ -987,17 +1043,13 @@ impl Tree {
                 ack.wait()?;
             }
         } else {
-            self.apply_batch_walker_inline(&pending, base_seq, None)?;
+            self.apply_batch_walker_inline(pending, base_seq, None)?;
             if self.cfg.memory_flush_on_write {
-                // Every inner op may have dirtied root + cross-blob
-                // children — drain the whole set rather than just
-                // the root. Some fallback paths may also have
-                // queued deferred deletes.
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     pub(crate) fn preflight_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<bool> {
