@@ -7,6 +7,7 @@
 
 pub mod atomic;
 pub mod builder;
+pub mod checkpoint;
 pub mod config;
 pub mod db;
 pub mod errors;

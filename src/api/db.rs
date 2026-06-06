@@ -15,6 +15,7 @@ use super::atomic::{BatchOp, RecordVersion};
 use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
+use super::checkpoint::{self, CheckpointImage};
 use super::snapshot::Snapshot;
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
@@ -375,6 +376,81 @@ impl DB {
             reachable.extend(crate::engine::collect_blob_guids(&self.store, snap_root)?);
         }
         self.store.gc_sweep_unreachable(&reachable)
+    }
+
+    /// Export a consistent point-in-time image of every live family for
+    /// the state-machine durability model: the owner (e.g. Raft) ships it
+    /// as a snapshot and installs it on a fresh node, then replays its log
+    /// from `applied_index`.
+    ///
+    /// Each family is captured with a copy-on-write snapshot taken under a
+    /// brief all-families freeze, so the image is a single consistent
+    /// instant; serialization then runs *outside* the freeze while live
+    /// applies continue (forking the frames the snapshots reference).
+    ///
+    /// `applied_index` is recorded verbatim — the caller must hold its
+    /// apply loop quiescent so the captured state matches that index, and
+    /// must not create or drop trees concurrently.
+    pub fn export_checkpoint(&self, applied_index: u64) -> Result<CheckpointImage> {
+        // Enumerate live families gate-free (the catalog range scan manages
+        // its own maintenance gate; holding one here would deadlock it).
+        let mut families: Vec<(Vec<u8>, u64, Tree)> = Vec::new();
+        for (name, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Live {
+                let open = self.open_tree_state(entry.tree_id)?;
+                families.push((name, entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
+            }
+        }
+
+        // Freeze every family's writers (tree-id order, matching
+        // DB::view/apply_atomic) and snapshot each — O(1) per snapshot.
+        let snaps: Vec<(Vec<u8>, Snapshot)> = {
+            let mut gates: Vec<(u64, Arc<Gate>)> =
+                families.iter().map(|(_, id, t)| (*id, t.mutation_gate())).collect();
+            gates.sort_by_key(|(id, _)| *id);
+            gates.dedup_by_key(|(id, _)| *id);
+            let _guards: Vec<_> = gates.iter().map(|(_, gate)| gate.enter_exclusive()).collect();
+
+            let mut snaps = Vec::with_capacity(families.len());
+            for (name, _, tree) in &families {
+                snaps.push((name.clone(), tree.snapshot_unlocked(b"")?));
+            }
+            snaps
+        };
+
+        // Serialize after releasing the freeze — applies resume here.
+        let mut buf = checkpoint::begin(applied_index, snaps.len() as u32);
+        for (name, snap) in &snaps {
+            let mut block = Vec::new();
+            for entry in snap.range() {
+                if let RangeEntry::Key { key, value, .. } = entry? {
+                    checkpoint::put_kv(&mut block, &key, &value);
+                }
+            }
+            checkpoint::put_family(&mut buf, name, &block);
+        }
+        Ok(CheckpointImage::from_raw(buf))
+    }
+
+    /// Install a checkpoint produced by [`Self::export_checkpoint`] into
+    /// this (fresh) DB and return the image's `applied_index`. The owner
+    /// then replays its log from that index.
+    ///
+    /// Intended for a fresh / wiped DB (node bootstrap or Raft
+    /// `InstallSnapshot`): every family is recreated and repopulated. On
+    /// error the partially-installed DB must be discarded and the install
+    /// retried — do not serve from a half-installed DB.
+    pub fn install_checkpoint(&self, image: &CheckpointImage) -> Result<u64> {
+        let decoded = checkpoint::decode(image.as_bytes())?;
+        for (name, kv) in &decoded.families {
+            let name = std::str::from_utf8(name)
+                .map_err(|_| Error::node_corrupt("checkpoint image: non-utf8 family name"))?;
+            let tree = self.create_tree(name)?;
+            for (key, value) in kv {
+                tree.put(key, value)?;
+            }
+        }
+        Ok(decoded.applied_index)
     }
 
     /// Force one DB-wide checkpoint round.
