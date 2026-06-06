@@ -119,6 +119,15 @@ pub enum Error {
     /// local WAL a torn multi-family write has no replay to heal it, so
     /// use [`crate::DB::atomic`] there.
     ScatterRequiresStateMachine,
+    /// [`crate::DB::scatter_independent`] received two operations for the
+    /// same `(tree, key)`. Independent scatter requires one op per key so
+    /// parallel execution cannot change ordered scatter semantics.
+    ScatterDuplicateKey {
+        /// Tree containing the duplicate key.
+        tree: String,
+        /// Duplicate key length, reported without dumping user bytes.
+        key_len: usize,
+    },
     /// [`crate::DB::commit_durable`] was called under
     /// [`crate::Durability::Wal`]. The durable recovery point is the WAL
     /// in that mode; `commit_durable` only applies when an external log
@@ -232,6 +241,10 @@ impl std::fmt::Display for Error {
             Self::ScatterRequiresStateMachine => write!(
                 f,
                 "scatter requires StateMachine durability; use atomic under a local WAL"
+            ),
+            Self::ScatterDuplicateKey { tree, key_len } => write!(
+                f,
+                "scatter_independent duplicate key in tree {tree} ({key_len} bytes)"
             ),
             Self::CommitDurableRequiresStateMachine => write!(
                 f,

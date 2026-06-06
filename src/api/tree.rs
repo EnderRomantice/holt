@@ -23,7 +23,9 @@ use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, 
 use super::view::View;
 use crate::concurrency::{CommitGate, EndpointLocks, Gate};
 use crate::engine;
-use crate::engine::{KeyRangeBuilder, KeyRangeEntry, RangeBuilder};
+use crate::engine::{
+    KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyScanOutcome, PrefixCount, RangeBuilder,
+};
 use crate::journal::codec::{
     encode_erase_record, encode_insert_record, encode_rename_object_record,
     encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
@@ -122,6 +124,37 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
     }
     let data_used = u64::from(space_used).saturating_sub(DATA_AREA_START as u64);
     ((data_used.saturating_mul(1000)) / blob_data_capacity) as u32
+}
+
+pub(crate) fn count_scan_limit(limit: usize) -> usize {
+    if limit == 0 {
+        usize::MAX
+    } else {
+        limit.saturating_add(1)
+    }
+}
+
+pub(crate) fn prefix_count_from_seen(
+    seen: u64,
+    limit: usize,
+    outcome: KeyScanOutcome,
+) -> PrefixCount {
+    if limit == 0 {
+        PrefixCount {
+            count: seen,
+            exact: true,
+            stats: outcome.stats,
+            cache_hit: outcome.cache_hit,
+        }
+    } else {
+        let limit_u64 = limit as u64;
+        PrefixCount {
+            count: seen.min(limit_u64),
+            exact: seen <= limit_u64,
+            stats: outcome.stats,
+            cache_hit: outcome.cache_hit,
+        }
+    }
 }
 
 /// An `holt` tree — your handle to one metadata store.
@@ -1553,6 +1586,26 @@ impl Tree {
     /// values are not needed for every emitted key.
     pub fn scan_keys(&self, prefix: &[u8]) -> KeyRangeBuilder {
         self.range_keys().prefix(prefix)
+    }
+
+    /// Count live keys under `prefix`, optionally capped by `limit`.
+    ///
+    /// `limit == 0` means exact / unbounded. For non-zero limits, the
+    /// implementation walks at most one entry past the limit so callers can
+    /// distinguish "exactly N" from "N or more" without materialising a full
+    /// giant directory.
+    pub fn prefix_count(&self, prefix: &[u8], limit: usize) -> Result<PrefixCount> {
+        let scan_limit = count_scan_limit(limit);
+        let mut seen = 0u64;
+        let outcome = self
+            .scan_keys(prefix)
+            .visit_with_outcome(scan_limit, |entry| {
+                if let KeyRangeEntryRef::Key { .. } = entry {
+                    seen = seen.saturating_add(1);
+                }
+                Ok(())
+            })?;
+        Ok(prefix_count_from_seen(seen, limit, outcome))
     }
 
     /// Run a read-only transaction over a prefix snapshot.

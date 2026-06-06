@@ -52,6 +52,51 @@ fn scatter_creates_across_families() {
 }
 
 #[test]
+fn scatter_independent_creates_across_families() {
+    let db = sm_db();
+    db.create_tree("dentries").unwrap();
+    db.create_tree("inodes").unwrap();
+    let applied = db
+        .scatter_independent(|s| {
+            s.put_if_absent("dentries", b"dir/f", b"ino=7");
+            s.put_if_absent("inodes", b"7", b"meta");
+        })
+        .unwrap();
+    assert_eq!(applied, vec![true, true]);
+    assert_eq!(
+        db.open_tree("dentries").unwrap().get(b"dir/f").unwrap(),
+        Some(b"ino=7".to_vec()),
+    );
+    assert_eq!(
+        db.open_tree("inodes").unwrap().get(b"7").unwrap(),
+        Some(b"meta".to_vec()),
+    );
+}
+
+#[test]
+fn scatter_independent_rejects_duplicate_keys() {
+    let db = sm_db();
+    db.create_tree("dentries").unwrap();
+    let err = db
+        .scatter_independent(|s| {
+            s.put_if_absent("dentries", b"dir/f", b"ino=7");
+            s.put_if_absent("dentries", b"dir/f", b"ino=8");
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::ScatterDuplicateKey {
+            tree,
+            key_len: 5
+        } if tree == "dentries"
+    ));
+    assert_eq!(
+        db.open_tree("dentries").unwrap().get(b"dir/f").unwrap(),
+        None
+    );
+}
+
+#[test]
 fn scatter_reports_conflict_per_op() {
     let db = sm_db();
     let dentries = db.create_tree("dentries").unwrap();

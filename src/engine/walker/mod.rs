@@ -70,8 +70,8 @@ pub use merge::try_merge_children;
 pub use migrate::{blob_needs_compaction, compact_blob};
 pub(crate) use range::PrefixListCache;
 pub use range::{
-    KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder, RangeEntry,
-    RangeIter, ScanStats,
+    KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, KeyScanOutcome, PrefixCount,
+    RangeBuilder, RangeEntry, RangeIter, ScanStats,
 };
 pub(crate) use scan::collect_blob_children_from_frame;
 pub use scan::{collect_blob_guids, collect_blob_topology_silent};

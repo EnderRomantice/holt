@@ -376,24 +376,71 @@ impl DB {
                 handles.insert(name.clone(), self.tree_from_state(tree_id, open)?);
             }
             let tree = &handles[name];
-            applied.push(match op {
-                ScatterOp::Put { key, value } => {
-                    tree.put(key, value)?;
-                    true
-                }
-                ScatterOp::PutIfAbsent { key, value } => tree.put_if_absent(key, value)?,
-                ScatterOp::CompareAndPut {
-                    key,
-                    expected,
-                    value,
-                } => tree.compare_and_put(key, *expected, value)?,
-                ScatterOp::Delete { key } => tree.delete(key)?,
-                ScatterOp::DeleteIfVersion { key, expected } => {
-                    tree.delete_if_version(key, *expected)?
-                }
-            });
+            applied.push(apply_scatter_op(tree, op)?);
         }
         Ok(applied)
+    }
+
+    /// Apply independent single-key writes across families concurrently.
+    ///
+    /// This has the same StateMachine-only durability contract as
+    /// [`Self::scatter`], but it additionally rejects duplicate `(tree, key)`
+    /// pairs up front and then lets unrelated keys run through their own
+    /// per-key Holt write paths in parallel. Use this only when no buffered
+    /// op depends on the effect of an earlier op in the same scatter batch.
+    pub fn scatter_independent<F>(&self, build: F) -> Result<Vec<bool>>
+    where
+        F: FnOnce(&mut Scatter),
+    {
+        if !self.cfg.durability.is_state_machine() {
+            return Err(Error::ScatterRequiresStateMachine);
+        }
+        let mut scatter = Scatter::default();
+        build(&mut scatter);
+        if scatter.ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        validate_scatter_independent(&scatter)?;
+
+        let mut handles: HashMap<String, Tree> = HashMap::new();
+        for (name, _) in &scatter.ops {
+            if !handles.contains_key(name) {
+                let name_bytes = validate_tree_name(name)?;
+                let tree_id = self
+                    .catalog_lookup_live(name_bytes)?
+                    .ok_or_else(|| Error::TreeNotFound { name: name.clone() })?;
+                let open = self.open_tree_state(tree_id)?;
+                handles.insert(name.clone(), self.tree_from_state(tree_id, open)?);
+            }
+        }
+
+        let mut results = (0..scatter.ops.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Result<bool>>>>();
+        std::thread::scope(|scope| {
+            let mut joins = Vec::with_capacity(scatter.ops.len());
+            for (idx, (name, op)) in scatter.ops.into_iter().enumerate() {
+                let tree = handles
+                    .get(&name)
+                    .expect("scatter tree handles are resolved before workers")
+                    .clone();
+                joins.push(scope.spawn(move || (idx, apply_scatter_op(&tree, &op))));
+            }
+            for join in joins {
+                match join.join() {
+                    Ok((idx, result)) => results[idx] = Some(result),
+                    Err(_) => {
+                        return Err(Error::Internal("scatter_independent worker panicked"));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        results
+            .into_iter()
+            .map(|result| result.expect("scatter worker populated every result"))
+            .collect()
     }
 
     /// Run a read-only transaction over explicit tree/prefix scopes.
@@ -557,7 +604,8 @@ impl DB {
     /// Intended for a fresh / wiped DB (node bootstrap or Raft
     /// `InstallSnapshot`): every family is recreated and repopulated. On
     /// error the partially-installed DB must be discarded and the install
-    /// retried — do not serve from a half-installed DB.
+    /// retried — do not serve from a half-installed DB. Holt does not yet
+    /// provide online replacement of a live DB image.
     pub fn install_checkpoint(&self, image: &CheckpointImage) -> Result<u64> {
         let decoded = checkpoint::decode(image.as_bytes())?;
         for (name, kv) in &decoded.families {
@@ -1248,7 +1296,7 @@ impl DBAtomicBatch {
 /// One buffered op in a [`Scatter`]. Only the genuinely-independent
 /// single-key conditional writes are representable — rename and the
 /// `assert_*` guards need real atomicity and live on [`DBAtomicBatch`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ScatterOp {
     Put {
         key: Vec<u8>,
@@ -1270,6 +1318,18 @@ enum ScatterOp {
         key: Vec<u8>,
         expected: RecordVersion,
     },
+}
+
+impl ScatterOp {
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Put { key, .. }
+            | Self::PutIfAbsent { key, .. }
+            | Self::CompareAndPut { key, .. }
+            | Self::Delete { key }
+            | Self::DeleteIfVersion { key, .. } => key,
+        }
+    }
 }
 
 /// Builder for [`DB::scatter`] — buffers independent single-key
@@ -1351,6 +1411,41 @@ impl Scatter {
     /// `true` when no operations have been buffered.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+}
+
+fn validate_scatter_independent(scatter: &Scatter) -> Result<()> {
+    let mut seen = HashSet::with_capacity(scatter.ops.len());
+    for (tree, op) in &scatter.ops {
+        let key = op.key();
+        let mut identity = Vec::with_capacity(tree.len() + 1 + key.len());
+        identity.extend_from_slice(tree.as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(key);
+        if !seen.insert(identity) {
+            return Err(Error::ScatterDuplicateKey {
+                tree: tree.clone(),
+                key_len: key.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_scatter_op(tree: &Tree, op: &ScatterOp) -> Result<bool> {
+    match op {
+        ScatterOp::Put { key, value } => {
+            tree.put(key, value)?;
+            Ok(true)
+        }
+        ScatterOp::PutIfAbsent { key, value } => tree.put_if_absent(key, value),
+        ScatterOp::CompareAndPut {
+            key,
+            expected,
+            value,
+        } => tree.compare_and_put(key, *expected, value),
+        ScatterOp::Delete { key } => tree.delete(key),
+        ScatterOp::DeleteIfVersion { key, expected } => tree.delete_if_version(key, *expected),
     }
 }
 

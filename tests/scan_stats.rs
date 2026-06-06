@@ -84,3 +84,59 @@ fn cache_hit_reports_zero_visited() {
     assert_eq!(second.visited, 0);
     assert_eq!(second.restarts, 0);
 }
+
+#[test]
+fn visit_with_outcome_reports_cache_hits() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..8u32 {
+        tree.put(format!("hot/{i}").as_bytes(), b"v").unwrap();
+    }
+
+    let first = tree
+        .scan_keys(b"hot/")
+        .visit_with_outcome(16, |_| Ok(()))
+        .unwrap();
+    assert!(!first.cache_hit);
+    assert_eq!(first.stats.returned, 8);
+
+    let second = tree
+        .scan_keys(b"hot/")
+        .visit_with_outcome(16, |_| Ok(()))
+        .unwrap();
+    assert!(second.cache_hit);
+    assert_eq!(second.stats.returned, 8);
+    assert_eq!(second.stats.visited, 0);
+}
+
+#[test]
+fn prefix_count_can_stop_after_limit() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..20u32 {
+        tree.put(format!("dir/{i:04}").as_bytes(), b"v").unwrap();
+    }
+
+    let bounded = tree.prefix_count(b"dir/", 10).unwrap();
+    assert_eq!(bounded.count, 10);
+    assert!(!bounded.exact);
+    assert_eq!(bounded.stats.returned, 11);
+
+    let exact = tree.prefix_count(b"dir/", 0).unwrap();
+    assert_eq!(exact.count, 20);
+    assert!(exact.exact);
+}
+
+#[test]
+fn view_prefix_count_reads_captured_state() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"dir/a", b"1").unwrap();
+    tree.put(b"dir/b", b"2").unwrap();
+
+    tree.view(b"dir/", |view| {
+        tree.put(b"dir/c", b"3").unwrap();
+        let count = view.prefix_count(b"dir/", 0).unwrap();
+        assert_eq!(count.count, 2);
+        assert!(count.exact);
+        Ok(())
+    })
+    .unwrap();
+}

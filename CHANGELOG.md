@@ -7,6 +7,35 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.5.2] — 2026-06-06
+
+### Added
+
+- Added `CheckpointImage::validate()` to validate a full exported DB
+  checkpoint image before install or archive handoff, not just its header.
+- Added `KeyScanOutcome` and `KeyRangeBuilder::visit_with_outcome` so callers
+  can distinguish prefix-list cache hits from real ART walks without changing
+  the stable `ScanStats` field set.
+- Added `PrefixCount`, `Tree::prefix_count`, and `View::prefix_count` for
+  bounded DFS-style prefix cardinality checks. Non-zero limits scan at most one
+  entry past the limit and report whether the count is exact.
+- Added `DB::scatter_independent` for StateMachine-mode independent single-key
+  fan-out across named families. It rejects duplicate `(tree, key)` pairs and
+  applies unrelated writes concurrently through Holt's native per-key paths.
+
+### Changed
+
+- Refactored `DB::scatter` to share the same single-key apply helper as
+  `scatter_independent`, keeping ordered scatter semantics while avoiding a
+  second implementation of each operation kind.
+- Clarified `DB::install_checkpoint` as a fresh/wiped-DB install path; Holt does
+  not expose online live-DB checkpoint replacement.
+
+### Validation
+
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --test scan_stats --test scatter --test checkpoint`
+
 ## [0.5.1] — 2026-06-06
 
 ### Fixed

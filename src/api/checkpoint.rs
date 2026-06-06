@@ -52,6 +52,16 @@ impl CheckpointImage {
         Ok(parse_header(&self.bytes)?.0)
     }
 
+    /// Validate the complete checkpoint image and return its applied index.
+    ///
+    /// Unlike [`Self::applied_index`], this walks every encoded family and
+    /// key/value block, catching truncated bodies, trailing bytes, and
+    /// malformed length prefixes before a caller stages the image for
+    /// installation.
+    pub fn validate(&self) -> Result<u64> {
+        Ok(decode(&self.bytes)?.applied_index)
+    }
+
     pub(crate) fn from_raw(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }

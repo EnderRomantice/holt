@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use super::atomic::{Record, RecordVersion};
 use super::errors::{Error, Result};
+use super::tree::{count_scan_limit, prefix_count_from_seen};
 use crate::concurrency::Gate;
-use crate::engine::{self, KeyRangeBuilder, RangeBuilder};
+use crate::engine::{self, KeyRangeBuilder, KeyRangeEntryRef, RangeBuilder};
 use crate::layout::BlobGuid;
 use crate::store::{BufferManager, CachedBlob};
 
@@ -112,6 +113,24 @@ impl View {
         Ok(stats.returned + stats.rollup == 0)
     }
 
+    /// Count captured live keys under `prefix`, optionally capped by `limit`.
+    ///
+    /// `limit == 0` means exact / unbounded. Reads remain inside the view's
+    /// copy-on-write snapshot and never observe later live-tree writes.
+    pub fn prefix_count(&self, prefix: &[u8], limit: usize) -> Result<crate::PrefixCount> {
+        let scan_limit = count_scan_limit(limit);
+        let mut seen = 0u64;
+        let outcome = self
+            .scan_keys(prefix)?
+            .visit_with_outcome(scan_limit, |entry| {
+                if let KeyRangeEntryRef::Key { .. } = entry {
+                    seen = seen.saturating_add(1);
+                }
+                Ok(())
+            })?;
+        Ok(prefix_count_from_seen(seen, limit, outcome))
+    }
+
     fn lookup_record(&self, key: &[u8]) -> Result<Option<Record>> {
         let search = engine::SearchKey::user(key);
         engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| Record {
@@ -196,6 +215,14 @@ impl ViewKeyRangeBuilder {
         F: FnMut(crate::KeyRangeEntryRef<'_>) -> Result<()>,
     {
         self.inner.visit(limit, visitor)
+    }
+
+    /// Visit key-only entries and return scan/cache outcome metadata.
+    pub fn visit_with_outcome<F>(self, limit: usize, visitor: F) -> Result<crate::KeyScanOutcome>
+    where
+        F: FnMut(crate::KeyRangeEntryRef<'_>) -> Result<()>,
+    {
+        self.inner.visit_with_outcome(limit, visitor)
     }
 }
 

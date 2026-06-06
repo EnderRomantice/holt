@@ -25,6 +25,7 @@ fn checkpoint_round_trips_all_families() {
         db.export_checkpoint(42).unwrap()
     };
     assert_eq!(image.applied_index().unwrap(), 42);
+    assert_eq!(image.validate().unwrap(), 42);
 
     // Install into a fresh DB.
     let db = sm_db();
@@ -106,10 +107,11 @@ fn checkpoint_is_a_consistent_snapshot() {
 #[test]
 fn install_rejects_corrupt_image() {
     let db = sm_db();
-    assert!(db
-        .install_checkpoint(&CheckpointImage::from_bytes(vec![0u8; 4]))
-        .is_err());
-    assert!(db
-        .install_checkpoint(&CheckpointImage::from_bytes(b"holtckp1".to_vec()))
-        .is_err());
+    let truncated = CheckpointImage::from_bytes(vec![0u8; 4]);
+    assert!(truncated.validate().is_err());
+    assert!(db.install_checkpoint(&truncated).is_err());
+
+    let bad_header = CheckpointImage::from_bytes(b"holtckp1".to_vec());
+    assert!(bad_header.validate().is_err());
+    assert!(db.install_checkpoint(&bad_header).is_err());
 }

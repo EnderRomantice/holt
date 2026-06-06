@@ -140,6 +140,38 @@ pub struct ScanStats {
     pub restarts: u64,
 }
 
+/// Result of a borrowed key-only range visit.
+///
+/// This is the non-breaking companion to [`ScanStats`]: `ScanStats`
+/// keeps its stable public field set, while `KeyScanOutcome` adds
+/// execution metadata that callers use to tell whether a hot directory
+/// listing came from the prefix-list cache or walked the ART.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyScanOutcome {
+    /// Per-scan work accounting.
+    pub stats: ScanStats,
+    /// `true` when the result was served entirely from the prefix-list cache.
+    pub cache_hit: bool,
+}
+
+/// Bounded count of live keys under a prefix.
+///
+/// `limit == 0` means unbounded / exact. For non-zero limits, `count`
+/// is capped at `limit`; `exact == false` means at least one more key
+/// exists beyond the reported count. `stats` and `cache_hit` describe
+/// the underlying key-only scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixCount {
+    /// Number of matching live keys, capped by the requested limit.
+    pub count: u64,
+    /// `true` when `count` is the exact number of matching keys.
+    pub exact: bool,
+    /// Per-scan work accounting for the count operation.
+    pub stats: ScanStats,
+    /// `true` when the count was served entirely from the prefix-list cache.
+    pub cache_hit: bool,
+}
+
 const PREFIX_LIST_CACHE_SLOTS: usize = 256;
 const PREFIX_LIST_CACHE_MAX_LIMIT: usize = 256;
 
@@ -499,12 +531,24 @@ impl KeyRangeBuilder {
     /// but avoids allocating one `Vec<u8>` per emitted entry. The
     /// slices passed to `visitor` are valid only for the duration
     /// of that callback.
-    pub fn visit<F>(self, limit: usize, mut visitor: F) -> Result<ScanStats>
+    pub fn visit<F>(self, limit: usize, visitor: F) -> Result<ScanStats>
+    where
+        F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
+    {
+        self.visit_with_outcome(limit, visitor)
+            .map(|outcome| outcome.stats)
+    }
+
+    /// Visit key-only range entries and return scan/cache outcome metadata.
+    ///
+    /// Prefer this over [`Self::visit`] when the caller wants to distinguish
+    /// a real ART walk from a prefix-list cache hit.
+    pub fn visit_with_outcome<F>(self, limit: usize, mut visitor: F) -> Result<KeyScanOutcome>
     where
         F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
     {
         if limit == 0 {
-            return Ok(ScanStats::default());
+            return Ok(KeyScanOutcome::default());
         }
 
         let mut builder = self;
@@ -537,7 +581,10 @@ impl KeyRangeBuilder {
                 )?
             };
             if hit.is_some() {
-                return Ok(stats);
+                return Ok(KeyScanOutcome {
+                    stats,
+                    cache_hit: true,
+                });
             }
         }
 
@@ -587,7 +634,10 @@ impl KeyRangeBuilder {
                 );
             }
         }
-        Ok(iter.stats())
+        Ok(KeyScanOutcome {
+            stats: iter.stats(),
+            cache_hit: false,
+        })
     }
 }
 
