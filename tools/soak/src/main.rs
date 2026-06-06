@@ -440,7 +440,7 @@ fn run_db_crash_child(cfg: &Config) -> Result<()> {
 fn open_tree(cfg: &Config) -> holt::Result<Tree> {
     let mut tree_cfg = TreeConfig::new(&cfg.dir);
     tree_cfg.buffer_pool_size = cfg.buffer_pool;
-    tree_cfg.wal_sync = cfg.wal_sync;
+    tree_cfg.durability = holt::Durability::Wal { sync: cfg.wal_sync };
     tree_cfg.checkpoint = CheckpointConfig::default();
     Tree::open(tree_cfg)
 }
@@ -448,7 +448,7 @@ fn open_tree(cfg: &Config) -> holt::Result<Tree> {
 fn open_db(cfg: &Config) -> holt::Result<DB> {
     let mut tree_cfg = TreeConfig::new(&cfg.dir);
     tree_cfg.buffer_pool_size = cfg.buffer_pool;
-    tree_cfg.wal_sync = cfg.wal_sync;
+    tree_cfg.durability = holt::Durability::Wal { sync: cfg.wal_sync };
     tree_cfg.checkpoint = CheckpointConfig::default();
     DB::open(tree_cfg)
 }

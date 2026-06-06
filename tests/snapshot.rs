@@ -69,9 +69,7 @@ fn snapshot_reads_across_blob_boundaries() {
     let snap = tree.snapshot(b"").unwrap();
     for i in 0..N {
         assert_eq!(
-            snap.get(format!("k{i:08}").as_bytes())
-                .unwrap()
-                .as_deref(),
+            snap.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
             Some(&value[..]),
             "snapshot lost key {i} across a blob-frame boundary",
         );
@@ -86,7 +84,10 @@ fn snapshot_scope_restricts_reads() {
     tree.put(b"orders/x", b"9").unwrap();
 
     let snap = tree.snapshot(b"users/").unwrap();
-    assert_eq!(snap.get(b"users/alice").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(
+        snap.get(b"users/alice").unwrap().as_deref(),
+        Some(&b"1"[..])
+    );
     assert_eq!(snap.scope(), b"users/");
 
     let err = snap.get(b"orders/x").unwrap_err();
@@ -146,7 +147,8 @@ fn snapshot_isolates_cross_blob_writes() {
         tree.put(format!("k{i:08}").as_bytes(), b"UPDATED").unwrap();
     }
     for i in N..N + 100 {
-        tree.put(format!("k{i:08}").as_bytes(), b"brand-new").unwrap();
+        tree.put(format!("k{i:08}").as_bytes(), b"brand-new")
+            .unwrap();
     }
     for i in (2..N).step_by(7) {
         tree.delete(format!("k{i:08}").as_bytes()).unwrap();
@@ -156,9 +158,7 @@ fn snapshot_isolates_cross_blob_writes() {
     // value, and no post-snapshot insert is visible.
     for i in 0..N {
         assert_eq!(
-            snap.get(format!("k{i:08}").as_bytes())
-                .unwrap()
-                .as_deref(),
+            snap.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
             Some(&orig[..]),
             "snapshot key {i} changed under a live cross-blob write",
         );
@@ -186,9 +186,7 @@ fn snapshot_isolates_cross_blob_writes() {
     }
     for i in N..N + 100 {
         assert_eq!(
-            tree.get(format!("k{i:08}").as_bytes())
-                .unwrap()
-                .as_deref(),
+            tree.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
             Some(&b"brand-new"[..]),
         );
     }
@@ -363,9 +361,7 @@ fn retire_reclaims_forked_frames() {
     for i in 0..N {
         let want: &[u8] = if i % 3 == 0 { b"x" } else { &orig };
         assert_eq!(
-            tree.get(format!("k{i:08}").as_bytes())
-                .unwrap()
-                .as_deref(),
+            tree.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
             Some(want),
             "live key {i}",
         );
@@ -414,9 +410,7 @@ fn overlapping_snapshots_reclaim_after_last_retires() {
     );
     for i in 0..N {
         assert_eq!(
-            tree.get(format!("k{i:08}").as_bytes())
-                .unwrap()
-                .as_deref(),
+            tree.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
             Some(&b"b"[..]),
             "live key {i}",
         );

@@ -590,7 +590,7 @@ fn assert_view_prefix_matches_model(view: &View, model: &BTreeMap<Vec<u8>, Vec<u
 fuzz_target!(|ops: Ops| {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_sync = true;
+    cfg.durability = holt::Durability::Wal { sync: true };
     cfg.checkpoint.enabled = false;
 
     let mut db = DB::open(cfg.clone()).unwrap();

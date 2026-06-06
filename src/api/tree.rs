@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
+use super::snapshot::Snapshot;
 use super::stats::OpenStats;
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
-use super::snapshot::Snapshot;
 use super::view::View;
 use crate::concurrency::{CommitGate, EndpointLocks, Gate};
 use crate::engine;
@@ -627,7 +627,9 @@ impl Tree {
         }
 
         if !new_ops.is_empty() {
-            let base_seq = self.next_seq.fetch_add(new_ops.len() as u64, Ordering::Relaxed);
+            let base_seq = self
+                .next_seq
+                .fetch_add(new_ops.len() as u64, Ordering::Relaxed);
             self.commit_batch(&new_ops, base_seq)?;
         }
         Ok(results)
@@ -1620,7 +1622,12 @@ impl Tree {
         self.store
             .mark_dirty_cached(self.root_guid, STRUCTURAL_SEQ, self.root_pin.as_ref());
 
-        let view = View::new(prefix.to_vec(), Arc::clone(&self.store), snap_root, root_pin);
+        let view = View::new(
+            prefix.to_vec(),
+            Arc::clone(&self.store),
+            snap_root,
+            root_pin,
+        );
         Ok(Snapshot::new(view, Arc::clone(&self.store), epoch))
     }
 

@@ -470,7 +470,7 @@ fn assert_view_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, di
 fuzz_target!(|ops: Ops| {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_sync = true;
+    cfg.durability = holt::Durability::Wal { sync: true };
 
     let mut tree = Tree::open(cfg.clone()).unwrap();
     let mut model = BTreeMap::new();

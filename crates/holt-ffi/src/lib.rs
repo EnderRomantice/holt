@@ -241,7 +241,9 @@ pub unsafe extern "C" fn holt_tree_open_with_wal_sync(
     boundary(|| {
         let path = unsafe { open_path(path) }?;
         let tree = TreeBuilder::new(path)
-            .wal_sync(wal_sync != 0)
+            .durability(holt::Durability::Wal {
+                sync: wal_sync != 0,
+            })
             .open()
             .map_err(|err| err.to_string())?;
         assign_tree(out, tree)

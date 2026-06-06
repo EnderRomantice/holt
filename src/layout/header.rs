@@ -176,7 +176,8 @@ pub const BLOB_GUID_OFFSET: usize = offset_of!(BlobHeader, blob_guid);
 /// `buf` is at least [`HEADER_SIZE`] bytes.
 #[inline]
 pub fn set_frame_blob_guid(buf: &mut [u8], guid: BlobGuid) {
-    buf[BLOB_GUID_OFFSET..BLOB_GUID_OFFSET + size_of::<BlobGuid>()].copy_from_slice(guid.as_slice());
+    buf[BLOB_GUID_OFFSET..BLOB_GUID_OFFSET + size_of::<BlobGuid>()]
+        .copy_from_slice(guid.as_slice());
 }
 
 #[cfg(test)]
