@@ -94,7 +94,7 @@ pub struct TreeConfig {
     pub durability: Durability,
     /// **Memory-only** BM-commit toggle (no effect on
     /// file-backed trees — the WAL + `Tree::checkpoint` is the
-    /// durability path there; see [`Self::wal_sync`]).
+    /// durability path there; see [`Self::durability`]).
     ///
     /// For memory trees: `true` (the default) drains the BM
     /// dirty set into the backing `BlobStore` after every `put` /
