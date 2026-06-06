@@ -194,8 +194,8 @@ checkpoint has a WAL record admitted and flushed before the bytes
 are copied for write-through.
 
 The journal worker owns the `WalWriter`. Callers with
-`wal_sync = true` wait outside `CommitGate`; sync requests arriving
-in the short group window share one `sync_data`.
+`Durability::Wal { sync: true }` wait outside `CommitGate`; sync requests
+arriving in the short group window share one `sync_data`.
 
 `Tree::rename` takes a separate `Mutex<()>` `rename_lock` around
 its multi-step `lookup → erase → insert` so other renames see it

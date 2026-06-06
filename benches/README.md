@@ -167,8 +167,8 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 
 Profile: single-threaded, warm-service, file-backed persistent
 engines with WAL enabled. Holt uses `TreeConfig::new(tempdir)` with
-the default async journal acknowledgement (`wal_sync = false`) and
-the default background checkpointer; RocksDB uses WAL on with
+the default async journal acknowledgement (`Durability::Wal { sync: false }`)
+and the default background checkpointer; RocksDB uses WAL on with
 `sync = false`; SQLite uses a file-backed WAL database with
 `synchronous = OFF`. This is the product-default persistent hot
 path, not a per-operation power-loss durability benchmark.
@@ -239,8 +239,8 @@ a cold data-file I/O benchmark:
 
 - **holt**: `TreeConfig::new(tempdir)` (FileBlobStore with
   `F_NOCACHE` on macOS / `O_DIRECT` on Linux) and
-  `wal_sync = false`. Foreground mutations return after the journal
-  worker queue accepts the encoded WAL record; blobs only hit disk
+  `Durability::Wal { sync: false }`. Foreground mutations return after the
+  journal worker queue accepts the encoded WAL record; blobs only hit disk
   at checkpoint.
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.

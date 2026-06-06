@@ -24,7 +24,7 @@ labels: ["bug"]
 - `rustc --version --verbose`:
 - Platform (`uname -srm`):
 - Storage mode (`TreeConfig::memory()` / `::new(path)`):
-- Non-default config diff (`buffer_pool_size`, `wal_sync_on_commit`, …):
+- Non-default config diff (`buffer_pool_size`, `durability`, …):
 
 ## Logs / panic / backtrace
 

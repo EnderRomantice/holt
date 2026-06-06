@@ -13,9 +13,17 @@
 //! All core layers — layout, walker (insert / lookup / erase /
 //! range / spillover / compact / merge), persistent store
 //! (`O_DIRECT` + optional `io_uring`), WAL with replay, sharded
-//! buffer manager, background checkpointer — are in place and
-//! covered by integration + property tests. See `ROADMAP.md`
-//! for the post-0.3 direction.
+//! buffer manager, background checkpointer, copy-on-write
+//! snapshots — are in place and covered by integration + property
+//! tests.
+//!
+//! Durability is a policy orthogonal to storage ([`Durability`]):
+//! [`Durability::Wal`] makes holt's own WAL the durable record
+//! (single node), while [`Durability::StateMachine`] cedes
+//! durability to an external log (e.g. Raft) and attaches no WAL —
+//! [`DB::commit_durable`] then pins a crash-consistent on-disk
+//! checkpoint and reopen replays only the log tail past
+//! [`DB::durable_applied_index`]. See `ROADMAP.md` for direction.
 //!
 //! ## Quick taste
 //!

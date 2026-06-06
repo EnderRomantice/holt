@@ -28,8 +28,9 @@ Run on every push and pull request:
 | `property-matrix` | Higher-count proptest oracle runs |
 | `soak-normal` | Multi-thread lifecycle soak across async WAL, sync WAL, and constrained buffer-pool cases |
 | `soak-db-normal` | Multi-thread named-tree DB lifecycle soak with cross-tree atomic batches, DB views, checkpoint, and reopen |
-| `soak-crash` | Repeated `SIGKILL` with `wal_sync=true`; every acknowledged write must survive reopen |
-| `soak-db-crash` | Repeated `SIGKILL` with `wal_sync=true`; every acknowledged cross-tree DB atomic transaction must survive replay as a whole |
+| `soak-crash` | Repeated `SIGKILL` with sync WAL (`Durability::Wal { sync: true }`); every acknowledged write must survive reopen |
+| `soak-db-crash` | Repeated `SIGKILL` with sync WAL; every acknowledged cross-tree DB atomic transaction must survive replay as a whole |
+| `soak-sm-crash` | Repeated `SIGKILL` under `Durability::StateMachine` (**no WAL**); the recovered `durable_applied_index` must be internally consistent, never regress across crashes, and never fall below an acked `commit_durable` checkpoint |
 | `fuzz-long` | Time-bounded libFuzzer campaigns over the single-tree and multi-tree DB models |
 | `verified-model` | Manual Verus run for ART shape specs when a Verus binary is available |
 
@@ -39,7 +40,7 @@ Run on every push and pull request:
 `BTreeMap` oracle. The model covers:
 
 - `put`, `delete`, `get`;
-- `checkpoint` and `reopen` with `wal_sync=true`;
+- `checkpoint` and `reopen` with `Durability::Wal { sync: true }`;
 - `atomic` batches with create-only, compare-and-put, versioned delete,
   version assertions, prefix-empty assertions, and rename;
 - record range scans and prefix scans;
