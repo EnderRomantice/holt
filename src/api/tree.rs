@@ -964,12 +964,18 @@ impl Tree {
     ///   detected before any walker mutation. A failing rename
     ///   returns `Err`; a failed conditional guard returns
     ///   `Ok(false)`. Neither publishes partial user mutations.
-    /// - **Runtime visibility**: foreground writes, range scans, and
-    ///   view capture are blocked while the batch applies, so they
-    ///   cannot observe an intermediate batch state. Point reads stay
-    ///   optimistic and wait-free; if they overlap the batch, each
-    ///   individual key read linearizes either before or after the
-    ///   corresponding leaf mutation.
+    /// - **Runtime visibility**: under [`crate::Durability::Wal`]
+    ///   foreground writes, range scans, and view capture are blocked
+    ///   while the batch applies, so they cannot observe an intermediate
+    ///   batch state. Under [`crate::Durability::StateMachine`] the
+    ///   external log is the sole writer, so the batch takes the mutation
+    ///   gate *shared*
+    ///   (like a single-key write): concurrent range scans are no longer
+    ///   fenced and may observe an intermediate batch state — take a
+    ///   [`Self::snapshot`] for an all-or-none read, which still fences
+    ///   via the exclusive gate. Point reads stay optimistic and
+    ///   wait-free in both modes; each individual key read linearizes
+    ///   either before or after the corresponding leaf mutation.
     /// - **Crash atomicity**: yes. The single WAL record is the
     ///   recovery commit point; replay sees the whole batch or none.
     ///
@@ -1004,7 +1010,12 @@ impl Tree {
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
-        let _tree_mutation = self.mutation_gate.enter_exclusive();
+        // StateMachine durability: an external log serializes writes, so
+        // this batch is the only writer and takes the gate shared (like a
+        // single-key write) rather than fencing out concurrent scans.
+        let _tree_mutation = self
+            .mutation_gate
+            .enter_batch(self.cfg.durability.is_state_machine());
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without

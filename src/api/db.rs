@@ -777,9 +777,14 @@ impl DB {
             .collect::<Vec<_>>();
         gates.sort_by_key(|(tree_id, _)| *tree_id);
         gates.dedup_by_key(|(tree_id, _)| *tree_id);
+        // StateMachine durability: an external log serializes writes, so
+        // the batch is the only writer and takes each family's gate shared
+        // (like a single-key write) rather than fencing out concurrent
+        // scans. Snapshot/view capture still fences via the exclusive gate.
+        let relaxed = self.cfg.durability.is_state_machine();
         let _tree_guards = gates
             .iter()
-            .map(|(_, gate)| gate.enter_exclusive())
+            .map(|(_, gate)| gate.enter_batch(relaxed))
             .collect::<Vec<_>>();
         let count = count_wal_ops(&groups);
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
