@@ -781,7 +781,7 @@ fn inner_remove_child_and_collapse(
             }
             if n.count == 1 {
                 let (surviving_byte, surviving_child) = {
-                    let b = simd::find_next_nonzero_u32(&n.children, 0).ok_or(
+                    let b = simd::find_next_nonzero_u16(&n.children, 0).ok_or(
                         Error::node_corrupt("inner_remove_child_and_collapse: empty Node256"),
                     )?;
                     (b as u8, n.children[b])

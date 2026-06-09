@@ -158,7 +158,7 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
             let mut byte = 0usize;
-            while let Some(next_byte) = simd::find_next_nonzero_u32(&n.children, byte) {
+            while let Some(next_byte) = simd::find_next_nonzero_u16(&n.children, byte) {
                 byte = next_byte + 1;
                 scan_subtree(frame, n.children[next_byte] as u16, out)?;
             }

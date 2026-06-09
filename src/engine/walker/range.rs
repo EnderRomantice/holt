@@ -1973,7 +1973,7 @@ fn next_inner_child_ge(
             let n = read_node256(frame, slot)?;
             let min = min_byte.map_or(0, usize::from);
             let start = (from as usize).max(min).min(256);
-            let Some(b) = simd::find_next_nonzero_u32(&n.children, start) else {
+            let Some(b) = simd::find_next_nonzero_u16(&n.children, start) else {
                 return Ok(None);
             };
             let s = n.children[b];
@@ -2037,7 +2037,7 @@ fn next_inner_child_from(
             let start = (from as usize).min(256);
             // SIMD-scan the 256-`u32` children array for the next
             // populated slot index.
-            let Some(b) = simd::find_next_nonzero_u32(&n.children, start) else {
+            let Some(b) = simd::find_next_nonzero_u16(&n.children, start) else {
                 return Ok(None);
             };
             let s = n.children[b];

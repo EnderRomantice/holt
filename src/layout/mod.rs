@@ -74,10 +74,10 @@ mod tests {
         assert_eq!(size_of::<Leaf>(), 16);
         assert_eq!(size_of::<Prefix>(), 128);
         assert_eq!(size_of::<BlobNode>(), 128);
-        assert_eq!(size_of::<Node4>(), 24);
-        assert_eq!(size_of::<Node16>(), 88);
-        assert_eq!(size_of::<Node48>(), 456);
-        assert_eq!(size_of::<Node256>(), 1032);
+        assert_eq!(size_of::<Node4>(), 16);
+        assert_eq!(size_of::<Node16>(), 56);
+        assert_eq!(size_of::<Node48>(), 360);
+        assert_eq!(size_of::<Node256>(), 520);
     }
 
     #[test]

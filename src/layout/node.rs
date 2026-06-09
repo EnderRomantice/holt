@@ -64,14 +64,14 @@ impl NodeType {
 /// separate key/value extent; Prefix and Blob are both 128 B so
 /// their inline path-compressed bytes fit comfortably.
 pub const SIZE_BY_TYPE: [u32; 8] = [
-    16,   // Leaf
-    128,  // Prefix
-    128,  // Blob
-    24,   // Node4
-    88,   // Node16
-    456,  // Node48
-    1032, // Node256
-    8,    // EmptyRoot
+    16,  // Leaf
+    128, // Prefix
+    128, // Blob
+    16,  // Node4   (u16 children)
+    56,  // Node16  (u16 children)
+    360, // Node48  (u16 children)
+    520, // Node256 (u16 children)
+    8,   // EmptyRoot
 ];
 
 /// Bytes a single allocation of the given NodeType consumes.
@@ -114,10 +114,10 @@ mod tests {
         assert_eq!(size_of_node(NodeType::Leaf), 16);
         assert_eq!(size_of_node(NodeType::Prefix), 128);
         assert_eq!(size_of_node(NodeType::Blob), 128);
-        assert_eq!(size_of_node(NodeType::Node4), 24);
-        assert_eq!(size_of_node(NodeType::Node16), 88);
-        assert_eq!(size_of_node(NodeType::Node48), 456);
-        assert_eq!(size_of_node(NodeType::Node256), 1032);
+        assert_eq!(size_of_node(NodeType::Node4), 16);
+        assert_eq!(size_of_node(NodeType::Node16), 56);
+        assert_eq!(size_of_node(NodeType::Node48), 360);
+        assert_eq!(size_of_node(NodeType::Node256), 520);
         assert_eq!(size_of_node(NodeType::EmptyRoot), 8);
     }
 }

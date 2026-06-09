@@ -126,7 +126,7 @@ pub(super) fn write_node4_with(frame: &mut BlobFrame<'_>, children: &[(u8, u32)]
     n.count = sorted.len() as u8;
     for (i, (b, c)) in sorted.iter().enumerate() {
         n.keys[i] = *b;
-        n.children[i] = *c;
+        n.children[i] = *c as u16;
     }
     write_struct_to_slot(frame, out.slot, &n)?;
     Ok(out.slot)
@@ -206,7 +206,7 @@ pub(super) fn inner_update_child(
             let count = (n.count as usize).min(4);
             for i in 0..count {
                 if n.keys[i] == byte {
-                    n.children[i] = new_child;
+                    n.children[i] = new_child as u16;
                     return write_struct_to_slot(frame, slot, &n);
                 }
             }
@@ -217,7 +217,7 @@ pub(super) fn inner_update_child(
         NodeType::Node16 => {
             let mut n = read_node16(frame.as_ref(), slot)?;
             if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
-                n.children[i as usize] = new_child;
+                n.children[i as usize] = new_child as u16;
                 return write_struct_to_slot(frame, slot, &n);
             }
             Err(Error::node_corrupt(
@@ -232,12 +232,12 @@ pub(super) fn inner_update_child(
                     "inner_update_child: byte not found in Node48",
                 ));
             }
-            n.children[idx as usize - 1] = new_child;
+            n.children[idx as usize - 1] = new_child as u16;
             write_struct_to_slot(frame, slot, &n)
         }
         NodeType::Node256 => {
             let mut n = read_node256(frame.as_ref(), slot)?;
-            n.children[byte as usize] = new_child;
+            n.children[byte as usize] = new_child as u16;
             write_struct_to_slot(frame, slot, &n)
         }
         _ => Err(Error::node_corrupt("inner_update_child: not an inner node")),
@@ -298,7 +298,7 @@ pub(super) fn inner_add_child(
                     "inner_add_child: byte already present on Node256",
                 ));
             }
-            n.children[byte as usize] = new_child;
+            n.children[byte as usize] = new_child as u16;
             // Node256 capacity is 256 but `count` is u8 (max 255).
             // Saturate at 255 — the bit-set in `children[]` is the
             // authoritative population check; `count` is a stat
@@ -328,7 +328,7 @@ fn node4_insert_sorted(n: &mut Node4, byte: u8, child: u32) {
         i -= 1;
     }
     n.keys[pos] = byte;
-    n.children[pos] = child;
+    n.children[pos] = child as u16;
     n.count += 1;
 }
 
@@ -349,7 +349,7 @@ fn node16_insert_sorted(n: &mut Node16, byte: u8, child: u32) {
         i -= 1;
     }
     n.keys[pos] = byte;
-    n.children[pos] = child;
+    n.children[pos] = child as u16;
     n.count += 1;
 }
 
@@ -359,7 +359,7 @@ fn node48_insert(n: &mut Node48, byte: u8, child: u32) -> Result<()> {
     }
     for i in 0..48 {
         if n.children[i] == 0 {
-            n.children[i] = child;
+            n.children[i] = child as u16;
             n.index[byte as usize] = (i + 1) as u8;
             n.count += 1;
             return Ok(());
@@ -488,7 +488,7 @@ pub(super) fn shrink_node256_to_node48(
     // point at the new packed position.
     let mut packed = 0usize;
     let mut byte = 0usize;
-    while let Some(next_byte) = simd::find_next_nonzero_u32(&old.children, byte) {
+    while let Some(next_byte) = simd::find_next_nonzero_u16(&old.children, byte) {
         byte = next_byte + 1;
         let child = old.children[next_byte];
         n.children[packed] = child;
@@ -511,7 +511,7 @@ pub(super) fn finish_inner_with_sorted<T>(
     new_count: u8,
     body: &T,
     surviving_byte: u8,
-    surviving_child: u32,
+    surviving_child: u16,
 ) -> Result<super::types::EraseSignal> {
     use super::types::EraseSignal;
     if new_count == 0 {
@@ -520,7 +520,7 @@ pub(super) fn finish_inner_with_sorted<T>(
     }
     if new_count == 1 {
         frame.free_node(slot)?;
-        let new_slot = write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
+        let new_slot = write_prefix_chain(frame, &[surviving_byte], surviving_child)?;
         return Ok(EraseSignal::Replaced(new_slot));
     }
     write_struct_to_slot(frame, slot, body)?;

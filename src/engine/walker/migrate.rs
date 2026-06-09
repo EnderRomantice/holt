@@ -443,11 +443,11 @@ fn clone_node4(
         }
         pack_inner_node(dst, &survivors)
     } else {
-        let mut new_children = [0u32; 4];
+        let mut new_children = [0u16; 4];
         for (i, slot) in new_children.iter_mut().enumerate().take(count) {
             let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
                 .expect("preserve mode never returns None");
-            *slot = u32::from(cloned);
+            *slot = cloned;
         }
         let out = dst.alloc_node(NodeType::Node4)?;
         let mut new_n = Node4::empty();
@@ -476,11 +476,11 @@ fn clone_node16(
         }
         pack_inner_node(dst, &survivors)
     } else {
-        let mut new_children = [0u32; 16];
+        let mut new_children = [0u16; 16];
         for (i, slot) in new_children.iter_mut().enumerate().take(count) {
             let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
                 .expect("preserve mode never returns None");
-            *slot = u32::from(cloned);
+            *slot = cloned;
         }
         let out = dst.alloc_node(NodeType::Node16)?;
         let mut new_n = Node16::empty();
@@ -518,12 +518,12 @@ fn clone_node48(
         }
         pack_inner_node(dst, &survivors)
     } else {
-        let mut new_children = [0u32; 48];
+        let mut new_children = [0u16; 48];
         for (i, slot) in new_children.iter_mut().enumerate() {
             if src_n.children[i] != 0 {
                 let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
                     .expect("preserve mode never returns None");
-                *slot = u32::from(cloned);
+                *slot = cloned;
             }
         }
         let out = dst.alloc_node(NodeType::Node48)?;
@@ -555,12 +555,12 @@ fn clone_node256(
         }
         pack_inner_node(dst, &survivors)
     } else {
-        let mut new_children = [0u32; 256];
+        let mut new_children = [0u16; 256];
         for (i, slot) in new_children.iter_mut().enumerate() {
             if src_n.children[i] != 0 {
                 let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
                     .expect("preserve mode never returns None");
-                *slot = u32::from(cloned);
+                *slot = cloned;
             }
         }
         let out = dst.alloc_node(NodeType::Node256)?;
@@ -614,7 +614,7 @@ fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<O
             n.count = survivors.len() as u8;
             for (i, &(b, c)) in survivors.iter().enumerate() {
                 n.keys[i] = b;
-                n.children[i] = c;
+                n.children[i] = c as u16;
             }
             write_struct_to_slot(dst, out.slot, &n)?;
             Ok(Some(out.slot))
@@ -625,7 +625,7 @@ fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<O
             n.count = survivors.len() as u8;
             for (i, &(b, c)) in survivors.iter().enumerate() {
                 n.keys[i] = b;
-                n.children[i] = c;
+                n.children[i] = c as u16;
             }
             write_struct_to_slot(dst, out.slot, &n)?;
             Ok(Some(out.slot))
@@ -635,7 +635,7 @@ fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<O
             let mut n = Node48::empty();
             n.count = survivors.len() as u8;
             for (ci, &(b, c)) in survivors.iter().enumerate() {
-                n.children[ci] = c;
+                n.children[ci] = c as u16;
                 n.index[b as usize] = (ci as u8) + 1;
             }
             write_struct_to_slot(dst, out.slot, &n)?;
@@ -649,7 +649,7 @@ fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<O
             // the count field is informational.
             n.count = survivors.len() as u8;
             for &(b, c) in survivors {
-                n.children[b as usize] = c;
+                n.children[b as usize] = c as u16;
             }
             write_struct_to_slot(dst, out.slot, &n)?;
             Ok(Some(out.slot))

@@ -550,7 +550,7 @@ mod tests {
         let space_before = frame.header().space_used;
         let out = frame.alloc_node(NodeType::Node4).unwrap();
         assert_eq!(out.slot, 2);
-        assert_eq!(frame.header().space_used, space_before + 24);
+        assert_eq!(frame.header().space_used, space_before + 16);
         assert_eq!(frame.header().num_slots, 2);
 
         // The slot entry decodes back to Node4 with the right offset.

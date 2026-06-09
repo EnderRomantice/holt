@@ -116,5 +116,5 @@ pub(super) fn read_node256_child(frame: BlobFrameRef<'_>, slot: u16, byte: u8) -
     if body.len() != size_of::<Node256>() {
         return Err(Error::node_corrupt("read_node256_child: non-Node256 slot"));
     }
-    Ok(cast::<Node256>(body).children[byte as usize])
+    Ok(u32::from(cast::<Node256>(body).children[byte as usize]))
 }
