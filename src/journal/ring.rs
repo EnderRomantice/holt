@@ -284,6 +284,34 @@ impl WalRing {
         total as u64
     }
 
+    /// Reset the byte cursors to 0 after the ring has been fully drained
+    /// (post-checkpoint truncate, when the on-disk WAL is reset to its
+    /// header). The record count is deliberately NOT reset — it is a stable
+    /// global order across truncations (mirrors today's never-reset work id).
+    ///
+    /// Caller must guarantee no concurrent `reserve`/`fill`/`publish`/`copy`
+    /// (the checkpoint truncate boundary holds `commit_gate` exclusively and
+    /// the flusher is caught up). Asserts the ring is fully published +
+    /// drained.
+    pub(crate) fn reset_after_drain(&self) {
+        let adv = self.advance.lock().unwrap();
+        debug_assert!(adv.pending.is_empty(), "unpublished intents at reset");
+        let committed = self.committed_addr.load(Ordering::Relaxed);
+        debug_assert_eq!(self.tail.load(Ordering::Relaxed), committed, "tail not published");
+        debug_assert_eq!(
+            self.flush_cursor.load(Ordering::Relaxed),
+            committed,
+            "flusher not caught up"
+        );
+        // Order: cursors to 0 while holding `advance` so no folder/flusher
+        // observes a torn (committed_addr=0, tail=old) state. Release so a
+        // subsequent reserve/copy on another thread sees the reset.
+        self.flush_cursor.store(0, Ordering::Release);
+        self.committed_addr.store(0, Ordering::Release);
+        self.tail.store(0, Ordering::Release);
+        drop(adv);
+    }
+
     // --- watermark getters (for tests + later stages) ---
     #[inline]
     pub(crate) fn committed_addr(&self) -> u64 {
@@ -563,6 +591,121 @@ mod tests {
             .map(|(s, k, v)| (*s, k.clone(), v.clone()))
             .collect();
         assert_eq!(got, expected, "replay must round-trip records in order");
+    }
+
+    /// The durability-preserving drainer: a BACKGROUND flusher thread drains
+    /// the committed prefix into the real `WalWriter` (whose 64KB auto-drain
+    /// pushes async bytes to the OS promptly — preserving process-crash
+    /// durability, unlike a drain-only-at-checkpoint shortcut) while N
+    /// producers append concurrently to a small ring with manual
+    /// backpressure (stage-5 preview). After teardown every record replays
+    /// back exactly once through the real reader.
+    #[test]
+    fn background_flusher_concurrent_producers_replay() {
+        use crate::journal::codec::encode_insert_record;
+        use crate::journal::reader::replay;
+        use crate::journal::wal_op::WalOp;
+        use crate::journal::writer::WalWriter;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::Mutex;
+        use std::thread;
+
+        const PRODUCERS: usize = 4;
+        const PER: usize = 250;
+        let tree_id = 9u64;
+        // 4 KiB ring forces many wraps + reuse for 50KB+ of records; the
+        // background flusher frees RAM and producers wait on
+        // reserve_space_ready (stage-5 backpressure, previewed in the test).
+        let ring = Arc::new(WalRing::with_capacity(4096));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bg.wal");
+        let writer = Arc::new(Mutex::new(WalWriter::open_or_create(&path, tree_id).unwrap()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let flusher = {
+            let ring = Arc::clone(&ring);
+            let writer = Arc::clone(&writer);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || loop {
+                let n = ring.copy_committed_prefix(&mut |s| {
+                    writer.lock().unwrap().append_encoded(s).unwrap();
+                });
+                if n == 0 {
+                    if stop.load(O::Acquire) && ring.flush_cursor() == ring.committed_addr() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+
+        let mut handles = Vec::new();
+        for p in 0..PRODUCERS {
+            let ring = Arc::clone(&ring);
+            handles.push(thread::spawn(move || {
+                for i in 0..PER {
+                    let seq = (p * PER + i + 1) as u64;
+                    let key = format!("p{p}/obj-{i}").into_bytes();
+                    let value = vec![(seq & 0xff) as u8; (i % 29) + 1];
+                    let mut rec = Vec::new();
+                    encode_insert_record(&mut rec, seq, tree_id, &key, &value);
+                    assert!(rec.len() as u64 <= ring.capacity());
+                    let t = ring.reserve(rec.len() as u64);
+                    while !ring.reserve_space_ready(&t) {
+                        std::hint::spin_loop();
+                    }
+                    ring.fill(&t, &rec);
+                    ring.publish(&t);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(true, O::Release);
+        flusher.join().unwrap();
+        writer.lock().unwrap().flush().unwrap();
+
+        let total = PRODUCERS * PER;
+        assert_eq!(ring.committed_records(), total as u64);
+
+        let mut seqs = std::collections::BTreeSet::new();
+        replay(&path, |op, seq, _| {
+            if let WalOp::Insert { tree_id: tid, .. } = op {
+                assert_eq!(*tid, tree_id);
+                assert!(seqs.insert(seq), "duplicate seq {seq} on replay");
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seqs.len(), total, "every record must replay exactly once");
+        assert_eq!(*seqs.iter().next().unwrap(), 1);
+        assert_eq!(*seqs.iter().next_back().unwrap(), total as u64);
+    }
+
+    /// `reset_after_drain` (the truncate path) zeroes the byte cursors but
+    /// keeps the record count, and appends resume from byte 0.
+    #[test]
+    fn reset_after_drain_keeps_record_count() {
+        let ring = WalRing::with_capacity(256);
+        for i in 0..3u8 {
+            ring.append(&vec![i + 1; 20]);
+        }
+        let mut sink = Vec::new();
+        ring.copy_committed_prefix(&mut |s| sink.extend_from_slice(s));
+        assert_eq!(ring.committed_records(), 3);
+        assert_eq!((ring.tail(), ring.committed_addr(), ring.flush_cursor()), (60, 60, 60));
+
+        ring.reset_after_drain();
+        assert_eq!((ring.tail(), ring.committed_addr(), ring.flush_cursor()), (0, 0, 0));
+        assert_eq!(ring.committed_records(), 3, "record count survives truncate reset");
+
+        let t = ring.append(&vec![9u8; 10]);
+        assert_eq!(t.start, 0, "appends resume from byte 0 after reset");
+        assert_eq!(ring.committed_records(), 4);
+        let mut sink2 = Vec::new();
+        ring.copy_committed_prefix(&mut |s| sink2.extend_from_slice(s));
+        assert_eq!(sink2, vec![9u8; 10]);
     }
 }
 
