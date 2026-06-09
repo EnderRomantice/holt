@@ -125,6 +125,18 @@ pub struct TreeStats {
     /// `inner_store.read_blob` because the entry was absent or
     /// evicted. Tracks cold-start + eviction churn.
     pub bm_cache_misses: u64,
+    /// Successful full-frame reads from the blob store after a BM
+    /// miss. A read here means Holt pulled one complete blob frame
+    /// from the backing store.
+    pub bm_full_blob_reads: u64,
+    /// Bytes read by successful full-frame blob-store reads.
+    pub bm_full_blob_read_bytes: u64,
+    /// Full-frame reads caused by point get/put paths.
+    pub bm_point_full_blob_reads: u64,
+    /// Full-frame reads caused by range/list scan paths.
+    pub bm_scan_full_blob_reads: u64,
+    /// Full-frame reads caused by silent stats/maintenance paths.
+    pub bm_silent_full_blob_reads: u64,
     /// Cumulative wait-free read restarts in `Tree::get` — each
     /// one means a concurrent writer lapped an optimistic
     /// snapshot and the lookup walked the tree from scratch.
@@ -261,6 +273,16 @@ pub struct DBStats {
     pub bm_cache_hits: u64,
     /// Shared BufferManager cache misses.
     pub bm_cache_misses: u64,
+    /// Shared successful full-frame reads from the blob store.
+    pub bm_full_blob_reads: u64,
+    /// Shared bytes read by successful full-frame blob-store reads.
+    pub bm_full_blob_read_bytes: u64,
+    /// Shared full-frame reads caused by point get/put paths.
+    pub bm_point_full_blob_reads: u64,
+    /// Shared full-frame reads caused by range/list scan paths.
+    pub bm_scan_full_blob_reads: u64,
+    /// Shared full-frame reads caused by silent stats/maintenance paths.
+    pub bm_silent_full_blob_reads: u64,
     /// Shared optimistic point-read restarts.
     pub bm_optimistic_restarts: u64,
     /// Shared range cursor restarts.

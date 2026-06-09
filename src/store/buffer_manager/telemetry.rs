@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) struct Telemetry {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    full_blob_reads: AtomicU64,
+    point_full_blob_reads: AtomicU64,
+    scan_full_blob_reads: AtomicU64,
+    silent_full_blob_reads: AtomicU64,
     optimistic_restarts: AtomicU64,
     range_restarts: AtomicU64,
     walker_ops: AtomicU64,
@@ -26,6 +30,21 @@ impl Telemetry {
 
     pub(super) fn note_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_point_full_blob_read(&self) {
+        self.full_blob_reads.fetch_add(1, Ordering::Relaxed);
+        self.point_full_blob_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_scan_full_blob_read(&self) {
+        self.full_blob_reads.fetch_add(1, Ordering::Relaxed);
+        self.scan_full_blob_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_silent_full_blob_read(&self) {
+        self.full_blob_reads.fetch_add(1, Ordering::Relaxed);
+        self.silent_full_blob_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn note_optimistic_restart(&self) {
@@ -82,6 +101,22 @@ impl Telemetry {
 
     pub(super) fn cache_misses(&self) -> u64 {
         self.cache_misses.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn full_blob_reads(&self) -> u64 {
+        self.full_blob_reads.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn point_full_blob_reads(&self) -> u64 {
+        self.point_full_blob_reads.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn scan_full_blob_reads(&self) -> u64 {
+        self.scan_full_blob_reads.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn silent_full_blob_reads(&self) -> u64 {
+        self.silent_full_blob_reads.load(Ordering::Relaxed)
     }
 
     pub(super) fn optimistic_restarts(&self) -> u64 {

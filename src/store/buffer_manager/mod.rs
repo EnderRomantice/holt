@@ -140,7 +140,7 @@ use dashmap::DashMap;
 use guid_hash::GuidBuildHasher;
 
 use crate::api::errors::{Error, Result};
-use crate::layout::BlobGuid;
+use crate::layout::{BlobGuid, PAGE_SIZE};
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
 
@@ -661,6 +661,37 @@ impl BufferManager {
         self.telemetry.cache_misses()
     }
 
+    /// Successful full-frame reads from the inner store after a
+    /// BufferManager miss. Each read pulls one `PAGE_SIZE` blob.
+    #[must_use]
+    pub fn full_blob_reads(&self) -> u64 {
+        self.telemetry.full_blob_reads()
+    }
+
+    /// Bytes read by successful full-frame inner-store reads.
+    #[must_use]
+    pub fn full_blob_read_bytes(&self) -> u64 {
+        self.full_blob_reads() * PAGE_SIZE as u64
+    }
+
+    /// Full-frame reads caused by point get/put paths.
+    #[must_use]
+    pub fn point_full_blob_reads(&self) -> u64 {
+        self.telemetry.point_full_blob_reads()
+    }
+
+    /// Full-frame reads caused by range/list scan paths.
+    #[must_use]
+    pub fn scan_full_blob_reads(&self) -> u64 {
+        self.telemetry.scan_full_blob_reads()
+    }
+
+    /// Full-frame reads caused by silent introspection paths.
+    #[must_use]
+    pub fn silent_full_blob_reads(&self) -> u64 {
+        self.telemetry.silent_full_blob_reads()
+    }
+
     /// Cumulative optimistic-read restarts. Bumped by the lookup
     /// walker every time a `validate()` after a wait-free read
     /// returns `false` — a concurrent writer lapped the snapshot
@@ -1082,10 +1113,19 @@ impl BufferManager {
         // `scratch` is inserted into the cache or read.
         let mut scratch = self.alloc_blob_buf_uninit();
         self.store.read_blob(guid, &mut scratch)?;
+        self.note_full_blob_read(access);
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
         Ok(self.insert_owned_into_cache(guid, scratch, access))
+    }
+
+    fn note_full_blob_read(&self, access: PinAccess) {
+        match access {
+            PinAccess::Point => self.telemetry.note_point_full_blob_read(),
+            PinAccess::Scan => self.telemetry.note_scan_full_blob_read(),
+            PinAccess::Silent => self.telemetry.note_silent_full_blob_read(),
+        }
     }
 
     // ---------- dirty tracking ----------
@@ -1847,6 +1887,49 @@ mod tests {
         let second = bm.pin(guid).unwrap();
         assert_eq!(second.read().as_slice()[100], 9);
         assert_eq!(bm.cache_misses(), 1);
+        assert_eq!(bm.cache_hits(), 1);
+        assert_eq!(bm.full_blob_reads(), 1);
+        assert_eq!(bm.full_blob_read_bytes(), PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn full_blob_reads_are_classified_by_access_path() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..3u8 {
+            let mut guid = [0u8; 16];
+            guid[0] = i;
+            inner.write_blob(guid, &make_buf(i)).unwrap();
+        }
+
+        let bm = BufferManager::new(inner, 4);
+        drop(bm.pin([0; 16]).unwrap());
+
+        let mut scan = [0u8; 16];
+        scan[0] = 1;
+        drop(bm.pin_scan(scan).unwrap());
+
+        let mut silent = [0u8; 16];
+        silent[0] = 2;
+        drop(bm.pin_silent(silent).unwrap());
+
+        assert_eq!(bm.full_blob_reads(), 3);
+        assert_eq!(bm.full_blob_read_bytes(), 3 * PAGE_SIZE as u64);
+        assert_eq!(bm.point_full_blob_reads(), 1);
+        assert_eq!(bm.scan_full_blob_reads(), 1);
+        assert_eq!(bm.silent_full_blob_reads(), 1);
+        assert_eq!(
+            bm.cache_misses(),
+            2,
+            "silent miss does not count as a public cache miss"
+        );
+        assert_eq!(bm.cache_hits(), 0);
+
+        drop(bm.pin([0; 16]).unwrap());
+        assert_eq!(
+            bm.full_blob_reads(),
+            3,
+            "cache hits must not count as store reads"
+        );
         assert_eq!(bm.cache_hits(), 1);
     }
 

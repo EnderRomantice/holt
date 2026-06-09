@@ -670,7 +670,9 @@ fn print_stats(label: &str, tree: &Tree, progress: u64) -> Result<()> {
     println!(
         "{{\"event\":\"stats\",\"label\":\"{label}\",\"progress\":{progress},\
          \"blobs\":{},\"dirty\":{},\"pending_delete\":{},\"bm_hits\":{},\
-         \"bm_misses\":{},\"route_hits\":{},\"route_misses\":{},\
+         \"bm_misses\":{},\"bm_reads\":{},\"bm_read_bytes\":{},\
+         \"bm_point_reads\":{},\"bm_scan_reads\":{},\"bm_silent_reads\":{},\
+         \"route_hits\":{},\"route_misses\":{},\
          \"wal_pending_work\":{pending_work},\"wal_checkpoint_debt\":{journal_debt},\
          \"checkpoint_failed\":{ck_failed},\"replay_records\":{},\
          \"replay_micros\":{}}}",
@@ -679,6 +681,11 @@ fn print_stats(label: &str, tree: &Tree, progress: u64) -> Result<()> {
         s.bm_pending_delete_count,
         s.bm_cache_hits,
         s.bm_cache_misses,
+        s.bm_full_blob_reads,
+        s.bm_full_blob_read_bytes,
+        s.bm_point_full_blob_reads,
+        s.bm_scan_full_blob_reads,
+        s.bm_silent_full_blob_reads,
         s.route_cache.hits,
         s.route_cache.misses,
         s.open.wal_replay_records,
@@ -695,7 +702,9 @@ fn print_db_stats(label: &str, db: &DB, progress: u64) {
     println!(
         "{{\"event\":\"stats\",\"label\":\"{label}\",\"progress\":{progress},\
          \"open_trees\":{},\"dirty\":{},\"pending_delete\":{},\"bm_hits\":{},\
-         \"bm_misses\":{},\"walker_ops\":{},\"max_blob_hops\":{},\
+         \"bm_misses\":{},\"bm_reads\":{},\"bm_read_bytes\":{},\
+         \"bm_point_reads\":{},\"bm_scan_reads\":{},\"bm_silent_reads\":{},\
+         \"walker_ops\":{},\"max_blob_hops\":{},\
          \"wal_pending_work\":{pending_work},\"wal_checkpoint_debt\":{journal_debt},\
          \"checkpoint_failed\":{ck_failed},\"replay_records\":{},\
          \"replay_micros\":{}}}",
@@ -704,6 +713,11 @@ fn print_db_stats(label: &str, db: &DB, progress: u64) {
         s.bm_pending_delete_count,
         s.bm_cache_hits,
         s.bm_cache_misses,
+        s.bm_full_blob_reads,
+        s.bm_full_blob_read_bytes,
+        s.bm_point_full_blob_reads,
+        s.bm_scan_full_blob_reads,
+        s.bm_silent_full_blob_reads,
         s.bm_walker_ops,
         s.bm_max_blob_hops,
         s.open.wal_replay_records,

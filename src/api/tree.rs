@@ -116,6 +116,62 @@ struct BlobStatsAggregate {
     overfull_child_blobs: u32,
 }
 
+struct BufferStatsSnapshot {
+    dirty_count: usize,
+    pending_delete_count: usize,
+    cache_hits: u64,
+    cache_misses: u64,
+    full_blob_reads: u64,
+    full_blob_read_bytes: u64,
+    point_full_blob_reads: u64,
+    scan_full_blob_reads: u64,
+    silent_full_blob_reads: u64,
+    optimistic_restarts: u64,
+    range_restarts: u64,
+    walker_ops: u64,
+    walker_blob_hops: u64,
+    max_blob_hops: u64,
+    max_cross_blob_depth: u64,
+    spillovers: u64,
+    merges: u64,
+    route_resident_count: usize,
+    route_resident_demotions: u64,
+    cache_evictions: u64,
+    eviction_skips_protected: u64,
+    eviction_skips_route_resident: u64,
+    admission_protects: u64,
+}
+
+impl BufferStatsSnapshot {
+    fn collect(store: &BufferManager) -> Self {
+        Self {
+            dirty_count: store.dirty_count(),
+            pending_delete_count: store.pending_delete_count(),
+            cache_hits: store.cache_hits(),
+            cache_misses: store.cache_misses(),
+            full_blob_reads: store.full_blob_reads(),
+            full_blob_read_bytes: store.full_blob_read_bytes(),
+            point_full_blob_reads: store.point_full_blob_reads(),
+            scan_full_blob_reads: store.scan_full_blob_reads(),
+            silent_full_blob_reads: store.silent_full_blob_reads(),
+            optimistic_restarts: store.optimistic_restarts(),
+            range_restarts: store.range_restarts(),
+            walker_ops: store.walker_ops(),
+            walker_blob_hops: store.walker_blob_hops(),
+            max_blob_hops: store.max_blob_hops(),
+            max_cross_blob_depth: store.max_cross_blob_depth(),
+            spillovers: store.spillover_count(),
+            merges: store.merge_count(),
+            route_resident_count: store.route_resident_count(),
+            route_resident_demotions: store.route_resident_demotions(),
+            cache_evictions: store.cache_evictions(),
+            eviction_skips_protected: store.eviction_skips_protected(),
+            eviction_skips_route_resident: store.eviction_skips_route_resident(),
+            admission_protects: store.admission_protects(),
+        }
+    }
+}
+
 fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
     if blob_data_capacity == 0 {
         return 0;
@@ -2106,24 +2162,7 @@ impl Tree {
     pub fn stats(&self) -> Result<TreeStats> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let aggregate = self.collect_blob_stats_silent()?;
-        let bm_dirty_count = self.store.dirty_count();
-        let bm_pending_delete_count = self.store.pending_delete_count();
-        let bm_cache_hits = self.store.cache_hits();
-        let bm_cache_misses = self.store.cache_misses();
-        let bm_optimistic_restarts = self.store.optimistic_restarts();
-        let bm_range_restarts = self.store.range_restarts();
-        let bm_walker_ops = self.store.walker_ops();
-        let bm_walker_blob_hops = self.store.walker_blob_hops();
-        let bm_max_blob_hops = self.store.max_blob_hops();
-        let bm_max_cross_blob_depth = self.store.max_cross_blob_depth();
-        let bm_spillovers = self.store.spillover_count();
-        let bm_merges = self.store.merge_count();
-        let bm_route_resident_count = self.store.route_resident_count();
-        let bm_route_resident_demotions = self.store.route_resident_demotions();
-        let bm_cache_evictions = self.store.cache_evictions();
-        let bm_eviction_skips_protected = self.store.eviction_skips_protected();
-        let bm_eviction_skips_route_resident = self.store.eviction_skips_route_resident();
-        let bm_admission_protects = self.store.admission_protects();
+        let bm = BufferStatsSnapshot::collect(&self.store);
         let route = self.route_cache.stats();
         let route_cache = RouteCacheStats {
             entries: route.entries,
@@ -2174,24 +2213,29 @@ impl Tree {
             underfilled_child_blobs: aggregate.underfilled_child_blobs,
             overfull_child_blobs: aggregate.overfull_child_blobs,
             blobs: aggregate.blobs,
-            bm_dirty_count,
-            bm_pending_delete_count,
-            bm_cache_hits,
-            bm_cache_misses,
-            bm_optimistic_restarts,
-            bm_range_restarts,
-            bm_walker_ops,
-            bm_walker_blob_hops,
-            bm_max_blob_hops,
-            bm_max_cross_blob_depth,
-            bm_spillovers,
-            bm_merges,
-            bm_route_resident_count,
-            bm_route_resident_demotions,
-            bm_cache_evictions,
-            bm_eviction_skips_protected,
-            bm_eviction_skips_route_resident,
-            bm_admission_protects,
+            bm_dirty_count: bm.dirty_count,
+            bm_pending_delete_count: bm.pending_delete_count,
+            bm_cache_hits: bm.cache_hits,
+            bm_cache_misses: bm.cache_misses,
+            bm_full_blob_reads: bm.full_blob_reads,
+            bm_full_blob_read_bytes: bm.full_blob_read_bytes,
+            bm_point_full_blob_reads: bm.point_full_blob_reads,
+            bm_scan_full_blob_reads: bm.scan_full_blob_reads,
+            bm_silent_full_blob_reads: bm.silent_full_blob_reads,
+            bm_optimistic_restarts: bm.optimistic_restarts,
+            bm_range_restarts: bm.range_restarts,
+            bm_walker_ops: bm.walker_ops,
+            bm_walker_blob_hops: bm.walker_blob_hops,
+            bm_max_blob_hops: bm.max_blob_hops,
+            bm_max_cross_blob_depth: bm.max_cross_blob_depth,
+            bm_spillovers: bm.spillovers,
+            bm_merges: bm.merges,
+            bm_route_resident_count: bm.route_resident_count,
+            bm_route_resident_demotions: bm.route_resident_demotions,
+            bm_cache_evictions: bm.cache_evictions,
+            bm_eviction_skips_protected: bm.eviction_skips_protected,
+            bm_eviction_skips_route_resident: bm.eviction_skips_route_resident,
+            bm_admission_protects: bm.admission_protects,
             route_cache,
             open: self.open_stats,
             journal,

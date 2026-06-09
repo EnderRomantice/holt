@@ -49,6 +49,11 @@
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
+//! | `holt_bm_full_blob_reads_total`         | counter | `TreeStats::bm_full_blob_reads`        |
+//! | `holt_bm_full_blob_read_bytes_total`    | counter | `TreeStats::bm_full_blob_read_bytes`   |
+//! | `holt_bm_point_full_blob_reads_total`   | counter | `TreeStats::bm_point_full_blob_reads`  |
+//! | `holt_bm_scan_full_blob_reads_total`    | counter | `TreeStats::bm_scan_full_blob_reads`   |
+//! | `holt_bm_silent_full_blob_reads_total`  | counter | `TreeStats::bm_silent_full_blob_reads` |
 //! | `holt_bm_optimistic_restarts_total`     | counter | `TreeStats::bm_optimistic_restarts`    |
 //! | `holt_bm_range_restarts_total`          | counter | `TreeStats::bm_range_restarts`         |
 //! | `holt_bm_walker_ops_total`              | counter | `TreeStats::bm_walker_ops`             |
@@ -250,6 +255,41 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Cumulative buffer-manager cache misses (fell through to store).",
         "counter",
         stats.bm_cache_misses,
+    );
+    metric(
+        &mut out,
+        "holt_bm_full_blob_reads_total",
+        "Successful full-frame blob reads after buffer-manager misses.",
+        "counter",
+        stats.bm_full_blob_reads,
+    );
+    metric(
+        &mut out,
+        "holt_bm_full_blob_read_bytes_total",
+        "Bytes read by successful full-frame blob reads.",
+        "counter",
+        stats.bm_full_blob_read_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_bm_point_full_blob_reads_total",
+        "Full-frame blob reads caused by point get/put paths.",
+        "counter",
+        stats.bm_point_full_blob_reads,
+    );
+    metric(
+        &mut out,
+        "holt_bm_scan_full_blob_reads_total",
+        "Full-frame blob reads caused by range/list scan paths.",
+        "counter",
+        stats.bm_scan_full_blob_reads,
+    );
+    metric(
+        &mut out,
+        "holt_bm_silent_full_blob_reads_total",
+        "Full-frame blob reads caused by silent stats/maintenance paths.",
+        "counter",
+        stats.bm_silent_full_blob_reads,
     );
     metric(
         &mut out,
@@ -614,6 +654,11 @@ mod tests {
             bm_pending_delete_count: 1,
             bm_cache_hits: 1_000,
             bm_cache_misses: 25,
+            bm_full_blob_reads: 20,
+            bm_full_blob_read_bytes: 10_485_760,
+            bm_point_full_blob_reads: 12,
+            bm_scan_full_blob_reads: 7,
+            bm_silent_full_blob_reads: 1,
             bm_optimistic_restarts: 3,
             bm_range_restarts: 2,
             bm_walker_ops: 4,
@@ -676,6 +721,11 @@ mod tests {
         assert!(out.contains("holt_blob_count 3\n"));
         // Monotonic counters keep the `_total` suffix...
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
+        assert!(out.contains("holt_bm_full_blob_reads_total 20\n"));
+        assert!(out.contains("holt_bm_full_blob_read_bytes_total 10485760\n"));
+        assert!(out.contains("holt_bm_point_full_blob_reads_total 12\n"));
+        assert!(out.contains("holt_bm_scan_full_blob_reads_total 7\n"));
+        assert!(out.contains("holt_bm_silent_full_blob_reads_total 1\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
         assert!(out.contains("holt_bm_range_restarts_total 2\n"));
         assert!(out.contains("holt_bm_walker_ops_total 4\n"));

@@ -114,9 +114,12 @@ default, then runs high-pressure operation loops:
 
 The stress harness prints `ns/op`, `Mops/s`, and Holt shape
 telemetry (`blobs`, cross-blob `edges`, `max_depth`, `avg_depth`,
-blob fill ratios, walker hop counters). Those shape metrics are
-the main signal for diagnosing whether 20M writes remain stable
-or start paying extra blob-hop / spillover cost.
+blob fill ratios, walker hop counters). It also reports
+BufferManager cold-I/O counters: `bm_reads`, `bm_read_bytes`, and
+the `bm_point_reads` / `bm_scan_reads` / `bm_silent_reads`
+breakdown. Shape metrics diagnose whether 20M writes remain
+stable; cold-I/O counters diagnose how much full-frame blob I/O is
+caused by cold point reads, scans, or stats/maintenance walks.
 
 Holt runs one preload checkpoint barrier before timing. That keeps
 bulk-load checkpoint catch-up out of the hot-service numbers while
@@ -164,6 +167,17 @@ HOLT_STRESS_BUFFER_POOL=16 \
 HOLT_STRESS_OPS=get \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 ```
+
+When running cold-cache or constrained-buffer studies, use the
+`holt_shape` line as the primary Holt-specific diagnostic:
+`bm_point_reads * 512 KiB / get_ops` shows the average backing-store
+bytes pulled by user point lookups, while `bm_scan_reads` and
+`bm_silent_reads` separate scan-driven churn and post-timing stats
+collection.
+With `HOLT_STRESS_REOPEN_AFTER_PRELOAD=1`, the harness does not
+call `Tree::stats()` between reopen and timing; stats collection
+pins blobs and would otherwise prewarm the very cold cache being
+measured.
 
 Profile: single-threaded, warm-service, file-backed persistent
 engines with WAL enabled. Holt uses `TreeConfig::new(tempdir)` with
