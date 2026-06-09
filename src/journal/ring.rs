@@ -473,6 +473,97 @@ mod tests {
         }
         assert!(seen.iter().all(|&b| b), "no record may be lost");
     }
+
+    /// End-to-end integration with the REAL WAL stack: draining the ring's
+    /// committed prefix into the real `WalWriter` produces a byte-for-byte
+    /// identical file to the direct (legacy) append path, and that file
+    /// replays back to the original inserts in order through the real
+    /// reader. This is the stage-2 golden-file / byte-identical-replay gate;
+    /// it proves `copy_committed_prefix` composes with `append_encoded`'s
+    /// opaque-byte append (incl. records split across the physical wrap) and
+    /// the on-disk codec + torn-tail reader — unchanged.
+    #[test]
+    fn ring_to_walwriter_byte_identical_and_replays() {
+        use crate::journal::codec::encode_insert_record;
+        use crate::journal::reader::replay;
+        use crate::journal::wal_op::WalOp;
+        use crate::journal::writer::WalWriter;
+
+        let tree_id = 7u64;
+        // Varied key/value sizes so records straddle the physical wrap.
+        let inputs: Vec<(u64, Vec<u8>, Vec<u8>)> = (0..64u64)
+            .map(|i| {
+                let key = format!("bucket/{:02}/object-{i}", i % 4).into_bytes();
+                let value = vec![(i & 0xff) as u8; (i as usize % 37) + 1];
+                (i + 1, key, value) // seq is 1-indexed
+            })
+            .collect();
+        let records: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|(seq, k, v)| {
+                let mut buf = Vec::new();
+                encode_insert_record(&mut buf, *seq, tree_id, k, v);
+                buf
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Path A — direct append (what the legacy worker does per record).
+        let path_a = dir.path().join("a.wal");
+        {
+            let mut w = WalWriter::open_or_create(&path_a, tree_id).unwrap();
+            for r in &records {
+                w.append_encoded(r).unwrap();
+            }
+            w.flush().unwrap();
+        }
+
+        // Path B — through the ring, drained incrementally into a real
+        // WalWriter. Tiny capacity forces physical wrap; the per-record
+        // drain frees ring space so stage-1's no-backpressure ring never
+        // overruns.
+        let path_b = dir.path().join("b.wal");
+        {
+            let ring = WalRing::with_capacity(256);
+            let mut w = WalWriter::open_or_create(&path_b, tree_id).unwrap();
+            for r in &records {
+                assert!(r.len() as u64 <= ring.capacity());
+                ring.append(r);
+                ring.copy_committed_prefix(&mut |s| w.append_encoded(s).unwrap());
+            }
+            w.flush().unwrap();
+        }
+
+        // 1. Byte-for-byte identical WAL file.
+        assert_eq!(
+            std::fs::read(&path_a).unwrap(),
+            std::fs::read(&path_b).unwrap(),
+            "ring-produced WAL must be byte-identical to the direct path"
+        );
+
+        // 2. Replays through the real reader to the original inserts, in order.
+        let mut got: Vec<(u64, Vec<u8>, Vec<u8>)> = Vec::new();
+        replay(&path_b, |op, seq, _| {
+            if let WalOp::Insert {
+                key,
+                value,
+                tree_id: tid,
+                ..
+            } = op
+            {
+                assert_eq!(*tid, tree_id);
+                got.push((seq, key.clone(), value.clone()));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let expected: Vec<(u64, Vec<u8>, Vec<u8>)> = inputs
+            .iter()
+            .map(|(s, k, v)| (*s, k.clone(), v.clone()))
+            .collect();
+        assert_eq!(got, expected, "replay must round-trip records in order");
+    }
 }
 
 // ===========================================================================
