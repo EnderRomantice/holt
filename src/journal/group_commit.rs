@@ -1,9 +1,14 @@
-//! WAL append coordinator.
+//! WAL append coordinator (legacy channel+worker backend).
 //!
 //! `WalWriter` owns the file format and append/truncate mechanics.
 //! This module owns concurrency around the WAL file. All append
 //! records go through the worker, so foreground writers do not
 //! perform per-operation WAL file writes.
+//!
+//! Under the `wal_ring` feature this backend's `Journal` is unused (the
+//! ring-backed `group_commit_ring::Journal` is selected instead);
+//! `JournalStats` is still shared from here, so suppress dead-code there.
+#![cfg_attr(feature = "wal_ring", allow(dead_code))]
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use std::collections::VecDeque;

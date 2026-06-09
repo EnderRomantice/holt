@@ -243,12 +243,15 @@ impl WalRing {
         }
         if addr != start_addr {
             adv.committed_count += folded;
-            // Publish count first, then addr (Release): a flusher that
-            // Acquire-loads committed_addr and then reads committed_records
-            // sees a record count >= the prefix it is about to copy.
+            // Store addr BEFORE records (both Release): this guarantees
+            // "committed_records visible ⟹ committed_addr visible". A flusher
+            // that reads committed_records == RC (Acquire) and then loads
+            // committed_addr is guaranteed CA >= end(RC), so copying to CA
+            // drains >= RC records and `flushed = base + RC` is a safe lower
+            // bound on durable records.
+            self.committed_addr.store(addr, Ordering::Release);
             self.committed_records
                 .store(adv.committed_count, Ordering::Release);
-            self.committed_addr.store(addr, Ordering::Release);
         }
         // `adv` unlock = Release: this writer's memcpy (done before the lock)
         // happens-before any later folder's Acquire of `advance`, hence
@@ -689,7 +692,7 @@ mod tests {
     fn reset_after_drain_keeps_record_count() {
         let ring = WalRing::with_capacity(256);
         for i in 0..3u8 {
-            ring.append(&vec![i + 1; 20]);
+            ring.append(&[i + 1; 20]);
         }
         let mut sink = Vec::new();
         ring.copy_committed_prefix(&mut |s| sink.extend_from_slice(s));
@@ -700,7 +703,7 @@ mod tests {
         assert_eq!((ring.tail(), ring.committed_addr(), ring.flush_cursor()), (0, 0, 0));
         assert_eq!(ring.committed_records(), 3, "record count survives truncate reset");
 
-        let t = ring.append(&vec![9u8; 10]);
+        let t = ring.append(&[9u8; 10]);
         assert_eq!(t.start, 0, "appends resume from byte 0 after reset");
         assert_eq!(ring.committed_records(), 4);
         let mut sink2 = Vec::new();

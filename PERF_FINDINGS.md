@@ -185,36 +185,60 @@ writes, it's structural" verdict**: holt's *structure* scales (5.78 Mops/s
 @ 16t ≈ 9× RocksDB's durable 0.62). Only the WAL plumbing doesn't — and
 that is fixable without touching read/scan/cold locality.
 
-**Recommended fix — lock-free shared WAL ring (single ordered log).**
-Replace the per-record `Vec` + channel + single-encoder-worker with a
-shared ring buffer: each writer reserves a byte range via one atomic
-`fetch_add` on the tail, memcpies its encoded record into the reservation
-**in parallel**, and publishes; a single flusher writes committed
-contiguous prefixes (and fsyncs on the sync path). This keeps ONE ordered
-log — so the global `next_seq`/trim-watermark/single-pass-replay invariants
-are preserved (unlike the rejected multi-lane `wal-commit-sharding`, which
-breaks the I2 trim watermark and silently corrupts cross-lane Rename/Batch)
-— while moving the encode off the worker and letting 16 threads append
-concurrently. Plausible payoff: durable concurrent write from 0.29 toward
-the memory-mode 5.78 ceiling, i.e. **beating** RocksDB on concurrent write,
-not merely matching it. Concurrency-/durability-critical: own focused
-session with concurrent_stress + checkpoint_failpoint + SIGKILL crash-soak.
+**Fix — lock-free shared WAL ring (single ordered log): IMPLEMENTED &
+MEASURED, beats RocksDB.** Replaced the per-record `Vec` + channel +
+single-encoder-worker with a shared in-RAM ring: each writer reserves a byte
+range via one atomic `fetch_add` on the tail (gap-free byte tiling = the
+order key), memcpies its encoded record **in parallel**, and publishes by
+folding the contiguous published byte interval into `committed_addr` under a
+brief lock; a single background flusher drains the committed prefix into the
+**unchanged** `WalWriter` (so on-disk format + replay reader are byte-for-byte
+identical) and fsyncs on the sync path. ONE ordered log → trim-watermark /
+single-pass-replay invariants preserved (unlike the rejected multi-lane
+`wal-commit-sharding`). Behind the `wal_ring` feature (default off → legacy
+backend) for A/B + safe rollback. See `src/journal/ring.rs` +
+`src/journal/group_commit_ring.rs`, design in `docs/design/wal-ring.md`.
 
-Until that lands, the honest write story: single-thread durable write is at
-parity with RocksDB; concurrent durable write loses **purely on WAL
-plumbing**, not on the data structure. Reads (2.2–2.44×), scans (~parity),
-and cold-miss remain holt's durable edge.
+Measured A/B (x86, `objstore put`, 50k ops/thread, same machine; RocksDB the
+fixed comparator):
+
+   | threads | legacy Mops/s | **ring Mops/s** | RocksDB | ring vs RocksDB |
+   |--------:|--------------:|----------------:|--------:|----------------:|
+   | 1  | 0.105 | 0.112 | 0.271 | 0.41× (p50 1.5µs) |
+   | 4  | 0.453 | **2.605** | 0.495 | **5.3×** |
+   | 8  | 0.316 | **2.049** | 0.701 | **2.9×** |
+   | 16 | 0.287 | **1.660** | 0.640 | **2.6×** |
+
+Negative→positive scaling; **5.8–6.5× over legacy, 2.6–5.3× over RocksDB** at
+4/8/16 threads; p99 51µs @16t (legacy 286µs). It does not reach the 5.78
+memory-mode ceiling — one ordered file still funnels through a single flusher
++ the shared `tail.fetch_add` cacheline + the in-publish `advance` lock (the
+4→16t taper). **holt now beats RocksDB on concurrent durable write** while
+keeping its read/scan/cold edge.
+
+Validated (both arches, ring LIVE in the engine under the feature): 6 ring
+`Journal` contract tests, lib 286, **proptest BTreeMap/WAL-replay oracle 5**,
+**checkpoint_failpoint crash-injection 8**, concurrent_stress 3 (+10× release
+loop 0 flaky), loom gap-safety model, clippy clean. loom also **caught a real
+design bug** (separate work-id counter could disagree with byte order →
+unpublished-gap copy) → keyed on the byte tiling instead.
+
+Remaining hardening (not blocking the win, but before flipping the default):
+a dedicated multi-process **SIGKILL crash-soak** of the ring path (the async
+RAM→page-cache window + flusher-mid-drain), a loom model of the `Journal`-level
+`advance`-lock contention at 16+ writers, and built-in backpressure (today the
+ring is sized so it never trips; the bench previews manual backpressure). The
+1-thread mean carries a one-off ~66ms warmup/checkpoint outlier (p50 1.5µs) to
+investigate.
 
 ## Suggested next work (each its own focused session)
 
-- **Lock-free shared WAL ring** — THE concurrent-write fix, isolated by
-  measurement (see "Write-concurrency bottleneck" above). The ceiling is
-  the WAL group-commit plumbing (per-record `Vec`+channel+single worker),
-  not the tree: memory-mode hits 5.78 Mops/s @ 16t vs WAL-mode 0.29.
-  Replace it with an atomic-tail-reserved shared ring (parallel memcpy,
-  single flusher, ONE ordered log → trim/replay invariants preserved).
-  Plausibly *beats* RocksDB on concurrent durable write. Own focused
-  session: crash-soak + checkpoint_failpoint critical.
+- ~~**Lock-free shared WAL ring**~~ — **DONE & MEASURED** (see
+  "Write-concurrency bottleneck" above): the ring backend beats RocksDB
+  2.6–5.3× on concurrent durable write (5.8–6.5× over legacy), dual-arch
+  validated with proptest oracle + checkpoint_failpoint. Behind `wal_ring`
+  (default off). Remaining hardening: multi-process SIGKILL crash-soak +
+  `advance`-lock loom + built-in backpressure before flipping the default.
 - ~~**Optimistic write descent**~~ / ~~**prefix-sharded-forest**~~ — both
   **RULED OUT by measurement**: the root latch (shared or exclusive) is
   not the bottleneck (no-merge multi-root A/B: 16 roots ≈ 1 root at 16t),

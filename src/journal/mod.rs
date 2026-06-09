@@ -27,12 +27,21 @@ pub mod reader;
 pub mod wal_op;
 pub mod writer;
 
-// Stage 1 of the lock-free shared WAL ring (docs/design/wal-ring.md).
-// Self-contained: the ring buffer + its reserve/publish/advance/flush
-// protocol and tests, NOT yet wired into `group_commit`. Behind a feature
-// so the default build and the production path are untouched.
+// Lock-free shared WAL ring (docs/design/wal-ring.md): the ring buffer
+// (`ring`) + the ring-backed coordinator (`group_commit_ring`). Behind the
+// `wal_ring` feature; the default build uses the legacy channel+worker.
 #[cfg(feature = "wal_ring")]
 pub(crate) mod ring;
+#[cfg(feature = "wal_ring")]
+pub(crate) mod group_commit_ring;
+
+/// The active WAL coordinator: ring-backed under `wal_ring`, else the legacy
+/// channel+worker. Both expose the same `pub(crate)` API and share the
+/// internal `JournalStats` type from `group_commit`.
+#[cfg(not(feature = "wal_ring"))]
+pub(crate) use group_commit::Journal;
+#[cfg(feature = "wal_ring")]
+pub(crate) use group_commit_ring::Journal;
 
 #[cfg(test)]
 mod tests;

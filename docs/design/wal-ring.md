@@ -1,6 +1,14 @@
 # Design: lock-free shared WAL ring (concurrent-append group commit)
 
-Status: **proposed (design only — not implemented)**. Gated behind a flag for A/B.
+Status: **IMPLEMENTED & MEASURED** behind the `wal_ring` feature (default off).
+A/B (x86, `objstore put`): concurrent durable write **2.6–5.3× faster than
+RocksDB** at 4/8/16 threads (5.8–6.5× over the legacy backend), negative→
+positive scaling, p99 51µs @16t. Validated dual-arch with the ring LIVE: 6
+contract tests, proptest oracle, checkpoint_failpoint crash-injection,
+concurrent_stress, loom gap-safety. Remaining before flipping the default:
+multi-process SIGKILL crash-soak + `advance`-lock loom + built-in backpressure.
+Note: the realized design keys on the **byte tiling**, not a separate work-id
+(loom caught the work-id/byte-order disagreement — see below).
 
 ## Problem (measured, not assumed)
 
