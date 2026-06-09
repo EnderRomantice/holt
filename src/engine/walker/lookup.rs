@@ -16,36 +16,40 @@ use std::sync::Arc;
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
-use super::readers::resolve_typed;
+use super::readers::{child_offset, resolve_typed};
 use super::route::{pin_route_parent, validate_route_edge};
+use crate::store::decode_child_off;
 use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
 use super::SearchKey;
 
-/// Look up `key` in the tree rooted at `start_slot` (depth 0).
+/// Look up `key` in the tree whose root is the encoded offset
+/// `start_root` (depth 0).
 ///
-/// Takes a [`BlobFrameRef`] so the read path can run against a
-/// shared buffer (e.g. a `BufferManager` read-guard) with no
-/// copies. Returned borrows are tied to the lifetime of that
+/// `start_root` is the *encoded* root offset as stored in
+/// `header.root_slot` (see `encode_child_off`); it is decoded once
+/// before descent. Takes a [`BlobFrameRef`] so the read path can run
+/// against a shared buffer (e.g. a `BufferManager` read-guard) with
+/// no copies. Returned borrows are tied to the lifetime of that
 /// underlying buffer.
 #[cfg(test)]
 pub(super) fn lookup<'a>(
     frame: BlobFrameRef<'a>,
-    start_slot: u16,
+    start_root: u16,
     key: &[u8],
 ) -> Result<LookupResult<'a>> {
-    descend(frame, start_slot, SearchKey::exact(key), 0)
+    descend(frame, decode_child_off(start_root), SearchKey::exact(key), 0)
 }
 
-/// Continue a lookup at `start_slot` with a non-zero `depth` — used
-/// by callers driving cross-blob descent through
+/// Continue a lookup at the encoded root `start_root` with a non-zero
+/// `depth` — used by callers driving cross-blob descent through
 /// [`LookupResult::Crossing`].
 pub(super) fn lookup_at<'a>(
     frame: BlobFrameRef<'a>,
-    start_slot: u16,
+    start_root: u16,
     key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
-    descend(frame, start_slot, key, depth)
+    descend(frame, decode_child_off(start_root), key, depth)
 }
 
 /// Multi-blob lookup — wait-free in the common case.
@@ -324,11 +328,11 @@ fn pin_validated_child(
 
 fn descend<'a>(
     frame: BlobFrameRef<'a>,
-    slot: u16,
+    off: u32,
     key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
-    let (ntype, body) = resolve_typed(frame, slot)?;
+    let (ntype, body) = resolve_typed(frame, off)?;
     match ntype {
         NodeType::Invalid => Err(Error::node_corrupt(
             "walker::descend: hit NodeType::Invalid",
@@ -411,7 +415,7 @@ fn prefix_descend<'a>(
     if !key.range_eq(depth, &p.bytes[..plen]) {
         return Ok(LookupResult::NotFound);
     }
-    descend(frame, p.child as u16, key, depth + plen)
+    descend(frame, child_offset(p.child as u16), key, depth + plen)
 }
 
 fn node4_descend<'a>(
@@ -427,9 +431,9 @@ fn node4_descend<'a>(
     let count = (n.count as usize).min(4);
     for i in 0..count {
         if n.keys[i] == byte {
-            let child = n.children[i] as u16;
-            frame.prefetch_node(child);
-            return descend(frame, child, key, depth + 1);
+            let child_off = child_offset(n.children[i]);
+            frame.prefetch_at(child_off);
+            return descend(frame, child_off, key, depth + 1);
         }
         if n.keys[i] > byte {
             break;
@@ -449,9 +453,9 @@ fn node16_descend<'a>(
         return Ok(LookupResult::NotFound);
     };
     if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
-        let child = n.children[i as usize] as u16;
-        frame.prefetch_node(child);
-        return descend(frame, child, key, depth + 1);
+        let child_off = child_offset(n.children[i as usize]);
+        frame.prefetch_at(child_off);
+        return descend(frame, child_off, key, depth + 1);
     }
     Ok(LookupResult::NotFound)
 }
@@ -476,9 +480,9 @@ fn node48_descend<'a>(
             "walker::node48_descend: child index out of range",
         ));
     }
-    let child = n.children[ci] as u16;
-    frame.prefetch_node(child);
-    descend(frame, child, key, depth + 1)
+    let child_off = child_offset(n.children[ci]);
+    frame.prefetch_at(child_off);
+    descend(frame, child_off, key, depth + 1)
 }
 
 fn node256_descend<'a>(
@@ -491,11 +495,11 @@ fn node256_descend<'a>(
     let Some(byte) = key.byte_at(depth) else {
         return Ok(LookupResult::NotFound);
     };
-    let slot = n.children[byte as usize];
-    if slot == 0 {
+    let encoded = n.children[byte as usize];
+    if encoded == 0 {
         return Ok(LookupResult::NotFound);
     }
-    let child = slot as u16;
-    frame.prefetch_node(child);
-    descend(frame, child, key, depth + 1)
+    let child_off = child_offset(encoded);
+    frame.prefetch_at(child_off);
+    descend(frame, child_off, key, depth + 1)
 }

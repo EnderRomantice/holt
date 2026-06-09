@@ -31,6 +31,72 @@ use std::mem::size_of;
 /// emits.
 pub const SPILLOVER_RESERVATION: u32 = 128;
 
+/// `DATA_AREA_START / 8` — the biased origin all child offsets are
+/// measured from. Every node body lives at `byte_offset >=
+/// DATA_AREA_START`, so its `byte_offset / 8` is `>= DATA_BASE_DIV8`.
+const DATA_BASE_DIV8: u32 = DATA_AREA_START / 8;
+
+/// Largest biased child value that can occur — `(PAGE_SIZE -
+/// DATA_AREA_START)/8 + 1`. Asserted `< u16::MAX` so the existing
+/// `[u16; N]` child arrays hold any in-blob offset with headroom.
+const MAX_CHILD_BIAS: u32 = (PAGE_SIZE - DATA_AREA_START) / 8 + 1;
+const _: () = assert!(MAX_CHILD_BIAS < u16::MAX as u32);
+
+/// Encode a node body's absolute `byte_offset` into the biased `u16`
+/// stored in a child field (`children[N]`, `Prefix.child`,
+/// `header.root`).
+///
+/// Encoding is `(byte_offset / 8) - (DATA_AREA_START / 8) + 1`. The
+/// `+1` bias reserves the encoded value `0` as the universal
+/// "no child / null" sentinel (Node48 `index -> children`, Node256
+/// direct slots, 1-based-ness). A real body sits at `byte_offset >=
+/// DATA_AREA_START`, so its encoded value is always `>= 1` — never
+/// collides with the null sentinel even for a body at exactly
+/// `DATA_AREA_START` (which only ever happens for the init EmptyRoot,
+/// never a child target).
+#[inline]
+#[must_use]
+pub fn encode_child_off(byte_offset: u32) -> u16 {
+    debug_assert_eq!(byte_offset % 8, 0, "child body must be 8-byte aligned");
+    debug_assert!(
+        byte_offset >= DATA_AREA_START,
+        "child body offset below data area: {byte_offset:#x}"
+    );
+    debug_assert!(byte_offset < PAGE_SIZE, "child body offset past page");
+    let biased = byte_offset / 8 - DATA_BASE_DIV8 + 1;
+    debug_assert!(biased >= 1, "encoded child offset must never be the 0 sentinel");
+    debug_assert!(biased <= MAX_CHILD_BIAS);
+    biased as u16
+}
+
+/// Decode a biased child `u16` back to the absolute `byte_offset`.
+/// Inverse of [`encode_child_off`]. The caller must have already
+/// rejected the `0` null sentinel.
+#[inline]
+#[must_use]
+pub fn decode_child_off(encoded: u16) -> u32 {
+    debug_assert_ne!(encoded, 0, "decode_child_off on the 0 null sentinel");
+    (u32::from(encoded) - 1 + DATA_BASE_DIV8) * 8
+}
+
+/// Read a node's `NodeType` from its body at absolute `off`.
+///
+/// Every node body carries its `node_type` discriminant at `+1`
+/// (every inner node, `Prefix`, `BlobNode`, and — post-reorder — the
+/// `Leaf` header; the `EmptyRoot` sentinel's `+1` is stamped in
+/// [`BlobFrame::init`]). This is the offset-addressed replacement for
+/// the slot-table `node_type` lookup. Returns `None` if `off + 2`
+/// runs past the buffer or the byte doesn't decode to a `NodeType`.
+#[inline]
+#[must_use]
+pub fn ntype_at_offset(buf: &[u8], off: usize) -> Option<NodeType> {
+    let tag_off = off.checked_add(1)?;
+    if tag_off >= buf.len() {
+        return None;
+    }
+    NodeType::from_raw(buf[tag_off])
+}
+
 /// Free-list size class for `ntype` — the index into
 /// [`BlobHeader::free_list_head`](crate::layout::BlobHeader). Every
 /// type maps to its own `ntype - 1` slot. (Leaf nodes are now
@@ -59,10 +125,10 @@ fn leaf_body_len_at(buf: &[u8], off: usize) -> Option<usize> {
         return None;
     }
     // SAFETY-equivalent: read the two length fields directly from the
-    // header bytes (value_len @ +8, key_len @ +10) without forming a
+    // header bytes (value_len @ +2, key_len @ +4) without forming a
     // misaligned reference. Little-endian, matching `#[repr(C)]`.
-    let value_len = u32::from(u16::from_le_bytes([buf[off + 8], buf[off + 9]]));
-    let key_len = u32::from(u16::from_le_bytes([buf[off + 10], buf[off + 11]]));
+    let value_len = u32::from(u16::from_le_bytes([buf[off + 2], buf[off + 3]]));
+    let key_len = u32::from(u16::from_le_bytes([buf[off + 4], buf[off + 5]]));
     let total = leaf_body_size(key_len, value_len) as usize;
     if off.checked_add(total)? > buf.len() {
         return None;
@@ -173,57 +239,47 @@ impl<'a> BlobFrameRef<'a> {
         unsafe { &*self.buf.as_ptr().cast::<BlobHeader>() }
     }
 
-    /// Read a 1-based slot table entry. `None` if out of range.
+    /// Resolve a node's `NodeType` directly from its body at absolute
+    /// `byte_offset` — the offset-addressed replacement for
+    /// `slot_entry(slot).node_type()`. See [`ntype_at_offset`].
+    #[inline]
     #[must_use]
-    pub fn slot_entry(&self, slot: u16) -> Option<SlotEntry> {
-        let h = self.header();
-        if slot == 0 || slot > h.num_slots {
-            return None;
-        }
-        let off = HEADER_SIZE as usize + (slot as usize - 1) * 4;
-        let raw_bytes = &self.buf[off..off + 4];
-        let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
-        Some(SlotEntryRaw(raw).decode())
+    pub fn ntype_at(&self, byte_offset: u32) -> Option<NodeType> {
+        ntype_at_offset(self.buf, byte_offset as usize)
     }
 
-    /// Resolve a slot to a const view of its body bytes.
+    /// Resolve a node body at absolute `byte_offset` to a const slice.
     ///
-    /// For a `Leaf` the body is variable-size and self-describing:
-    /// its length is read back from the 16-byte header via
-    /// [`leaf_body_len_at`]. Every other type uses its fixed
-    /// `size_of_node`.
+    /// The offset-addressed twin of [`Self::body_of_slot`]: it reads the
+    /// `NodeType` from `body[off + 1]` (no slot lookup) and sizes the
+    /// body — a `Leaf` via its self-describing header, everything else
+    /// via `size_of_node`. Returns `None` on an out-of-range offset or
+    /// an undecodable / `Invalid` type tag.
     #[must_use]
-    pub fn body_of_slot(&self, slot: u16) -> Option<&'a [u8]> {
-        let e = self.slot_entry(slot)?;
-        let ntype = e.node_type()?;
+    pub fn body_at_offset(&self, byte_offset: u32) -> Option<&'a [u8]> {
+        let off = byte_offset as usize;
+        let ntype = ntype_at_offset(self.buf, off)?;
         if ntype == NodeType::Invalid {
             return None;
         }
-        let off = e.byte_offset() as usize;
         let size = if ntype == NodeType::Leaf {
             leaf_body_len_at(self.buf, off)?
         } else {
             size_of_node(ntype) as usize
         };
-        if off + size > self.buf.len() {
+        let end = off.checked_add(size)?;
+        if end > self.buf.len() {
             return None;
         }
-        Some(&self.buf[off..off + size])
+        Some(&self.buf[off..end])
     }
 
-    /// Best-effort prefetch of the node body at `slot`, used during
-    /// descent to warm the next level's body cache line while the
-    /// current level finishes. The slot-table entry is already warm
-    /// from the parent's child scan; this resolves the body offset
-    /// and issues a read-prefetch hint. Never faults — the entry is
-    /// bounds-checked and a prefetch never dereferences the pointer.
+    /// Best-effort prefetch of the node body at absolute `byte_offset`.
+    /// Offset-addressed twin of [`Self::prefetch_node`]; never faults.
     #[inline]
-    pub fn prefetch_node(&self, slot: u16) {
-        let Some(e) = self.slot_entry(slot) else {
-            return;
-        };
-        let off = e.byte_offset() as usize;
-        if e.node_type().is_some_and(|nt| nt != NodeType::Invalid) && off < self.buf.len() {
+    pub fn prefetch_at(&self, byte_offset: u32) {
+        let off = byte_offset as usize;
+        if off < self.buf.len() {
             // SAFETY: `off < buf.len()`, so the pointer is in-bounds;
             // a prefetch hint reads nothing and cannot fault.
             crate::engine::prefetch_read_data(unsafe { self.buf.as_ptr().add(off) });
@@ -292,9 +348,18 @@ impl<'a> BlobFrame<'a> {
         // Allocate the empty-tree root sentinel.
         let out = frame.alloc_node(NodeType::EmptyRoot)?;
         debug_assert_eq!(out.slot, 1);
-        // Body is already zero (we memset the whole buffer above);
-        // record it as the tree's root.
-        frame.header_mut().root_slot = out.slot;
+        // The 8-byte body is all-zero from the memset above; stamp its
+        // self-describing `node_type @ +1` byte so an offset-addressed
+        // reader resolves it as `EmptyRoot` (the only node whose body
+        // isn't otherwise written with a `node_type` byte). Then record
+        // its encoded body offset as the tree root.
+        let root_off = frame
+            .offset_of_slot(out.slot)
+            .expect("freshly allocated sentinel has a slot offset");
+        if let Some(body) = frame.bytes_at_mut(root_off, 8) {
+            body[1] = NodeType::EmptyRoot.as_u8();
+        }
+        frame.header_mut().root_slot = encode_child_off(root_off);
         Ok(frame)
     }
 
@@ -345,7 +410,9 @@ impl<'a> BlobFrame<'a> {
     /// For a `Leaf` the body is variable-size and self-describing:
     /// its length is read back from the 16-byte header via
     /// [`leaf_body_len_at`]. Every other type uses its fixed
-    /// `size_of_node`.
+    /// `size_of_node`. v4 addresses nodes by offset
+    /// ([`Self::body_at_offset`]); this slot reader survives for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn body_of_slot(&self, slot: u16) -> Option<&[u8]> {
         let e = self.slot_entry(slot)?;
@@ -365,28 +432,81 @@ impl<'a> BlobFrame<'a> {
         Some(&self.buf[off..off + size])
     }
 
-    /// Mutable view of a slot's body bytes.
-    ///
-    /// For a `Leaf` the body is variable-size and self-describing:
-    /// its length is read back from the 16-byte header via
-    /// [`leaf_body_len_at`]. Every other type uses its fixed
-    /// `size_of_node`.
-    pub fn body_of_slot_mut(&mut self, slot: u16) -> Option<&mut [u8]> {
-        let e = self.slot_entry(slot)?;
-        let ntype = e.node_type()?;
+    /// Resolve a node's `NodeType` directly from its body at absolute
+    /// `byte_offset` — offset-addressed twin of
+    /// `slot_entry(slot).node_type()`.
+    #[inline]
+    #[must_use]
+    pub fn ntype_at(&self, byte_offset: u32) -> Option<NodeType> {
+        ntype_at_offset(self.buf, byte_offset as usize)
+    }
+
+    /// Resolve a node body at absolute `byte_offset` to a const slice.
+    /// Offset-addressed twin of [`Self::body_of_slot`].
+    #[must_use]
+    pub fn body_at_offset(&self, byte_offset: u32) -> Option<&[u8]> {
+        let off = byte_offset as usize;
+        let ntype = ntype_at_offset(self.buf, off)?;
         if ntype == NodeType::Invalid {
             return None;
         }
-        let off = e.byte_offset() as usize;
         let size = if ntype == NodeType::Leaf {
             leaf_body_len_at(self.buf, off)?
         } else {
             size_of_node(ntype) as usize
         };
-        if off + size > self.buf.len() {
+        let end = off.checked_add(size)?;
+        if end > self.buf.len() {
             return None;
         }
-        Some(&mut self.buf[off..off + size])
+        Some(&self.buf[off..end])
+    }
+
+    /// Mutable node body at absolute `byte_offset`. Offset-addressed
+    /// twin of [`Self::body_of_slot_mut`].
+    pub fn body_at_offset_mut(&mut self, byte_offset: u32) -> Option<&mut [u8]> {
+        let off = byte_offset as usize;
+        let ntype = ntype_at_offset(self.buf, off)?;
+        if ntype == NodeType::Invalid {
+            return None;
+        }
+        let size = if ntype == NodeType::Leaf {
+            leaf_body_len_at(self.buf, off)?
+        } else {
+            size_of_node(ntype) as usize
+        };
+        let end = off.checked_add(size)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(&mut self.buf[off..end])
+    }
+
+    /// Byte offset of the body registered in slot `slot`, if any.
+    /// Used by the allocator-facing call sites that still allocate a
+    /// slot for bookkeeping but address the body by offset.
+    #[must_use]
+    pub fn offset_of_slot(&self, slot: u16) -> Option<u32> {
+        self.slot_entry(slot).map(SlotEntry::byte_offset)
+    }
+
+    /// Record that the node body at `byte_offset` has been abandoned
+    /// (made unreachable by a structural op). Bumps `header.dead_bytes`
+    /// by the body's size so [`crate::engine::walker::blob_needs_compaction`]
+    /// can trigger a rebuild before the blob bloats. Best-effort: an
+    /// unresolvable offset is silently ignored (the bytes are still
+    /// reclaimed at the next compaction regardless of the counter).
+    pub fn note_abandoned(&mut self, byte_offset: u32) {
+        let size = {
+            let off = byte_offset as usize;
+            match ntype_at_offset(self.buf, off) {
+                Some(NodeType::Leaf) => leaf_body_len_at(self.buf, off).unwrap_or(0) as u32,
+                Some(nt) if nt != NodeType::Invalid => size_of_node(nt),
+                _ => 0,
+            }
+        };
+        let h = self.header_mut();
+        h.dead_bytes = h.dead_bytes.saturating_add(size);
     }
 
     /// Allocate a node of the given NodeType.
@@ -498,6 +618,16 @@ impl<'a> BlobFrame<'a> {
     /// remain in place (they'll be overwritten on the next alloc
     /// that reuses this slot).
     ///
+    /// **v4 abandon-on-free**: the walker no longer calls `free_node` —
+    /// structural ops (node grow/shrink/collapse, leaf realloc, prefix
+    /// split, EmptyRoot replacement) abandon the old node instead
+    /// (leaving it unreachable, reclaimed at the next compaction) and
+    /// bump `header.dead_bytes`. The per-NodeType free lists are
+    /// therefore no longer populated on the hot path; `alloc_node`'s
+    /// free-list-reuse branches are dormant (the bump path always
+    /// fires). This method is retained for tests / diagnostics and any
+    /// future explicit-reclaim path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn free_node(&mut self, slot: u16) -> Result<(), FreeError> {
         let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
         let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
@@ -511,6 +641,7 @@ impl<'a> BlobFrame<'a> {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn free_node_inner(&mut self, slot: u16) -> Result<(), FreeError> {
         let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
         let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
@@ -616,17 +747,26 @@ mod tests {
         let h = frame.header();
         assert_eq!(h.blob_guid, [0xAB; 16]);
         assert_eq!(h.num_slots, 1);
+        // `root_slot` now stores the encoded root offset; the sentinel
+        // sits at DATA_AREA_START, which encodes to 1.
+        assert_eq!(h.root_slot, encode_child_off(DATA_AREA_START));
         assert_eq!(h.root_slot, 1);
         // After allocating the 8-byte sentinel, space_used is
         // DATA_AREA_START + 8.
         assert_eq!(h.space_used, DATA_AREA_START + 8);
 
-        // The root slot is tagged empty_root and its body is all zero.
+        // The sentinel is self-describing via its `node_type @ +1`
+        // byte and resolves to EmptyRoot by offset (v4 addressing) and
+        // by slot (bookkeeping).
+        let root_off = decode_child_off(h.root_slot);
+        assert_eq!(frame.ntype_at(root_off), Some(NodeType::EmptyRoot));
         let e = frame.slot_entry(1).unwrap();
         assert_eq!(e.node_type(), Some(NodeType::EmptyRoot));
         let body = frame.body_of_slot(1).unwrap();
         assert_eq!(body.len(), 8);
-        assert!(body.iter().all(|b| *b == 0));
+        // Only the node_type byte at +1 is set; the rest stay zero.
+        assert_eq!(body[1], NodeType::EmptyRoot.as_u8());
+        assert!(body.iter().enumerate().all(|(i, b)| i == 1 || *b == 0));
     }
 
     #[test]

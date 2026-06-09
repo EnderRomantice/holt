@@ -23,11 +23,12 @@ use crate::layout::{
     DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
 use crate::store::blob_store::AlignedBlobBuf;
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
+use crate::store::{decode_child_off, encode_child_off, BlobFrame, BlobFrameRef, BufferManager};
 
 use super::cast;
+use super::readers::child_offset;
 use super::types::MakeBlobOutcome;
-use super::writers::{write_prefix_chain, write_struct_to_slot};
+use super::writers::{write_prefix_chain, write_struct_at};
 
 /// Conservative bump-area headroom kept free during a merge.
 ///
@@ -59,10 +60,10 @@ const MERGE_RESERVE: u32 = 0x1000;
 #[cfg(test)]
 pub fn make_blob_from_node(
     src_frame: &BlobFrame<'_>,
-    src_slot: u16,
+    src_off: u32,
     new_guid: BlobGuid,
 ) -> Result<MakeBlobOutcome> {
-    make_blob_from_node_with_buf(AlignedBlobBuf::zeroed(), src_frame, src_slot, new_guid)
+    make_blob_from_node_with_buf(AlignedBlobBuf::zeroed(), src_frame, src_off, new_guid)
 }
 
 /// Same as [`make_blob_from_node`], but allocates the destination
@@ -73,53 +74,55 @@ pub fn make_blob_from_node(
 pub fn make_blob_from_node_in(
     bm: &BufferManager,
     src_frame: &BlobFrame<'_>,
-    src_slot: u16,
+    src_off: u32,
     new_guid: BlobGuid,
 ) -> Result<MakeBlobOutcome> {
-    make_blob_from_node_with_buf(bm.alloc_blob_buf_zeroed(), src_frame, src_slot, new_guid)
+    make_blob_from_node_with_buf(bm.alloc_blob_buf_zeroed(), src_frame, src_off, new_guid)
 }
 
 fn make_blob_from_node_with_buf(
     mut buf: AlignedBlobBuf,
     src_frame: &BlobFrame<'_>,
-    src_slot: u16,
+    src_off: u32,
     new_guid: BlobGuid,
 ) -> Result<MakeBlobOutcome> {
-    let cloned_root_slot;
+    let cloned_root_off;
     {
         let mut new_frame = BlobFrame::init(buf.as_mut_slice(), new_guid)?;
-        cloned_root_slot = clone_subtree(src_frame, &mut new_frame, src_slot, false)?
+        cloned_root_off = clone_subtree(src_frame, &mut new_frame, src_off, false)?
             .expect("preserve mode never returns None");
-
-        // Release the EmptyRoot sentinel that `BlobFrame::init`
-        // seeded at slot 1; it's unreachable now.
-        if new_frame.header().root_slot == 1 && cloned_root_slot != 1 {
-            new_frame.free_node(1)?;
-        }
-        new_frame.header_mut().root_slot = cloned_root_slot;
+        // The EmptyRoot sentinel `BlobFrame::init` seeded at
+        // DATA_AREA_START is now unreachable (the cloned root sits
+        // after it); abandon-on-free leaves its 8 bytes to be reclaimed
+        // by a future compaction of this fresh blob. Record the cloned
+        // root's encoded offset.
+        new_frame.header_mut().root_slot = encode_child_off(cloned_root_off);
     }
     Ok(MakeBlobOutcome { buf })
 }
 
+/// Threshold of abandoned (`dead_bytes`) weight that, on its own,
+/// makes a rebuild worth the 512 KB scratch alloc + memcpy. Roughly
+/// 6% of the data-area capacity — small enough to keep a churny blob
+/// from bloating, large enough not to compact on a couple of node
+/// grows.
+const DEAD_BYTES_COMPACT_THRESHOLD: u32 = (PAGE_SIZE - DATA_AREA_START) / 16;
+
 /// Cheap header-level predicate for whether `compact_blob` can
-/// reclaim anything.
+/// reclaim anything worthwhile.
 ///
-/// Tombstoned leaves keep their (contiguous) bodies until compaction;
-/// freed leaf slots also imply leaked leaf bodies from alloc-fresh
-/// same-key updates (a same-key update whose new total outgrows the
-/// leaf's current allocation). Other free-list entries are normal ART
-/// shape churn (EmptyRoot release, Node4→Node16 growth, prefix splits)
-/// and are cheap to reuse in place, so they are not enough to make
-/// online `Tree::compact` pay a 512 KB scratch allocation + memcpy.
+/// v4 uses abandon-on-free: structural ops (node grow/shrink/collapse,
+/// leaf value-grow realloc, EmptyRoot replacement, prefix split) don't
+/// return their old node to a free list — they leave it unreachable
+/// and bump `header.dead_bytes`. The per-NodeType free lists are no
+/// longer populated by the walker, so the old free-list trigger is
+/// dead; the dead-bytes counter is the churn signal now. Tombstoned
+/// leaves keep their (contiguous) bodies until compaction too, so a
+/// non-zero `tombstone_leaf_cnt` is also a trigger.
 #[must_use]
 pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
     let h = frame.header();
-    // A freed leaf slot is the churn signal. Leaves are now a single
-    // variable-size, self-describing node and land on their own
-    // class-0 free list (see `free_list_class`); their freed bytes are
-    // reclaimed by compaction exactly as the old separate extents were.
-    let leaf_free_list = h.free_list_head[NodeType::Leaf as usize - 1];
-    h.tombstone_leaf_cnt != 0 || leaf_free_list != 0
+    h.tombstone_leaf_cnt != 0 || h.dead_bytes >= DEAD_BYTES_COMPACT_THRESHOLD
 }
 
 /// Repack `buf` in place, discarding all unreachable bytes plus
@@ -154,32 +157,31 @@ pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
 /// the heap, lives for the duration of the call) plus one full
 /// blob memcpy at the end. Roughly tens of µs on a modern machine.
 pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
-    let (blob_guid, old_root, old_compact_times) = {
+    let (blob_guid, old_root_off, old_compact_times) = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let h = old_frame.header();
-        (h.blob_guid, h.root_slot, h.compact_times)
+        (h.blob_guid, decode_child_off(h.root_slot), h.compact_times)
     };
 
     let mut new_buf = buf.zeroed_like();
     {
         let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
-        let cloned = clone_subtree(&old_frame, &mut new_frame, old_root, true)?;
-        let entry = match cloned {
-            Some(slot) => slot,
+        let cloned = clone_subtree(&old_frame, &mut new_frame, old_root_off, true)?;
+        let entry_off = match cloned {
+            Some(off) => off,
             None => {
-                // Every leaf below the old root was tombstoned —
-                // the new tree is empty. Re-seed the EmptyRoot
-                // sentinel as the new root.
-                new_frame.alloc_node(NodeType::EmptyRoot)?.slot
+                // Every leaf below the old root was tombstoned — the
+                // new tree is empty. The EmptyRoot sentinel `init`
+                // already seeded at DATA_AREA_START (encoded root 1) is
+                // the new root; reuse it.
+                decode_child_off(1)
             }
         };
-        if new_frame.header().root_slot == 1 && entry != 1 {
-            new_frame.free_node(1)?;
-        }
         let h = new_frame.header_mut();
-        h.root_slot = entry;
+        h.root_slot = encode_child_off(entry_off);
         h.tombstone_leaf_cnt = 0;
+        h.dead_bytes = 0;
         h.compact_times = old_compact_times.saturating_add(1);
     }
 
@@ -218,9 +220,9 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
 pub fn is_mergeable(
     bm: &BufferManager,
     parent_frame: &BlobFrame<'_>,
-    parent_bn_slot: u16,
+    parent_bn_off: u32,
 ) -> Result<bool> {
-    let bn = read_blob_node(parent_frame, parent_bn_slot)?;
+    let bn = read_blob_node(parent_frame, parent_bn_off)?;
     let child_pin = bm.pin(bn.child_blob_guid)?;
     let guard = child_pin.read();
     let child_frame = BlobFrameRef::wrap(guard.as_slice());
@@ -275,10 +277,10 @@ pub fn is_mergeable(
 pub fn merge_blob(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
-    parent_bn_slot: u16,
+    parent_bn_off: u32,
     seq: u64,
-) -> Result<u16> {
-    let bn = read_blob_node(parent_frame, parent_bn_slot)?;
+) -> Result<u32> {
+    let bn = read_blob_node(parent_frame, parent_bn_off)?;
     let child_guid = bn.child_blob_guid;
     let plen = (bn.prefix_len as usize).min(BLOB_MAX_INLINE);
     let prefix_bytes: Vec<u8> = bn.bytes[..plen].to_vec();
@@ -287,8 +289,8 @@ pub fn merge_blob(
         let child_pin = bm.pin(child_guid)?;
         let mut child_guard = child_pin.write();
         let child_frame = child_guard.frame();
-        let child_root = child_frame.header().root_slot;
-        clone_subtree(&child_frame, parent_frame, child_root, false)?
+        let child_root_off = decode_child_off(child_frame.header().root_slot);
+        clone_subtree(&child_frame, parent_frame, child_root_off, false)?
             .expect("preserve mode never returns None")
     };
 
@@ -298,7 +300,14 @@ pub fn merge_blob(
         write_prefix_chain(parent_frame, &prefix_bytes, new_subtree_root)?
     };
 
-    parent_frame.free_node(parent_bn_slot)?;
+    // Abandon-on-free: the parent's BlobNode is unreachable now that
+    // the grandparent will be repointed at `inlined_root`.
+    parent_frame.note_abandoned(parent_bn_off);
+    // Keep external-blob accounting correct — the BlobNode is gone.
+    {
+        let h = parent_frame.header_mut();
+        h.num_ext_blobs = h.num_ext_blobs.saturating_sub(1);
+    }
     // Hand the now-orphaned child blob to the deferred-delete
     // protocol. An inline `bm.delete_blob` here would push the
     // manifest mutation to in-memory before the caller's WAL
@@ -313,7 +322,7 @@ pub fn merge_blob(
     tracing::debug!(
         target: "holt::engine::merge",
         child_guid = ?&child_guid[..4],
-        parent_bn_slot = parent_bn_slot,
+        parent_bn_off = parent_bn_off,
         inlined_root = inlined_root,
         "merge_blob: folded child into parent + queued delete",
     );
@@ -321,8 +330,8 @@ pub fn merge_blob(
     Ok(inlined_root)
 }
 
-fn read_blob_node(frame: &BlobFrame<'_>, slot: u16) -> Result<BlobNode> {
-    let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
+fn read_blob_node(frame: &BlobFrame<'_>, off: u32) -> Result<BlobNode> {
+    let body = frame.body_at_offset(off).ok_or(Error::node_corrupt(
         "read_blob_node: body resolution failed",
     ))?;
     Ok(*cast::<BlobNode>(body))
@@ -344,16 +353,13 @@ fn read_blob_node(frame: &BlobFrame<'_>, slot: u16) -> Result<BlobNode> {
 fn clone_subtree(
     src: &BlobFrame<'_>,
     dst: &mut BlobFrame<'_>,
-    src_slot: u16,
+    src_off: u32,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
-    let entry = src
-        .slot_entry(src_slot)
-        .ok_or(Error::node_corrupt("clone_subtree: invalid src slot"))?;
-    let ntype = entry
-        .node_type()
+) -> Result<Option<u32>> {
+    let ntype = src
+        .ntype_at(src_off)
         .ok_or(Error::node_corrupt("clone_subtree: undecodable src ntype"))?;
-    let body = src.body_of_slot(src_slot).ok_or(Error::node_corrupt(
+    let body = src.body_at_offset(src_off).ok_or(Error::node_corrupt(
         "clone_subtree: src body resolution failed",
     ))?;
 
@@ -363,7 +369,15 @@ fn clone_subtree(
         )),
         NodeType::EmptyRoot => {
             let out = dst.alloc_node(NodeType::EmptyRoot)?;
-            Ok(Some(out.slot))
+            let off = dst
+                .offset_of_slot(out.slot)
+                .ok_or(Error::node_corrupt("clone_subtree: EmptyRoot offset"))?;
+            // Stamp the self-describing node_type byte so the clone is
+            // offset-resolvable like the init sentinel.
+            if let Some(b) = dst.bytes_at_mut(off, 8) {
+                b[1] = NodeType::EmptyRoot.as_u8();
+            }
+            Ok(Some(off))
         }
         NodeType::Leaf => clone_leaf(body, dst, filter_tombstones),
         NodeType::Prefix => clone_prefix(src, body, dst, filter_tombstones),
@@ -384,8 +398,8 @@ fn clone_leaf(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
-    // `src_body` is the full leaf body (sized by `body_of_slot` from
+) -> Result<Option<u32>> {
+    // `src_body` is the full leaf body (sized by `body_at_offset` from
     // the header's key_len/value_len). Decode only the 16-byte header.
     let src_leaf = *cast::<Leaf>(&src_body[..std::mem::size_of::<Leaf>()]);
     if filter_tombstones && src_leaf.tombstone != 0 {
@@ -400,23 +414,21 @@ fn clone_leaf(
         )
     );
     let out = dst.alloc_leaf(total)?;
-    // The freshly-allocated dst leaf body's header is still zero, so
-    // `body_of_slot_mut` would size it as the bare 16-byte header.
-    // Address it by byte offset and copy the source body verbatim
-    // (`[header][key][value]`) — no key_offset to repoint; the dst
-    // becomes self-describing once the header bytes land.
     let dst_off = dst
-        .slot_entry(out.slot)
-        .ok_or(Error::node_corrupt("clone_leaf: dst slot entry"))?
-        .byte_offset();
+        .offset_of_slot(out.slot)
+        .ok_or(Error::node_corrupt("clone_leaf: dst slot offset"))?;
     {
+        // The freshly-allocated dst leaf body's header is still zero,
+        // so address it by byte offset and copy the source body
+        // verbatim (`[header][key][value]`, incl. the `node_type @ +1`
+        // byte) — the dst becomes self-describing once the bytes land.
         let dst_body = dst
             .bytes_at_mut(dst_off, total)
             .ok_or(Error::node_corrupt("clone_leaf: dst body out of range"))?;
         debug_assert_eq!(dst_body.len(), src_body.len());
         dst_body.copy_from_slice(src_body);
     }
-    Ok(Some(out.slot))
+    Ok(Some(dst_off))
 }
 
 fn clone_prefix(
@@ -424,16 +436,20 @@ fn clone_prefix(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
+) -> Result<Option<u32>> {
     let p = *cast::<Prefix>(src_body);
     let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-    let Some(new_child) = clone_subtree(src, dst, p.child as u16, filter_tombstones)? else {
+    let Some(new_child_off) = clone_subtree(src, dst, child_offset(p.child as u16), filter_tombstones)?
+    else {
         return Ok(None);
     };
     let out = dst.alloc_node(NodeType::Prefix)?;
-    let new_p = Prefix::new(&p.bytes[..plen], u32::from(new_child));
-    write_struct_to_slot(dst, out.slot, &new_p)?;
-    Ok(Some(out.slot))
+    let off = dst
+        .offset_of_slot(out.slot)
+        .ok_or(Error::node_corrupt("clone_prefix: dst offset"))?;
+    let new_p = Prefix::new(&p.bytes[..plen], u32::from(encode_child_off(new_child_off)));
+    write_struct_at(dst, off, &new_p)?;
+    Ok(Some(off))
 }
 
 fn clone_node4(
@@ -441,31 +457,36 @@ fn clone_node4(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
+) -> Result<Option<u32>> {
     let src_n = *cast::<Node4>(src_body);
     let count = (src_n.count as usize).min(4);
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(new_child) = clone_subtree(src, dst, src_n.children[i] as u16, true)? {
-                survivors.push((src_n.keys[i], u32::from(new_child)));
+            if let Some(new_child) =
+                clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
+            {
+                survivors.push((src_n.keys[i], new_child));
             }
         }
         pack_inner_node(dst, &survivors)
     } else {
         let mut new_children = [0u16; 4];
-        for (i, slot) in new_children.iter_mut().enumerate().take(count) {
-            let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
+        for (i, child) in new_children.iter_mut().enumerate().take(count) {
+            let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
                 .expect("preserve mode never returns None");
-            *slot = cloned;
+            *child = encode_child_off(cloned);
         }
         let out = dst.alloc_node(NodeType::Node4)?;
+        let off = dst
+            .offset_of_slot(out.slot)
+            .ok_or(Error::node_corrupt("clone_node4: dst offset"))?;
         let mut new_n = Node4::empty();
         new_n.count = src_n.count;
         new_n.keys = src_n.keys;
         new_n.children = new_children;
-        write_struct_to_slot(dst, out.slot, &new_n)?;
-        Ok(Some(out.slot))
+        write_struct_at(dst, off, &new_n)?;
+        Ok(Some(off))
     }
 }
 
@@ -474,31 +495,36 @@ fn clone_node16(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
+) -> Result<Option<u32>> {
     let src_n = *cast::<Node16>(src_body);
     let count = (src_n.count as usize).min(16);
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(new_child) = clone_subtree(src, dst, src_n.children[i] as u16, true)? {
-                survivors.push((src_n.keys[i], u32::from(new_child)));
+            if let Some(new_child) =
+                clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
+            {
+                survivors.push((src_n.keys[i], new_child));
             }
         }
         pack_inner_node(dst, &survivors)
     } else {
         let mut new_children = [0u16; 16];
-        for (i, slot) in new_children.iter_mut().enumerate().take(count) {
-            let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
+        for (i, child) in new_children.iter_mut().enumerate().take(count) {
+            let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
                 .expect("preserve mode never returns None");
-            *slot = cloned;
+            *child = encode_child_off(cloned);
         }
         let out = dst.alloc_node(NodeType::Node16)?;
+        let off = dst
+            .offset_of_slot(out.slot)
+            .ok_or(Error::node_corrupt("clone_node16: dst offset"))?;
         let mut new_n = Node16::empty();
         new_n.count = src_n.count;
         new_n.keys = src_n.keys;
         new_n.children = new_children;
-        write_struct_to_slot(dst, out.slot, &new_n)?;
-        Ok(Some(out.slot))
+        write_struct_at(dst, off, &new_n)?;
+        Ok(Some(off))
     }
 }
 
@@ -507,7 +533,7 @@ fn clone_node48(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
+) -> Result<Option<u32>> {
     let src_n = *cast::<Node48>(src_body);
     if filter_tombstones {
         // Iterate bytes 0..256 in order — naturally yields survivors
@@ -522,27 +548,32 @@ fn clone_node48(
             if ci >= 48 {
                 return Err(Error::node_corrupt("clone_node48: index out of range"));
             }
-            if let Some(new_child) = clone_subtree(src, dst, src_n.children[ci] as u16, true)? {
-                survivors.push((b as u8, u32::from(new_child)));
+            if let Some(new_child) =
+                clone_subtree(src, dst, child_offset(src_n.children[ci]), true)?
+            {
+                survivors.push((b as u8, new_child));
             }
         }
         pack_inner_node(dst, &survivors)
     } else {
         let mut new_children = [0u16; 48];
-        for (i, slot) in new_children.iter_mut().enumerate() {
+        for (i, child) in new_children.iter_mut().enumerate() {
             if src_n.children[i] != 0 {
-                let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
+                let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
                     .expect("preserve mode never returns None");
-                *slot = cloned;
+                *child = encode_child_off(cloned);
             }
         }
         let out = dst.alloc_node(NodeType::Node48)?;
+        let off = dst
+            .offset_of_slot(out.slot)
+            .ok_or(Error::node_corrupt("clone_node48: dst offset"))?;
         let mut new_n = Node48::empty();
         new_n.count = src_n.count;
         new_n.index = src_n.index;
         new_n.children = new_children;
-        write_struct_to_slot(dst, out.slot, &new_n)?;
-        Ok(Some(out.slot))
+        write_struct_at(dst, off, &new_n)?;
+        Ok(Some(off))
     }
 }
 
@@ -551,44 +582,50 @@ fn clone_node256(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
-) -> Result<Option<u16>> {
+) -> Result<Option<u32>> {
     let src_n = *cast::<Node256>(src_body);
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(64);
-        for (b, &child_slot) in src_n.children.iter().enumerate() {
-            if child_slot == 0 {
+        for (b, &child_enc) in src_n.children.iter().enumerate() {
+            if child_enc == 0 {
                 continue;
             }
-            if let Some(new_child) = clone_subtree(src, dst, child_slot, true)? {
-                survivors.push((b as u8, u32::from(new_child)));
+            if let Some(new_child) = clone_subtree(src, dst, child_offset(child_enc), true)? {
+                survivors.push((b as u8, new_child));
             }
         }
         pack_inner_node(dst, &survivors)
     } else {
         let mut new_children = [0u16; 256];
-        for (i, slot) in new_children.iter_mut().enumerate() {
+        for (i, child) in new_children.iter_mut().enumerate() {
             if src_n.children[i] != 0 {
-                let cloned = clone_subtree(src, dst, src_n.children[i] as u16, false)?
+                let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
                     .expect("preserve mode never returns None");
-                *slot = cloned;
+                *child = encode_child_off(cloned);
             }
         }
         let out = dst.alloc_node(NodeType::Node256)?;
+        let off = dst
+            .offset_of_slot(out.slot)
+            .ok_or(Error::node_corrupt("clone_node256: dst offset"))?;
         let mut new_n = Node256::empty();
         new_n.count = src_n.count;
         new_n.children = new_children;
-        write_struct_to_slot(dst, out.slot, &new_n)?;
-        Ok(Some(out.slot))
+        write_struct_at(dst, off, &new_n)?;
+        Ok(Some(off))
     }
 }
 
-fn clone_blob_node(src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<Option<u16>> {
+fn clone_blob_node(src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<Option<u32>> {
     let src_b = *cast::<BlobNode>(src_body);
     let plen = (src_b.prefix_len as usize).min(BLOB_MAX_INLINE);
     let new_b = BlobNode::new(&src_b.bytes[..plen], src_b.child_blob_guid);
     let out = dst.alloc_node(NodeType::Blob)?;
-    write_struct_to_slot(dst, out.slot, &new_b)?;
-    Ok(Some(out.slot))
+    let off = dst
+        .offset_of_slot(out.slot)
+        .ok_or(Error::node_corrupt("clone_blob_node: dst offset"))?;
+    write_struct_at(dst, off, &new_b)?;
+    Ok(Some(off))
 }
 
 /// Pack `survivors` into the smallest inner-node variant that fits.
@@ -606,63 +643,72 @@ fn clone_blob_node(src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<Option<u1
 /// store keys in sorted order and their lookup paths break out
 /// early on `keys[i] > byte`, so out-of-order entries would corrupt
 /// future descents.
-fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<Option<u16>> {
+fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<Option<u32>> {
     debug_assert!(
         survivors.windows(2).all(|w| w[0].0 < w[1].0),
         "pack_inner_node: survivors must be byte-sorted ascending"
     );
+    // `survivors` carry child *byte offsets* in the destination blob;
+    // the helper encodes them into the `u16` child fields.
+    let alloc = |dst: &mut BlobFrame<'_>, nt: NodeType| -> Result<(u16, u32)> {
+        let out = dst.alloc_node(nt)?;
+        let off = dst
+            .offset_of_slot(out.slot)
+            .ok_or(Error::node_corrupt("pack_inner_node: dst offset"))?;
+        Ok((out.slot, off))
+    };
     match survivors.len() {
         0 => Ok(None),
         1 => {
-            let (byte, child) = survivors[0];
-            let slot = write_prefix_chain(dst, &[byte], child as u16)?;
-            Ok(Some(slot))
+            let (byte, child_off) = survivors[0];
+            let off = write_prefix_chain(dst, &[byte], child_off)?;
+            Ok(Some(off))
         }
         2..=4 => {
-            let out = dst.alloc_node(NodeType::Node4)?;
+            let (_, off) = alloc(dst, NodeType::Node4)?;
             let mut n = Node4::empty();
             n.count = survivors.len() as u8;
             for (i, &(b, c)) in survivors.iter().enumerate() {
                 n.keys[i] = b;
-                n.children[i] = c as u16;
+                n.children[i] = encode_child_off(c);
             }
-            write_struct_to_slot(dst, out.slot, &n)?;
-            Ok(Some(out.slot))
+            write_struct_at(dst, off, &n)?;
+            Ok(Some(off))
         }
         5..=16 => {
-            let out = dst.alloc_node(NodeType::Node16)?;
+            let (_, off) = alloc(dst, NodeType::Node16)?;
             let mut n = Node16::empty();
             n.count = survivors.len() as u8;
             for (i, &(b, c)) in survivors.iter().enumerate() {
                 n.keys[i] = b;
-                n.children[i] = c as u16;
+                n.children[i] = encode_child_off(c);
             }
-            write_struct_to_slot(dst, out.slot, &n)?;
-            Ok(Some(out.slot))
+            write_struct_at(dst, off, &n)?;
+            Ok(Some(off))
         }
         17..=48 => {
-            let out = dst.alloc_node(NodeType::Node48)?;
+            let (_, off) = alloc(dst, NodeType::Node48)?;
             let mut n = Node48::empty();
             n.count = survivors.len() as u8;
             for (ci, &(b, c)) in survivors.iter().enumerate() {
-                n.children[ci] = c as u16;
+                n.children[ci] = encode_child_off(c);
                 n.index[b as usize] = (ci as u8) + 1;
             }
-            write_struct_to_slot(dst, out.slot, &n)?;
-            Ok(Some(out.slot))
+            write_struct_at(dst, off, &n)?;
+            Ok(Some(off))
         }
         _ => {
-            let out = dst.alloc_node(NodeType::Node256)?;
+            let (_, off) = alloc(dst, NodeType::Node256)?;
             let mut n = Node256::empty();
             // `count: u8` wraps to 0 at 256 children; tolerate that
             // — the lookup path only consults `children[byte]` so
             // the count field is informational.
             n.count = survivors.len() as u8;
             for &(b, c) in survivors {
-                n.children[b as usize] = c as u16;
+                n.children[b as usize] = encode_child_off(c);
             }
-            write_struct_to_slot(dst, out.slot, &n)?;
-            Ok(Some(out.slot))
+            write_struct_at(dst, off, &n)?;
+            Ok(Some(off))
         }
     }
 }
