@@ -55,11 +55,26 @@ already-encoded records, single flusher copying a contiguous prefix into the
 **UNCHANGED** `WalWriter::append_encoded`), with the fatal flaws excised by the
 **one load-bearing decision**:
 
-> Key the committed-prefix watermark and ALL checkpoint watermarks on a
-> **dense, gap-free per-record work-id** (the existing `next_work` semantics),
-> allocated **and published synchronously at the reservation point, inside
-> `commit_gate.enter_writer`** — never on `next_seq` (gappy) and never on a raw
-> byte address (decouples reservation from publish → breaks W2D).
+> Key the committed-prefix watermark and ALL checkpoint watermarks on the
+> **byte tiling** — `tail.fetch_add(len)` hands out gap-free contiguous ranges
+> (each start == the previous end), so the byte address *is* the dense,
+> gap-free order key. Fold *published byte intervals* into `committed_addr`,
+> synchronously, at the reservation point inside `commit_gate.enter_writer` —
+> never on `next_seq` (gappy) and never on the *reserved* `tail` (decouples
+> reservation from publish → breaks W2D).
+
+> **Stage-1 correction (loom-driven).** The synthesized spec keyed the prefix
+> on a *separate* dense `work_alloc` counter. Implementing it (stage 1) and
+> running the loom model **caught the flaw the spec flagged as open question
+> #3**: `work_alloc` and `tail` are independent `fetch_add`s whose orders can
+> disagree, so folding by work-id can advance `committed_addr` over a byte
+> range whose lower bytes aren't published yet → the contiguous-byte flusher
+> copies an unpublished gap (silent corruption; CRC can't catch it). Keying on
+> the byte tiling uses the **one** natural order and is immune — and is simpler
+> (no second counter). File order = byte order = a valid linearization
+> (conflicting same-key ops are ordered by the endpoint lock → ordered `tail`
+> alloc). All W2D / no-stall properties below hold identically in the byte
+> domain. See `src/journal/ring.rs` (behind the `wal_ring` feature).
 
 On-disk format (`codec.rs`), `WalWriter` (`writer.rs`), and the replay reader
 (`reader.rs`) are **byte-for-byte untouched**. `FORMAT_VERSION` stays 3.

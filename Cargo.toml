@@ -41,6 +41,11 @@ rand = "0.10"
 tempfile = "3"
 proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
 
+# Model-checker for the WAL ring's lock-free reserve/publish/advance protocol.
+# Only compiled under `--cfg loom` (a separate test pass), never in normal builds.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [features]
 default = ["io-uring"]
 # Linux-only file-store fast path. Non-Linux builds ignore it.
@@ -49,6 +54,10 @@ io-uring = ["dep:io-uring"]
 tracing = ["dep:tracing"]
 # Enables the `holt::metrics` Prometheus text renderer.
 metrics = []
+# Experimental lock-free shared WAL ring (concurrent-append group commit).
+# Stage 1: self-contained ring buffer + loom/unit tests, NOT yet wired into
+# the Journal (zero production-path impact). See docs/design/wal-ring.md.
+wal_ring = []
 
 [profile.release]
 lto = "thin"
