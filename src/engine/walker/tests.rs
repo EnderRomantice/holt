@@ -85,39 +85,49 @@ fn ntype_at(frame: &BlobFrame<'_>, slot: u16) -> NodeType {
 }
 
 #[test]
-fn small_record_inlines_and_round_trips() {
-    use crate::layout::fits_leaf_inline;
+fn small_and_medium_records_round_trip_through_one_leaf() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
 
-    // Single small key: the root points straight at the leaf, so the
-    // root slot itself must be a LeafInline (key+value in the body).
-    assert!(fits_leaf_inline(3, 5));
+    // A leaf is now a SINGLE variable-size, self-describing node
+    // (`[16B header][key][value]`) regardless of size: the root points
+    // straight at the leaf, so the root slot itself is a `Leaf`.
     put(&mut frame, b"abc", b"value", 1);
     let root = frame.header().root_slot;
-    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+    assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
     assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"value"[..]));
 
-    // Same-key small→small update rewrites the fixed body in place:
-    // node stays a LeafInline and no new slot is consumed.
+    // Same-key small→small update rewrites the body in place when the
+    // new total fits the leaf's current allocation: node stays a
+    // `Leaf` and no new slot is consumed.
     let slots_before = frame.header().num_slots;
     let root = frame.header().root_slot;
     insert(&mut frame, root, b"abc", b"v2", 2).unwrap();
     let root = frame.header().root_slot;
-    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+    assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
     assert_eq!(frame.header().num_slots, slots_before, "in-place update");
+    assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"v2"[..]));
+
+    // A medium record (> the old 44-byte inline cap) takes exactly the
+    // same single-leaf path and round-trips.
+    let med_key = vec![b'm'; 40];
+    let med_val = vec![0x7u8; 80];
+    put(&mut frame, &med_key, &med_val, 3);
+    assert_eq!(get(&frame, &med_key).as_deref(), Some(med_val.as_slice()));
+    // Both records are still readable side by side.
     assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"v2"[..]));
 }
 
 #[test]
-fn leaf_inline_grows_to_extent_then_reuses_it() {
+fn leaf_value_grows_then_shrinks_in_place() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
     put(&mut frame, b"abc", b"tiny", 1);
     let root = frame.header().root_slot;
-    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+    assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
 
-    // Value over the inline cap spills to a regular extent Leaf.
+    // Growing the value past the leaf's current allocation reallocs a
+    // fresh, larger leaf (slot may change); value round-trips.
     let big = vec![0xAB; 200];
     let root = frame.header().root_slot;
     insert(&mut frame, root, b"abc", &big, 2).unwrap();
@@ -125,44 +135,24 @@ fn leaf_inline_grows_to_extent_then_reuses_it() {
     assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
     assert_eq!(get(&frame, b"abc").as_deref(), Some(big.as_slice()));
 
-    // Shrinking back below the inline cap deliberately keeps the
-    // existing extent and reuses it in place — that's cheaper than
-    // freeing the extent to re-inline, so the node stays an extent
-    // Leaf while the value round-trips correctly.
+    // Shrinking back keeps the existing (larger) allocation and
+    // overwrites in place — cheaper than reallocating a smaller leaf.
+    let slots_before = frame.header().num_slots;
     let root = frame.header().root_slot;
     insert(&mut frame, root, b"abc", b"sm", 3).unwrap();
     let root = frame.header().root_slot;
     assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
+    assert_eq!(frame.header().num_slots, slots_before, "shrink in place");
     assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"sm"[..]));
 }
 
 #[test]
-fn leaf_inline_cap_boundary() {
-    use crate::layout::{fits_leaf_inline, LEAF_INLINE_CAP};
-    // Exactly at the cap inlines; one byte past does not. Length
-    // fields are u8, so neither dimension may exceed 255.
-    assert!(fits_leaf_inline(10, LEAF_INLINE_CAP - 10));
-    assert!(!fits_leaf_inline(10, LEAF_INLINE_CAP - 10 + 1));
-    assert!(!fits_leaf_inline(256, 0));
-    assert!(!fits_leaf_inline(0, 256));
-
-    let (mut buf, _) = fresh_blob();
-    let mut frame = BlobFrame::wrap(&mut buf);
-    let key = vec![b'k'; 10];
-    let val = vec![0x7u8; LEAF_INLINE_CAP - 10]; // fills the body exactly
-    put(&mut frame, &key, &val, 1);
-    let root = frame.header().root_slot;
-    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
-    assert_eq!(get(&frame, &key).as_deref(), Some(val.as_slice()));
-}
-
-#[test]
-fn leaf_inline_split_erase_and_compaction() {
+fn leaf_split_erase_and_compaction() {
     let (mut buf, _) = fresh_blob();
     {
         let mut frame = BlobFrame::wrap(&mut buf);
-        // Two small keys sharing a prefix split the original inline
-        // leaf into an inner node with two inline-leaf children.
+        // Two keys sharing a prefix split the original leaf into an
+        // inner node with two leaf children.
         put(&mut frame, b"abc/01", b"x", 1);
         put(&mut frame, b"abc/02", b"y", 2);
         assert_eq!(get(&frame, b"abc/01").as_deref(), Some(&b"x"[..]));
@@ -174,7 +164,8 @@ fn leaf_inline_split_erase_and_compaction() {
         assert_eq!(get(&frame, b"abc/01"), None);
         assert_eq!(get(&frame, b"abc/02").as_deref(), Some(&b"y"[..]));
     }
-    // Compaction rebuilds the live tree via clone_leaf_inline.
+    // Compaction rebuilds the live tree via clone_leaf (verbatim body
+    // copy), dropping the tombstoned leaf.
     compact_in_place(&mut buf);
     let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(get(&frame, b"abc/02").as_deref(), Some(&b"y"[..]));
@@ -186,8 +177,8 @@ fn leaf_fingerprint_rejects_wrong_key_keeps_present_key() {
     let (mut buf, _) = fresh_blob();
     let mut frame = BlobFrame::wrap(&mut buf);
 
-    // Large value forces an extent Leaf (not LeafInline); the
-    // fingerprint gate only guards the extent read path.
+    // Any value size now uses the single self-describing leaf; the
+    // fingerprint gate guards the inline key compare on the read path.
     let big = vec![0xCD; 100];
     put(&mut frame, b"hello", &big, 1);
 
@@ -198,11 +189,11 @@ fn leaf_fingerprint_rejects_wrong_key_keeps_present_key() {
     assert_eq!(get(&frame, b"hellx"), None);
     assert_eq!(get(&frame, b"help"), None);
 
-    // The written extent leaf carries a non-zero fingerprint.
+    // The written leaf carries a non-zero fingerprint in its header.
     let root = frame.header().root_slot;
     assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
     let body = frame.as_ref().body_of_slot(root).unwrap();
-    let leaf = *cast::<crate::layout::Leaf>(body);
+    let leaf = *cast::<crate::layout::Leaf>(&body[..16]);
     assert_ne!(leaf.key_fp, 0, "written leaf must carry a fingerprint");
 
     // Keys sharing a long prefix: a missing sibling resolves to

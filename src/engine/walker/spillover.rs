@@ -10,7 +10,7 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{
-    leaf_extent_size, size_of_node, BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType,
+    leaf_body_size, size_of_node, BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType,
     Prefix, DATA_AREA_START, PAGE_SIZE,
 };
 use crate::store::{BlobFrame, BufferManager};
@@ -194,13 +194,15 @@ fn subtree_footprint_memo(
     match ntype {
         NodeType::Invalid => unreachable!("handled before size_of_node"),
         NodeType::Leaf => {
+            // A leaf is one contiguous, self-describing node
+            // (`[16B header][key][value]`). `size_of_node(Leaf)` only
+            // counts the 16-byte header, so replace `out.bytes` with
+            // the full variable body size — adding it would double-
+            // count the header and skew spillover victim selection.
             let (key, leaf) = read_leaf_key_ref(frame.as_ref(), root)?;
-            out.bytes = out.bytes.saturating_add(leaf_extent_size(
-                key.len() as u32,
-                u32::from(leaf.value_size),
-            ));
+            out.bytes = leaf_body_size(key.len() as u32, u32::from(leaf.value_len));
         }
-        NodeType::LeafInline | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
             out = out.saturating_add(subtree_footprint_memo(frame, p.child as u16, memo)?);
@@ -401,7 +403,7 @@ fn collect_victim_candidates(
                 memo,
             )?;
         }
-        NodeType::Leaf | NodeType::LeafInline | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Invalid => {
             return Err(Error::node_corrupt("collect_victim_candidates: Invalid"));
         }
@@ -545,7 +547,7 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
         NodeType::Invalid => {
             return Err(Error::node_corrupt("free_subtree: Invalid in source"));
         }
-        NodeType::Leaf | NodeType::LeafInline | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(&body_copy);
             free_subtree(frame, p.child as u16)?;

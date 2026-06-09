@@ -2,9 +2,7 @@
 //! `insert_at` dispatch + per-NodeType arms.
 
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
-use crate::layout::{
-    fits_leaf_inline, leaf_extent_size, BlobNode, Leaf, LeafInline, NodeType, BLOB_MAX_INLINE,
-};
+use crate::layout::{leaf_body_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
 use super::cast;
@@ -17,7 +15,7 @@ use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
-    write_leaf_seq, write_node4_with, write_prefix_chain, write_struct_to_slot,
+    write_node4_with, write_prefix_chain, write_struct_to_slot,
 };
 use super::SearchKey;
 use super::MAX_SPILLOVER_ATTEMPTS;
@@ -836,10 +834,6 @@ fn insert_at_step(
         NodeType::Leaf => {
             insert_into_leaf(frame, slot, key, value, depth, seq, condition).map(InsertStep::Done)
         }
-        NodeType::LeafInline => {
-            insert_into_leaf_inline(frame, slot, key, value, depth, seq, condition)
-                .map(InsertStep::Done)
-        }
         NodeType::Prefix => insert_into_prefix_step(
             frame,
             slot,
@@ -978,105 +972,6 @@ fn insert_into_empty_root(
     })
 }
 
-/// `insert_into_leaf` for an inline leaf. Same-key updates realloc a
-/// fresh leaf (inline or extent, by size) and free the old inline
-/// node — the parent repoints via `slot_after`; divergence splits
-/// reuse the inline node as one branch via [`write_leaf_split`].
-fn insert_into_leaf_inline(
-    frame: &mut BlobFrame<'_>,
-    leaf_slot: u16,
-    new_key: SearchKey<'_>,
-    new_value: &[u8],
-    depth: usize,
-    seq: u64,
-    condition: InsertCondition,
-) -> Result<InsertReturn> {
-    let li = *cast::<LeafInline>(
-        frame
-            .body_of_slot(leaf_slot)
-            .ok_or(Error::node_corrupt("insert_into_leaf_inline: body"))?,
-    );
-
-    if new_key.eq_slice(li.key()) {
-        let was_tombstoned = li.tombstone != 0;
-        if !was_tombstoned {
-            match condition {
-                InsertCondition::Always => {}
-                InsertCondition::IfVersion(expected) if li.seq == expected => {}
-                InsertCondition::IfAbsent | InsertCondition::IfVersion(_) => {
-                    return Ok(InsertReturn {
-                        slot_after: leaf_slot,
-                        mutated: false,
-                    });
-                }
-            }
-        } else if matches!(condition, InsertCondition::IfVersion(_)) {
-            return Ok(InsertReturn {
-                slot_after: leaf_slot,
-                mutated: false,
-            });
-        }
-        // The body is a fixed 56 B, so any replacement value that
-        // still fits inline can be rewritten in place — no alloc, no
-        // free, same slot. (This is strictly more flexible than the
-        // extent-leaf in-place path, which requires an exact size
-        // match.) Only when the new value outgrows the inline cap do
-        // we fall back to a fresh extent leaf and release this slot.
-        if fits_leaf_inline(li.key().len(), new_value.len()) {
-            let new_li = LeafInline::live(li.key(), new_value, seq);
-            write_struct_to_slot(frame, leaf_slot, &new_li)?;
-            if was_tombstoned {
-                let h = frame.header_mut();
-                h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
-            }
-            return Ok(InsertReturn {
-                slot_after: leaf_slot,
-                mutated: true,
-            });
-        }
-        let new_slot = write_leaf(frame, new_key, new_value, seq)?;
-        frame.free_node(leaf_slot)?;
-        if was_tombstoned {
-            let h = frame.header_mut();
-            h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
-        }
-        return Ok(InsertReturn {
-            slot_after: new_slot,
-            mutated: true,
-        });
-    }
-
-    let split = {
-        let existing_key = li.key();
-        let suffix_a = &existing_key[depth..];
-        let common_len = new_key.common_prefix_with_slice(depth, suffix_a);
-        if common_len == suffix_a.len() || common_len == new_key.remaining_len(depth) {
-            return Err(Error::NotYetImplemented(
-                "walker::insert_into_leaf_inline: one key is a strict prefix of the other",
-            ));
-        }
-        LeafSplitPlan {
-            common_prefix: suffix_a[..common_len].to_vec(),
-            byte_existing: suffix_a[common_len],
-            byte_new: new_key
-                .byte_at(depth + common_len)
-                .expect("new key has divergence byte"),
-        }
-    };
-
-    if matches!(condition, InsertCondition::IfVersion(_)) {
-        return Ok(InsertReturn {
-            slot_after: leaf_slot,
-            mutated: false,
-        });
-    }
-    let final_slot = write_leaf_split(frame, leaf_slot, new_key, new_value, seq, &split)?;
-    Ok(InsertReturn {
-        slot_after: final_slot,
-        mutated: true,
-    })
-}
-
 struct LeafSplitPlan {
     common_prefix: Vec<u8>,
     byte_existing: u8,
@@ -1153,50 +1048,52 @@ fn insert_into_leaf(
             //    the user's view this is a fresh insert (`previous`
             //    is `None`) and the blob's `tombstone_leaf_cnt` drops
             //    by one because the slot leaves the tombstone state.
-            // 2. **Update**: the existing leaf is live — return the
-            //    overwrite in place when extents fit; fall back to
-            //    alloc-fresh + free-old when the value grew past the
-            //    existing extent.
+            // 2. **Update**: the existing leaf is live — overwrite in
+            //    place when the new total fits the slot's current
+            //    allocated body; otherwise alloc-fresh + free-old.
             //
             // `Leaf::live` always pins `tombstone = 0` so both write
             // paths naturally clear the bit in the new leaf body.
             let was_tombstoned = existing_leaf.tombstone != 0;
-            if !was_tombstoned && new_value.len() == usize::from(existing_leaf.value_size) {
-                let key_len_u32 = new_key.len() as u32;
-                let value_offset = existing_leaf.key_offset + 2 + key_len_u32;
-                let region = frame
-                    .bytes_at_mut(value_offset, u32::from(existing_leaf.value_size))
-                    .ok_or(Error::node_corrupt(
-                        "insert_into_leaf: same-size value range out of bounds",
-                    ))?;
-                region.copy_from_slice(new_value);
-                write_leaf_seq(frame, leaf_slot, seq)?;
-                return Ok(InsertReturn {
-                    slot_after: leaf_slot,
-                    mutated: true,
-                });
-            }
-            let key_off = existing_leaf.key_offset;
-            let key_len_u32 = new_key.len() as u32;
-            let old_extent_size =
-                leaf_extent_size(key_len_u32, u32::from(existing_leaf.value_size));
-            let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
+            let key_len = existing_leaf.key_len as usize;
+            let new_value_len = new_value.len();
+            let new_total = leaf_body_size(key_len as u32, new_value_len as u32) as usize;
+            // The leaf is one contiguous self-describing node; resolve
+            // its current allocated body size via `body_of_slot`.
+            let cur_body_len = frame
+                .body_of_slot(leaf_slot)
+                .ok_or(Error::node_corrupt("insert_into_leaf: leaf body"))?
+                .len();
 
-            if new_extent_size <= old_extent_size {
-                let value_offset = key_off + 2 + key_len_u32;
-                let value_room = old_extent_size - 2 - key_len_u32;
-                let region =
-                    frame
-                        .bytes_at_mut(value_offset, value_room)
-                        .ok_or(Error::node_corrupt(
-                            "insert_into_leaf: extent value range out of bounds",
-                        ))?;
-                region[..new_value.len()].copy_from_slice(new_value);
-                for b in &mut region[new_value.len()..] {
-                    *b = 0;
+            if new_total <= cur_body_len {
+                // In-place overwrite: the key stays put at
+                // `body[16..16+key_len]`; rewrite the header (fresh
+                // value_len, seq, fingerprint; tombstone cleared) and
+                // the value at `body[16+key_len..]`, zeroing any
+                // shrink tail.
+                let new_leaf = Leaf::live(
+                    key_len as u16,
+                    new_value_len as u16,
+                    seq,
+                    new_key.fingerprint(),
+                );
+                {
+                    let body = frame.body_of_slot_mut(leaf_slot).ok_or(
+                        Error::node_corrupt("insert_into_leaf: leaf body (mut)"),
+                    )?;
+                    let hdr = unsafe {
+                        std::slice::from_raw_parts(
+                            std::ptr::from_ref::<Leaf>(&new_leaf).cast::<u8>(),
+                            std::mem::size_of::<Leaf>(),
+                        )
+                    };
+                    body[..16].copy_from_slice(hdr);
+                    let value_start = 16 + key_len;
+                    body[value_start..value_start + new_value_len].copy_from_slice(new_value);
+                    for b in &mut body[value_start + new_value_len..] {
+                        *b = 0;
+                    }
                 }
-                let new_leaf = Leaf::live(key_off, new_value.len() as u16, seq, new_key.fingerprint());
-                write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
                 if was_tombstoned {
                     let h = frame.header_mut();
                     h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
@@ -1207,10 +1104,10 @@ fn insert_into_leaf(
                 });
             }
 
-            // Value grew past the existing extent — fall back to alloc-
-            // fresh + free-old. The old extent bytes leak until
-            // `compact_blob` reclaims; the old leaf slot returns to its
-            // per-NodeType free list.
+            // Value grew past the current allocated body — alloc a
+            // fresh leaf + free the old slot. The old body bytes leak
+            // until `compact_blob` reclaims; the old leaf slot returns
+            // to its class-0 free list.
             let new_slot = write_leaf(frame, new_key, new_value, seq)?;
             frame.free_node(leaf_slot)?;
             if was_tombstoned {

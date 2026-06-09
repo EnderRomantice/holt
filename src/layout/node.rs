@@ -7,8 +7,11 @@ pub enum NodeType {
     /// Sentinel — never appears in a valid tree. Reading a slot
     /// tagged `invalid` panics.
     Invalid = 0,
-    /// Key-value leaf (16-byte body + bump-allocated extent for
-    /// key/value bytes).
+    /// Key-value leaf. A single variable-size, self-describing node:
+    /// `[16B header][key bytes][value bytes]`, allocated contiguously
+    /// in the data area. `size_of_node` reports the 16-byte header
+    /// size; the true body size is recovered from the header's
+    /// `key_len`/`value_len` by `body_of_slot`.
     Leaf = 1,
     /// Path-compressed prefix (128-byte fixed body; up to 112
     /// inline bytes).
@@ -27,11 +30,6 @@ pub enum NodeType {
     /// Empty-tree sentinel: 8 bytes all zero. Allocated once on
     /// `BlobFrame::init` and stored at `header.root_slot`.
     EmptyRoot = 8,
-    /// Small-record leaf with key+value inlined into a fixed 56-byte
-    /// body (no separate extent). Used when `key.len() + value.len()
-    /// <= LEAF_INLINE_CAP`, saving the extent allocation and the
-    /// second cache miss on the read path.
-    LeafInline = 9,
 }
 
 impl NodeType {
@@ -50,7 +48,6 @@ impl NodeType {
             6 => Some(Self::Node48),
             7 => Some(Self::Node256),
             8 => Some(Self::EmptyRoot),
-            9 => Some(Self::LeafInline),
             _ => None,
         }
     }
@@ -66,11 +63,13 @@ impl NodeType {
 ///
 /// Sizes are chosen so the four ART-internal variants
 /// (Node{4,16,48,256}) fit their children + index arrays exactly
-/// with no slack. Leaf is a fixed 16-byte header pointing at a
-/// separate key/value extent; Prefix and Blob are both 128 B so
-/// their inline path-compressed bytes fit comfortably.
-pub const SIZE_BY_TYPE: [u32; 9] = [
-    16,  // Leaf
+/// with no slack. `Leaf` is reported here as its 16-byte HEADER only;
+/// a leaf node is variable-size (`[16B header][key][value]`) and its
+/// true allocation is recovered from `key_len`/`value_len` by
+/// `body_of_slot`. Prefix and Blob are both 128 B so their inline
+/// path-compressed bytes fit comfortably.
+pub const SIZE_BY_TYPE: [u32; 8] = [
+    16,  // Leaf (header only — see note above)
     128, // Prefix
     128, // Blob
     16,  // Node4   (u16 children)
@@ -78,13 +77,17 @@ pub const SIZE_BY_TYPE: [u32; 9] = [
     360, // Node48  (u16 children)
     520, // Node256 (u16 children)
     8,   // EmptyRoot
-    56,  // LeafInline (12-byte header + 44-byte inline key/value;
-         // same size as Node16 so it shares Node16's free list)
 ];
 
 /// Bytes a single allocation of the given NodeType consumes.
 ///
 /// Panics on `NodeType::Invalid` (which has no associated size).
+///
+/// **Note:** for `NodeType::Leaf` this returns the 16-byte HEADER
+/// size only — a leaf is variable-size and its true body length is
+/// `leaf_body_size(key_len, value_len)`, recovered from the header by
+/// `body_of_slot`. Sizing a leaf slot via `size_of_node` alone would
+/// under-read the key/value bytes.
 #[must_use]
 pub fn size_of_node(ntype: NodeType) -> u32 {
     assert!(ntype != NodeType::Invalid, "size_of_node(Invalid)");
@@ -108,13 +111,12 @@ mod tests {
             NodeType::Node48,
             NodeType::Node256,
             NodeType::EmptyRoot,
-            NodeType::LeafInline,
         ];
         for t in all {
             assert_eq!(NodeType::from_raw(t.as_u8()), Some(t));
         }
-        // Values 10 and above are not in the enum.
-        assert_eq!(NodeType::from_raw(10), None);
+        // Values 9 and above are not in the enum.
+        assert_eq!(NodeType::from_raw(9), None);
         assert_eq!(NodeType::from_raw(255), None);
     }
 
@@ -128,6 +130,5 @@ mod tests {
         assert_eq!(size_of_node(NodeType::Node48), 360);
         assert_eq!(size_of_node(NodeType::Node256), 520);
         assert_eq!(size_of_node(NodeType::EmptyRoot), 8);
-        assert_eq!(size_of_node(NodeType::LeafInline), 56);
     }
 }

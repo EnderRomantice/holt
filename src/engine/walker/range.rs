@@ -27,9 +27,7 @@ use std::sync::{Arc, Mutex};
 use crate::api::atomic::RecordVersion;
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::concurrency::Gate;
-use crate::layout::{
-    BlobGuid, BlobNode, Leaf, LeafInline, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE,
-};
+use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use smallvec::SmallVec;
@@ -791,31 +789,19 @@ fn project_range_leaf(
     projection: RangeProjection,
     emit_buf: &mut Vec<u8>,
 ) -> Result<LeafAction> {
-    let (ntype, body) = resolve_typed(frame, slot)?;
-    // Both leaf encodings funnel into the same filter/emit logic;
-    // they differ only in where key/value bytes live (a separate
-    // extent for `Leaf`, inline in the body for `LeafInline`).
-    let (tombstone, stored_key, record_value, seq): (u8, &[u8], Option<&[u8]>, u64) =
-        if ntype == NodeType::LeafInline {
-            let li = cast::<LeafInline>(body);
-            let value = match projection {
-                RangeProjection::Records => Some(li.value()),
-                RangeProjection::KeysOnly | RangeProjection::KeyRefs => None,
-            };
-            (li.tombstone, li.key(), value, li.seq)
-        } else {
-            let leaf = *cast::<Leaf>(body);
-            let (key, value) = match projection {
-                RangeProjection::Records => {
-                    let (k, v) = leaf_extent(frame, &leaf)?;
-                    (k, Some(v))
-                }
-                RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
-                    (leaf_key_extent(frame, &leaf)?, None)
-                }
-            };
-            (leaf.tombstone, key, value, leaf.seq)
-        };
+    let (_ntype, body) = resolve_typed(frame, slot)?;
+    // A leaf is one contiguous, self-describing node:
+    // `[16B header][key][value]`. Decode the 16-byte header, then read
+    // key (and, for record projections, value) from the same body.
+    let leaf = *cast::<Leaf>(&body[..std::mem::size_of::<Leaf>()]);
+    let (stored_key, record_value): (&[u8], Option<&[u8]>) = match projection {
+        RangeProjection::Records => {
+            let (k, v) = leaf_extent(frame, slot)?;
+            (k, Some(v))
+        }
+        RangeProjection::KeysOnly | RangeProjection::KeyRefs => (leaf_key_extent(frame, slot)?, None),
+    };
+    let (tombstone, seq) = (leaf.tombstone, leaf.seq);
     if tombstone != 0 {
         return Ok(LeafAction::Skip);
     }
@@ -1311,7 +1297,7 @@ impl RangeIter {
             };
             let top_ntype = top.ntype;
             match top_ntype {
-                NodeType::Leaf | NodeType::LeafInline => {
+                NodeType::Leaf => {
                     let idx = self.stack.len() - 1;
                     if self.stack[idx].next == 0 {
                         let is_candidate = {
@@ -1505,7 +1491,7 @@ impl RangeIter {
             };
             let top_ntype = top.ntype;
             match top_ntype {
-                NodeType::Leaf | NodeType::LeafInline => {
+                NodeType::Leaf => {
                     let idx = self.stack.len() - 1;
                     if self.stack[idx].next == 0 {
                         self.stack[idx].next = 1;

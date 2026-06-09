@@ -9,8 +9,8 @@ use std::mem::{offset_of, size_of};
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
 use crate::layout::{
-    fits_leaf_inline, leaf_extent_size, BlobGuid, BlobNode, Leaf, LeafInline, Node16, Node256,
-    Node4, Node48, NodeType, Prefix, LEAF_INLINE_CAP, PREFIX_MAX_INLINE,
+    leaf_body_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
+    PREFIX_MAX_INLINE,
 };
 use crate::store::BlobFrame;
 
@@ -60,38 +60,57 @@ pub(super) fn write_leaf(
     value: &[u8],
     seq: u64,
 ) -> Result<u16> {
+    // A leaf is a single, contiguous, self-describing node:
+    // `[16B header][key bytes][value bytes]`. Allocate one variable-
+    // size node sized `align8(16 + key_len + value_len)` and write the
+    // header + key + value into it in place — no separate extent.
     let key_len = key.len();
-    // Small records inline key+value into a single 56-byte node,
-    // skipping the extent allocation and the second cache miss.
-    if fits_leaf_inline(key_len, value.len()) {
-        let mut keybuf = [0u8; LEAF_INLINE_CAP];
-        key.write_to_slice(&mut keybuf[..key_len]);
-        let li = LeafInline::live(&keybuf[..key_len], value, seq);
-        let out = frame.alloc_node(NodeType::LeafInline)?;
-        write_struct_to_slot(frame, out.slot, &li)?;
-        return Ok(out.slot);
-    }
-    let ext_size = leaf_extent_size(key_len as u32, value.len() as u32);
-    let ext = frame.alloc_extent(ext_size)?;
+    let value_len = value.len();
+    let total = leaf_body_size(key_len as u32, value_len as u32);
+    let out = frame.alloc_leaf(total)?;
+    let leaf = Leaf::live(key_len as u16, value_len as u16, seq, key.fingerprint());
+    // The freshly-allocated leaf body's header is still zero, so
+    // `body_of_slot` would size it as the bare 16-byte header. Address
+    // the region by its byte offset and write `[header][key][value]`
+    // directly; the leaf becomes self-describing once the header lands.
+    let body_off = frame
+        .slot_entry(out.slot)
+        .ok_or(Error::node_corrupt("write_leaf: slot entry"))?
+        .byte_offset();
     {
-        let s = frame
-            .bytes_at_mut(ext.byte_offset, ext_size)
-            .ok_or(Error::node_corrupt("write_leaf: extent out of range"))?;
-        s[..2].copy_from_slice(&(key_len as u16).to_le_bytes());
-        key.write_to_slice(&mut s[2..2 + key_len]);
-        s[2 + key_len..2 + key_len + value.len()].copy_from_slice(value);
+        let body = frame
+            .bytes_at_mut(body_off, total)
+            .ok_or(Error::node_corrupt("write_leaf: body out of range"))?;
+        // Header bytes.
+        let hdr = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref::<Leaf>(&leaf).cast::<u8>(),
+                size_of::<Leaf>(),
+            )
+        };
+        body[..16].copy_from_slice(hdr);
+        // Key (with virtual terminator) then value.
+        key.write_to_slice(&mut body[16..16 + key_len]);
+        body[16 + key_len..16 + key_len + value_len].copy_from_slice(value);
     }
-    let leaf_out = frame.alloc_node(NodeType::Leaf)?;
-    let leaf = Leaf::live(ext.byte_offset, value.len() as u16, seq, key.fingerprint());
-    write_struct_to_slot(frame, leaf_out.slot, &leaf)?;
-    Ok(leaf_out.slot)
+    Ok(out.slot)
 }
 
+/// Overwrite only the `seq` field of a leaf header in place.
+///
+/// Retained as a focused primitive for stamping a fresh record
+/// sequence onto an existing leaf without rewriting the rest of its
+/// header/body. (The hot same-key in-place update path rewrites the
+/// whole 16-byte header, so it does not need this.)
+#[allow(dead_code)]
 pub(super) fn write_leaf_seq(frame: &mut BlobFrame<'_>, slot: u16, seq: u64) -> Result<()> {
     let body = frame
         .body_of_slot_mut(slot)
         .ok_or(Error::node_corrupt("write_leaf_seq: body"))?;
-    if body.len() != size_of::<Leaf>() {
+    // The leaf body is variable-size (`[16B header][key][value]`); the
+    // 16-byte header at the front carries `seq @ +0`. A valid leaf
+    // body is always at least the header size.
+    if body.len() < size_of::<Leaf>() {
         return Err(Error::node_corrupt("write_leaf_seq: non-leaf slot"));
     }
     let seq_off = offset_of!(Leaf, seq);

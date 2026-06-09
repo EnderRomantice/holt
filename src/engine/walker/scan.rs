@@ -118,7 +118,7 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
         NodeType::Invalid => Err(Error::node_corrupt(
             "walker::scan::scan_subtree: hit NodeType::Invalid",
         )),
-        NodeType::EmptyRoot | NodeType::Leaf | NodeType::LeafInline => Ok(()),
+        NodeType::EmptyRoot | NodeType::Leaf => Ok(()),
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
             scan_subtree(frame, p.child as u16, out)

@@ -2,7 +2,8 @@
 //! dispatch + per-NodeType arms + collapse-on-lone-child rewiring.
 
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
-use crate::layout::{BlobNode, LeafInline, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
+use std::mem::offset_of;
 use std::sync::Arc;
 
 use super::cast;
@@ -448,9 +449,6 @@ fn erase_at_step(
             mutated: false,
         })),
         NodeType::Leaf => erase_at_leaf(frame, slot, key, condition).map(EraseStep::Done),
-        NodeType::LeafInline => {
-            erase_at_leaf_inline(frame, slot, key, condition).map(EraseStep::Done)
-        }
         NodeType::Prefix => {
             erase_at_prefix_step(frame, slot, key, depth, condition, allow_crossing)
         }
@@ -500,8 +498,11 @@ fn blob_node_erase_step(
 
 /// Soft-delete a leaf in place: flip its `tombstone` byte and bump
 /// the blob's `tombstone_leaf_cnt`. The leaf body stays in its slot
-/// (so the parent never sees the deletion) and the extent bytes
-/// stay allocated until [`super::compact_blob`] rebuilds the blob.
+/// (so the parent never sees the deletion) and its bytes stay
+/// allocated until [`super::compact_blob`] rebuilds the blob.
+///
+/// Only the single `tombstone` byte in the 16-byte header is written
+/// (the rest of the variable-size body is untouched).
 ///
 /// Returns `EraseSignal::Unchanged` so descending callers do not
 /// rewire parents — structural collapse is now a compaction-time
@@ -542,53 +543,14 @@ fn erase_at_leaf(
             });
         }
     }
-    let mut new_leaf = leaf;
-    new_leaf.tombstone = 1;
-    write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
-    let h = frame.header_mut();
-    h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_add(1);
-    Ok(EraseReturn {
-        signal: EraseSignal::Unchanged,
-        mutated: true,
-    })
-}
-
-/// `erase_at_leaf` for an inline leaf: tombstone the inline node in
-/// place (key and value live in the body, no extent).
-fn erase_at_leaf_inline(
-    frame: &mut BlobFrame<'_>,
-    leaf_slot: u16,
-    key: SearchKey<'_>,
-    condition: EraseCondition,
-) -> Result<EraseReturn> {
-    let li = *cast::<LeafInline>(
-        frame
-            .body_of_slot(leaf_slot)
-            .ok_or(Error::node_corrupt("erase_at_leaf_inline: body"))?,
-    );
-    if !key.eq_slice(li.key()) {
-        return Ok(EraseReturn {
-            signal: EraseSignal::Unchanged,
-            mutated: false,
-        });
+    // Flip only the tombstone byte in the contiguous body's header;
+    // the key/value bytes that follow are left in place.
+    {
+        let body = frame
+            .body_of_slot_mut(leaf_slot)
+            .ok_or(Error::node_corrupt("erase_at_leaf: leaf body"))?;
+        body[offset_of!(Leaf, tombstone)] = 1;
     }
-    if li.tombstone != 0 {
-        return Ok(EraseReturn {
-            signal: EraseSignal::Unchanged,
-            mutated: false,
-        });
-    }
-    if let EraseCondition::IfVersion(expected) = condition {
-        if li.seq != expected {
-            return Ok(EraseReturn {
-                signal: EraseSignal::Unchanged,
-                mutated: false,
-            });
-        }
-    }
-    let mut new_li = li;
-    new_li.tombstone = 1;
-    write_struct_to_slot(frame, leaf_slot, &new_li)?;
     let h = frame.header_mut();
     h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_add(1);
     Ok(EraseReturn {

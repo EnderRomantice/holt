@@ -8,15 +8,15 @@ use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::engine::simd;
 use crate::engine::{RouteCache, RouteHit};
 use crate::layout::{
-    BlobGuid, BlobNode, Leaf, LeafInline, Node16, Node256, Node4, Node48, NodeType, Prefix,
-    BLOB_MAX_INLINE,
+    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
+use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
-use super::readers::{leaf_extent, resolve_typed};
+use super::readers::resolve_typed;
 use super::route::{pin_route_parent, validate_route_edge};
 use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
 use super::SearchKey;
@@ -334,8 +334,7 @@ fn descend<'a>(
             "walker::descend: hit NodeType::Invalid",
         )),
         NodeType::EmptyRoot => Ok(LookupResult::NotFound),
-        NodeType::Leaf => leaf_check(frame, body, key, depth),
-        NodeType::LeafInline => Ok(inline_leaf_check(body, key)),
+        NodeType::Leaf => leaf_check(body, key, depth),
         NodeType::Prefix => prefix_descend(frame, body, key, depth),
         NodeType::Node4 => node4_descend(frame, body, key, depth),
         NodeType::Node16 => node16_descend(frame, body, key, depth),
@@ -362,50 +361,38 @@ fn blob_descend<'a>(body: &[u8], key: SearchKey<'_>, depth: usize) -> Result<Loo
     }))
 }
 
-fn leaf_check<'a>(
-    frame: BlobFrameRef<'a>,
-    body: &'a [u8],
-    key: SearchKey<'_>,
-    _depth: usize,
-) -> Result<LookupResult<'a>> {
-    let leaf = cast::<Leaf>(body);
+fn leaf_check<'a>(body: &'a [u8], key: SearchKey<'_>, _depth: usize) -> Result<LookupResult<'a>> {
+    // The leaf is one contiguous, self-describing node:
+    // `[16B header][key][value]`. Cast ONLY the 16-byte header.
+    let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
     if leaf.tombstone != 0 {
         return Ok(LookupResult::NotFound);
     }
     // Fingerprint gate: a path-compressed ART reaches a leaf whose key
     // may still differ from the search key (lazy expansion). When the
     // leaf carries a fingerprint (`!= 0`) and it disagrees with the
-    // search key's, the keys cannot be equal — reject without the
-    // second cache miss of reading the key extent. A match (or an
+    // search key's, the keys cannot be equal — reject without the SIMD
+    // key compare against the inline key bytes. A match (or an
     // un-fingerprinted older leaf) still does the full compare below,
     // so this is never a false negative.
     if leaf.key_fp != 0 && leaf.key_fp != key.fingerprint() {
         return Ok(LookupResult::NotFound);
     }
-    let (leaf_key, value) = leaf_extent(frame, leaf)?;
+    let key_len = leaf.key_len as usize;
+    let value_len = leaf.value_len as usize;
+    let key_end = 16 + key_len;
+    let value_end = key_end + value_len;
+    if value_end > body.len() {
+        return Err(Error::node_corrupt("leaf_check: key/value out of range"));
+    }
+    let leaf_key = &body[16..key_end];
     if !key.eq_slice(leaf_key) {
         return Ok(LookupResult::NotFound);
     }
     Ok(LookupResult::Found(LookupHit {
-        value,
+        value: &body[key_end..value_end],
         seq: leaf.seq,
     }))
-}
-
-/// `leaf_check` for an inline leaf: key and value both live in the
-/// node body, so no extent read is needed.
-fn inline_leaf_check<'a>(body: &'a [u8], key: SearchKey<'_>) -> LookupResult<'a> {
-    let li = cast::<LeafInline>(body);
-    if li.tombstone != 0 {
-        return LookupResult::NotFound;
-    }
-    if !key.eq_slice(li.key()) {
-        return LookupResult::NotFound;
-    }
-    LookupResult::Found(LookupHit {
-        value: li.value(),
-        seq: li.seq,
-    })
 }
 
 fn prefix_descend<'a>(

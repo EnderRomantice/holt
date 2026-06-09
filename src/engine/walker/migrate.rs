@@ -19,8 +19,8 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{
-    leaf_extent_size, BlobGuid, BlobNode, Leaf, LeafInline, Node16, Node256, Node4, Node48,
-    NodeType, Prefix, BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
+    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
+    DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
 use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
@@ -45,11 +45,13 @@ const MERGE_RESERVE: u32 = 0x1000;
 /// [`BlobNode`] placeholder where the subtree used to live, and
 /// writes both blobs back.
 ///
-/// **Leaf extents are deep-copied as well** — they live in the new
-/// blob's data area at fresh offsets pointed at by each cloned
-/// Leaf's `key_offset`. The original blob is untouched; freeing
-/// the migrated slots is the caller's responsibility (typical
-/// pattern is one `BlobFrame::free_node` per migrated slot).
+/// **Leaf bodies are deep-copied verbatim** — each leaf is one
+/// contiguous, self-describing node (`[16B header][key][value]`), so
+/// the clone bump-allocates a same-size leaf in the new blob's data
+/// area and copies the bytes across (no offset to repoint). The
+/// original blob is untouched; freeing the migrated slots is the
+/// caller's responsibility (typical pattern is one
+/// `BlobFrame::free_node` per migrated slot).
 ///
 /// Migration is **preserve-mode** — tombstones in the source travel
 /// to the destination verbatim. Compaction (in either blob) is the
@@ -102,26 +104,22 @@ fn make_blob_from_node_with_buf(
 /// Cheap header-level predicate for whether `compact_blob` can
 /// reclaim anything.
 ///
-/// Tombstoned leaves keep their key/value extents until compaction;
-/// freed leaf slots also imply leaked leaf extents from alloc-fresh
-/// same-key updates. Other free-list entries are normal ART shape
-/// churn (EmptyRoot release, Node4→Node16 growth, prefix splits)
+/// Tombstoned leaves keep their (contiguous) bodies until compaction;
+/// freed leaf slots also imply leaked leaf bodies from alloc-fresh
+/// same-key updates (a same-key update whose new total outgrows the
+/// leaf's current allocation). Other free-list entries are normal ART
+/// shape churn (EmptyRoot release, Node4→Node16 growth, prefix splits)
 /// and are cheap to reuse in place, so they are not enough to make
 /// online `Tree::compact` pay a 512 KB scratch allocation + memcpy.
 #[must_use]
 pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
     let h = frame.header();
-    // A freed leaf slot is the churn signal. Regular `Leaf` nodes
-    // land on their own free list; `LeafInline` nodes are 56 B and
-    // share `Node16`'s free list (see `free_list_class`), so a
-    // small-record same-key update parks the old slot there instead.
-    // We check both lists — the Node16 list can also hold a freed
-    // inner node, which only makes the heuristic slightly more eager
-    // (that slot is reclaimable space too, and compaction is a safe,
-    // idempotent background pass).
+    // A freed leaf slot is the churn signal. Leaves are now a single
+    // variable-size, self-describing node and land on their own
+    // class-0 free list (see `free_list_class`); their freed bytes are
+    // reclaimed by compaction exactly as the old separate extents were.
     let leaf_free_list = h.free_list_head[NodeType::Leaf as usize - 1];
-    let inline_free_list = h.free_list_head[NodeType::Node16 as usize - 1];
-    h.tombstone_leaf_cnt != 0 || leaf_free_list != 0 || inline_free_list != 0
+    h.tombstone_leaf_cnt != 0 || leaf_free_list != 0
 }
 
 /// Repack `buf` in place, discarding all unreachable bytes plus
@@ -146,11 +144,11 @@ pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
 /// - If every leaf in the source was tombstoned, the root becomes
 ///   the freshly-allocated `EmptyRoot` sentinel.
 ///
-/// **What this reclaims:** the leaf key/value extents (allocated
-/// via `alloc_extent`, which has no free list), dead node bodies
+/// **What this reclaims:** leaf bodies whose slots returned to the
+/// class-0 free list (alloc-fresh same-key updates), dead node bodies
 /// whose slots returned to a per-NodeType free list but whose
-/// `NodeType` isn't being allocated any more, and every leaf body
-/// + extent whose `tombstone` byte was set.
+/// `NodeType` isn't being allocated any more, and every (contiguous)
+/// leaf body whose `tombstone` byte was set.
 ///
 /// **What this costs:** one scratch `AlignedBlobBuf` (512 KB on
 /// the heap, lives for the duration of the call) plus one full
@@ -367,8 +365,7 @@ fn clone_subtree(
             let out = dst.alloc_node(NodeType::EmptyRoot)?;
             Ok(Some(out.slot))
         }
-        NodeType::Leaf => clone_leaf(src, body, dst, filter_tombstones),
-        NodeType::LeafInline => clone_leaf_inline(body, dst, filter_tombstones),
+        NodeType::Leaf => clone_leaf(body, dst, filter_tombstones),
         NodeType::Prefix => clone_prefix(src, body, dst, filter_tombstones),
         NodeType::Node4 => clone_node4(src, body, dst, filter_tombstones),
         NodeType::Node16 => clone_node16(src, body, dst, filter_tombstones),
@@ -378,70 +375,47 @@ fn clone_subtree(
     }
 }
 
+/// Clone a leaf verbatim. A leaf is one contiguous, self-describing
+/// node (`[16B header][key][value]`), so the clone bump-allocates a
+/// same-size leaf in the destination and copies the whole body across
+/// — no key_offset to repoint. The tombstone byte travels with the
+/// body in preserve-mode; filter-mode drops tombstoned survivors.
 fn clone_leaf(
-    src: &BlobFrame<'_>,
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
 ) -> Result<Option<u16>> {
-    let src_leaf = *cast::<Leaf>(src_body);
+    // `src_body` is the full leaf body (sized by `body_of_slot` from
+    // the header's key_len/value_len). Decode only the 16-byte header.
+    let src_leaf = *cast::<Leaf>(&src_body[..std::mem::size_of::<Leaf>()]);
     if filter_tombstones && src_leaf.tombstone != 0 {
         return Ok(None);
     }
-    let hdr = src
-        .bytes_at(src_leaf.key_offset, 2)
-        .ok_or(Error::node_corrupt(
-            "clone_leaf: extent header out of range",
-        ))?;
-    let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
-    let ext_total = leaf_extent_size(key_len, u32::from(src_leaf.value_size));
-    let src_ext = src
-        .bytes_at(src_leaf.key_offset, ext_total)
-        .ok_or(Error::node_corrupt("clone_leaf: extent body out of range"))?
-        .to_vec();
-
-    let dst_ext = dst.alloc_extent(ext_total)?;
-    dst.bytes_at_mut(dst_ext.byte_offset, ext_total)
-        .ok_or(Error::node_corrupt("clone_leaf: dst extent out of range"))?
-        .copy_from_slice(&src_ext);
-
-    let leaf_out = dst.alloc_node(NodeType::Leaf)?;
-    // Preserve tombstone byte in preserve-mode; filter-mode bailed
-    // out above so the survivor is always live.
-    let new_leaf = if filter_tombstones {
-        // Carry the source key fingerprint over — the key bytes are
-        // copied verbatim, so the fingerprint is still valid.
-        Leaf::live(
-            dst_ext.byte_offset,
-            src_leaf.value_size,
-            src_leaf.seq,
-            src_leaf.key_fp,
+    let total = src_body.len() as u32;
+    debug_assert_eq!(
+        total,
+        crate::layout::leaf_body_size(
+            u32::from(src_leaf.key_len),
+            u32::from(src_leaf.value_len),
         )
-    } else {
-        let mut copy = src_leaf;
-        copy.key_offset = dst_ext.byte_offset;
-        copy
-    };
-    write_struct_to_slot(dst, leaf_out.slot, &new_leaf)?;
-    Ok(Some(leaf_out.slot))
-}
-
-/// Clone a [`LeafInline`]. Unlike [`clone_leaf`] there is no
-/// separate key/value extent to copy — the bytes live inline in the
-/// 56-byte body — so a straight struct copy reproduces the node
-/// verbatim. The tombstone byte is preserved in preserve-mode;
-/// filter-mode drops tombstoned survivors.
-fn clone_leaf_inline(
-    src_body: &[u8],
-    dst: &mut BlobFrame<'_>,
-    filter_tombstones: bool,
-) -> Result<Option<u16>> {
-    let src_li = *cast::<LeafInline>(src_body);
-    if filter_tombstones && src_li.tombstone != 0 {
-        return Ok(None);
+    );
+    let out = dst.alloc_leaf(total)?;
+    // The freshly-allocated dst leaf body's header is still zero, so
+    // `body_of_slot_mut` would size it as the bare 16-byte header.
+    // Address it by byte offset and copy the source body verbatim
+    // (`[header][key][value]`) — no key_offset to repoint; the dst
+    // becomes self-describing once the header bytes land.
+    let dst_off = dst
+        .slot_entry(out.slot)
+        .ok_or(Error::node_corrupt("clone_leaf: dst slot entry"))?
+        .byte_offset();
+    {
+        let dst_body = dst
+            .bytes_at_mut(dst_off, total)
+            .ok_or(Error::node_corrupt("clone_leaf: dst body out of range"))?;
+        debug_assert_eq!(dst_body.len(), src_body.len());
+        dst_body.copy_from_slice(src_body);
     }
-    let out = dst.alloc_node(NodeType::LeafInline)?;
-    write_struct_to_slot(dst, out.slot, &src_li)?;
     Ok(Some(out.slot))
 }
 

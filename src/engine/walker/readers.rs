@@ -7,7 +7,7 @@
 //! [`super::writers`].
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{Leaf, LeafInline, Node16, Node256, Node4, Node48, NodeType, Prefix};
+use crate::layout::{Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix};
 use crate::store::BlobFrameRef;
 use std::mem::size_of;
 
@@ -34,58 +34,63 @@ pub(super) fn ntype_of(frame: BlobFrameRef<'_>, slot: u16) -> Result<NodeType> {
         .ok_or(Error::node_corrupt("walker: undecodable node type"))
 }
 
-pub(super) fn leaf_extent<'a>(
-    frame: BlobFrameRef<'a>,
-    leaf: &Leaf,
-) -> Result<(&'a [u8], &'a [u8])> {
-    let hdr = frame
-        .bytes_at(leaf.key_offset, 2)
-        .ok_or(Error::node_corrupt("leaf extent header out of range"))?;
-    let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
-    let total = 2 + key_len + u32::from(leaf.value_size);
-    let extent = frame
-        .bytes_at(leaf.key_offset, total)
-        .ok_or(Error::node_corrupt("leaf extent body out of range"))?;
-    Ok((
-        &extent[2..2 + key_len as usize],
-        &extent[2 + key_len as usize..],
-    ))
+/// Split a leaf's contiguous self-describing body
+/// (`[16B header][key][value]`) into `(key, value)` slices.
+///
+/// `body` must be the full leaf body as returned by
+/// `body_of_slot` (already sized to `align8(16 + key_len +
+/// value_len)`), and `leaf` the header decoded from `body[..16]`.
+fn split_leaf_body<'a>(body: &'a [u8], leaf: &Leaf) -> Result<(&'a [u8], &'a [u8])> {
+    let key_len = leaf.key_len as usize;
+    let value_len = leaf.value_len as usize;
+    let key_end = 16usize
+        .checked_add(key_len)
+        .ok_or(Error::node_corrupt("leaf body: key length overflow"))?;
+    let value_end = key_end
+        .checked_add(value_len)
+        .ok_or(Error::node_corrupt("leaf body: value length overflow"))?;
+    if value_end > body.len() {
+        return Err(Error::node_corrupt("leaf body: key/value out of range"));
+    }
+    Ok((&body[16..key_end], &body[key_end..value_end]))
 }
 
-pub(super) fn leaf_key_extent<'a>(frame: BlobFrameRef<'a>, leaf: &Leaf) -> Result<&'a [u8]> {
-    let hdr = frame
-        .bytes_at(leaf.key_offset, 2)
-        .ok_or(Error::node_corrupt("leaf key extent header out of range"))?;
-    let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
-    frame
-        .bytes_at(leaf.key_offset + 2, key_len)
-        .ok_or(Error::node_corrupt("leaf key extent body out of range"))
+/// Borrow `(key, value)` of the leaf at `slot` from its contiguous
+/// self-describing body.
+pub(super) fn leaf_extent(frame: BlobFrameRef<'_>, slot: u16) -> Result<(&[u8], &[u8])> {
+    let body = frame
+        .body_of_slot(slot)
+        .ok_or(Error::node_corrupt("leaf body resolution failed"))?;
+    let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
+    split_leaf_body(body, &leaf)
 }
 
-/// Borrow the key and copy only the small leaf header. Update and
-/// delete walkers can decide key equality without allocating; the
-/// returned key borrow must not cross a later frame mutation.
+/// Borrow the key bytes of the leaf at `slot` from its contiguous
+/// self-describing body.
+pub(super) fn leaf_key_extent(frame: BlobFrameRef<'_>, slot: u16) -> Result<&[u8]> {
+    let (key, _value) = leaf_extent(frame, slot)?;
+    Ok(key)
+}
+
+/// Borrow the key and copy the small leaf header. Update and delete
+/// walkers can decide key equality without allocating; the returned
+/// key borrow must not cross a later frame mutation.
 pub(super) fn read_leaf_key_ref(frame: BlobFrameRef<'_>, slot: u16) -> Result<(&[u8], Leaf)> {
     let body = frame
         .body_of_slot(slot)
         .ok_or(Error::node_corrupt("read_leaf_key_ref: body"))?;
-    let leaf = *cast::<Leaf>(body);
-    let k = leaf_key_extent(frame, &leaf)?;
-    Ok((k, leaf))
+    let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
+    let (key, _value) = split_leaf_body(body, &leaf)?;
+    Ok((key, leaf))
 }
 
-/// Borrow the key of a leaf slot regardless of physical layout:
-/// a regular [`Leaf`] keeps its key in a separate extent, while a
-/// [`LeafInline`] carries it inline in the body. Used where a
-/// walker needs only key ordering/equality and doesn't care which
-/// leaf encoding is on disk.
+/// Borrow the key of a leaf slot. With the flattened, single-encoding
+/// leaf the key lives in the contiguous body at `body[16..16+key_len]`.
+/// Used where a walker needs only key ordering/equality.
 pub(super) fn leaf_any_key(frame: BlobFrameRef<'_>, slot: u16) -> Result<&[u8]> {
-    let (ntype, body) = resolve_typed(frame, slot)?;
-    if ntype == NodeType::LeafInline {
-        return Ok(cast::<LeafInline>(body).key());
-    }
-    let leaf = *cast::<Leaf>(body);
-    leaf_key_extent(frame, &leaf)
+    let (_ntype, body) = resolve_typed(frame, slot)?;
+    let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
+    split_leaf_body(body, &leaf).map(|(key, _value)| key)
 }
 
 pub(super) fn read_prefix(frame: BlobFrameRef<'_>, slot: u16) -> Result<Prefix> {

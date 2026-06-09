@@ -73,7 +73,7 @@ fn try_merge_subtree(
         NodeType::Invalid => Err(Error::node_corrupt(
             "try_merge_subtree: hit NodeType::Invalid",
         )),
-        NodeType::EmptyRoot | NodeType::Leaf | NodeType::LeafInline => Ok(slot),
+        NodeType::EmptyRoot | NodeType::Leaf => Ok(slot),
         NodeType::Prefix => merge_under_prefix(bm, frame, slot, stats, seq),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
             merge_under_inner(bm, frame, slot, ntype, stats, seq)
