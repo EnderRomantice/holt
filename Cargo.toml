@@ -68,6 +68,10 @@ opt-level = 3
 inherits = "release"
 
 [[example]]
+name = "wal_crash_soak"
+path = "examples/wal_crash_soak.rs"
+
+[[example]]
 name = "basic_kv"
 path = "examples/basic_kv.rs"
 

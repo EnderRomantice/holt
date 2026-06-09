@@ -758,4 +758,35 @@ mod loom_tests {
             assert_eq!(ring.committed_records(), 2);
         });
     }
+
+    /// Three concurrent publishers + a racing flusher. Stresses the `advance`
+    /// lock (BTreeMap insert + contiguous fold) under more interleavings:
+    /// asserts no torn/gap copy, dense final fold, and — implicitly — no
+    /// deadlock (the lock is a leaf; the flusher never takes it).
+    #[test]
+    fn gap_safety_three_producers_one_flusher() {
+        loom::model(|| {
+            let ring = Arc::new(WalRing::with_capacity(64));
+            let mut workers = Vec::new();
+            for tag in 1u8..=3 {
+                let ring = Arc::clone(&ring);
+                workers.push(thread::spawn(move || ring.append(&[tag; 4])));
+            }
+            let mut drained: Vec<u8> = Vec::new();
+            ring.copy_committed_prefix(&mut |s| drained.extend_from_slice(s));
+            for &b in &drained {
+                assert!((1..=3).contains(&b), "torn/gap byte {b}");
+            }
+            for w in workers {
+                w.join().unwrap();
+            }
+            let mut rest: Vec<u8> = Vec::new();
+            ring.copy_committed_prefix(&mut |s| rest.extend_from_slice(s));
+            for &b in &rest {
+                assert!((1..=3).contains(&b), "torn/gap byte {b} in final drain");
+            }
+            assert_eq!(drained.len() + rest.len(), 12, "all three must drain");
+            assert_eq!(ring.committed_records(), 3);
+        });
+    }
 }

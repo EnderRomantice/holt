@@ -38,7 +38,7 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use crate::api::errors::{Error, Result};
 
 use super::group_commit::JournalStats;
-use super::ring::WalRing;
+use super::ring::{ReserveTicket, WalRing};
 use super::writer::WalWriter;
 
 /// In-RAM ring capacity. 16 MiB absorbs large metadata bursts between
@@ -83,6 +83,9 @@ struct Shared {
     /// Condvar handshake for `flushed`/`err` waiters.
     flushed_mx: Mutex<()>,
     flushed_cv: Condvar,
+    /// Condvar handshake for writers parked on ring backpressure.
+    space_mx: Mutex<()>,
+    space_cv: Condvar,
 
     control_tx: Sender<Control>,
     record_pool: Mutex<Vec<Vec<u8>>>,
@@ -117,6 +120,7 @@ impl Shared {
         let want_sync = self.sync_target.load(Ordering::Acquire) > self.flushed.load(Ordering::Acquire);
 
         let mut sink_err: Option<&'static str> = None;
+        let mut freed_space = false;
         {
             let mut w = self.writer.lock().unwrap();
             let copied = self.ring.copy_committed_prefix(&mut |bytes| {
@@ -132,6 +136,7 @@ impl Shared {
             if copied > 0 {
                 self.written.fetch_max(self.record_base + rc, Ordering::AcqRel);
                 self.batches.fetch_add(1, Ordering::Relaxed);
+                freed_space = true;
             }
             if want_sync {
                 if w.flush().is_err() {
@@ -147,6 +152,33 @@ impl Shared {
             let _g = self.flushed_mx.lock().unwrap();
             self.flushed_cv.notify_all();
         }
+        if freed_space {
+            // The flusher advanced flush_cursor: wake any writer parked on
+            // ring backpressure.
+            let _g = self.space_mx.lock().unwrap();
+            self.space_cv.notify_all();
+        }
+    }
+
+    /// Block until the reserved range fits below `flush_cursor + capacity`
+    /// (built-in backpressure). Parks on `space_cv` instead of spinning;
+    /// rare in practice (the ring is sized to absorb bursts between
+    /// checkpoints), but bounds RAM and CPU under sustained overload.
+    fn wait_for_ring_space(&self, ticket: &ReserveTicket) -> Result<()> {
+        let _ = self.control_tx.send(Control::Flush);
+        let mut guard = self.space_mx.lock().unwrap();
+        while !self.ring.reserve_space_ready(ticket) {
+            if let Some(m) = self.sticky_err() {
+                return Err(Error::Internal(m));
+            }
+            let _ = self.control_tx.send(Control::Flush);
+            let (next, _timeout) = self
+                .space_cv
+                .wait_timeout(guard, FLUSH_POLL.saturating_mul(4))
+                .unwrap();
+            guard = next;
+        }
+        Ok(())
     }
 
     /// Block until `flushed >= target` (or a flusher error). Used by sync
@@ -245,6 +277,8 @@ impl Journal {
             err: Mutex::new(None),
             flushed_mx: Mutex::new(()),
             flushed_cv: Condvar::new(),
+            space_mx: Mutex::new(()),
+            space_cv: Condvar::new(),
             control_tx,
             record_pool: Mutex::new(Vec::new()),
         });
@@ -274,13 +308,8 @@ impl Journal {
         // Reserve → backpressure wait → memcpy → publish. Stage-1 ring has no
         // built-in backpressure (stage 5); spin on the flusher freeing RAM.
         let ticket = self.shared.ring.reserve(bytes.len() as u64);
-        while !self.shared.ring.reserve_space_ready(&ticket) {
-            if let Some(m) = self.shared.sticky_err() {
-                return Err(Error::Internal(m));
-            }
-            // Nudge the flusher to drain and free RAM.
-            let _ = self.shared.control_tx.send(Control::Flush);
-            std::hint::spin_loop();
+        if !self.shared.ring.reserve_space_ready(&ticket) {
+            self.shared.wait_for_ring_space(&ticket)?;
         }
         self.shared.ring.fill(&ticket, &bytes);
         self.shared.ring.publish(&ticket);
@@ -288,8 +317,9 @@ impl Journal {
 
         let n = self.shared.queued.fetch_add(1, Ordering::AcqRel) + 1;
         self.shared.appends.fetch_add(1, Ordering::Relaxed);
-        // Wake the flusher to drain promptly (async process-crash durability).
-        let _ = self.shared.control_tx.send(Control::Flush);
+        // No per-op flusher wake: the flusher's FLUSH_POLL drains async
+        // records within the poll window (the async RAM→page-cache budget).
+        // Sync appends + checkpoint barriers wake it explicitly via flush_to.
 
         if sync {
             Ok(Some(JournalAck {
