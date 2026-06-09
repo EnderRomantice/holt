@@ -178,6 +178,25 @@ impl<'a> BlobFrameRef<'a> {
         Some(&self.buf[off..off + size])
     }
 
+    /// Best-effort prefetch of the node body at `slot`, used during
+    /// descent to warm the next level's body cache line while the
+    /// current level finishes. The slot-table entry is already warm
+    /// from the parent's child scan; this resolves the body offset
+    /// and issues a read-prefetch hint. Never faults — the entry is
+    /// bounds-checked and a prefetch never dereferences the pointer.
+    #[inline]
+    pub fn prefetch_node(&self, slot: u16) {
+        let Some(e) = self.slot_entry(slot) else {
+            return;
+        };
+        let off = e.byte_offset() as usize;
+        if e.node_type().is_some_and(|nt| nt != NodeType::Invalid) && off < self.buf.len() {
+            // SAFETY: `off < buf.len()`, so the pointer is in-bounds;
+            // a prefetch hint reads nothing and cannot fault.
+            crate::engine::prefetch_read_data(unsafe { self.buf.as_ptr().add(off) });
+        }
+    }
+
     /// Raw byte view at an arbitrary offset (Leaf extents).
     #[must_use]
     pub fn bytes_at(&self, offset: u32, len: u32) -> Option<&'a [u8]> {

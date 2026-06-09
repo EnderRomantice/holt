@@ -208,8 +208,9 @@ pub fn find_next_nonzero_byte(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 /// Hint the CPU that the cache line at `ptr` is likely to be read
-/// soon. This is intentionally best-effort and a no-op on targets
-/// where we do not have a stable cheap prefetch intrinsic.
+/// soon. Best-effort: a prefetch never dereferences `ptr` (a bad
+/// address cannot fault), it only nudges the cache. A no-op on
+/// targets without a stable cheap prefetch primitive.
 #[inline]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn prefetch_read_data(ptr: *const u8) {
@@ -217,6 +218,25 @@ pub(crate) fn prefetch_read_data(ptr: *const u8) {
         x86::prefetch_read_data(ptr);
     }
 }
+
+/// `PRFM PLDL1KEEP` — prefetch for load into L1, temporal-keep.
+#[inline]
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn prefetch_read_data(ptr: *const u8) {
+    // SAFETY: `prfm` is a hint that never accesses memory at `ptr`;
+    // it cannot fault on a bad address. `readonly` + `nostack` hold.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) ptr,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+}
+
+#[inline]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn prefetch_read_data(_ptr: *const u8) {}
 
 #[inline]
 fn longest_common_prefix_tail(a: &[u8], b: &[u8], mut i: usize, limit: usize) -> usize {

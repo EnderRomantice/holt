@@ -430,7 +430,9 @@ fn node4_descend<'a>(
     let count = (n.count as usize).min(4);
     for i in 0..count {
         if n.keys[i] == byte {
-            return descend(frame, n.children[i] as u16, key, depth + 1);
+            let child = n.children[i] as u16;
+            frame.prefetch_node(child);
+            return descend(frame, child, key, depth + 1);
         }
         if n.keys[i] > byte {
             break;
@@ -450,7 +452,9 @@ fn node16_descend<'a>(
         return Ok(LookupResult::NotFound);
     };
     if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
-        return descend(frame, n.children[i as usize] as u16, key, depth + 1);
+        let child = n.children[i as usize] as u16;
+        frame.prefetch_node(child);
+        return descend(frame, child, key, depth + 1);
     }
     Ok(LookupResult::NotFound)
 }
@@ -475,7 +479,9 @@ fn node48_descend<'a>(
             "walker::node48_descend: child index out of range",
         ));
     }
-    descend(frame, n.children[ci] as u16, key, depth + 1)
+    let child = n.children[ci] as u16;
+    frame.prefetch_node(child);
+    descend(frame, child, key, depth + 1)
 }
 
 fn node256_descend<'a>(
@@ -492,5 +498,7 @@ fn node256_descend<'a>(
     if slot == 0 {
         return Ok(LookupResult::NotFound);
     }
-    descend(frame, slot as u16, key, depth + 1)
+    let child = slot as u16;
+    frame.prefetch_node(child);
+    descend(frame, child, key, depth + 1)
 }
