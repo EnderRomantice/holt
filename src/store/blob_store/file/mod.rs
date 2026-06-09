@@ -13,8 +13,9 @@
 //!     blobs.dat      — single packed file, blob N lives at byte
 //!                      offset N * PAGE_SIZE
 //!     manifest.bin   — small file mapping BlobGuid → slot number
-//!                      plus `next_slot`; rewritten only when the
-//!                      manifest delta log is compacted
+//!                      and blob generation plus `next_slot`;
+//!                      rewritten only when the manifest delta log
+//!                      is compacted
 //!     manifest.log   — append-only set/delete deltas replayed on
 //!                      open; free slots are rebuilt from holes
 //! ```
@@ -124,14 +125,16 @@ const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// biased `byte_offset/8` instead of a slot, and the Leaf header was
 /// reordered to carry a self-describing `node_type @ +1` byte. Both
 /// change the on-blob byte layout, so v3 files are refused on load.
-const MANIFEST_VERSION: u16 = 4;
+/// v5 extends each manifest entry with a per-blob image generation,
+/// used by cold-read sidecars to reject stale acceleration records.
+const MANIFEST_VERSION: u16 = 5;
 /// Per-record magic for `manifest.log`.
 const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
 const MANIFEST_LOG_TY_SET: u8 = 1;
 const MANIFEST_LOG_TY_DELETE: u8 = 2;
 const MANIFEST_LOG_HEADER_SIZE: usize = 4 + 4 + 1;
 const MANIFEST_LOG_FOOTER_SIZE: usize = 4;
-const MANIFEST_LOG_SET_BODY_SIZE: usize = 16 + 8;
+const MANIFEST_LOG_SET_BODY_SIZE: usize = 16 + 8 + 8;
 const MANIFEST_LOG_DELETE_BODY_SIZE: usize = 16;
 const MANIFEST_LOG_MIN_COMPACT_BYTES: u64 = 1024 * 1024;
 const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
@@ -182,8 +185,8 @@ pub struct FileBlobStore {
 
 #[derive(Debug)]
 struct Manifest {
-    /// guid → slot index (offset on disk = slot * u64::from(PAGE_SIZE)).
-    slots: HashMap<BlobGuid, u64>,
+    /// guid → packed-file slot + image generation.
+    entries: HashMap<BlobGuid, ManifestEntry>,
     /// Next never-used slot to hand out when no reusable slot is
     /// available.
     next_slot: u64,
@@ -213,8 +216,20 @@ struct Manifest {
 
 #[derive(Debug, Clone, Copy)]
 enum ManifestDelta {
-    Set { guid: BlobGuid, slot: u64 },
-    Delete { guid: BlobGuid },
+    Set {
+        guid: BlobGuid,
+        slot: u64,
+        generation: u64,
+    },
+    Delete {
+        guid: BlobGuid,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManifestEntry {
+    slot: u64,
+    generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -381,52 +396,54 @@ impl FileBlobStore {
     /// Number of blobs in the manifest.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.manifest.read().unwrap().slots.len()
+        self.manifest.read().unwrap().entries.len()
     }
 
     /// True if the manifest is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.manifest.read().unwrap().slots.is_empty()
+        self.manifest.read().unwrap().entries.is_empty()
     }
 
     fn offset_of(&self, guid: BlobGuid) -> Result<u64> {
+        Ok(self.entry_of(guid)?.slot * u64::from(PAGE_SIZE))
+    }
+
+    fn entry_of(&self, guid: BlobGuid) -> Result<ManifestEntry> {
         let m = self.manifest.read().unwrap();
-        let slot = m.slots.get(&guid).copied().ok_or_else(|| {
+        m.entries.get(&guid).copied().ok_or_else(|| {
             Error::BlobStoreIo(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("blob {:02x?} not in manifest", &guid[..4]),
             ))
-        })?;
-        Ok(slot * u64::from(PAGE_SIZE))
+        })
     }
 
-    fn assign_slot(&self, guid: BlobGuid) -> u64 {
+    fn assign_write_slot(&self, guid: BlobGuid) -> u64 {
         let mut m = self.manifest.write().unwrap();
-        if let Some(&s) = m.slots.get(&guid) {
-            return s;
-        }
-        let s = m.allocate_slot();
-        m.slots.insert(guid, s);
-        m.pending_log.push(ManifestDelta::Set { guid, slot: s });
+        let entry = m.assign_write_entry(guid);
+        m.pending_log.push(ManifestDelta::Set {
+            guid,
+            slot: entry.slot,
+            generation: entry.generation,
+        });
         self.manifest_dirty.store(true, Ordering::Release);
-        s
+        entry.slot
     }
 
-    fn assign_slots(&self, guids: impl IntoIterator<Item = BlobGuid>) -> Vec<u64> {
+    fn assign_write_slots(&self, guids: impl IntoIterator<Item = BlobGuid>) -> Vec<u64> {
         let mut m = self.manifest.write().unwrap();
         let mut out = Vec::new();
         let mut dirty = false;
         for guid in guids {
-            if let Some(&s) = m.slots.get(&guid) {
-                out.push(s);
-                continue;
-            }
-            let s = m.allocate_slot();
-            m.slots.insert(guid, s);
-            m.pending_log.push(ManifestDelta::Set { guid, slot: s });
+            let entry = m.assign_write_entry(guid);
+            m.pending_log.push(ManifestDelta::Set {
+                guid,
+                slot: entry.slot,
+                generation: entry.generation,
+            });
             dirty = true;
-            out.push(s);
+            out.push(entry.slot);
         }
         if dirty {
             self.manifest_dirty.store(true, Ordering::Release);
@@ -455,7 +472,7 @@ impl FileBlobStore {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
-        let slots = self.assign_slots(writes.iter().map(|(guid, _)| *guid));
+        let slots = self.assign_write_slots(writes.iter().map(|(guid, _)| *guid));
         if let Some(required_slots) = slots.iter().map(|slot| slot.saturating_add(1)).max() {
             self.ensure_data_capacity(required_slots)?;
         }
@@ -742,7 +759,7 @@ impl BlobStore for FileBlobStore {
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        let slot = self.assign_slot(guid);
+        let slot = self.assign_write_slot(guid);
         let offset = slot * u64::from(PAGE_SIZE);
         self.ensure_data_capacity(slot.saturating_add(1))?;
         self.mark_data_write_started();
@@ -787,8 +804,8 @@ impl BlobStore for FileBlobStore {
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let mut m = self.manifest.write().unwrap();
-        if let Some(slot) = m.slots.remove(&guid) {
-            m.pending_free_slots.push(slot);
+        if let Some(entry) = m.entries.remove(&guid) {
+            m.pending_free_slots.push(entry.slot);
             m.pending_log.push(ManifestDelta::Delete { guid });
             self.manifest_dirty.store(true, Ordering::Release);
         }
@@ -797,7 +814,7 @@ impl BlobStore for FileBlobStore {
 
     fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
         let m = self.manifest.read().unwrap();
-        Ok(m.slots.keys().copied().collect())
+        Ok(m.entries.keys().copied().collect())
     }
 
     fn flush(&self) -> Result<()> {
@@ -830,21 +847,21 @@ impl BlobStore for FileBlobStore {
 
 impl Manifest {
     fn load_or_create(path: &Path, log_path: &Path) -> Result<Self> {
-        let (mut slots, mut next_slot) = match File::open(path) {
+        let (mut entries, mut next_slot) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
             Err(e) => return Err(Error::BlobStoreIo(e)),
         };
 
-        let replay = Self::replay_log(log_path, &mut slots, &mut next_slot)?;
+        let replay = Self::replay_log(log_path, &mut entries, &mut next_slot)?;
         if replay.valid_bytes < replay.file_bytes {
             truncate_manifest_log(log_path, replay.valid_bytes)?;
         }
-        let used_slots: Vec<_> = slots.values().copied().collect();
+        let used_slots: Vec<_> = entries.values().map(|entry| entry.slot).collect();
         let reusable_slots = ReusableSlots::reconstruct(next_slot, &used_slots)?;
 
         Ok(Self {
-            slots,
+            entries,
             next_slot,
             reusable_slots,
             pending_free_slots: Vec::new(),
@@ -855,7 +872,7 @@ impl Manifest {
         })
     }
 
-    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, u64>, u64)> {
+    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, ManifestEntry>, u64)> {
         // Header: magic 8 + version 2 + count 4 + reserved 2 + next_slot 8 = 24 B.
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
@@ -872,15 +889,30 @@ impl Manifest {
         // hdr[14..16] reserved (zero).
         let next_slot = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
 
-        let mut slots = HashMap::with_capacity(count);
+        let mut entries = HashMap::with_capacity(count);
         let mut used_slots = Vec::with_capacity(count);
-        let mut entry = [0u8; 24];
+        let mut entry = [0u8; 32];
         for _ in 0..count {
             f.read_exact(&mut entry)?;
             let mut g: BlobGuid = [0u8; 16];
             g.copy_from_slice(&entry[..16]);
             let s = u64::from_le_bytes(entry[16..24].try_into().unwrap());
-            if slots.insert(g, s).is_some() {
+            let generation = u64::from_le_bytes(entry[24..32].try_into().unwrap());
+            if generation == 0 {
+                return Err(Error::node_corrupt(
+                    "FileBlobStore::Manifest::zero generation",
+                ));
+            }
+            if entries
+                .insert(
+                    g,
+                    ManifestEntry {
+                        slot: s,
+                        generation,
+                    },
+                )
+                .is_some()
+            {
                 return Err(Error::node_corrupt(
                     "FileBlobStore::Manifest::duplicate guid",
                 ));
@@ -888,7 +920,22 @@ impl Manifest {
             used_slots.push(s);
         }
         ReusableSlots::reconstruct(next_slot, &used_slots)?;
-        Ok((slots, next_slot))
+        Ok((entries, next_slot))
+    }
+
+    fn assign_write_entry(&mut self, guid: BlobGuid) -> ManifestEntry {
+        if let Some(entry) = self.entries.get_mut(&guid) {
+            entry.generation = entry.generation.saturating_add(1);
+            debug_assert_ne!(entry.generation, 0);
+            return *entry;
+        }
+
+        let entry = ManifestEntry {
+            slot: self.allocate_slot(),
+            generation: 1,
+        };
+        self.entries.insert(guid, entry);
+        entry
     }
 
     fn allocate_slot(&mut self) -> u64 {
@@ -937,7 +984,7 @@ impl Manifest {
     }
 
     fn should_compact_log(&self) -> bool {
-        let snapshot_bytes = 24u64.saturating_add((self.slots.len() as u64).saturating_mul(24));
+        let snapshot_bytes = 24u64.saturating_add((self.entries.len() as u64).saturating_mul(32));
         self.log_bytes >= MANIFEST_LOG_MIN_COMPACT_BYTES
             && self.log_bytes >= snapshot_bytes.saturating_mul(MANIFEST_LOG_COMPACT_RATIO)
     }
@@ -955,7 +1002,7 @@ impl Manifest {
         let mut hdr = [0u8; 16];
         hdr[..8].copy_from_slice(&MANIFEST_MAGIC);
         hdr[8..10].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
-        let count = u32::try_from(self.slots.len()).map_err(|_| {
+        let count = u32::try_from(self.entries.len()).map_err(|_| {
             Error::BlobStoreIo(io::Error::other("manifest slot count exceeds u32::MAX"))
         })?;
         hdr[10..14].copy_from_slice(&count.to_le_bytes());
@@ -963,9 +1010,10 @@ impl Manifest {
         f.write_all(&hdr)?;
         f.write_all(&self.next_slot.to_le_bytes())?;
 
-        for (g, &s) in &self.slots {
+        for (g, entry) in &self.entries {
             f.write_all(g)?;
-            f.write_all(&s.to_le_bytes())?;
+            f.write_all(&entry.slot.to_le_bytes())?;
+            f.write_all(&entry.generation.to_le_bytes())?;
         }
 
         f.sync_all()?;
@@ -999,7 +1047,7 @@ impl Manifest {
 
     fn replay_log(
         log_path: &Path,
-        slots: &mut HashMap<BlobGuid, u64>,
+        entries: &mut HashMap<BlobGuid, ManifestEntry>,
         next_slot: &mut u64,
     ) -> Result<ManifestLogReplay> {
         let mut f = match File::open(log_path) {
@@ -1056,7 +1104,13 @@ impl Manifest {
                     let mut guid = [0u8; 16];
                     guid.copy_from_slice(&body[..16]);
                     let slot = u64::from_le_bytes(body[16..24].try_into().unwrap());
-                    slots.insert(guid, slot);
+                    let generation = u64::from_le_bytes(body[24..32].try_into().unwrap());
+                    if generation == 0 {
+                        return Err(Error::node_corrupt(
+                            "FileBlobStore::ManifestLog::zero generation",
+                        ));
+                    }
+                    entries.insert(guid, ManifestEntry { slot, generation });
                     *next_slot = (*next_slot).max(slot.saturating_add(1));
                 }
                 MANIFEST_LOG_TY_DELETE => {
@@ -1067,7 +1121,7 @@ impl Manifest {
                     }
                     let mut guid = [0u8; 16];
                     guid.copy_from_slice(body);
-                    slots.remove(&guid);
+                    entries.remove(&guid);
                 }
                 _ => {
                     return Err(Error::node_corrupt(
@@ -1097,10 +1151,15 @@ fn encode_manifest_delta(delta: ManifestDelta, out: &mut Vec<u8>) -> Result<()> 
     let len_pos = out.len();
     out.extend_from_slice(&[0u8; 4]);
     match delta {
-        ManifestDelta::Set { guid, slot } => {
+        ManifestDelta::Set {
+            guid,
+            slot,
+            generation,
+        } => {
             out.push(MANIFEST_LOG_TY_SET);
             out.extend_from_slice(&guid);
             out.extend_from_slice(&slot.to_le_bytes());
+            out.extend_from_slice(&generation.to_le_bytes());
         }
         ManifestDelta::Delete { guid } => {
             out.push(MANIFEST_LOG_TY_DELETE);
@@ -1331,6 +1390,57 @@ mod tests {
         let mut dst = AlignedBlobBuf::zeroed();
         b.read_blob(g, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 2);
+    }
+
+    #[test]
+    fn manifest_generation_bumps_on_each_blob_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let g: BlobGuid = [0x34; 16];
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g, &buf_with(1)).unwrap();
+            assert_eq!(b.entry_of(g).unwrap().generation, 1);
+            b.write_blob(g, &buf_with(2)).unwrap();
+            assert_eq!(b.entry_of(g).unwrap().generation, 2);
+            b.flush().unwrap();
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let entry = b.entry_of(g).unwrap();
+        assert_eq!(entry.slot, 0);
+        assert_eq!(entry.generation, 2);
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 2);
+    }
+
+    #[test]
+    fn batch_duplicate_guid_bumps_generation_per_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g: BlobGuid = [0x35; 16];
+        let one = buf_with(1);
+        let two = buf_with(2);
+        let three = buf_with(3);
+
+        b.write_blobs(&[(g, &one), (g, &two), (g, &three)]).unwrap();
+        assert_eq!(b.entry_of(g).unwrap().generation, 3);
+        b.flush().unwrap();
+        drop(b);
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        assert_eq!(b.entry_of(g).unwrap().generation, 3);
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 3);
     }
 
     #[test]
