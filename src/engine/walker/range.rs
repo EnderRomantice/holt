@@ -1757,13 +1757,30 @@ impl RangeIter {
                         let frame = BlobFrameRef::wrap(guard.as_slice());
                         let result = next_inner_child_from(frame, top.slot, top_ntype, top.next)?;
                         match result {
-                            Some((byte, child_slot, next_cursor)) => Some((
-                                byte,
-                                child_slot,
-                                ntype_of(frame, child_slot)?,
-                                next_cursor,
-                                version,
-                            )),
+                            Some((byte, child_slot, next_cursor)) => {
+                                // Scan-ahead prefetch: the child we
+                                // descend into now emits a whole
+                                // subtree of leaves before the iterator
+                                // reaches the next sibling, so warm
+                                // that sibling's body now — its load
+                                // overlaps the entire current-subtree
+                                // traversal. Best-effort: a peek error
+                                // just skips the hint.
+                                if let Some((_, sib_slot, _)) =
+                                    next_inner_child_from(frame, top.slot, top_ntype, next_cursor)
+                                        .ok()
+                                        .flatten()
+                                {
+                                    frame.prefetch_node(sib_slot);
+                                }
+                                Some((
+                                    byte,
+                                    child_slot,
+                                    ntype_of(frame, child_slot)?,
+                                    next_cursor,
+                                    version,
+                                ))
+                            }
                             None => None,
                         }
                     };
