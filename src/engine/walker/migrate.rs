@@ -19,8 +19,8 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{
-    leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
-    BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
+    leaf_extent_size, BlobGuid, BlobNode, Leaf, LeafInline, Node16, Node256, Node4, Node48,
+    NodeType, Prefix, BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
 use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
@@ -111,8 +111,17 @@ fn make_blob_from_node_with_buf(
 #[must_use]
 pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
     let h = frame.header();
+    // A freed leaf slot is the churn signal. Regular `Leaf` nodes
+    // land on their own free list; `LeafInline` nodes are 56 B and
+    // share `Node16`'s free list (see `free_list_class`), so a
+    // small-record same-key update parks the old slot there instead.
+    // We check both lists — the Node16 list can also hold a freed
+    // inner node, which only makes the heuristic slightly more eager
+    // (that slot is reclaimable space too, and compaction is a safe,
+    // idempotent background pass).
     let leaf_free_list = h.free_list_head[NodeType::Leaf as usize - 1];
-    h.tombstone_leaf_cnt != 0 || leaf_free_list != 0
+    let inline_free_list = h.free_list_head[NodeType::Node16 as usize - 1];
+    h.tombstone_leaf_cnt != 0 || leaf_free_list != 0 || inline_free_list != 0
 }
 
 /// Repack `buf` in place, discarding all unreachable bytes plus
@@ -359,6 +368,7 @@ fn clone_subtree(
             Ok(Some(out.slot))
         }
         NodeType::Leaf => clone_leaf(src, body, dst, filter_tombstones),
+        NodeType::LeafInline => clone_leaf_inline(body, dst, filter_tombstones),
         NodeType::Prefix => clone_prefix(src, body, dst, filter_tombstones),
         NodeType::Node4 => clone_node4(src, body, dst, filter_tombstones),
         NodeType::Node16 => clone_node16(src, body, dst, filter_tombstones),
@@ -407,6 +417,25 @@ fn clone_leaf(
     };
     write_struct_to_slot(dst, leaf_out.slot, &new_leaf)?;
     Ok(Some(leaf_out.slot))
+}
+
+/// Clone a [`LeafInline`]. Unlike [`clone_leaf`] there is no
+/// separate key/value extent to copy — the bytes live inline in the
+/// 56-byte body — so a straight struct copy reproduces the node
+/// verbatim. The tombstone byte is preserved in preserve-mode;
+/// filter-mode drops tombstoned survivors.
+fn clone_leaf_inline(
+    src_body: &[u8],
+    dst: &mut BlobFrame<'_>,
+    filter_tombstones: bool,
+) -> Result<Option<u16>> {
+    let src_li = *cast::<LeafInline>(src_body);
+    if filter_tombstones && src_li.tombstone != 0 {
+        return Ok(None);
+    }
+    let out = dst.alloc_node(NodeType::LeafInline)?;
+    write_struct_to_slot(dst, out.slot, &src_li)?;
+    Ok(Some(out.slot))
 }
 
 fn clone_prefix(
@@ -549,7 +578,7 @@ fn clone_node256(
             if child_slot == 0 {
                 continue;
             }
-            if let Some(new_child) = clone_subtree(src, dst, child_slot as u16, true)? {
+            if let Some(new_child) = clone_subtree(src, dst, child_slot, true)? {
                 survivors.push((b as u8, u32::from(new_child)));
             }
         }

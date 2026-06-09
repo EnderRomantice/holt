@@ -2,7 +2,7 @@
 //! dispatch + per-NodeType arms + collapse-on-lone-child rewiring.
 
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
-use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{BlobNode, LeafInline, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
 use super::cast;
@@ -448,6 +448,9 @@ fn erase_at_step(
             mutated: false,
         })),
         NodeType::Leaf => erase_at_leaf(frame, slot, key, condition).map(EraseStep::Done),
+        NodeType::LeafInline => {
+            erase_at_leaf_inline(frame, slot, key, condition).map(EraseStep::Done)
+        }
         NodeType::Prefix => {
             erase_at_prefix_step(frame, slot, key, depth, condition, allow_crossing)
         }
@@ -550,7 +553,50 @@ fn erase_at_leaf(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors erase_at_step's call shape
+/// `erase_at_leaf` for an inline leaf: tombstone the inline node in
+/// place (key and value live in the body, no extent).
+fn erase_at_leaf_inline(
+    frame: &mut BlobFrame<'_>,
+    leaf_slot: u16,
+    key: SearchKey<'_>,
+    condition: EraseCondition,
+) -> Result<EraseReturn> {
+    let li = *cast::<LeafInline>(
+        frame
+            .body_of_slot(leaf_slot)
+            .ok_or(Error::node_corrupt("erase_at_leaf_inline: body"))?,
+    );
+    if !key.eq_slice(li.key()) {
+        return Ok(EraseReturn {
+            signal: EraseSignal::Unchanged,
+            mutated: false,
+        });
+    }
+    if li.tombstone != 0 {
+        return Ok(EraseReturn {
+            signal: EraseSignal::Unchanged,
+            mutated: false,
+        });
+    }
+    if let EraseCondition::IfVersion(expected) = condition {
+        if li.seq != expected {
+            return Ok(EraseReturn {
+                signal: EraseSignal::Unchanged,
+                mutated: false,
+            });
+        }
+    }
+    let mut new_li = li;
+    new_li.tombstone = 1;
+    write_struct_to_slot(frame, leaf_slot, &new_li)?;
+    let h = frame.header_mut();
+    h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_add(1);
+    Ok(EraseReturn {
+        signal: EraseSignal::Unchanged,
+        mutated: true,
+    })
+}
+
 fn erase_at_prefix_step(
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
@@ -755,7 +801,7 @@ fn inner_remove_child_and_collapse(
                 };
                 frame.free_node(slot)?;
                 let new_slot =
-                    write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
+                    write_prefix_chain(frame, &[surviving_byte], surviving_child)?;
                 return Ok(EraseSignal::Replaced(new_slot));
             }
             if n.count <= SHRINK_NODE48_TO_NODE16_AT {
@@ -788,7 +834,7 @@ fn inner_remove_child_and_collapse(
                 };
                 frame.free_node(slot)?;
                 let new_slot =
-                    write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
+                    write_prefix_chain(frame, &[surviving_byte], surviving_child)?;
                 return Ok(EraseSignal::Replaced(new_slot));
             }
             if n.count <= SHRINK_NODE256_TO_NODE48_AT {

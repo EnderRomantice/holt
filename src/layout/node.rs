@@ -27,6 +27,11 @@ pub enum NodeType {
     /// Empty-tree sentinel: 8 bytes all zero. Allocated once on
     /// `BlobFrame::init` and stored at `header.root_slot`.
     EmptyRoot = 8,
+    /// Small-record leaf with key+value inlined into a fixed 56-byte
+    /// body (no separate extent). Used when `key.len() + value.len()
+    /// <= LEAF_INLINE_CAP`, saving the extent allocation and the
+    /// second cache miss on the read path.
+    LeafInline = 9,
 }
 
 impl NodeType {
@@ -45,6 +50,7 @@ impl NodeType {
             6 => Some(Self::Node48),
             7 => Some(Self::Node256),
             8 => Some(Self::EmptyRoot),
+            9 => Some(Self::LeafInline),
             _ => None,
         }
     }
@@ -63,7 +69,7 @@ impl NodeType {
 /// with no slack. Leaf is a fixed 16-byte header pointing at a
 /// separate key/value extent; Prefix and Blob are both 128 B so
 /// their inline path-compressed bytes fit comfortably.
-pub const SIZE_BY_TYPE: [u32; 8] = [
+pub const SIZE_BY_TYPE: [u32; 9] = [
     16,  // Leaf
     128, // Prefix
     128, // Blob
@@ -72,6 +78,8 @@ pub const SIZE_BY_TYPE: [u32; 8] = [
     360, // Node48  (u16 children)
     520, // Node256 (u16 children)
     8,   // EmptyRoot
+    56,  // LeafInline (12-byte header + 44-byte inline key/value;
+         // same size as Node16 so it shares Node16's free list)
 ];
 
 /// Bytes a single allocation of the given NodeType consumes.
@@ -100,12 +108,13 @@ mod tests {
             NodeType::Node48,
             NodeType::Node256,
             NodeType::EmptyRoot,
+            NodeType::LeafInline,
         ];
         for t in all {
             assert_eq!(NodeType::from_raw(t.as_u8()), Some(t));
         }
-        // Values 9 and above are not in the enum.
-        assert_eq!(NodeType::from_raw(9), None);
+        // Values 10 and above are not in the enum.
+        assert_eq!(NodeType::from_raw(10), None);
         assert_eq!(NodeType::from_raw(255), None);
     }
 
@@ -119,5 +128,6 @@ mod tests {
         assert_eq!(size_of_node(NodeType::Node48), 360);
         assert_eq!(size_of_node(NodeType::Node256), 520);
         assert_eq!(size_of_node(NodeType::EmptyRoot), 8);
+        assert_eq!(size_of_node(NodeType::LeafInline), 56);
     }
 }

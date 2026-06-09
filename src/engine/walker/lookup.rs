@@ -8,7 +8,8 @@ use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::engine::simd;
 use crate::engine::{RouteCache, RouteHit};
 use crate::layout::{
-    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
+    BlobGuid, BlobNode, Leaf, LeafInline, Node16, Node256, Node4, Node48, NodeType, Prefix,
+    BLOB_MAX_INLINE,
 };
 use std::sync::Arc;
 
@@ -334,6 +335,7 @@ fn descend<'a>(
         )),
         NodeType::EmptyRoot => Ok(LookupResult::NotFound),
         NodeType::Leaf => leaf_check(frame, body, key, depth),
+        NodeType::LeafInline => Ok(inline_leaf_check(body, key)),
         NodeType::Prefix => prefix_descend(frame, body, key, depth),
         NodeType::Node4 => node4_descend(frame, body, key, depth),
         NodeType::Node16 => node16_descend(frame, body, key, depth),
@@ -378,6 +380,22 @@ fn leaf_check<'a>(
         value,
         seq: leaf.seq,
     }))
+}
+
+/// `leaf_check` for an inline leaf: key and value both live in the
+/// node body, so no extent read is needed.
+fn inline_leaf_check<'a>(body: &'a [u8], key: SearchKey<'_>) -> LookupResult<'a> {
+    let li = cast::<LeafInline>(body);
+    if li.tombstone != 0 {
+        return LookupResult::NotFound;
+    }
+    if !key.eq_slice(li.key()) {
+        return LookupResult::NotFound;
+    }
+    LookupResult::Found(LookupHit {
+        value: li.value(),
+        seq: li.seq,
+    })
 }
 
 fn prefix_descend<'a>(

@@ -80,6 +80,107 @@ fn update_same_key_replaces_value() {
     assert_eq!(get(&frame, b"k").as_deref(), Some(&b"v2"[..]));
 }
 
+fn ntype_at(frame: &BlobFrame<'_>, slot: u16) -> NodeType {
+    frame.slot_entry(slot).unwrap().node_type().unwrap()
+}
+
+#[test]
+fn small_record_inlines_and_round_trips() {
+    use crate::layout::fits_leaf_inline;
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+
+    // Single small key: the root points straight at the leaf, so the
+    // root slot itself must be a LeafInline (key+value in the body).
+    assert!(fits_leaf_inline(3, 5));
+    put(&mut frame, b"abc", b"value", 1);
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+    assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"value"[..]));
+
+    // Same-key small→small update rewrites the fixed body in place:
+    // node stays a LeafInline and no new slot is consumed.
+    let slots_before = frame.header().num_slots;
+    let root = frame.header().root_slot;
+    insert(&mut frame, root, b"abc", b"v2", 2).unwrap();
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+    assert_eq!(frame.header().num_slots, slots_before, "in-place update");
+    assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"v2"[..]));
+}
+
+#[test]
+fn leaf_inline_grows_to_extent_then_reuses_it() {
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    put(&mut frame, b"abc", b"tiny", 1);
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+
+    // Value over the inline cap spills to a regular extent Leaf.
+    let big = vec![0xAB; 200];
+    let root = frame.header().root_slot;
+    insert(&mut frame, root, b"abc", &big, 2).unwrap();
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
+    assert_eq!(get(&frame, b"abc").as_deref(), Some(big.as_slice()));
+
+    // Shrinking back below the inline cap deliberately keeps the
+    // existing extent and reuses it in place — that's cheaper than
+    // freeing the extent to re-inline, so the node stays an extent
+    // Leaf while the value round-trips correctly.
+    let root = frame.header().root_slot;
+    insert(&mut frame, root, b"abc", b"sm", 3).unwrap();
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::Leaf);
+    assert_eq!(get(&frame, b"abc").as_deref(), Some(&b"sm"[..]));
+}
+
+#[test]
+fn leaf_inline_cap_boundary() {
+    use crate::layout::{fits_leaf_inline, LEAF_INLINE_CAP};
+    // Exactly at the cap inlines; one byte past does not. Length
+    // fields are u8, so neither dimension may exceed 255.
+    assert!(fits_leaf_inline(10, LEAF_INLINE_CAP - 10));
+    assert!(!fits_leaf_inline(10, LEAF_INLINE_CAP - 10 + 1));
+    assert!(!fits_leaf_inline(256, 0));
+    assert!(!fits_leaf_inline(0, 256));
+
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    let key = vec![b'k'; 10];
+    let val = vec![0x7u8; LEAF_INLINE_CAP - 10]; // fills the body exactly
+    put(&mut frame, &key, &val, 1);
+    let root = frame.header().root_slot;
+    assert_eq!(ntype_at(&frame, root), NodeType::LeafInline);
+    assert_eq!(get(&frame, &key).as_deref(), Some(val.as_slice()));
+}
+
+#[test]
+fn leaf_inline_split_erase_and_compaction() {
+    let (mut buf, _) = fresh_blob();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf);
+        // Two small keys sharing a prefix split the original inline
+        // leaf into an inner node with two inline-leaf children.
+        put(&mut frame, b"abc/01", b"x", 1);
+        put(&mut frame, b"abc/02", b"y", 2);
+        assert_eq!(get(&frame, b"abc/01").as_deref(), Some(&b"x"[..]));
+        assert_eq!(get(&frame, b"abc/02").as_deref(), Some(&b"y"[..]));
+
+        // Tombstone one; the survivor stays readable.
+        let root = frame.header().root_slot;
+        erase(&mut frame, root, b"abc/01").unwrap();
+        assert_eq!(get(&frame, b"abc/01"), None);
+        assert_eq!(get(&frame, b"abc/02").as_deref(), Some(&b"y"[..]));
+    }
+    // Compaction rebuilds the live tree via clone_leaf_inline.
+    compact_in_place(&mut buf);
+    let frame = BlobFrame::wrap(&mut buf);
+    assert_eq!(get(&frame, b"abc/02").as_deref(), Some(&b"y"[..]));
+    assert_eq!(get(&frame, b"abc/01"), None);
+}
+
 #[test]
 fn two_keys_with_shared_prefix_creates_prefix_plus_node4() {
     let (mut buf, _) = fresh_blob();

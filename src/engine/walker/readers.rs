@@ -7,7 +7,7 @@
 //! [`super::writers`].
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix};
+use crate::layout::{Leaf, LeafInline, Node16, Node256, Node4, Node48, NodeType, Prefix};
 use crate::store::BlobFrameRef;
 use std::mem::size_of;
 
@@ -72,6 +72,20 @@ pub(super) fn read_leaf_key_ref(frame: BlobFrameRef<'_>, slot: u16) -> Result<(&
     let leaf = *cast::<Leaf>(body);
     let k = leaf_key_extent(frame, &leaf)?;
     Ok((k, leaf))
+}
+
+/// Borrow the key of a leaf slot regardless of physical layout:
+/// a regular [`Leaf`] keeps its key in a separate extent, while a
+/// [`LeafInline`] carries it inline in the body. Used where a
+/// walker needs only key ordering/equality and doesn't care which
+/// leaf encoding is on disk.
+pub(super) fn leaf_any_key(frame: BlobFrameRef<'_>, slot: u16) -> Result<&[u8]> {
+    let (ntype, body) = resolve_typed(frame, slot)?;
+    if ntype == NodeType::LeafInline {
+        return Ok(cast::<LeafInline>(body).key());
+    }
+    let leaf = *cast::<Leaf>(body);
+    leaf_key_extent(frame, &leaf)
 }
 
 pub(super) fn read_prefix(frame: BlobFrameRef<'_>, slot: u16) -> Result<Prefix> {

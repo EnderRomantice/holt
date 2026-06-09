@@ -58,6 +58,87 @@ impl Leaf {
     }
 }
 
+/// Maximum inline key+value bytes a [`LeafInline`] node holds.
+/// Records with `key.len() + value.len() <= LEAF_INLINE_CAP` are
+/// stored inline (no separate extent); larger records use [`Leaf`]
+/// + a bump-allocated extent.
+pub const LEAF_INLINE_CAP: usize = 44;
+
+/// 56-byte leaf with the key+value bytes inlined into the node body
+/// (no separate extent). Same size as `Node16`, so it shares
+/// `Node16`'s free-list size class. Eliminates the extent
+/// allocation and the second cache miss that the extent-based
+/// [`Leaf`] pays on small records — the common shape for object /
+/// filesystem metadata (existence markers, ref counts, version
+/// tokens, short dentries, small inode fields).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LeafInline {
+    /// Monotonic record sequence (CAS token / WAL replay), mirrors
+    /// [`Leaf::seq`].
+    pub seq: u64,
+    /// 0 = live, 1 = tombstone (soft-deleted; pending compaction).
+    pub tombstone: u8,
+    /// Length of the inline key (`<= LEAF_INLINE_CAP`).
+    pub key_len: u8,
+    /// Length of the inline value (`key_len + value_len <= CAP`).
+    pub value_len: u8,
+    _pad: u8,
+    /// Inline bytes: `key ++ value`, only the first
+    /// `key_len + value_len` are valid.
+    pub bytes: [u8; LEAF_INLINE_CAP],
+}
+
+const _: () = assert!(size_of::<LeafInline>() == 56);
+const _: () = assert!(offset_of!(LeafInline, seq) == 0);
+const _: () = assert!(offset_of!(LeafInline, tombstone) == 8);
+const _: () = assert!(offset_of!(LeafInline, key_len) == 9);
+const _: () = assert!(offset_of!(LeafInline, value_len) == 10);
+const _: () = assert!(offset_of!(LeafInline, bytes) == 12);
+
+/// `true` iff a `(key, value)` pair fits in a [`LeafInline`] body.
+#[must_use]
+pub const fn fits_leaf_inline(key_len: usize, value_len: usize) -> bool {
+    key_len <= u8::MAX as usize
+        && value_len <= u8::MAX as usize
+        && key_len + value_len <= LEAF_INLINE_CAP
+}
+
+impl LeafInline {
+    /// Build a live inline leaf. Caller must have checked
+    /// [`fits_leaf_inline`].
+    #[must_use]
+    pub fn live(key: &[u8], value: &[u8], seq: u64) -> Self {
+        debug_assert!(fits_leaf_inline(key.len(), value.len()));
+        let mut bytes = [0u8; LEAF_INLINE_CAP];
+        bytes[..key.len()].copy_from_slice(key);
+        bytes[key.len()..key.len() + value.len()].copy_from_slice(value);
+        Self {
+            seq,
+            tombstone: 0,
+            key_len: key.len() as u8,
+            value_len: value.len() as u8,
+            _pad: 0,
+            bytes,
+        }
+    }
+
+    /// Borrow the inline key bytes.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        let k = (self.key_len as usize).min(LEAF_INLINE_CAP);
+        &self.bytes[..k]
+    }
+
+    /// Borrow the inline value bytes.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        let k = (self.key_len as usize).min(LEAF_INLINE_CAP);
+        let v = (self.value_len as usize).min(LEAF_INLINE_CAP - k);
+        &self.bytes[k..k + v]
+    }
+}
+
 /// Compute the 8-byte-aligned extent size needed for
 /// `(u16 key_len + key.len() + value.len())`.
 #[must_use]

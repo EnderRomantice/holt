@@ -73,7 +73,7 @@ fn try_merge_subtree(
         NodeType::Invalid => Err(Error::node_corrupt(
             "try_merge_subtree: hit NodeType::Invalid",
         )),
-        NodeType::EmptyRoot | NodeType::Leaf => Ok(slot),
+        NodeType::EmptyRoot | NodeType::Leaf | NodeType::LeafInline => Ok(slot),
         NodeType::Prefix => merge_under_prefix(bm, frame, slot, stats, seq),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
             merge_under_inner(bm, frame, slot, ntype, stats, seq)
@@ -148,7 +148,7 @@ fn merge_under_inner(
             let mut out = Vec::with_capacity(64);
             for (b, &c) in n.children.iter().enumerate() {
                 if c != 0 {
-                    out.push((b as u8, c as u16));
+                    out.push((b as u8, c));
                 }
             }
             out

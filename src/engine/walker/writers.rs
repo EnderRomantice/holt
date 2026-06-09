@@ -9,8 +9,8 @@ use std::mem::{offset_of, size_of};
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
 use crate::layout::{
-    leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
-    PREFIX_MAX_INLINE,
+    fits_leaf_inline, leaf_extent_size, BlobGuid, BlobNode, Leaf, LeafInline, Node16, Node256,
+    Node4, Node48, NodeType, Prefix, LEAF_INLINE_CAP, PREFIX_MAX_INLINE,
 };
 use crate::store::BlobFrame;
 
@@ -61,6 +61,16 @@ pub(super) fn write_leaf(
     seq: u64,
 ) -> Result<u16> {
     let key_len = key.len();
+    // Small records inline key+value into a single 56-byte node,
+    // skipping the extent allocation and the second cache miss.
+    if fits_leaf_inline(key_len, value.len()) {
+        let mut keybuf = [0u8; LEAF_INLINE_CAP];
+        key.write_to_slice(&mut keybuf[..key_len]);
+        let li = LeafInline::live(&keybuf[..key_len], value, seq);
+        let out = frame.alloc_node(NodeType::LeafInline)?;
+        write_struct_to_slot(frame, out.slot, &li)?;
+        return Ok(out.slot);
+    }
     let ext_size = leaf_extent_size(key_len as u32, value.len() as u32);
     let ext = frame.alloc_extent(ext_size)?;
     {

@@ -27,15 +27,17 @@ use std::sync::{Arc, Mutex};
 use crate::api::atomic::RecordVersion;
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::concurrency::Gate;
-use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
+use crate::layout::{
+    BlobGuid, BlobNode, Leaf, LeafInline, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE,
+};
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use smallvec::SmallVec;
 
 use super::cast;
 use super::readers::{
-    leaf_extent, leaf_key_extent, ntype_of, read_leaf_key_ref, read_node16, read_node256,
-    read_node4, read_node48, read_prefix,
+    leaf_any_key, leaf_extent, leaf_key_extent, ntype_of, read_node16, read_node256, read_node4,
+    read_node48, read_prefix, resolve_typed,
 };
 use crate::engine::simd;
 
@@ -789,23 +791,34 @@ fn project_range_leaf(
     projection: RangeProjection,
     emit_buf: &mut Vec<u8>,
 ) -> Result<LeafAction> {
-    let body = frame
-        .body_of_slot(slot)
-        .ok_or(Error::node_corrupt("project_range_leaf: body"))?;
-    let leaf = *cast::<Leaf>(body);
-    if leaf.tombstone != 0 {
+    let (ntype, body) = resolve_typed(frame, slot)?;
+    // Both leaf encodings funnel into the same filter/emit logic;
+    // they differ only in where key/value bytes live (a separate
+    // extent for `Leaf`, inline in the body for `LeafInline`).
+    let (tombstone, stored_key, record_value, seq): (u8, &[u8], Option<&[u8]>, u64) =
+        if ntype == NodeType::LeafInline {
+            let li = cast::<LeafInline>(body);
+            let value = match projection {
+                RangeProjection::Records => Some(li.value()),
+                RangeProjection::KeysOnly | RangeProjection::KeyRefs => None,
+            };
+            (li.tombstone, li.key(), value, li.seq)
+        } else {
+            let leaf = *cast::<Leaf>(body);
+            let (key, value) = match projection {
+                RangeProjection::Records => {
+                    let (k, v) = leaf_extent(frame, &leaf)?;
+                    (k, Some(v))
+                }
+                RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
+                    (leaf_key_extent(frame, &leaf)?, None)
+                }
+            };
+            (leaf.tombstone, key, value, leaf.seq)
+        };
+    if tombstone != 0 {
         return Ok(LeafAction::Skip);
     }
-
-    let (stored_key, record_value) = match projection {
-        RangeProjection::Records => {
-            let (key, value) = leaf_extent(frame, &leaf)?;
-            (key, Some(value))
-        }
-        RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
-            (leaf_key_extent(frame, &leaf)?, None)
-        }
-    };
     let user_key = if stored_key.last() == Some(&0) {
         &stored_key[..stored_key.len() - 1]
     } else {
@@ -837,11 +850,11 @@ fn project_range_leaf(
         emit_buf.clear();
         emit_buf.extend_from_slice(user_key);
         return Ok(LeafAction::KeyRef {
-            version: RecordVersion::new(leaf.seq),
+            version: RecordVersion::new(seq),
         });
     }
     let key = user_key.to_vec();
-    let version = RecordVersion::new(leaf.seq);
+    let version = RecordVersion::new(seq);
     Ok(LeafAction::Key {
         key,
         value: record_value.map(<[u8]>::to_vec),
@@ -1298,7 +1311,7 @@ impl RangeIter {
             };
             let top_ntype = top.ntype;
             match top_ntype {
-                NodeType::Leaf => {
+                NodeType::Leaf | NodeType::LeafInline => {
                     let idx = self.stack.len() - 1;
                     if self.stack[idx].next == 0 {
                         let is_candidate = {
@@ -1308,7 +1321,7 @@ impl RangeIter {
                                 return Ok(InitResult::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let (stored_key, _leaf) = read_leaf_key_ref(frame, top.slot)?;
+                            let stored_key = leaf_any_key(frame, top.slot)?;
                             let user_key: &[u8] = if stored_key.last() == Some(&0) {
                                 &stored_key[..stored_key.len() - 1]
                             } else {
@@ -1492,7 +1505,7 @@ impl RangeIter {
             };
             let top_ntype = top.ntype;
             match top_ntype {
-                NodeType::Leaf => {
+                NodeType::Leaf | NodeType::LeafInline => {
                     let idx = self.stack.len() - 1;
                     if self.stack[idx].next == 0 {
                         self.stack[idx].next = 1;

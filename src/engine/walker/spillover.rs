@@ -200,7 +200,7 @@ fn subtree_footprint_memo(
                 u32::from(leaf.value_size),
             ));
         }
-        NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::LeafInline | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
             out = out.saturating_add(subtree_footprint_memo(frame, p.child as u16, memo)?);
@@ -401,7 +401,7 @@ fn collect_victim_candidates(
                 memo,
             )?;
         }
-        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::Leaf | NodeType::LeafInline | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Invalid => {
             return Err(Error::node_corrupt("collect_victim_candidates: Invalid"));
         }
@@ -545,7 +545,7 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
         NodeType::Invalid => {
             return Err(Error::node_corrupt("free_subtree: Invalid in source"));
         }
-        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::Leaf | NodeType::LeafInline | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(&body_copy);
             free_subtree(frame, p.child as u16)?;

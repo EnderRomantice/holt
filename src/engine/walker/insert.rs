@@ -2,7 +2,9 @@
 //! `insert_at` dispatch + per-NodeType arms.
 
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
-use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{
+    fits_leaf_inline, leaf_extent_size, BlobNode, Leaf, LeafInline, NodeType, BLOB_MAX_INLINE,
+};
 use std::sync::Arc;
 
 use super::cast;
@@ -834,6 +836,10 @@ fn insert_at_step(
         NodeType::Leaf => {
             insert_into_leaf(frame, slot, key, value, depth, seq, condition).map(InsertStep::Done)
         }
+        NodeType::LeafInline => {
+            insert_into_leaf_inline(frame, slot, key, value, depth, seq, condition)
+                .map(InsertStep::Done)
+        }
         NodeType::Prefix => insert_into_prefix_step(
             frame,
             slot,
@@ -968,6 +974,105 @@ fn insert_into_empty_root(
     frame.free_node(empty_slot)?;
     Ok(InsertReturn {
         slot_after: new_slot,
+        mutated: true,
+    })
+}
+
+/// `insert_into_leaf` for an inline leaf. Same-key updates realloc a
+/// fresh leaf (inline or extent, by size) and free the old inline
+/// node — the parent repoints via `slot_after`; divergence splits
+/// reuse the inline node as one branch via [`write_leaf_split`].
+fn insert_into_leaf_inline(
+    frame: &mut BlobFrame<'_>,
+    leaf_slot: u16,
+    new_key: SearchKey<'_>,
+    new_value: &[u8],
+    depth: usize,
+    seq: u64,
+    condition: InsertCondition,
+) -> Result<InsertReturn> {
+    let li = *cast::<LeafInline>(
+        frame
+            .body_of_slot(leaf_slot)
+            .ok_or(Error::node_corrupt("insert_into_leaf_inline: body"))?,
+    );
+
+    if new_key.eq_slice(li.key()) {
+        let was_tombstoned = li.tombstone != 0;
+        if !was_tombstoned {
+            match condition {
+                InsertCondition::Always => {}
+                InsertCondition::IfVersion(expected) if li.seq == expected => {}
+                InsertCondition::IfAbsent | InsertCondition::IfVersion(_) => {
+                    return Ok(InsertReturn {
+                        slot_after: leaf_slot,
+                        mutated: false,
+                    });
+                }
+            }
+        } else if matches!(condition, InsertCondition::IfVersion(_)) {
+            return Ok(InsertReturn {
+                slot_after: leaf_slot,
+                mutated: false,
+            });
+        }
+        // The body is a fixed 56 B, so any replacement value that
+        // still fits inline can be rewritten in place — no alloc, no
+        // free, same slot. (This is strictly more flexible than the
+        // extent-leaf in-place path, which requires an exact size
+        // match.) Only when the new value outgrows the inline cap do
+        // we fall back to a fresh extent leaf and release this slot.
+        if fits_leaf_inline(li.key().len(), new_value.len()) {
+            let new_li = LeafInline::live(li.key(), new_value, seq);
+            write_struct_to_slot(frame, leaf_slot, &new_li)?;
+            if was_tombstoned {
+                let h = frame.header_mut();
+                h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
+            }
+            return Ok(InsertReturn {
+                slot_after: leaf_slot,
+                mutated: true,
+            });
+        }
+        let new_slot = write_leaf(frame, new_key, new_value, seq)?;
+        frame.free_node(leaf_slot)?;
+        if was_tombstoned {
+            let h = frame.header_mut();
+            h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_sub(1);
+        }
+        return Ok(InsertReturn {
+            slot_after: new_slot,
+            mutated: true,
+        });
+    }
+
+    let split = {
+        let existing_key = li.key();
+        let suffix_a = &existing_key[depth..];
+        let common_len = new_key.common_prefix_with_slice(depth, suffix_a);
+        if common_len == suffix_a.len() || common_len == new_key.remaining_len(depth) {
+            return Err(Error::NotYetImplemented(
+                "walker::insert_into_leaf_inline: one key is a strict prefix of the other",
+            ));
+        }
+        LeafSplitPlan {
+            common_prefix: suffix_a[..common_len].to_vec(),
+            byte_existing: suffix_a[common_len],
+            byte_new: new_key
+                .byte_at(depth + common_len)
+                .expect("new key has divergence byte"),
+        }
+    };
+
+    if matches!(condition, InsertCondition::IfVersion(_)) {
+        return Ok(InsertReturn {
+            slot_after: leaf_slot,
+            mutated: false,
+        });
+    }
+    let final_slot = write_leaf_split(frame, leaf_slot, new_key, new_value, seq, &split)?;
+    Ok(InsertReturn {
+        slot_after: final_slot,
         mutated: true,
     })
 }

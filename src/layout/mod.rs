@@ -20,7 +20,7 @@ pub use header::{
     set_frame_epoch_high_water, BlobGuid, BlobHeader, DATA_AREA_START, HEADER_SIZE, MAX_SLOTS,
     PAGE_SIZE,
 };
-pub use leaf::{leaf_extent_size, Leaf};
+pub use leaf::{fits_leaf_inline, leaf_extent_size, Leaf, LeafInline, LEAF_INLINE_CAP};
 pub use node::{size_of_node, NodeType, SIZE_BY_TYPE};
 pub use nodes::{Node16, Node256, Node4, Node48};
 pub use prefix::{Prefix, PREFIX_MAX_INLINE};
@@ -40,6 +40,7 @@ const _: () = {
     // SIZE_BY_TYPE[7] is the empty-tree sentinel (8 B all-zero,
     // no struct counterpart — it's just a zero u64).
     assert!(SIZE_BY_TYPE[7] == 8);
+    assert!(size_of::<LeafInline>() == SIZE_BY_TYPE[8] as usize);
 };
 
 #[cfg(test)]
@@ -78,6 +79,7 @@ mod tests {
         assert_eq!(size_of::<Node16>(), 56);
         assert_eq!(size_of::<Node48>(), 360);
         assert_eq!(size_of::<Node256>(), 520);
+        assert_eq!(size_of::<LeafInline>(), 56);
     }
 
     #[test]
@@ -87,6 +89,10 @@ mod tests {
         assert_eq!(size_of_node(NodeType::Blob) as usize, size_of::<BlobNode>());
         assert_eq!(size_of_node(NodeType::Node4) as usize, size_of::<Node4>());
         assert_eq!(size_of_node(NodeType::Node16) as usize, size_of::<Node16>());
+        assert_eq!(
+            size_of_node(NodeType::LeafInline) as usize,
+            size_of::<LeafInline>()
+        );
         assert_eq!(size_of_node(NodeType::Node48) as usize, size_of::<Node48>());
         assert_eq!(
             size_of_node(NodeType::Node256) as usize,

@@ -27,6 +27,19 @@ use crate::layout::{
 /// emits.
 pub const SPILLOVER_RESERVATION: u32 = 128;
 
+/// Free-list size class for `ntype` — the index into
+/// [`BlobHeader::free_list_head`](crate::layout::BlobHeader). A
+/// `LeafInline` node is exactly the same 56-byte size as `Node16`,
+/// so the two share one free list (a freed 56-byte slot can be
+/// reallocated as either); every other type maps to its own
+/// `ntype - 1` slot.
+const fn free_list_class(ntype: NodeType) -> usize {
+    match ntype {
+        NodeType::LeafInline => NodeType::Node16.as_u8() as usize - 1,
+        _ => ntype.as_u8() as usize - 1,
+    }
+}
+
 /// Errors from `alloc_node` / `alloc_extent`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AllocError {
@@ -347,7 +360,7 @@ impl<'a> BlobFrame<'a> {
             return Err(AllocError::InvalidRequest);
         }
         let size = size_of_node(ntype);
-        let ntype_idx = (ntype.as_u8() - 1) as usize;
+        let ntype_idx = free_list_class(ntype);
 
         // Try same-type free list first.
         let free_head = self.header().free_list_head[ntype_idx];
@@ -452,7 +465,7 @@ impl<'a> BlobFrame<'a> {
                 tag: e.ntype_or_next_free,
             });
         }
-        let ntype_idx = (ntype.as_u8() - 1) as usize;
+        let ntype_idx = free_list_class(ntype);
         let old_head = self.header().free_list_head[ntype_idx];
         let off = e.byte_offset();
         self.write_slot_entry(slot, SlotEntry::freed(old_head, off));
