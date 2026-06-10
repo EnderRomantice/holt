@@ -1162,11 +1162,12 @@ fn assert_routing_layout(frame: &BlobFrame<'_>) {
         rr.off, DATA_AREA_START,
         "routing region must start at DATA_AREA_START"
     );
+    let routing_len = frame.header().routing_len;
     assert!(
-        rr.off + rr.len <= rr.leaf_region_start,
+        rr.off + routing_len <= rr.leaf_region_start,
         "routing arena [{:#x},{:#x}) overlaps leaf region {:#x}",
         rr.off,
-        rr.off + rr.len,
+        rr.off + routing_len,
         rr.leaf_region_start,
     );
     assert_eq!(

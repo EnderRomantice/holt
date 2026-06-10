@@ -164,11 +164,12 @@ pub struct BlobHeader {
 pub struct RoutingRegion {
     /// Byte offset of the contiguous internal-node region within the frame.
     pub off: u32,
-    /// Byte length of the routing region.
-    pub len: u32,
     /// First byte offset of the page-aligned leaf region. A child offset
     /// `>= leaf_region_start` is a leaf (read via a targeted page read);
-    /// below it is an internal node inside the routing region.
+    /// below it is an internal node inside the routing region. The cold
+    /// read loads the whole `[off, leaf_region_start)` span (internal
+    /// nodes + bloom + page-align gap), so the raw `routing_len` is not
+    /// carried here — read it from the header if ever needed.
     pub leaf_region_start: u32,
 }
 
@@ -204,7 +205,6 @@ impl BlobHeader {
         }
         Some(RoutingRegion {
             off,
-            len: self.routing_len,
             leaf_region_start: lrs,
         })
     }
@@ -390,7 +390,6 @@ mod tests {
             routed.routing_region(),
             Some(RoutingRegion {
                 off: DATA_AREA_START,
-                len: 0x40,
                 leaf_region_start: DATA_AREA_START + 0x40,
             })
         );

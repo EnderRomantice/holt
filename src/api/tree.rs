@@ -2506,13 +2506,6 @@ impl Tree {
     pub fn config(&self) -> &TreeConfig {
         &self.cfg
     }
-
-    /// Total bytes a single blob frame consumes — useful for
-    /// capacity sizing.
-    #[must_use]
-    pub const fn page_size() -> u32 {
-        PAGE_SIZE
-    }
 }
 
 /// Replay `path` onto the BM-cached blobs and return the
