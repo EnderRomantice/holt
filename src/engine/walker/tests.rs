@@ -5,7 +5,7 @@
 use super::cast;
 use super::erase::erase;
 use super::insert::insert;
-use super::lookup::{lookup, lookup_at};
+use super::lookup::{cold_read_routed_into, lookup, lookup_at};
 use super::migrate::{blob_needs_compaction, compact_blob, make_blob_from_node};
 use super::readers::{
     child_offset, read_node16, read_node256, read_node4, read_node48, read_prefix,
@@ -1431,6 +1431,90 @@ fn structural_mutation_demotes_routed_blob_to_legacy() {
             vec![i, i ^ 0xFF]
         };
         assert_eq!(get(&frame, &[b'q', i]).as_deref(), Some(v.as_slice()), "q[{i}]");
+    }
+}
+
+/// Stage-3 gate: the cold routed read (header page + routing region +
+/// one leaf page, via a `read_range` closure standing in for the store)
+/// returns the same present/absent answers as the oracle, on a routed
+/// blob. Exercises the routed descent + on-demand leaf paging incl.
+/// straddling (> 4 KB) leaves, without the buffer-manager/eviction
+/// machinery.
+#[test]
+fn cold_read_routed_matches_oracle() {
+    use crate::store::ColdBlobLookup;
+    let (mut buf_vec, _) = fresh_blob();
+    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        let mut seq = 1u64;
+        for i in 0..60u8 {
+            let k = vec![b'q', i];
+            let v = if i % 7 == 0 {
+                vec![i; 5000]
+            } else {
+                vec![i, i ^ 0xFF]
+            };
+            put(&mut frame, &k, &v, seq);
+            seq += 1;
+            oracle.insert(k, v);
+        }
+        for i in 0..20u8 {
+            let k = vec![b'p', i];
+            let v = vec![i, 0xAB, i];
+            put(&mut frame, &k, &v, seq);
+            seq += 1;
+            oracle.insert(k, v);
+        }
+        let root = frame.header().root_slot;
+        for i in (0..60u8).step_by(2) {
+            let k = vec![b'q', i];
+            erase(&mut frame, root, &k).unwrap();
+            oracle.remove(&k);
+        }
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    assert!(
+        BlobFrame::wrap(buf.as_mut_slice())
+            .header()
+            .routing_region()
+            .is_some(),
+        "test needs a routed blob",
+    );
+    let src = buf.as_slice().to_vec();
+
+    // The walker `insert` used by `put` stores keys via SearchKey::exact
+    // (no ART terminator), so query the routed read the same way — the
+    // production cold path carries the user-style key its leaves were
+    // written with (api/tree.rs uses SearchKey::user throughout).
+    let routed = |k: &[u8]| -> Option<Vec<u8>> {
+        let mut scratch = AlignedBlobBuf::zeroed();
+        let mut read = |off: u64, dst: &mut [u8]| -> crate::api::errors::Result<()> {
+            let o = off as usize;
+            dst.copy_from_slice(&src[o..o + dst.len()]);
+            Ok(())
+        };
+        match cold_read_routed_into(scratch.as_mut_slice(), &mut read, SearchKey::exact(k), 0)
+            .unwrap()
+        {
+            ColdBlobLookup::Found { value, .. } => Some(value),
+            ColdBlobLookup::NotFound => None,
+            _ => panic!("unexpected cold result for {k:?}"),
+        }
+    };
+
+    for i in 0..60u8 {
+        let k = vec![b'q', i];
+        assert_eq!(routed(&k), oracle.get(&k).cloned(), "q[{i}]");
+    }
+    for i in 0..20u8 {
+        let k = vec![b'p', i];
+        assert_eq!(routed(&k), oracle.get(&k).cloned(), "p[{i}]");
+    }
+    // Absent: never-existed, prefix-divergent, and tombstoned-then-swept.
+    for k in [&b"q"[..], &b"qq"[..], &b"p"[..], &b"zzz"[..], &[b'q', 200][..]] {
+        assert_eq!(routed(k), None, "absent {k:?}");
     }
 }
 

@@ -1175,6 +1175,43 @@ impl BufferManager {
         Ok(lookup)
     }
 
+    /// Whether `guid` may be served by a cold, page-granular read
+    /// straight from the backing store (the stage-3 routed read).
+    ///
+    /// Returns `false` — meaning the caller must fall back to [`pin`]
+    /// (which reads the authoritative resident/full-frame image) —
+    /// when the blob is pending-delete, already resident in cache (a
+    /// dirty cache image may be newer than the on-disk frame), or
+    /// protected/pending a structural op. Mirrors the staleness guards
+    /// in [`cold_lookup_blob`].
+    ///
+    /// [`pin`]: Self::pin
+    /// [`cold_lookup_blob`]: Self::cold_lookup_blob
+    pub(crate) fn cold_read_eligible(&self, guid: BlobGuid) -> bool {
+        if self.is_pending_delete(guid) || self.cache.contains_key(&guid) {
+            return false;
+        }
+        let state = self.mutation_shard(guid).lock().unwrap();
+        !state.is_protected_or_pending(&guid)
+    }
+
+    /// Positional, page-granular read from the backing store, bypassing
+    /// the cache and the 512 KB io_uring ring (see
+    /// [`BlobStore::read_blob_range`]). The caller owns 4 KB alignment
+    /// of `byte_offset` and `dst` (length + base). Used by the stage-3
+    /// cold routed read to fetch the header page + routing region + one
+    /// leaf page instead of pinning the whole frame.
+    ///
+    /// [`BlobStore::read_blob_range`]: crate::store::blob_store::BlobStore::read_blob_range
+    pub(crate) fn read_blob_range(
+        &self,
+        guid: BlobGuid,
+        byte_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        self.store.read_blob_range(guid, byte_offset, dst)
+    }
+
     fn note_full_blob_read(&self, access: PinAccess) {
         match access {
             PinAccess::Point => self.telemetry.note_point_full_blob_read(),

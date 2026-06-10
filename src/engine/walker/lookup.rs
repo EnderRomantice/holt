@@ -8,12 +8,14 @@ use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::engine::simd;
 use crate::engine::{RouteCache, RouteHit};
 use crate::layout::{
-    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
+    leaf_body_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
+    BLOB_MAX_INLINE, HEADER_SIZE, PREFIX_MAX_INLINE,
 };
 use std::mem::size_of;
 use std::sync::Arc;
 
-use crate::store::{BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup};
+use crate::store::blob_store::AlignedBlobBuf;
+use crate::store::{page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup, PAGE_4K};
 
 use super::cast;
 use super::readers::{child_offset, resolve_typed};
@@ -374,7 +376,13 @@ where
     let mut child_guid = crossing.child_guid;
     let mut child_depth = crossing.child_depth;
     loop {
-        match bm.cold_lookup_blob(child_guid, user_key, child_depth)? {
+        // The sidecar (cold.idx) gets first refusal; on a miss (Unknown)
+        // try the stage-3 routed read before paying for a full pin.
+        let answer = match bm.cold_lookup_blob(child_guid, user_key, child_depth)? {
+            ColdBlobLookup::Unknown => cold_read_routed(bm, child_guid, key, child_depth),
+            answer => answer,
+        };
+        match answer {
             ColdBlobLookup::Unknown => {
                 let pin = bm.pin(child_guid)?;
                 pin.prefetch_header();
@@ -397,6 +405,249 @@ where
             ColdBlobLookup::NotFound => return Ok(ColdLookupOrPin::Done(None)),
         }
     }
+}
+
+// ---------- stage 3: cold routed read ----------
+
+/// Answer a cold point lookup against a **routed** blob by reading only
+/// the header page + routing region + one leaf page via
+/// `read_blob_range`, instead of pinning the whole 512 KB frame.
+///
+/// A pure accelerator: on ANY uncertainty — the blob isn't
+/// cold-eligible (cached/pending-delete/protected), it's in the legacy
+/// whole-frame layout (`routing_len == 0`), a read fails, or descent
+/// reaches an unexpected node — it returns [`ColdBlobLookup::Unknown`]
+/// and the caller falls back to `bm.pin`, which reads the authoritative
+/// image. So it can never change `get()` semantics; it only avoids I/O.
+fn cold_read_routed(
+    bm: &BufferManager,
+    guid: BlobGuid,
+    key: SearchKey<'_>,
+    depth: usize,
+) -> ColdBlobLookup {
+    if !bm.cold_read_eligible(guid) {
+        return ColdBlobLookup::Unknown;
+    }
+    // Descend with the SAME `key` the pin-fallback frame descent uses
+    // (the caller only reaches here with a user-style key), so a routed
+    // and a full-frame read are byte-for-byte equivalent.
+    let mut scratch = AlignedBlobBuf::zeroed();
+    let mut read_range = |off: u64, dst: &mut [u8]| bm.read_blob_range(guid, off, dst);
+    cold_read_routed_into(scratch.as_mut_slice(), &mut read_range, key, depth)
+        .unwrap_or(ColdBlobLookup::Unknown)
+}
+
+/// Routed-read core, decoupled from the buffer manager via a
+/// `read_range(byte_offset, dst)` closure so it can be unit-tested
+/// against an in-memory routed frame.
+///
+/// `scratch` must be a `PAGE_SIZE`, 4 KB-aligned, zeroed buffer; the
+/// header page, routing region, and one leaf page are read into it at
+/// their absolute offsets. Returns `Unknown` for a legacy
+/// (`routing_len == 0`) blob.
+pub(super) fn cold_read_routed_into(
+    scratch: &mut [u8],
+    read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
+    key: SearchKey<'_>,
+    depth: usize,
+) -> Result<ColdBlobLookup> {
+    // Header page → routing geometry + root.
+    read_range(0, &mut scratch[..HEADER_SIZE as usize])?;
+    let (root_off, rr) = {
+        let frame = BlobFrameRef::wrap(&scratch[..]);
+        let h = frame.header();
+        match h.routing_region() {
+            Some(rr) => (decode_child_off(h.root_slot), rr),
+            None => return Ok(ColdBlobLookup::Unknown), // legacy → full pin
+        }
+    };
+    // Routing region (internal nodes): [routing_off, leaf_region_start)
+    // — both page-aligned, so the read length is a 4 KB multiple.
+    read_range(
+        u64::from(rr.off),
+        &mut scratch[rr.off as usize..rr.leaf_region_start as usize],
+    )?;
+    descend_routed(scratch, read_range, root_off, key, depth, rr.leaf_region_start)
+}
+
+/// One step of the routed descent: the next child offset to visit, or a
+/// terminal answer.
+enum RoutedStep {
+    Visit(u32, usize),
+    Done(ColdBlobLookup),
+}
+
+/// Resolve the (resident, internal) node at `off` and decide the next
+/// routed step. Mirrors `descend`'s per-node dispatch; everything is
+/// copied out so the frame borrow can end before the caller pages in a
+/// leaf or recurses.
+fn routed_step(
+    frame: BlobFrameRef<'_>,
+    off: u32,
+    key: SearchKey<'_>,
+    depth: usize,
+) -> Result<RoutedStep> {
+    let (ntype, body) = resolve_typed(frame, off)?;
+    let not_found = RoutedStep::Done(ColdBlobLookup::NotFound);
+    Ok(match ntype {
+        NodeType::Prefix => {
+            let p = *cast::<Prefix>(body);
+            let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
+            if key.range_eq(depth, &p.bytes[..plen]) {
+                RoutedStep::Visit(child_offset(p.child as u16), depth + plen)
+            } else {
+                not_found
+            }
+        }
+        NodeType::Node4 => {
+            let n = *cast::<Node4>(body);
+            let Some(byte) = key.byte_at(depth) else {
+                return Ok(not_found);
+            };
+            let mut child = None;
+            for i in 0..(n.count as usize).min(4) {
+                if n.keys[i] == byte {
+                    child = Some(child_offset(n.children[i]));
+                    break;
+                }
+                if n.keys[i] > byte {
+                    break;
+                }
+            }
+            child.map_or(not_found, |c| RoutedStep::Visit(c, depth + 1))
+        }
+        NodeType::Node16 => {
+            let n = *cast::<Node16>(body);
+            match key
+                .byte_at(depth)
+                .and_then(|byte| simd::node16_find_byte(&n.keys, n.count, byte))
+            {
+                Some(i) => RoutedStep::Visit(child_offset(n.children[i as usize]), depth + 1),
+                None => not_found,
+            }
+        }
+        NodeType::Node48 => {
+            let n = *cast::<Node48>(body);
+            let idx = key.byte_at(depth).map_or(0, |byte| n.index[byte as usize]);
+            if idx == 0 {
+                not_found
+            } else {
+                let ci = idx as usize - 1;
+                if ci >= 48 {
+                    return Err(Error::node_corrupt("cold_read_routed: node48 index out of range"));
+                }
+                RoutedStep::Visit(child_offset(n.children[ci]), depth + 1)
+            }
+        }
+        NodeType::Node256 => {
+            let n = *cast::<Node256>(body);
+            match key.byte_at(depth) {
+                Some(byte) if n.children[byte as usize] != 0 => {
+                    RoutedStep::Visit(child_offset(n.children[byte as usize]), depth + 1)
+                }
+                _ => not_found,
+            }
+        }
+        NodeType::Blob => {
+            let b = *cast::<BlobNode>(body);
+            let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
+            if key.range_eq(depth, &b.bytes[..plen]) {
+                RoutedStep::Done(ColdBlobLookup::Crossing {
+                    child_guid: b.child_blob_guid,
+                    child_depth: depth + plen,
+                })
+            } else {
+                not_found
+            }
+        }
+        // A Leaf/EmptyRoot/Invalid at an internal position
+        // (off < leaf_region_start) is unexpected — bail to the
+        // authoritative full pin.
+        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Invalid => {
+            RoutedStep::Done(ColdBlobLookup::Unknown)
+        }
+    })
+}
+
+fn descend_routed(
+    scratch: &mut [u8],
+    read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
+    off: u32,
+    key: SearchKey<'_>,
+    depth: usize,
+    leaf_region_start: u32,
+) -> Result<ColdBlobLookup> {
+    // The decision is taken (and copied out) under a short frame borrow
+    // so we can page in a leaf or recurse with `&mut scratch` after.
+    let step = routed_step(BlobFrameRef::wrap(&scratch[..]), off, key, depth)?;
+    match step {
+        RoutedStep::Done(answer) => Ok(answer),
+        RoutedStep::Visit(child_off, new_depth) => {
+            if child_off >= leaf_region_start {
+                // Leaf: page it in, then run the leaf compare.
+                page_in_leaf(scratch, read_range, child_off)?;
+                let frame = BlobFrameRef::wrap(&scratch[..]);
+                let body = frame
+                    .body_at_offset(child_off)
+                    .ok_or(Error::node_corrupt("cold_read_routed: leaf body range"))?;
+                leaf_check_owned(body, key)
+            } else {
+                descend_routed(scratch, read_range, child_off, key, new_depth, leaf_region_start)
+            }
+        }
+    }
+}
+
+/// Page the leaf at `loff` (>= leaf_region_start) into `scratch` at its
+/// absolute offset: read the page(s) covering its 16-byte header, then
+/// extend to cover the full `[16B hdr][key][value]` body (a large
+/// value can straddle pages).
+fn page_in_leaf(
+    scratch: &mut [u8],
+    read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
+    loff: u32,
+) -> Result<()> {
+    let page0 = loff & !(PAGE_4K - 1);
+    let hdr_end = page_align_up(loff + size_of::<Leaf>() as u32);
+    read_range(u64::from(page0), &mut scratch[page0 as usize..hdr_end as usize])?;
+    let (key_len, value_len) = {
+        let leaf = cast::<Leaf>(&scratch[loff as usize..loff as usize + size_of::<Leaf>()]);
+        (u32::from(leaf.key_len), u32::from(leaf.value_len))
+    };
+    let body_end = page_align_up(loff + leaf_body_size(key_len, value_len));
+    if body_end > hdr_end {
+        read_range(
+            u64::from(hdr_end),
+            &mut scratch[hdr_end as usize..body_end as usize],
+        )?;
+    }
+    Ok(())
+}
+
+/// Like `leaf_check` but returns an owned [`ColdBlobLookup`] — the value
+/// is copied out of the paged-in buffer, which the caller drops.
+fn leaf_check_owned(body: &[u8], key: SearchKey<'_>) -> Result<ColdBlobLookup> {
+    let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
+    if leaf.tombstone != 0 {
+        return Ok(ColdBlobLookup::NotFound);
+    }
+    if leaf.key_fp != 0 && leaf.key_fp != key.fingerprint() {
+        return Ok(ColdBlobLookup::NotFound);
+    }
+    let key_len = leaf.key_len as usize;
+    let value_len = leaf.value_len as usize;
+    let key_end = 16 + key_len;
+    let value_end = key_end + value_len;
+    if value_end > body.len() {
+        return Err(Error::node_corrupt("cold_read_routed: leaf key/value range"));
+    }
+    if !key.eq_slice(&body[16..key_end]) {
+        return Ok(ColdBlobLookup::NotFound);
+    }
+    Ok(ColdBlobLookup::Found {
+        value: body[key_end..value_end].to_vec(),
+        seq: leaf.seq,
+    })
 }
 
 // ---------- descent dispatch ----------
