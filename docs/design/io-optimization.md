@@ -219,3 +219,86 @@ io_uring tuning is **ubuntu-territory** — implement + measure + crash-soak it 
 the Linux box where both the benefit and the durability behavior are real. Each
 such step still gets a full gate + a commit, and durability-sensitive changes get
 an adversarial review first.
+
+## Concurrency gives cold-read queue depth for free (measured)
+
+`HOLT_STRESS_GET_THREADS=N` runs the cold get phase across N cloned `Tree`
+handles. holt's cold-read path is **lock-free** (`offset_of` takes only a
+shared `manifest.read()`; the read is `read_exact_at`, a positional `pread`),
+so N concurrent cold gets = N concurrent `pread`s = device queue depth N with
+**no engine change**. Measured (2 M routed, cold, mac):
+
+| get threads | aggregate ns/op | speedup |
+|---|---|---|
+| 1 | 435,766 | 1× |
+| 4 | 86,894 | 5.0× |
+| 8 | 50,827 | 8.6× |
+| 16 | 34,404 | **12.7×** |
+
+This is why a single-threaded `get_many` batched-read API was **rejected**: any
+multi-threaded server already gets the cold-read parallelism for free. (Fair
+single-thread comparison, both cold + direct I/O at matched memory: holt ~430 µs
+vs rocksdb ~67 µs — rocksdb does ~1 SST-block read; holt's deeper read count is
+the gap to close, see "fundamental" below. `HOLT_STRESS_ROCKSDB_DIRECT=true`
+makes the comparison fair: rocksdb cold get 3 µs → 67 µs once the OS page cache
+is removed.)
+
+## (c) Cold-scan I/O read-ahead — precise plan (mac-doable, NOT YET DONE)
+
+A cold `range`/`list` reads child blobs **sequentially** (QD=1) — the descent
+pins one child blob, consumes its whole subtree, then the next. No I/O
+read-ahead exists today (the `prefetch_at`/`prefetch_header` calls are
+**CPU-cache** prefetch of in-memory node bodies, not disk reads). Plan:
+
+- Add `BufferManager::pin_scan_many(&[guid]) -> Vec<Option<Arc<CachedBlob>>>`:
+  concurrent `pin_scan` via `std::thread::scope` (QD = batch size). Lock-free
+  pread, same as the proven concurrent-get path.
+- `RangeIter` (range.rs; `KeyRangeIter` just wraps it — one iterator) gains a
+  bounded `prefetch: HashMap<BlobGuid, Arc<CachedBlob>>` window. At a directory
+  Node whose children are `Blob` crossings, peek the next K child guids from the
+  **cached parent** (no I/O), `pin_scan_many` them (QD=K), stash in the window.
+  `pin_scan_or_restart` consults the window first (`remove` → held pin) before
+  pinning. So K cold child blobs are read in ~1 round-trip (QD=K) and then
+  consumed from cache, instead of K serial round-trips.
+- **Correctness is neutral**: pre-pinning only changes *when* a blob enters
+  cache; the iterator's existing per-frame `version` checks remain the safety
+  net (a pre-pinned blob is the same blob, re-validated on use). Keep the window
+  keyed strictly by guid. **Clear the window on every `RangeAdvance::Restart` +
+  in `restart_cursor`** so stale pins don't linger or grow unbounded.
+- Gate: the range `routing==full==oracle` + range proptests (catch any scan
+  regression), full lib + integration, and a **cold `list` bench** (working set
+  ≫ cache) to measure the pipeline win. Adversarial-review the window lifecycle
+  before commit. Deferred from the marathon session that designed it —
+  delicate-iterator surgery deserves a focused pass, not a tail-of-session rush.
+
+## Fundamental: how to SURPASS rocksdb on cold point reads
+
+The fair single-thread gap (holt ~430 µs vs rocksdb ~67 µs) is a **read-count**
+gap: rocksdb does ~1 block read per cold point lookup; holt crosses depth-2/3
+blobs, each a cold `header + [routing] + leaf` read (~4–6 reads on a deep cold
+get). To match/beat rocksdb, drive the per-lookup cold disk-read count to ≤1
+(positive) / 0 (negative) — the LSM "resident index, disk only for data block"
+principle, applied to the ART:
+
+1. **Resident routing skeleton**: keep *all* routing regions resident (they are
+   internal-node-only, ~tens of MB even at 20 M keys), not just a bounded hot
+   subset — bump/adapt the stage-4 `RoutingCache` budget. Eliminates the
+   routing-region read.
+2. **Pin the upper-tree blobs** (root already pinned; pin intermediate parents)
+   so cross-blob hops resolve in RAM — only the final leaf blob is cold.
+3. **Drop the per-lookup header read**: the cold read re-reads the header for
+   `compact_times` validation. Replace with a BM-maintained in-RAM
+   `(guid → version)` map (bumped on compaction + the `alloc_leaf` de-route),
+   so the resident skeleton is validated without a header read → cold positive
+   read = **1 leaf-page read**. This is the high-value lever, but it is the
+   `cold.idx`-class invalidation hazard — needs airtight invalidation + an
+   adversarial review.
+4. **Resident bloom** (already lives in the routing region → resident with the
+   skeleton): cold negative = **0 reads**.
+
+Result: cold positive = 1 read, cold negative = 0 reads — parity with rocksdb,
+then ahead via deterministic single-path descent (no LSM level/run fan-out), no
+compaction read-amplification, path-prefix locality, and a structure-only
+resident set that is smaller than rocksdb's data-block cache. This is the real
+"surpass rocksdb cold read" track (higher-value than (c) for point reads; (c)
+helps scans, where holt already leads).
