@@ -151,6 +151,7 @@ struct StressConfig {
     reopen_after_preload: bool,
     compact_after_preload: bool,
     rocksdb_direct: bool,
+    get_threads: usize,
     engines: Vec<String>,
     ops: Vec<String>,
 }
@@ -207,6 +208,13 @@ impl StressConfig {
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_ROCKSDB_DIRECT", s))
                 .unwrap_or(false),
+            // Run the cold get phase across N cloned Tree handles. Holt's
+            // read path is lock-free (positional pread, shared-read
+            // manifest lock), so N concurrent cold gets = N concurrent
+            // preads = device queue depth N for free. If get throughput
+            // scales with this, the cold-read parallelism is already
+            // there with no engine change.
+            get_threads: env_usize("HOLT_STRESS_GET_THREADS", 1).max(1),
             engines,
             ops,
         }
@@ -246,8 +254,8 @@ fn main() {
         cfg.ops.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},compact_after_preload={},rocksdb_direct={}",
-        cfg.wal_sync, cfg.reopen_after_preload, cfg.compact_after_preload, cfg.rocksdb_direct
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},compact_after_preload={},rocksdb_direct={},get_threads={}",
+        cfg.wal_sync, cfg.reopen_after_preload, cfg.compact_after_preload, cfg.rocksdb_direct, cfg.get_threads
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
@@ -302,7 +310,12 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     }
 
     if cfg.selected_op("get") {
-        report("holt", "get", samples.len(), time_get_holt(&tree, samples));
+        report(
+            "holt",
+            "get",
+            samples.len(),
+            time_get_holt_concurrent(&tree, samples, cfg.get_threads),
+        );
     }
     if cfg.selected_op("put") {
         report("holt", "put", samples.len(), time_put_holt(&tree, samples));
@@ -689,6 +702,29 @@ fn time_get_holt(tree: &Tree, samples: &[OpSample]) -> Duration {
     time_samples(samples, |sample| {
         black_box(tree.get(black_box(&sample.key)).expect("holt get"));
     })
+}
+
+/// Time the get phase across `threads` cloned `Tree` handles (sharing
+/// one backing store). Returns wall-clock for ALL `samples`, so
+/// `report` shows aggregate throughput — the lever that exposes free
+/// device queue depth on holt's lock-free cold-read path.
+fn time_get_holt_concurrent(tree: &Tree, samples: &[OpSample], threads: usize) -> Duration {
+    if threads <= 1 {
+        return time_get_holt(tree, samples);
+    }
+    let chunk = samples.len().div_ceil(threads);
+    let start = Instant::now();
+    std::thread::scope(|scope| {
+        for c in samples.chunks(chunk) {
+            let t = tree.clone();
+            scope.spawn(move || {
+                for sample in c {
+                    black_box(t.get(black_box(&sample.key)).expect("holt get"));
+                }
+            });
+        }
+    });
+    start.elapsed()
 }
 
 fn time_put_holt(tree: &Tree, samples: &[OpSample]) -> Duration {
