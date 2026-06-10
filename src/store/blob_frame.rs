@@ -549,6 +549,17 @@ impl<'a> BlobFrame<'a> {
     ///
     pub fn alloc_node(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
         let outcome = self.alloc_node_inner(ntype)?;
+        // A new internal node allocated into a *routed* frame lands at the
+        // leaf-arena high-water (>= leaf_region_start), where a cold reader
+        // classifies offsets as leaves — silently breaking the routing
+        // invariant. Invalidate the routing layout (the next compaction
+        // re-routes); cold reads fall back to the legacy whole-frame path
+        // until then. New leaves (alloc_leaf) need no such guard — they are
+        // correctly classified above leaf_region_start. During the routing
+        // build itself routing_len is still 0, so this is a no-op.
+        if self.header().routing_len != 0 {
+            self.header_mut().routing_len = 0;
+        }
         if ntype == NodeType::Blob {
             self.header_mut().num_ext_blobs = self.header().num_ext_blobs.saturating_add(1);
         }

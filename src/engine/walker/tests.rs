@@ -1383,6 +1383,57 @@ fn compact_near_full_stays_correct() {
     }
 }
 
+#[test]
+fn structural_mutation_demotes_routed_blob_to_legacy() {
+    // Build a blob comfortably over the routing threshold (same shape as
+    // the gate: a Prefix over a Node256 with some > 4 KB values).
+    let (mut buf_vec, _) = fresh_blob();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        for i in 0..60u8 {
+            let v = if i % 7 == 0 {
+                vec![i; 5000]
+            } else {
+                vec![i, i ^ 0xFF]
+            };
+            put(&mut frame, &[b'q', i], &v, i as u64 + 1);
+        }
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    {
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        assert!(
+            frame.header().routing_region().is_some(),
+            "expected a routed layout after compaction",
+        );
+    }
+    // Insert under a brand-new first byte: the root Prefix('q') must split,
+    // allocating a new internal node — which must invalidate the routing
+    // layout (a new internal node would otherwise land above
+    // leaf_region_start and be misread as a leaf on a cold read).
+    {
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        let root = frame.header().root_slot;
+        insert(&mut frame, root, b"zz", b"new", 1000).unwrap();
+        assert!(
+            frame.header().routing_region().is_none(),
+            "a structural mutation (node growth) must de-route the blob",
+        );
+    }
+    // Everything still readable via the (now legacy) full-frame descent.
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert_eq!(get(&frame, b"zz").as_deref(), Some(&b"new"[..]));
+    for i in 0..60u8 {
+        let v = if i % 7 == 0 {
+            vec![i; 5000]
+        } else {
+            vec![i, i ^ 0xFF]
+        };
+        assert_eq!(get(&frame, &[b'q', i]).as_deref(), Some(v.as_slice()), "q[{i}]");
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
