@@ -109,6 +109,52 @@ crash-soak (`cargo run --release --example wal_crash_soak -- 40`).
 ### Stage 6 — per-blob bloom (later)
 A bloom in the header for free *within-prefix* negatives. Orthogonal/additive.
 
+### Stage 3.5/4 addendum — push io_uring to the extreme (cold-read I/O backend)
+
+**Today's io_uring is NOT optimized** (`src/store/blob_store/file/uring.rs`): one
+ring behind a **global Mutex**, **synchronous `submit_and_wait(1)` per read** (no
+read batching — only checkpoint writes batch via `pwrite_many_at`), **no SQPOLL,
+no IOPOLL**. It captures only the *static* registration wins (`register_files` +
+`register_buffers` → `ReadFixed`/`WriteFixed`, O_DIRECT). So the cold-read path
+runs at **device queue depth 1** — exactly wrong for random reads over a working
+set >> RAM. And `read_blob_range` (the page-granular primitive) currently
+**bypasses the ring** (plain `read_exact_at`).
+
+This is the right place to fix io_uring, because the only paths that touch disk
+are cold misses + checkpoint writes; the warm read path (holt's 2.1–2.4× win)
+has **no I/O**, so optimizing io_uring only pays on the cold path — the one this
+work redesigns. Fold this into stages 3–4:
+
+1. **Route page-granular cold reads through a batched-async read interface**, not
+   plain `pread`. The BM cold path issues a *wave* of leaf-page reads (across
+   concurrent queries and/or a single query's pages) as one batch.
+2. **Linux backend — io_uring to the extreme:**
+   - **Multi-SQE submit**: push N page-read SQEs, `submit_and_wait(N)` → device
+     QD = N (the big lever for random cold reads). (Today reads are QD 1.)
+   - **Per-core / small pool of rings** to drop the single global Mutex →
+     concurrent submission from multiple threads.
+   - Optional **IOPOLL** (NVMe busy-poll completions, lowest latency, burns a
+     poller core) and **SQPOLL** (kernel-side submit, cuts the `io_uring_enter`
+     syscall) behind config flags.
+   - Keep the existing fixed files + fixed buffers + ordered batched writes.
+3. **Cross-platform backend (macOS + Linux-without-io_uring): a small thread pool
+   of blocking `pread`s** → the same device parallelism without io_uring. Do
+   **NOT** use Darwin POSIX aio (`aio_read`/`lio_listio`) — it is libc
+   thread-pool-emulated and weak. Keep `F_NOCACHE`.
+4. **Interface**: extend `BlobStore` with a batched read (e.g.
+   `read_pages_batch(&[(guid, page, dst)])` or a submit/poll pair), backed by
+   io_uring (multi-SQE) on Linux and the thread pool elsewhere — one interface,
+   two backends. macOS is dev/test (prod = Linux NVMe), so it needs *correct +
+   parallel*, not *extreme*.
+5. **Measure on a REAL cold bench** (ubuntu/x86): dataset >> RAM, **drop the OS
+   page cache** (the current 137× is page-cache-warm and not representative),
+   sweep **QD = 1 vs 8 / 32 / 64**, report cold p50/p99 + throughput; compare to
+   RocksDB at matched block-cache bytes.
+
+Sequencing: do this *after* stage 3 lands the routed read (so there is a real
+page-read load to batch), as part of or right after stage 4 (resident routing
+cache). Until then, single-op reads are fine.
+
 ## cold.idx safety review (why stage 5 deletes a bug class)
 
 A multi-agent review of the cold.idx stack (`ae0c524..b3a08ac`) found (steady
@@ -174,7 +220,10 @@ them by construction:
 - **#18 (in progress):** Cold-read in-blob routing region. Stage 1 done
   (`12ce05a`); primitive done (`808a5fa`); design (`137d5ba`). **Next: stage 2**
   two-arena compaction build + `routing==full` test → stage 3 `cold_read_routed`
-  (+ data-integrity gate + cold bench) → stage 4 resident routing cache → stage 5
-  remove cold.idx (+ crash-soak) → stage 6 bloom.
+  (+ data-integrity gate + cold bench) → **stage 3.5/4 io_uring-to-the-extreme
+  cold-read backend** (batched multi-SQE async reads / per-core rings /
+  IOPOLL+SQPOLL on Linux; thread-pool backend for macOS+fallback; QD-sweep cold
+  bench) → stage 4 resident routing cache → stage 5 remove cold.idx (+ crash-soak)
+  → stage 6 bloom.
 - **#10 (pending):** R2 BlobNode prefix bloom — folds into stage 6.
 - **#12 (pending):** hot-scan residual ~4% (separate, low priority).
