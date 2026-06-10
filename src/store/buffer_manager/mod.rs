@@ -143,6 +143,7 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
+use super::routing_cache::RoutingCache;
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -221,11 +222,20 @@ enum PinAccess {
     Silent,
 }
 
+/// Byte budget for the resident routing-region cache (cold-read stage
+/// 4). ~32 MB holds the routing regions of thousands of routed blobs
+/// (each ≈ 1–2 pages); a normal working set fits without eviction.
+const ROUTING_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
 /// Frequency-aware blob cache; see the module docs.
 pub struct BufferManager {
     store: Arc<dyn BlobStore>,
     alloc_uninit: Arc<dyn Fn() -> AlignedBlobBuf + Send + Sync>,
     capacity: usize,
+    /// Bounded, `compact_times`-validated cache of routed blobs' routing
+    /// regions (cold-read stage 4), so a repeat cold read skips the
+    /// routing-region read.
+    routing_cache: RoutingCache,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -501,6 +511,7 @@ impl BufferManager {
             store,
             alloc_uninit: Arc::new(alloc_uninit),
             capacity,
+            routing_cache: RoutingCache::new(ROUTING_CACHE_BUDGET_BYTES),
             cache: DashMap::with_hasher(GuidBuildHasher),
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
@@ -1153,6 +1164,24 @@ impl BufferManager {
         dst: &mut [u8],
     ) -> Result<()> {
         self.store.read_blob_range(guid, byte_offset, dst)
+    }
+
+    /// Stage-4 routing cache: fill `dst` with `guid`'s cached routing
+    /// region if one is resident at exactly `compact_times` (validated
+    /// against the freshly-read header). Returns `true` on a hit.
+    pub(crate) fn routing_region_cached(
+        &self,
+        guid: BlobGuid,
+        compact_times: u32,
+        dst: &mut [u8],
+    ) -> bool {
+        self.routing_cache.fill(guid, compact_times, dst)
+    }
+
+    /// Cache `guid`'s routing region (`region`) at `compact_times` for
+    /// the next cold read.
+    pub(crate) fn routing_region_store(&self, guid: BlobGuid, compact_times: u32, region: &[u8]) {
+        self.routing_cache.put(guid, compact_times, region);
     }
 
     fn note_full_blob_read(&self, access: PinAccess) {

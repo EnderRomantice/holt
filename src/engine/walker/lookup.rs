@@ -429,10 +429,44 @@ fn cold_read_routed(
     // Descend with the SAME `key` the pin-fallback frame descent uses
     // (the caller only reaches here with a user-style key), so a routed
     // and a full-frame read are byte-for-byte equivalent.
+    routed_read_cached(bm, guid, key, depth).unwrap_or(ColdBlobLookup::Unknown)
+}
+
+/// Routed cold read with the stage-4 resident routing cache: read the
+/// header page, then fill the routing region from the cache (validated
+/// by `compact_times`) or read + cache it, then descend and page in the
+/// one leaf. Errors map to `Unknown` (→ authoritative pin) at the call
+/// site, so this can only avoid I/O, never change semantics.
+fn routed_read_cached(
+    bm: &BufferManager,
+    guid: BlobGuid,
+    key: SearchKey<'_>,
+    depth: usize,
+) -> Result<ColdBlobLookup> {
     let mut scratch = AlignedBlobBuf::zeroed();
-    let mut read_range = |off: u64, dst: &mut [u8]| bm.read_blob_range(guid, off, dst);
-    cold_read_routed_into(scratch.as_mut_slice(), &mut read_range, key, depth)
-        .unwrap_or(ColdBlobLookup::Unknown)
+    let buf = scratch.as_mut_slice();
+
+    // Header page → routing geometry + the cache-validation version.
+    bm.read_blob_range(guid, 0, &mut buf[..HEADER_SIZE as usize])?;
+    let (root_off, rr, compact_times) = {
+        let frame = BlobFrameRef::wrap(&buf[..]);
+        let h = frame.header();
+        match h.routing_region() {
+            Some(rr) => (decode_child_off(h.root_slot), rr, h.compact_times),
+            None => return Ok(ColdBlobLookup::Unknown), // legacy → full pin
+        }
+    };
+
+    // Routing region: resident cache hit (skip the read) or read +
+    // populate. `[routing_off, leaf_region_start)` is page-aligned.
+    let (rs, re) = (rr.off as usize, rr.leaf_region_start as usize);
+    if !bm.routing_region_cached(guid, compact_times, &mut buf[rs..re]) {
+        bm.read_blob_range(guid, u64::from(rr.off), &mut buf[rs..re])?;
+        bm.routing_region_store(guid, compact_times, &buf[rs..re]);
+    }
+
+    let mut leaf_read = |off: u64, dst: &mut [u8]| bm.read_blob_range(guid, off, dst);
+    descend_routed(buf, &mut leaf_read, root_off, key, depth, rr.leaf_region_start)
 }
 
 /// Routed-read core, decoupled from the buffer manager via a
@@ -443,6 +477,7 @@ fn cold_read_routed(
 /// header page, routing region, and one leaf page are read into it at
 /// their absolute offsets. Returns `Unknown` for a legacy
 /// (`routing_len == 0`) blob.
+#[cfg(test)]
 pub(super) fn cold_read_routed_into(
     scratch: &mut [u8],
     read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,

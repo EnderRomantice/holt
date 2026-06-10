@@ -13,6 +13,7 @@
 mod blob_frame;
 pub(crate) mod blob_store;
 mod buffer_manager;
+mod routing_cache;
 
 pub(crate) use blob_frame::{
     decode_child_off, encode_child_off, page_align_up, PAGE_4K, SPILLOVER_RESERVATION,
