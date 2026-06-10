@@ -2389,6 +2389,27 @@ impl Tree {
         Ok(())
     }
 
+    /// Whether a maintenance pass should rebuild the blob `guid` whose
+    /// current cached image is `frame`. Two independent reasons:
+    ///
+    /// - **churn** — [`engine::blob_needs_compaction`]: tombstones or
+    ///   dead-byte waste to reclaim. Unconditional; compaction already
+    ///   serialises under the mutation gate.
+    /// - **routing** — the blob is not yet routed but
+    ///   [`engine::blob_would_route`] (a write-cold, bulk-loaded blob
+    ///   that never accrued churn), AND it has settled write-cold
+    ///   (`!has_unflushed_blob`). Without this, a write-once dataset
+    ///   stays legacy forever and every cold point read pins a full
+    ///   512 KB frame. The write-cold gate is a pure efficiency
+    ///   heuristic — it avoids routing a blob mid-write that the next
+    ///   structural mutation would just de-route; correctness never
+    ///   depends on it (a stale route is de-routed by `alloc_node`, and
+    ///   a cold routed read falls back to a full pin on any mismatch).
+    fn blob_wants_compaction(&self, guid: BlobGuid, frame: BlobFrameRef<'_>) -> bool {
+        engine::blob_needs_compaction(frame)
+            || (engine::blob_would_route(frame) && !self.store.has_unflushed_blob(guid))
+    }
+
     fn seed_maintenance_candidates(&self) -> Result<()> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let _tree_mutation = self.mutation_gate.enter_shared();
@@ -2398,7 +2419,7 @@ impl Tree {
             let guard = pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let header = frame.header();
-            if engine::blob_needs_compaction(frame) {
+            if self.blob_wants_compaction(guid, frame) {
                 self.store.note_compaction_candidate(guid);
             }
             if header.num_ext_blobs != 0 {
@@ -2419,7 +2440,7 @@ impl Tree {
         let pin = self.store.pin(guid)?;
         let needs_compaction = {
             let guard = pin.read();
-            engine::blob_needs_compaction(BlobFrameRef::wrap(guard.as_slice()))
+            self.blob_wants_compaction(guid, BlobFrameRef::wrap(guard.as_slice()))
         };
         if !needs_compaction {
             return Ok(false);
@@ -2433,7 +2454,7 @@ impl Tree {
             let mut guard = pin.write();
             let still_needs_compaction = {
                 let frame = guard.frame();
-                engine::blob_needs_compaction(frame.as_ref())
+                self.blob_wants_compaction(guid, frame.as_ref())
             };
             if still_needs_compaction {
                 engine::compact_blob(&mut guard)?;

@@ -133,6 +133,46 @@ pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
     h.tombstone_leaf_cnt != 0 || h.dead_bytes >= DEAD_BYTES_COMPACT_THRESHOLD
 }
 
+/// Whether compacting `frame` **now** would produce a routed
+/// (page-granular cold-read) layout.
+///
+/// A read-only pass-0 measurement ([`routing_budget`] +
+/// [`routing_geometry`]) — no allocation, no mutation. The maintenance
+/// scheduler uses it to lazily route blobs that settled write-cold
+/// without ever accruing the tombstone / dead-byte churn that
+/// [`blob_needs_compaction`] keys on — e.g. a bulk-loaded, write-once
+/// dataset whose blobs are born legacy and would otherwise stay legacy
+/// forever, pinning a full 512 KB frame on every cold point read.
+///
+/// Returns `false` for a blob that is **already routed**
+/// (`routing_len != 0`) — recompacting it gains nothing — and for any
+/// blob [`routing_geometry`] would steer to the legacy layout
+/// (degenerate tree, below `ROUTE_MIN_LEAF_BYTES`, or doesn't fit the
+/// two-arena layout). That "false unless it will actually route"
+/// property is what keeps the scheduler from re-compacting the same
+/// won't-route blob every maintenance cycle.
+#[must_use]
+pub fn blob_would_route(frame: BlobFrameRef<'_>) -> bool {
+    let h = frame.header();
+    if h.routing_len != 0 {
+        return false; // already routed — nothing to gain
+    }
+    if h.routing_unfit != 0 {
+        // A prior compaction intended to route this blob but its clone
+        // overran the measured budget and fell back to legacy. Don't
+        // re-schedule it forever; a later churn compaction (which clears
+        // the flag by rebuilding from zero) re-evaluates routability.
+        return false;
+    }
+    let root_off = decode_child_off(h.root_slot);
+    match routing_budget(frame, root_off) {
+        Ok(budget) => routing_geometry(budget).is_some(),
+        // Undecodable source — leave it to `blob_needs_compaction`;
+        // never schedule a routing rewrite we can't measure.
+        Err(_) => false,
+    }
+}
+
 /// Repack `buf` in place, discarding all unreachable bytes plus
 /// every tombstoned leaf.
 ///
@@ -184,7 +224,7 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
     // the two-arena layout). See `docs/design/cold-read-oracle.md`.
     let routed_lrs = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
-        routing_geometry(routing_budget(&old_frame, old_root_off)?)
+        routing_geometry(routing_budget(old_frame.as_ref(), old_root_off)?)
     };
 
     let mut new_buf = buf.zeroed_like();
@@ -237,6 +277,16 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
                     h.routing_len = internal_end - DATA_AREA_START;
                     h.leaf_region_start = lrs;
                     h.space_used = leaf_cursor;
+                } else if routed_lrs.is_some() {
+                    // We INTENDED to route (`routed_lrs` was `Some`) but
+                    // the routed clone overran the measured budget and we
+                    // fell back to this legacy rebuild. Record that so the
+                    // maintenance scheduler (`blob_would_route`) won't keep
+                    // re-selecting this blob for routing every cycle — a
+                    // budget/clone drift would otherwise recompact a
+                    // settled blob forever. Cleared automatically on the
+                    // next compaction (the frame is rebuilt from zero).
+                    h.routing_unfit = 1;
                 }
             }
             overran
@@ -472,7 +522,7 @@ struct BudgetNode {
 ///
 /// **Keep in lockstep with `clone_subtree` (below) and
 /// `pack_inner_node`.**
-fn routing_budget(src: &BlobFrame<'_>, src_off: u32) -> Result<Option<BudgetNode>> {
+fn routing_budget(src: BlobFrameRef<'_>, src_off: u32) -> Result<Option<BudgetNode>> {
     let ntype = src
         .ntype_at(src_off)
         .ok_or(Error::node_corrupt("routing_budget: undecodable src ntype"))?;
@@ -548,7 +598,7 @@ fn routing_budget(src: &BlobFrame<'_>, src_off: u32) -> Result<Option<BudgetNode
 /// `pack_inner_node` tier size. Mirrors the inner-node arms of
 /// `clone_subtree` (survivor count) + `pack_inner_node` (tier).
 fn budget_inner(
-    src: &BlobFrame<'_>,
+    src: BlobFrameRef<'_>,
     child_offs: impl Iterator<Item = u32>,
 ) -> Result<Option<BudgetNode>> {
     let mut survivors = 0usize;

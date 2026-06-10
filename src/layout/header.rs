@@ -126,7 +126,19 @@ pub struct BlobHeader {
     pub routing_off: u32,
     pub routing_len: u32,
     pub leaf_region_start: u32,
-    _pad_bc: [u8; (HEADER_SIZE as usize) - 0xbc],
+    /// Set by the routing-aware compactor when pass-0 measured this blob
+    /// as routable (`blob_would_route`) but the routed clone overran and
+    /// it fell back to the legacy layout — a `routing_budget` /
+    /// `clone_subtree` drift a correct build never hits (a `debug_assert`
+    /// fires there). The maintenance scheduler treats a blob with this
+    /// set as un-routable, so such a drift cannot make a settled blob
+    /// recompact on every maintenance cycle (unbounded write
+    /// amplification). Every compaction rebuilds the frame from zero, so
+    /// it is naturally cleared on the next (e.g. churn-driven)
+    /// compaction, which re-evaluates routability. `0` is the safe
+    /// default for every existing blob (`init` zeroes the frame).
+    pub routing_unfit: u32,
+    _pad_c0: [u8; (HEADER_SIZE as usize) - 0xc0],
 }
 
 /// The cold-read routing region recorded in a [`BlobHeader`].
@@ -149,13 +161,38 @@ pub struct RoutingRegion {
 impl BlobHeader {
     /// The cold-read routing region, or `None` if this blob is in the legacy
     /// whole-frame layout (descend over the entire 512 KB frame).
+    ///
+    /// Returns `None` not only for `routing_len == 0` (the legacy
+    /// sentinel) but also for any header whose routing bounds fall
+    /// outside the frame's data area — `routing_off < DATA_AREA_START`,
+    /// `leaf_region_start > PAGE_SIZE`, a non-ascending
+    /// `routing_off .. leaf_region_start`, or a routing length that
+    /// runs past the leaf region. A compactor-written routed blob always
+    /// satisfies these; a header that fails them is corrupt (bit rot /
+    /// torn write), and treating it as legacy keeps the cold routed read
+    /// a *pure accelerator*: its caller slices `[routing_off,
+    /// leaf_region_start)` out of a `PAGE_SIZE` buffer, so an out-of-range
+    /// bound here must steer it to the authoritative full-frame pin
+    /// rather than panic on an out-of-bounds slice.
     #[allow(dead_code)] // first consumer is stage 3 (cold_read_routed)
     #[must_use]
     pub fn routing_region(&self) -> Option<RoutingRegion> {
-        (self.routing_len != 0).then_some(RoutingRegion {
-            off: self.routing_off,
+        if self.routing_len == 0 {
+            return None;
+        }
+        let off = self.routing_off;
+        let lrs = self.leaf_region_start;
+        let routing_end = off.checked_add(self.routing_len)?;
+        // Bounds the cold read relies on (see doc above). All must hold
+        // for a compactor-written routed blob; any failure ⇒ corrupt ⇒
+        // legacy fallback.
+        if off < DATA_AREA_START || off >= lrs || lrs > PAGE_SIZE || routing_end > lrs {
+            return None;
+        }
+        Some(RoutingRegion {
+            off,
             len: self.routing_len,
-            leaf_region_start: self.leaf_region_start,
+            leaf_region_start: lrs,
         })
     }
 }
@@ -178,6 +215,7 @@ const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
 const _: () = assert!(offset_of!(BlobHeader, routing_off) == 0xb0);
 const _: () = assert!(offset_of!(BlobHeader, routing_len) == 0xb4);
 const _: () = assert!(offset_of!(BlobHeader, leaf_region_start) == 0xb8);
+const _: () = assert!(offset_of!(BlobHeader, routing_unfit) == 0xbc);
 
 /// Byte offset of [`BlobHeader::created_epoch`] within a frame buffer.
 pub const CREATED_EPOCH_OFFSET: usize = offset_of!(BlobHeader, created_epoch);
@@ -311,6 +349,67 @@ mod tests {
                 len: 0x40,
                 leaf_region_start: DATA_AREA_START + 0x40,
             })
+        );
+    }
+
+    #[test]
+    fn corrupt_routing_bounds_report_legacy() {
+        // A non-zero `routing_len` with out-of-range bounds (bit rot /
+        // torn write) must report the legacy layout, NOT a region the
+        // cold routed read would slice out of bounds. Each case flips one
+        // bound past its limit.
+        let base = BlobHeader {
+            routing_len: 0x40,
+            routing_off: DATA_AREA_START,
+            leaf_region_start: DATA_AREA_START + 0x40,
+            ..unsafe { core::mem::zeroed::<BlobHeader>() }
+        };
+        // Box the headers so the assertions don't stack a `[BlobHeader; N]`
+        // array (each header is 4 KB).
+        let assert_legacy = |h: Box<BlobHeader>, label: &str| {
+            assert_eq!(h.routing_region(), None, "{label} must be legacy");
+        };
+        // routing_off before the data area.
+        assert_legacy(
+            Box::new(BlobHeader {
+                routing_off: DATA_AREA_START - 8,
+                ..base
+            }),
+            "routing_off before data area",
+        );
+        // leaf_region_start past the end of the frame.
+        assert_legacy(
+            Box::new(BlobHeader {
+                leaf_region_start: PAGE_SIZE + 8,
+                ..base
+            }),
+            "leaf_region_start past frame",
+        );
+        // Non-ascending: leaf_region_start at/below routing_off.
+        assert_legacy(
+            Box::new(BlobHeader {
+                leaf_region_start: DATA_AREA_START,
+                ..base
+            }),
+            "leaf_region_start <= routing_off",
+        );
+        // routing_len runs past leaf_region_start.
+        assert_legacy(
+            Box::new(BlobHeader {
+                routing_len: 0x80,
+                leaf_region_start: DATA_AREA_START + 0x40,
+                ..base
+            }),
+            "routing_len past leaf region",
+        );
+        // routing_off + routing_len overflows u32.
+        assert_legacy(
+            Box::new(BlobHeader {
+                routing_off: u32::MAX - 4,
+                routing_len: 0x40,
+                ..base
+            }),
+            "routing_off + routing_len overflow",
         );
     }
 }

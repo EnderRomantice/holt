@@ -149,6 +149,7 @@ struct StressConfig {
     buffer_pool_size: usize,
     wal_sync: bool,
     reopen_after_preload: bool,
+    compact_after_preload: bool,
     engines: Vec<String>,
     ops: Vec<String>,
 }
@@ -191,6 +192,10 @@ impl StressConfig {
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_REOPEN_AFTER_PRELOAD", s))
                 .unwrap_or(false),
+            compact_after_preload: env::var("HOLT_STRESS_COMPACT_AFTER_PRELOAD")
+                .as_deref()
+                .map(|s| parse_bool_env("HOLT_STRESS_COMPACT_AFTER_PRELOAD", s))
+                .unwrap_or(false),
             engines,
             ops,
         }
@@ -230,8 +235,8 @@ fn main() {
         cfg.ops.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={}",
-        cfg.wal_sync, cfg.reopen_after_preload
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},compact_after_preload={}",
+        cfg.wal_sync, cfg.reopen_after_preload, cfg.compact_after_preload
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
@@ -275,6 +280,10 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     print_holt_shape("preload", &tree);
     tree.checkpoint().expect("holt preload checkpoint");
     print_holt_shape("ready", &tree);
+    if cfg.compact_after_preload {
+        compact_holt_until_settled(&tree);
+        print_holt_shape("routed", &tree);
+    }
     if cfg.reopen_after_preload {
         drop(tree);
         tree = Tree::open(tree_cfg).expect("holt reopen");
@@ -557,6 +566,53 @@ fn preload_holt(tree: &Tree, workload: Workload, n_keys: usize) {
             progress("holt", "preload", i + 1, n_keys);
         }
     }
+}
+
+/// Drive maintenance compaction to a fixpoint so the bulk-loaded,
+/// write-once dataset gets routed (page-granular cold reads) before the
+/// timed phase. A write-once load never accrues tombstone/dead-byte
+/// churn, so blobs are born legacy; the maintenance scheduler routes
+/// each settled blob the first time a seed pass sees it (see
+/// `Tree::blob_wants_compaction`).
+///
+/// `Tree::compact` only (re)seeds the candidate queues when BOTH the
+/// compaction and merge queues are empty, and a write-once preload
+/// leaves merge candidates queued inline (parent blobs with crossings).
+/// So the first few passes just *drain* the merge queue without bumping
+/// `total_compactions`; routing only engages once a later pass finds
+/// both queues empty, seeds, and compacts the would-route leaves. We
+/// therefore wait for `total_compactions` to stay flat across a window
+/// of consecutive passes rather than exiting on the first flat pass.
+/// `MAX_PASSES` is a safety bound against a pathological never-settles
+/// loop, not the expected exit.
+fn compact_holt_until_settled(tree: &Tree) {
+    const MAX_PASSES: usize = 1024;
+    const STABLE_WINDOW: usize = 4;
+    let mut prev = tree.stats().expect("holt stats").total_compactions;
+    let mut stable = 0usize;
+    for pass in 0..MAX_PASSES {
+        tree.compact().expect("holt compact-after-preload");
+        tree.checkpoint().expect("holt compact-after-preload checkpoint");
+        let now = tree.stats().expect("holt stats").total_compactions;
+        if now == prev {
+            stable += 1;
+            if stable >= STABLE_WINDOW {
+                eprintln!(
+                    "holt compact-after-preload settled after {} passes (total_compactions={now})",
+                    pass + 1
+                );
+                return;
+            }
+        } else {
+            eprintln!(
+                "holt compact-after-preload pass {}: total_compactions {prev} -> {now}",
+                pass + 1
+            );
+            stable = 0;
+            prev = now;
+        }
+    }
+    eprintln!("holt compact-after-preload hit MAX_PASSES={MAX_PASSES} cap (not settled)");
 }
 
 #[cfg(feature = "comparators")]

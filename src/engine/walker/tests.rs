@@ -6,7 +6,9 @@ use super::cast;
 use super::erase::erase;
 use super::insert::insert;
 use super::lookup::{cold_read_routed_into, lookup, lookup_at};
-use super::migrate::{blob_needs_compaction, compact_blob, make_blob_from_node};
+use super::migrate::{
+    blob_needs_compaction, blob_would_route, compact_blob, make_blob_from_node,
+};
 use super::readers::{
     child_offset, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
@@ -1303,6 +1305,74 @@ fn routing_equals_full_descend_and_oracle() {
     for k in [&b"q"[..], &b"qq"[..], &b"p"[..], &b"zzz"[..]] {
         assert_eq!(check(k), None, "absent {k:?}");
     }
+}
+
+/// `blob_would_route` (the B/C maintenance predicate) reports `true`
+/// for a settled, multi-tier, under-capacity legacy blob, and the
+/// `routing_unfit` header flag suppresses that — so a budget/clone
+/// drift that forces an overrun→legacy fallback cannot make the
+/// scheduler recompact the same blob on every maintenance cycle. A real
+/// compaction routes it and clears the flag, after which the blob is
+/// already routed and `blob_would_route` is `false`.
+#[test]
+fn blob_would_route_respects_unfit_flag() {
+    let (mut buf_vec, _) = fresh_blob();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        let mut seq = 1u64;
+        // Same multi-tier shape as `routing_equals_full_descend_and_oracle`,
+        // which is known to route after compaction.
+        for i in 0..60u8 {
+            let v = if i % 7 == 0 {
+                vec![i; 5000]
+            } else {
+                vec![i, i ^ 0xFF]
+            };
+            put(&mut frame, &[b'q', i], &v, seq);
+            seq += 1;
+        }
+        for i in 0..20u8 {
+            put(&mut frame, &[b'p', i], &[i, 0xAB, i], seq);
+            seq += 1;
+        }
+    }
+
+    let mut buf = aligned_from_vec(&buf_vec);
+    {
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        assert_eq!(frame.header().routing_len, 0, "starts legacy");
+        assert!(
+            blob_would_route(frame.as_ref()),
+            "a multi-tier, under-capacity legacy blob should be routable",
+        );
+    }
+    {
+        // The unfit flag (set by an overrun→legacy fallback) suppresses it.
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        frame.header_mut().routing_unfit = 1;
+        assert!(
+            !blob_would_route(frame.as_ref()),
+            "routing_unfit must suppress re-routing",
+        );
+    }
+
+    // A real compaction rebuilds from zero (clearing unfit) and routes it;
+    // once routed there is nothing to gain, so blob_would_route is false.
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert!(
+        frame.header().routing_region().is_some(),
+        "compaction should route this shape",
+    );
+    assert_eq!(
+        frame.header().routing_unfit,
+        0,
+        "a fresh compaction rebuild clears the unfit flag",
+    );
+    assert!(
+        !blob_would_route(frame.as_ref()),
+        "an already-routed blob is not a routing candidate",
+    );
 }
 
 #[test]

@@ -3,6 +3,55 @@
 Hand this to the next session. Everything below is grounded in committed code +
 measurements; no re-derivation needed.
 
+## Latest increment (2026-06-11) — routing now ENGAGES for write-once data
+
+Stages 2–5 only routed blobs the existing churn compactor rebuilt
+(`blob_needs_compaction`: tombstones / dead bytes). A **write-once bulk load**
+never accrues churn, so its blobs were born legacy and **stayed legacy forever**
+— every cold point read still pinned the full 512 KB frame. Fixed (the "B/C"
+plan):
+
+- **`blob_would_route(frame)`** (`src/engine/walker/migrate.rs`): read-only pass-0
+  measurement (`routing_budget` + `routing_geometry`, now taking the `Copy`
+  `BlobFrameRef`). True iff compacting now would route. False for already-routed
+  (`routing_len != 0`) and won't-route blobs — that's what stops the scheduler
+  re-compacting a won't-route blob every cycle.
+- **`Tree::blob_wants_compaction(guid, frame)`** (`src/api/tree.rs`): unifies the
+  two compaction reasons — **churn** (`blob_needs_compaction`) OR **routing**
+  (`blob_would_route && !has_unflushed_blob`, the write-cold gate). Wired into
+  the seed + both re-checks in `compact_candidate_blob`. The write-cold gate is a
+  pure efficiency heuristic (don't route a blob mid-write the next mutation would
+  de-route); correctness never depends on it.
+- **Bench knob `HOLT_STRESS_COMPACT_AFTER_PRELOAD`** (`benches/stress.rs`): loops
+  `compact()`+`checkpoint()` to a `total_compactions` fixpoint so the bulk dataset
+  routes before the timed phase. NB `compact()` only seeds when BOTH candidate
+  queues are empty, and a write-once preload leaves merge candidates queued inline
+  — so the first passes just drain merges; routing engages a few passes later
+  (stable-window terminator, not first-flat-pass).
+
+**Measured (mac, O_DIRECT, objstore 2M keys, working set ≫ 64-blob cache):**
+cold `get` **820 µs → 423 µs (1.94×)**; full-frame pins over 200K gets
+**287,733 → 1**. (rocksdb ~2.9 µs uses the OS page cache; the holt-vs-rocksdb
+gap is the O_DIRECT-vs-buffered asymmetry — the real comparison still belongs on
+the **ubuntu SSD** box.)
+
+**Two robustness fixes from the adversarial review of this change:**
+- **`routing_unfit` header flag** (`src/layout/header.rs` @0xbc): set by
+  `compact_blob` when pass-0 said "routable" but the routed clone overran and fell
+  back to legacy (a budget/clone drift a correct build never hits). Without it the
+  new scheduler would recompact such a blob every cycle (unbounded write amp).
+  `blob_would_route` skips a flagged blob; every compaction rebuilds from zero so
+  the flag self-clears for re-evaluation. Test: `blob_would_route_respects_unfit_flag`.
+- **`routing_region()` bounds validation** (`src/layout/header.rs`): returns `None`
+  (→ legacy → authoritative full pin) for any header whose routing bounds fall
+  outside the frame, so a corrupt/torn header can't make the cold read slice out
+  of range and panic. Test: `corrupt_routing_bounds_report_legacy`.
+
+Gate: 299 lib + 40 integration tests, clippy clean, 40/40 SIGKILL crash-soak.
+Still pending: the **ubuntu (x86) cold `bm_read_bytes`/latency bench** with
+routing engaged (`HOLT_STRESS_COMPACT_AFTER_PRELOAD=true`) + side-by-side vs
+rocksdb at scale.
+
 ## TL;DR — start here
 
 - **Branch:** `perf/cold-read-observability` (clean tree).
