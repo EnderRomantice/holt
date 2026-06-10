@@ -13,20 +13,22 @@ measurements; no re-derivation needed.
   leaves after it, so a cold read loads the small routing region + **one leaf
   page** (~8–12 KB, or ~4 KB with the routing region resident) and **reuses the
   existing descent**. Full design: `docs/design/cold-read-oracle.md`.
-- **Done:** design + primitive + header fields + **stage 2 build** (`ed997c6`)
-  + **mutation-path prereq** (`2f850fa`) + **stage 3 cold routed read**
-  (`33bc3d4`). Cold reads of routed blobs now go header page + routing region +
-  one leaf page instead of a 512 KB pin; the routing region is the live cold
-  path (alongside cold.idx, which is next to be removed).
-- **Next:** **remove the `cold.idx` sidecar (was "stage 5")** — decisions
-  locked: **bump manifest v5→v6 and drop the dead per-entry `generation` field**
-  (existing v5 stores refused on open — matches the no-migration policy), and
-  **delete the public `bm_cold_lookup_*` telemetry** (TreeStats/SystemStats +
-  Prometheus). Exhaustive removal surface (15 files) is in the session
-  transcript's `coldread-io-surface-map` workflow result; do it in two gated
-  commits — (a) sidecar machinery + telemetry, rewiring `cold_lookup_or_pin` to
-  `cold_read_routed`/pin (keep the `ColdBlobLookup` enum as the routed-read
-  result type); (b) the v6 manifest bump. Gate (b) with the SIGKILL crash-soak.
+- **Done:** design + primitive + header fields + **stage 2 build** (`ed997c6`,
+  +sentinel fix `d66ba98`) + **mutation-path prereq** (`2f850fa`) + **stage 3
+  cold routed read** (`33bc3d4`) + **cold.idx sidecar removed** (`dea3862`) +
+  **manifest v6 dropping the dead `generation` field** (`249572e`). The in-blob
+  routing region is now the SOLE cold-read acceleration: a cold point read of a
+  routed blob loads the header page + routing region + one leaf page instead of
+  pinning the 512 KB frame; legacy/uncertain → full pin. The whole cold.idx
+  crash/staleness bug class is gone.
+- **Next:** **stage 4 — bounded resident routing cache** (keep routing regions
+  hot in an accounted cache, ~15–30 MB for 5 M keys, so a cold read is 1 leaf
+  pread); **stage 6 — per-blob bloom**; **stage 3.5/4 io_uring cold backend**.
+  And the still-pending **ubuntu (x86) cold `bm_read_bytes` drop bench** for
+  stages 2–3 (target 512 KB → ~8–12 KB) + the `routed_get == tree.get`
+  data-integrity gate over real cold/evicted blobs end-to-end (unit + the
+  `cold_read_touches_one_child_blob_after_reopen` integration test cover it on
+  mac; the I/O-reduction number needs the ubuntu box).
 - **Then:** stage 4 resident routing cache; stage 6 per-blob bloom; ubuntu cold
   `bm_read_bytes` drop bench (512 KB → ~8–12 KB) for stages 2–3.
 - **Validation cadence (unchanged):** correctness/compile on **mac (aarch64)**;
@@ -143,7 +145,7 @@ Keep routing regions hot in a **bounded, accounted** cache (~15–30 MB for 5 M
 keys, vs cold.idx's 1 GB+). Cold read → 1 leaf pread. Account it in/alongside the
 BM pool budget (do NOT repeat cold.idx's unbounded sin).
 
-### Stage 5 — remove `cold.idx`  ← **START HERE** (stages 2–3 + prereq are done)
+### Stage 5 — remove `cold.idx`  ✅ DONE (`dea3862` sidecar + `249572e` v6)
 The routing region now subsumes the sidecar (stage 3 reads cold via routing).
 **Decisions locked:** bump manifest v5→v6 dropping the dead per-entry
 `generation` field (confirmed cold.idx-only; v5 stores then refused on open — no
@@ -210,7 +212,11 @@ Sequencing: do this *after* stage 3 lands the routed read (so there is a real
 page-read load to batch), as part of or right after stage 4 (resident routing
 cache). Until then, single-op reads are fine.
 
-## cold.idx safety review (why stage 5 deletes a bug class)
+## cold.idx safety review (the bug class deleted by `dea3862`/`249572e`)
+
+*Historical: the cold.idx sidecar is gone (stage 5 done). The bugs below were
+its motivation; the routing region is crash-safe by construction (it lives in
+the blob frame, no separate file, no generation aliasing). Kept for context.*
 
 A multi-agent review of the cold.idx stack (`ae0c524..b3a08ac`) found (steady
 state is sound — residency mutex + manifest-v5 generation are the load-bearing
@@ -274,13 +280,13 @@ them by construction:
 
 - **#18 (in progress):** Cold-read in-blob routing region. Design (`137d5ba`);
   primitive (`808a5fa`); stage 1 header fields (`12ce05a`); **stage 2 build
-  (`ed997c6`), mutation-path prereq (`2f850fa`), stage 3 cold routed read
-  (`33bc3d4`) all done.** **Next: remove the `cold.idx` sidecar** (v6 manifest
-  bump dropping the dead `generation` field + delete the public
-  `bm_cold_lookup_*` telemetry; two gated commits, crash-soak on the v6 one) →
+  (`ed997c6` + sentinel fix `d66ba98`), mutation-path prereq (`2f850fa`), stage
+  3 cold routed read (`33bc3d4`), cold.idx sidecar removed (`dea3862`), manifest
+  v6 dropping the dead generation field (`249572e`) — all done.** Routing region
+  is the sole cold-read accelerator. **Next: stage 4 resident routing cache** →
   **stage 3.5/4 io_uring-to-the-extreme cold-read backend** (batched multi-SQE
   async reads / per-core rings / IOPOLL+SQPOLL on Linux; thread-pool backend for
-  macOS+fallback; QD-sweep cold bench) → stage 4 resident routing cache → stage 6
-  bloom. (Ubuntu cold `bm_read_bytes` drop bench for stages 2–3 still pending.)
+  macOS+fallback; QD-sweep cold bench) → stage 6 bloom. (Ubuntu cold
+  `bm_read_bytes` drop bench for stages 2–3 still pending.)
 - **#10 (pending):** R2 BlobNode prefix bloom — folds into stage 6.
 - **#12 (pending):** hot-scan residual ~4% (separate, low priority).
