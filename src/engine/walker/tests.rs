@@ -1307,6 +1307,168 @@ fn routing_equals_full_descend_and_oracle() {
     }
 }
 
+/// Stage 6: `compact_blob` builds a per-blob bloom at the routing-region
+/// tail. Verify (against the compacted blob's own bloom bytes) that every
+/// present key probes "maybe" (the load-bearing no-false-negative
+/// contract) and that absent keys are overwhelmingly rejected (the
+/// negative-lookup win). Querying the bloom bytes directly is the
+/// deterministic test of the *build*; `cold_read_routed_matches_oracle`
+/// covers the *query* path end-to-end (present keys pass through
+/// `bloom_rejects` to `Found`, so a false negative would fail it).
+#[test]
+fn compacted_blob_bloom_is_consistent() {
+    use crate::store::bloom_contains;
+    let (mut buf_vec, _) = fresh_blob();
+    let mut present: Vec<Vec<u8>> = Vec::new();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        let mut seq = 1u64;
+        for i in 0..60u8 {
+            let k = vec![b'q', i];
+            let v = if i % 7 == 0 {
+                vec![i; 5000]
+            } else {
+                vec![i, i ^ 0xFF]
+            };
+            put(&mut frame, &k, &v, seq);
+            seq += 1;
+        }
+        for i in 0..20u8 {
+            put(&mut frame, &[b'p', i], &[i, 0xAB, i], seq);
+            seq += 1;
+        }
+        // Tombstone every other 'q' so the survivors define the bloom.
+        let root = frame.header().root_slot;
+        for i in (0..60u8).step_by(2) {
+            erase(&mut frame, root, &[b'q', i]).unwrap();
+        }
+        for i in (1..60u8).step_by(2) {
+            present.push(vec![b'q', i]);
+        }
+        for i in 0..20u8 {
+            present.push(vec![b'p', i]);
+        }
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+
+    let (off, len, bpk) = BlobFrame::wrap(buf.as_mut_slice())
+        .header()
+        .bloom_region()
+        .expect("routed blob must carry a bloom");
+    let bloom = buf.as_slice()[off as usize..(off + len) as usize].to_vec();
+
+    // No false negatives: every survivor must probe "maybe". `put` stores
+    // keys terminator-free (SearchKey::exact), so the stored bytes — what
+    // the bloom was built over — are the raw keys.
+    for k in &present {
+        assert!(
+            bloom_contains(&bloom, bpk, k),
+            "false negative: present key {k:?} missed the bloom"
+        );
+    }
+
+    // Absent keys are overwhelmingly rejected (a few false positives are
+    // fine — that just falls back to the leaf read).
+    let mut rejected = 0usize;
+    let trials = 500u16;
+    for i in 0..trials {
+        let probe = [b'z', (i & 0xFF) as u8, (i >> 8) as u8];
+        if !bloom_contains(&bloom, bpk, &probe) {
+            rejected += 1;
+        }
+    }
+    // rejected/trials > 0.9  ⟺  rejected*10 > trials*9 (integer math).
+    assert!(
+        rejected * 10 > usize::from(trials) * 9,
+        "bloom rejected only {rejected}/{trials} absent keys — FPR too high"
+    );
+}
+
+/// An in-place leaf append after routing must invalidate the bloom so a
+/// cold read can't false-negative the appended key. The new key's bytes
+/// were not in the bloom (built at the last compaction); without
+/// invalidation `bloom_rejects` would return a spurious `NotFound`.
+#[test]
+fn leaf_append_after_routing_does_not_false_negative() {
+    use crate::store::ColdBlobLookup;
+    let (mut buf_vec, _) = fresh_blob();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        let mut seq = 1u64;
+        // 60 'q' keys (no erases) → a Node256 on the 2nd byte, so adding
+        // one more 'q' child below is a pure leaf append (no node grow,
+        // no de-route) — it exercises the alloc_leaf bloom-invalidation
+        // hook specifically, not the alloc_node de-route.
+        for i in 0..60u8 {
+            let v = if i % 7 == 0 {
+                vec![i; 5000]
+            } else {
+                vec![i, i ^ 0xFF]
+            };
+            put(&mut frame, &[b'q', i], &v, seq);
+            seq += 1;
+        }
+        for i in 0..20u8 {
+            put(&mut frame, &[b'p', i], &[i, 0xAB, i], seq);
+            seq += 1;
+        }
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    assert!(
+        BlobFrame::wrap(buf.as_mut_slice())
+            .header()
+            .bloom_region()
+            .is_some(),
+        "test needs a routed blob with a bloom",
+    );
+
+    // Append a brand-new key in place (a leaf the bloom never saw).
+    let new_key = [b'q', 200u8];
+    {
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        put(&mut frame, &new_key, &[0xCD, 0xCD], 9999);
+    }
+    // The append must have de-routed the blob: it rewrote a parent child
+    // pointer in the routing region, which the resident routing cache
+    // would otherwise serve stale. De-routing zeroes routing_len (so the
+    // cold read falls back to a full pin) and bloom_len.
+    {
+        let h = BlobFrame::wrap(buf.as_mut_slice());
+        let h = h.header();
+        assert!(
+            h.routing_region().is_none(),
+            "leaf append must de-route (routing_len=0) to avoid a stale routing cache",
+        );
+        assert!(h.bloom_region().is_none(), "and drop the stale bloom");
+    }
+
+    let src = buf.as_slice().to_vec();
+    let routed = |k: &[u8]| -> ColdBlobLookup {
+        let mut scratch = AlignedBlobBuf::zeroed();
+        let mut read = |off: u64, dst: &mut [u8]| -> crate::api::errors::Result<()> {
+            let o = off as usize;
+            dst.copy_from_slice(&src[o..o + dst.len()]);
+            Ok(())
+        };
+        cold_read_routed_into(scratch.as_mut_slice(), &mut read, SearchKey::exact(k), 0).unwrap()
+    };
+    // The appended key must be findable — NEVER a (false-negative)
+    // NotFound. `Unknown` is fine (de-routed → caller authoritatively
+    // full-pins, which finds it).
+    match routed(&new_key) {
+        ColdBlobLookup::Found { value, .. } => assert_eq!(value, vec![0xCD, 0xCD]),
+        ColdBlobLookup::Unknown => {}
+        other => panic!("appended key wrongly resolved {other:?} — bloom false negative"),
+    }
+    // A still-present old key likewise must not be lost.
+    match routed(&[b'q', 1]) {
+        ColdBlobLookup::Found { .. } | ColdBlobLookup::Unknown => {}
+        other => panic!("present key wrongly resolved {other:?}"),
+    }
+}
+
 /// `blob_would_route` (the B/C maintenance predicate) reports `true`
 /// for a settled, multi-tier, under-capacity legacy blob, and the
 /// `routing_unfit` header flag suppresses that — so a budget/clone

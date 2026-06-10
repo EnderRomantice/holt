@@ -35,12 +35,6 @@
 //! (`filter_len_pages`, `filter_bits_per_key`) and the BM sidecar will
 //! carry.
 
-// Stage 6.0 lands the data structure in isolation; its first non-test
-// consumers are stage 6.1 (build at compaction) and 6.2 (query in the
-// routed cold read). Until then the items below are exercised only by
-// this module's tests. Remove when 6.2 wires it in.
-#![allow(dead_code)]
-
 /// Default bits per key — ~1% false-positive rate at the optimal probe
 /// count. Tunable per blob (the header reserves `filter_bits_per_key`).
 pub(crate) const BLOOM_BITS_PER_KEY: u8 = 8;
@@ -250,8 +244,9 @@ mod tests {
                 fp += 1;
             }
         }
-        let rate = fp as f64 / probes as f64;
-        assert!(rate < 0.05, "FPR too high: {rate:.4} (expected ~0.02)");
+        // fp/probes < 0.05  ⟺  fp*20 < probes (integer math; math target
+        // is ~0.02, the 0.05 ceiling absorbs variance).
+        assert!(fp * 20 < probes, "FPR too high: {fp}/{probes} (expected ~0.02)");
     }
 
     #[test]

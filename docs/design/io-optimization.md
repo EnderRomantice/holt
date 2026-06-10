@@ -149,10 +149,19 @@ semantics.
   later (stage 6.x) decision, gated on measured benefit.
 - **Never a false negative (contract).** The bloom only filters the *leaf-read*
   decision after the routed descent reaches a child `>= leaf_region_start`. On
-  any uncertainty (epoch mismatch, stale flag, no filter, corrupt) → read the
-  leaf as today. `compact_blob` rebuilds it from the final leaf set; `alloc_node`
-  de-route marks it stale. Enforced by a `bloom_never_false_negative` test over
-  100 k random present/absent keys across mutation/compaction/eviction.
+  any uncertainty (no filter, unexpected `bits_per_key`, key too long, corrupt
+  bounds) → read the leaf as today. `compact_blob` rebuilds it from the final
+  leaf set.
+- **Leaf appends de-route (correctness, not just the bloom).** An in-place
+  `alloc_leaf` into a routed blob rewrites the parent node's child pointer, which
+  lives in the routing region, *without* bumping `compact_times`. The resident
+  routing cache is keyed/validated by `compact_times` alone, so it would serve a
+  later cold read a **stale routing region** (missing the new child → wrong
+  descent / false negative) and a stale bloom. So `alloc_leaf` now **de-routes**
+  (`routing_len = 0`, mirroring `alloc_node`) — the blob leaves the cold routed
+  path until the next compaction re-routes it. This also fixes a latent stage-4
+  routing-cache staleness that predates the bloom. Verified by
+  `leaf_append_after_routing_does_not_false_negative` and the SIGKILL crash-soak.
 - **Build.** At `compact_blob` / spillover, after the final leaf set is placed,
   one DFS pass feeds leaf keys to a `BloomBuilder` (size adaptive, like
   `routing_len`). Populated into the BM sidecar on cache fill.

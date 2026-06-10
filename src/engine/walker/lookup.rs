@@ -15,7 +15,10 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::store::blob_store::AlignedBlobBuf;
-use crate::store::{page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup, PAGE_4K};
+use crate::store::{
+    bloom_contains, page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup,
+    BLOOM_BITS_PER_KEY, PAGE_4K,
+};
 
 use super::cast;
 use super::readers::{child_offset, resolve_typed};
@@ -602,6 +605,48 @@ fn routed_step(
     })
 }
 
+/// Largest key length the bloom probe materializes on the stack. Longer
+/// keys skip the bloom and read the leaf (rare for metadata keys; only
+/// costs the read it would have anyway — never a false negative).
+const BLOOM_PROBE_MAX_KEY: usize = 1024;
+
+/// Stage 6: consult the per-blob bloom resident in `scratch`'s routing
+/// region for `key`. Returns `true` ONLY when the bloom proves `key` is
+/// absent from this blob — so the cold read can answer `NotFound`
+/// without the leaf-page read. `false` means "maybe present" (or there
+/// is no usable bloom, or the key is too long to probe): fall through to
+/// the authoritative leaf read.
+///
+/// Never a false negative: the filter was built over each leaf's stored
+/// key bytes, and `SearchKey::write_to_slice` reproduces exactly those
+/// bytes (user bytes + ART terminator) here, so a present key always
+/// hashes to set bits.
+fn bloom_rejects(scratch: &[u8], key: SearchKey<'_>) -> bool {
+    let Some((boff, blen, bpk)) = BlobFrameRef::wrap(scratch).header().bloom_region() else {
+        return false; // no bloom ⇒ "maybe" ⇒ read the leaf
+    };
+    // The compactor only ever writes BLOOM_BITS_PER_KEY. An unexpected
+    // value means a corrupt header field (probe count is derived from it,
+    // so a wrong value could under-probe → a false negative); treat it as
+    // "no bloom" and read the leaf. Defensive: the field shares page 0's
+    // first sector with bloom_off/len, so a torn write can't desync them,
+    // but a pure-accelerator must never trust an unexpected value.
+    if bpk != BLOOM_BITS_PER_KEY {
+        return false;
+    }
+    let klen = key.len();
+    if klen > BLOOM_PROBE_MAX_KEY {
+        return false;
+    }
+    let (bs, be) = (boff as usize, (boff + blen) as usize);
+    if be > scratch.len() {
+        return false; // defensive — bloom_region already bounds-checked
+    }
+    let mut kbuf = [0u8; BLOOM_PROBE_MAX_KEY];
+    key.write_to_slice(&mut kbuf[..klen]);
+    !bloom_contains(&scratch[bs..be], bpk, &kbuf[..klen])
+}
+
 fn descend_routed(
     scratch: &mut [u8],
     read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
@@ -617,6 +662,11 @@ fn descend_routed(
         RoutedStep::Done(answer) => Ok(answer),
         RoutedStep::Visit(child_off, new_depth) => {
             if child_off >= leaf_region_start {
+                // Stage 6: if the blob's resident bloom proves `key` is
+                // absent, answer NotFound WITHOUT the leaf-page read.
+                if bloom_rejects(scratch, key) {
+                    return Ok(ColdBlobLookup::NotFound);
+                }
                 // Leaf: page it in, then run the leaf compare.
                 page_in_leaf(scratch, read_range, child_off)?;
                 let frame = BlobFrameRef::wrap(&scratch[..]);
