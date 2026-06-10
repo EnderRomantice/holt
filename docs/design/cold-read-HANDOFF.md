@@ -13,13 +13,22 @@ measurements; no re-derivation needed.
   leaves after it, so a cold read loads the small routing region + **one leaf
   page** (~8–12 KB, or ~4 KB with the routing region resident) and **reuses the
   existing descent**. Full design: `docs/design/cold-read-oracle.md`.
-- **Done:** design + page-read primitive + header fields + **stage 2 two-arena
-  compaction build** (stages 0–2; stage 2 = `ed997c6`).
-- **Next:** **stage 3 — the cold routed read in `src/engine/walker/lookup.rs`**
-  (`cold_read_routed`), gated by the `routed_get == tree.get` data-integrity
-  test (present / absent / crossing). **Land the mutation-path prerequisite
-  first** (see "Stage 3 prerequisite" below): a post-routed in-place structural
-  mutation must zero `routing_len`, else stage 3 reads stale geometry.
+- **Done:** design + primitive + header fields + **stage 2 build** (`ed997c6`)
+  + **mutation-path prereq** (`2f850fa`) + **stage 3 cold routed read**
+  (`33bc3d4`). Cold reads of routed blobs now go header page + routing region +
+  one leaf page instead of a 512 KB pin; the routing region is the live cold
+  path (alongside cold.idx, which is next to be removed).
+- **Next:** **remove the `cold.idx` sidecar (was "stage 5")** — decisions
+  locked: **bump manifest v5→v6 and drop the dead per-entry `generation` field**
+  (existing v5 stores refused on open — matches the no-migration policy), and
+  **delete the public `bm_cold_lookup_*` telemetry** (TreeStats/SystemStats +
+  Prometheus). Exhaustive removal surface (15 files) is in the session
+  transcript's `coldread-io-surface-map` workflow result; do it in two gated
+  commits — (a) sidecar machinery + telemetry, rewiring `cold_lookup_or_pin` to
+  `cold_read_routed`/pin (keep the `ColdBlobLookup` enum as the routed-read
+  result type); (b) the v6 manifest bump. Gate (b) with the SIGKILL crash-soak.
+- **Then:** stage 4 resident routing cache; stage 6 per-blob bloom; ubuntu cold
+  `bm_read_bytes` drop bench (512 KB → ~8–12 KB) for stages 2–3.
 - **Validation cadence (unchanged):** correctness/compile on **mac (aarch64)**;
   real I/O + benches on **ubuntu (x86)** via rsync (see "Validation" below).
 
@@ -53,6 +62,9 @@ crash-safe by construction.
 | `12ce05a` | **Stage 1 — header fields (transparent).** `BlobHeader` gains `routing_off/routing_len/leaf_region_start` (u32, at 0xb0/b4/b8, carved from pad; size still 4096; offset asserts extended). `BlobHeader::routing_region() -> Option<RoutingRegion>` (None ⇒ legacy whole-frame). **Safety:** `BlobFrameMut::init` zeroes the whole frame ⇒ every old/not-yet-recompacted blob reads `routing_len==0` ⇒ full-pin fallback; **no manifest bump needed.** Pinned by `header::tests::zeroed_header_is_legacy_layout`. The reader is `#[allow(dead_code)]` until stage 3. |
 | `ed997c6` | **Stage 2 — two-arena compaction build.** `compact_blob` now: pass-0 `routing_budget` sizes the live subtree EXACTLY (via `packed_inner_size`, which mirrors `pack_inner_node`'s tier collapse — a 1-survivor node packs to a 128 B `Prefix`, *larger* than a source `Node4`/`Node16`, so source size would under-count); fixes a page-aligned `leaf_region_start` up front; clones with internals bumping `space_used` (routing arena) and `clone_leaf` drawing from `alloc_leaf_at` (leaf cursor); stamps the header fields. **Back-patch unchanged** (post-order `encode_child_off`). Release-safe overrun guard → legacy rebuild (+`debug_assert!`). Spillover/merge stay legacy; merge demotes a routed parent (`routing_len=0`). Blobs with `< ROUTE_MIN_LEAF_BYTES` (8 KB leaves) stay legacy so the ≤4 KB page-align gap can't dominate `space_used`. Gated by `routing_equals_full_descend_and_oracle` + `routed_compaction_matches_oracle` proptest + degenerate/fallback cases + `packed_inner_size_matches_pack_inner_node`. Full suite + clippy green on aarch64. |
 
+| `2f850fa` | **Mutation-path prereq.** `alloc_node` zeroes `routing_len` when it's non-zero — allocating a NEW internal node into a routed frame would place it at the leaf-arena high-water (≥ `leaf_region_start`), misread as a leaf on a cold read. So the first structural mutation de-routes the blob (legacy cold reads until the next compaction). Leaf appends need no guard (a new leaf ≥ `leaf_region_start` is correctly classified). Cleaner than the originally-planned `writers.rs` hook: one spot catches all internal-node growth incl. CoW-fork-then-mutate. Gated by `structural_mutation_demotes_routed_blob_to_legacy`. |
+| `33bc3d4` | **Stage 3 — cold routed read.** `cold_read_routed` in `lookup.rs`, slotted into `cold_lookup_or_pin`'s `Unknown` arm: read header page + routing region + one leaf page (two if a >4 KB value straddles) via `bm.read_blob_range`, descend the resident routing region (`routed_step` mirrors `descend`), page in just the target leaf. New BM methods: `cold_read_eligible` (staleness guard mirroring `cold_lookup_blob`) + `read_blob_range`. **Pure accelerator:** any uncertainty (legacy layout / not cold-eligible / read error / unexpected node) → `Unknown` → authoritative `bm.pin`; uses the same `SearchKey` the pin-fallback descent would, so routed == full read. Gated by `cold_read_routed_matches_oracle` (the testable core takes a `read_range` closure). Cold I/O bench is ubuntu. |
+
 **Stage 2 decisions (beyond the original four):** routing is gated on
 `ROUTE_MIN_LEAF_BYTES = 2 * PAGE_4K` (8 KB) — a tunable. Routed `space_used`
 = legacy + the ≤4 KB page-align gap, so `is_mergeable` over-counts a routed
@@ -63,20 +75,17 @@ honestly (no upper cap — stage 3 owns any full-pin-on-large-routing policy).
 (The WAL ring work — the other big effort — is on a **separate branch**
 (`perf/u16-children`) and is unrelated to this cold-read line; don't conflate.)
 
-## Stage 3 prerequisite — mutation-path policy (land before stage 3 trusts the fields)
+## Stage 3 prerequisite — mutation-path policy  ✅ DONE (`2f850fa`)
 
-Stage 2's build is correct in isolation, but a **post-routed in-place
-structural mutation** (an insert that grows an internal node, or appends a
-leaf via `alloc_node`/`alloc_leaf` from `space_used` = top of the leaf arena)
-places a NEW internal node *above* `leaf_region_start`, silently violating the
-`off < leaf_region_start ⟺ internal` invariant. `merge_blob` already demotes
-(zeros `routing_len`); the general writer path in `src/engine/walker/writers.rs`
-(insert / CoW after fork) must do the same: **zero `routing_len` on the first
-structural mutation of a routed frame** (simplest, safe). Until that lands,
-stage 3's reader cannot trust `routing_region()` on a frame that may have been
-mutated since its last compaction. `fork_frame` / snapshot copy bytes verbatim,
-so a forked routed frame inherits a `leaf_region_start` that a later in-place
-mutation would invalidate too — same fix covers it.
+A post-routed in-place structural mutation that allocates a NEW internal node
+placed it *above* `leaf_region_start` (misread as a leaf on a cold read),
+silently violating the `off < leaf_region_start ⟺ internal` invariant. **Fixed
+in `alloc_node`** (not `writers.rs` as originally planned): it zeros
+`routing_len` whenever it's non-zero, so the first structural mutation de-routes
+the blob (legacy cold reads until the next compaction re-routes). One spot
+catches insert/grow/prefix-split and the CoW-fork-then-mutate case; leaf appends
+need no guard (a new leaf ≥ `leaf_region_start` is correctly classified). Gated
+by `structural_mutation_demotes_routed_blob_to_legacy`.
 
 (The WAL ring work — the other big effort — is on a **separate branch**
 (`perf/u16-children`) and is unrelated to this cold-read line; don't conflate.)
@@ -113,7 +122,7 @@ retained below for context.*
 - Spillover (`install_new_blob`) writes fresh blobs too — apply the same layout
   there, or leave spillover blobs legacy and let the next compaction route them.
 
-### Stage 3 — cold routed read  ← **START HERE** (land the mutation-path prerequisite above first)
+### Stage 3 — cold routed read  ✅ DONE (`33bc3d4`)  — original plan retained below
 **File:** `src/engine/walker/lookup.rs` — `cold_lookup_or_pin` (currently ~line
 356; the `ColdBlobLookup::Unknown` arm at the non-resident fallback does
 `bm.pin(child_guid)` = the 512 KB read). Add `cold_read_routed`:
@@ -134,12 +143,23 @@ Keep routing regions hot in a **bounded, accounted** cache (~15–30 MB for 5 M
 keys, vs cold.idx's 1 GB+). Cold read → 1 leaf pread. Account it in/alongside the
 BM pool budget (do NOT repeat cold.idx's unbounded sin).
 
-### Stage 5 — remove `cold.idx`
-The routing region subsumes the sidecar. Delete `src/store/blob_store/file/
-cold_index.rs` + the `cold_lookup_blob` sidecar path + `summarize_blob_for_cold_
-index` + the manifest generation field if only the sidecar used it. **This
-deletes the entire cold.idx bug class** (below). Gate: full suite + the SIGKILL
-crash-soak (`cargo run --release --example wal_crash_soak -- 40`).
+### Stage 5 — remove `cold.idx`  ← **START HERE** (stages 2–3 + prereq are done)
+The routing region now subsumes the sidecar (stage 3 reads cold via routing).
+**Decisions locked:** bump manifest v5→v6 dropping the dead per-entry
+`generation` field (confirmed cold.idx-only; v5 stores then refused on open — no
+migration, per existing policy); **delete** the public `bm_cold_lookup_*`
+telemetry (TreeStats/SystemStats + Prometheus). **Keep** the `ColdBlobLookup`
+enum as the routed-read result type. Exhaustive 15-file removal surface is in the
+session transcript's `coldread-io-surface-map` workflow result — confirmed:
+`cold.idx` has NO manifest/WAL/recovery coupling (`replay()` self-contained,
+"safe to delete and rebuilt"), `summarize_blob_for_cold_index`'s sole non-test
+caller is `ColdIndex::put_blob` (keep the `#[ignore]` `cold_read_page_touch_
+ceiling` analysis test in `cold.rs`), and `crc32fast` is shared (don't drop the
+dep). Do it in **two gated commits**: (a) sidecar machinery + telemetry, rewiring
+`cold_lookup_or_pin` to `cold_read_routed`/pin; (b) the v6 bump. Gate (a) = full
+suite + clippy; gate (b) = + SIGKILL crash-soak
+(`cargo run --release --example wal_crash_soak -- 40`). **This deletes the entire
+cold.idx bug class** (below).
 
 ### Stage 6 — per-blob bloom (later)
 A bloom in the header for free *within-prefix* negatives. Orthogonal/additive.
@@ -253,14 +273,14 @@ them by construction:
 ## Tasks (mirror of the tracker)
 
 - **#18 (in progress):** Cold-read in-blob routing region. Design (`137d5ba`);
-  primitive (`808a5fa`); stage 1 header fields (`12ce05a`); **stage 2 two-arena
-  compaction build + `routing==full` gate (`ed997c6`) done.** **Next: the
-  mutation-path prerequisite (zero `routing_len` on first structural mutation in
-  `writers.rs`), then stage 3 `cold_read_routed`** (+ `routed_get==tree.get`
-  data-integrity gate + cold bench) → **stage 3.5/4 io_uring-to-the-extreme
-  cold-read backend** (batched multi-SQE async reads / per-core rings /
-  IOPOLL+SQPOLL on Linux; thread-pool backend for macOS+fallback; QD-sweep cold
-  bench) → stage 4 resident routing cache → stage 5 remove cold.idx (+ crash-soak)
-  → stage 6 bloom.
+  primitive (`808a5fa`); stage 1 header fields (`12ce05a`); **stage 2 build
+  (`ed997c6`), mutation-path prereq (`2f850fa`), stage 3 cold routed read
+  (`33bc3d4`) all done.** **Next: remove the `cold.idx` sidecar** (v6 manifest
+  bump dropping the dead `generation` field + delete the public
+  `bm_cold_lookup_*` telemetry; two gated commits, crash-soak on the v6 one) →
+  **stage 3.5/4 io_uring-to-the-extreme cold-read backend** (batched multi-SQE
+  async reads / per-core rings / IOPOLL+SQPOLL on Linux; thread-pool backend for
+  macOS+fallback; QD-sweep cold bench) → stage 4 resident routing cache → stage 6
+  bloom. (Ubuntu cold `bm_read_bytes` drop bench for stages 2–3 still pending.)
 - **#10 (pending):** R2 BlobNode prefix bloom — folds into stage 6.
 - **#12 (pending):** hot-scan residual ~4% (separate, low priority).
