@@ -7,6 +7,43 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [Unreleased]
+
+### Added
+
+- `BlobStore::read_blobs` — a batched full-frame read on the public trait.
+  The default loops over `read_blob`; stores override it for device
+  parallelism (Linux `io_uring` submits one ring batch, the `pread` store
+  fans the reads across worker threads). Used by the cold-scan read-ahead.
+- Page-granular cold reads. A point lookup on routed (write-cold) data fetches
+  only the header page, the blob's routing region, and the one leaf page its
+  descent reaches (~18 KB mean) instead of pinning the whole 512 KB frame
+  (~27× less cold I/O). The routing region is built at compaction.
+- Per-blob bloom filter at the tail of the routing region (read for free with
+  it): cold negative lookups answer `NotFound` without a leaf-page read.
+  No false negatives. Additive on disk (`bloom_len == 0` = no bloom).
+- Bounded resident routing cache: routing regions for hot blobs are held in a
+  byte-bounded cache so repeat cold reads skip the routing-region read.
+- Cold-scan I/O read-ahead: range scans prefetch upcoming child blobs through
+  `pin_scan_many` → batched `read_blobs`, reading them at the device's natural
+  queue depth instead of one serial round-trip each.
+
+### Changed
+
+- Manifest format `v5` → `v6`: the per-blob routing-region geometry is recorded
+  in the blob header. Reopen of a `v5` store writes `v6` on first checkpoint.
+- Compaction builds (and the read path validates) the routing region + bloom;
+  structural write-path mutations de-route a blob, and write-cold blobs are
+  re-routed lazily by maintenance.
+
+### Removed
+
+- Removed the `cold.idx` cold-read sidecar — the in-blob routing region is now
+  the sole cold-read path.
+- Removed the `docs/design/` working notes. Rationale for shipped features lives
+  in commit messages; rationale for rejected paths (io_uring WAL rewrite, the
+  two blob-fill fixes) lives in git history.
+
 ## [0.6.0] — 2026-06-10
 
 ### Added

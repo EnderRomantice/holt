@@ -289,26 +289,34 @@ Success criteria:
 - Checkpoint backlog should drain without forcing foreground writers
   through long global waits.
 
-### P1 — Negative lookup filter, in-memory first
+Closed investigations (so they are not re-opened):
 
-Metadata workloads are unusually negative-heavy: `open/stat/head`
-often ask for keys that do not exist. Holt should exploit that, but
-without changing the disk format prematurely.
+- **Resident route-cache sizing — exonerated by measurement.** A 2M→20M scale
+  curve showed the route cache uses <14% of capacity at 87–99% hit rate; it is
+  not the scale bottleneck. The real signal is blob fill efficiency (83–87% of
+  blobs below the 35% fill floor at scale), i.e. a disk-*space* cost.
+- **Two blob-fill fixes — designed and adversarially refuted, closed.** Tighter
+  spillover packing cannot balance a path-shaped tree (no single ~50% edge) and
+  does nothing for the existing corpus; a sibling-merge primitive double-consumes
+  the branching byte (silent wrong-read) and the eligible population is tiny.
+  Fill is a space cost that the page-granular routing region already mitigates
+  for read *latency*; revisit only if disk space itself becomes the constraint,
+  diagnostic-first.
 
-- Add a per-cached-blob negative-lookup sidecar filter first. It must
-  never introduce false negatives: on mutation uncertainty, mark the
-  filter stale and fall back to the full walker.
-- Use the filter only at cross-blob boundaries and within hot prefixes
-  where avoiding another blob hop is measurable.
-- Rebuild filters from blob contents on cache fill. Persisting the
-  filter in the blob header is a later on-disk-format decision, not
-  the first implementation.
+### P1 — Negative lookup filter (DONE via per-blob bloom)
 
-Success criteria:
+Metadata workloads are unusually negative-heavy: `open/stat/head` often ask for
+keys that do not exist. Shipped (unreleased branch) as a **per-blob bloom
+filter**, which went further than the original in-memory-first plan:
 
-- Negative point lookup latency improves on path-shaped workloads
-  without regressing positive lookups.
-- Filter memory overhead is bounded and visible in `Tree::stats`.
+- Built from stored keys at compaction and embedded at the tail of the routing
+  region (`bloom_off` / `bloom_len` in the blob header), so it is read for free
+  with the routing region on a cold read.
+- A cold negative lookup answers `NotFound` without the leaf-page read. The
+  bloom never false-negatives (it only ever *skips* a leaf read), so it cannot
+  change `get()` semantics; a structural mutation de-routes the blob and clears
+  the bloom until the next compaction rebuilds it.
+- On disk it is additive (`bloom_len == 0` = no bloom = legacy behavior).
 
 ### P2 — Explicit bulk-load path
 
@@ -334,8 +342,18 @@ Success criteria:
 The v0.3 Linux backend already has the useful fixed-file /
 fixed-buffer / batched-ring foundation. The next I/O gain is not
 `SQPOLL` or linked-fsync by default; those did not help Holt's short
-checkpoint batches enough to justify the complexity. The next gain is
-execution-model work:
+checkpoint batches enough to justify the complexity.
+
+An **io_uring WAL/checkpoint rewrite was investigated and rejected**: the WAL
+is already user-space group-committed (one `write` + one `fdatasync` per
+barrier, no fan-out for a ring to parallelize), the cost is the device flush
+not syscall entry, and io_uring `Write` ignoring `O_APPEND` would force
+error-prone explicit-offset bookkeeping on the durability hot path for a
+sub-microsecond win. All fsync-device-bound metadata paths (WAL, `manifest.log`,
+`manifest.bin`) are non-candidates under the synchronous-flusher architecture.
+The read-side batched ring (`pread_many`) did land, for cold-scan read-ahead.
+
+The next gain is execution-model work:
 
 - Keep dirty-byte and dirty-age watermarks so checkpoint starts before
   the dirty set becomes a foreground-write problem.

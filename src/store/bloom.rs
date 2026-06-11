@@ -1,5 +1,4 @@
-//! Per-blob bloom filter — stage 6.0 of the cold-read fix
-//! (`docs/design/io-optimization.md`, `docs/design/cold-read-oracle.md`).
+//! Per-blob bloom filter — the negative-lookup arm of the cold-read path.
 //!
 //! Metadata workloads are negative-heavy (`open`/`stat`/`head` of keys
 //! that do not exist). A routed cold read still pays one leaf-page

@@ -31,8 +31,10 @@ compaction stalls, or a single global writer lock.
   manifest replay, and reopen recovery.
 - **Concurrent hot path**: optimistic reads and per-blob latching for
   disjoint subtrees.
-- **Cold-read sidecar**: checkpointed lookup summaries can avoid pulling
-  full 512 KB blobs for cold point reads.
+- **Page-granular cold reads**: an in-blob routing region clusters a blob's
+  internal nodes so a cold point lookup reads only the pages its descent
+  touches (~18 KB mean, ~27× less I/O) instead of pinning the whole 512 KB
+  frame, and a per-blob bloom skips even the leaf read on negative lookups.
 - **Hardware-aware implementation**: SIMD search paths, hardware CRC32C,
   and Linux `io_uring` support.
 
@@ -155,8 +157,9 @@ checkpointing:
 
 - WAL records make acknowledged mutations replayable.
 - Checkpoints flush dirty blob frames and compact the manifest.
-- A cold lookup sidecar is rebuilt from checkpointed blobs and is never
-  the source of truth.
+- Cold point reads are served page-granularly from the in-blob routing
+  region (built at compaction); it is a read accelerator, never the source
+  of truth.
 - `Durability::Wal { sync: false }` is the default throughput mode.
   Use `sync: true` when every committed mutation must force WAL sync.
 

@@ -269,6 +269,33 @@ Observability paths (`Tree::stats`, metrics scrapes) use
 cache hit/miss counters or refresh the LRU tick — the call
 must not inflate the very counters it's about to report.
 
+### Cold-read path — page-granular reads instead of full-frame pins
+
+For write-cold data a point lookup does not need the whole 512 KB
+frame. Four layers cut the cold read down:
+
+1. **In-blob routing region.** On compaction a blob's internal nodes
+   are clustered into `[routing_off, leaf_region_start)` and its leaves
+   are page-aligned at/after `leaf_region_start` (`layout/header.rs`).
+   A cold routed read fetches the header page + routing region + the one
+   leaf page its descent reaches — ~18 KB mean, ~27× less cold I/O than
+   pinning the frame. `routing_len == 0` is the legacy whole-frame layout.
+2. **Per-blob bloom** (`bloom_off` / `bloom_len`, at the routing-region
+   tail, so it is read for free with the region). A negative cold lookup
+   returns `NotFound` without the leaf-page read. Built from stored keys,
+   so it never false-negatives; it only ever *skips* a leaf read.
+3. **Bounded resident routing cache** (`store/routing_cache.rs`), keyed by
+   `(guid, compact_times)` under a fixed byte budget — repeat cold reads of
+   a hot blob skip the routing-region read, paying header + leaf page only.
+4. **Cold-scan read-ahead.** `BufferManager::pin_scan_many` probes the
+   cache for upcoming children, batches the misses through
+   `BlobStore::read_blobs`, and inserts them before the walker arrives —
+   so scans read children at device queue depth, not one round-trip each.
+
+Structural write-path mutations de-route a blob (`routing_len = 0`); the
+maintenance pass re-routes write-cold blobs lazily so write-once data
+regains the page-granular path without a foreground cost.
+
 ### Crossing cost — why no pointer swizzling
 
 A LeanStore-style optimization would *swizzle* the `BlobNode`
@@ -405,6 +432,7 @@ pub trait BlobStore: Send + Sync {
     fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf;
     fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf;
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
+    fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>>;
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()>;
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()>;
     fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()>;

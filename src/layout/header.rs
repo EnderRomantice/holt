@@ -112,8 +112,7 @@ pub struct BlobHeader {
     _pad_90: [u8; 0x10],
     /// 128-bit blob identifier.
     pub blob_guid: BlobGuid,
-    /// Page-granular cold-read routing region (see
-    /// `docs/design/cold-read-oracle.md`). When a blob is compacted into the
+    /// Page-granular cold-read routing region. When a blob is compacted into the
     /// routing layout, every internal node is clustered into
     /// `[routing_off, routing_off + routing_len)` and leaves are page-aligned
     /// at/after `leaf_region_start`, so a cold lookup reads the small routing
@@ -149,7 +148,7 @@ pub struct BlobHeader {
     /// filter bytes; `bloom_bits_per_key` is the build parameter
     /// `bloom_contains` needs to recompute the probe count. A bloom only
     /// ever *skips* a leaf read on a provable miss, so it cannot change
-    /// `get()` semantics. See `docs/design/io-optimization.md`.
+    /// `get()` semantics.
     pub bloom_off: u32,
     pub bloom_len: u32,
     pub bloom_bits_per_key: u32,

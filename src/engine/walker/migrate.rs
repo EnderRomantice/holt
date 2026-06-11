@@ -221,7 +221,7 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
     // front, the clone places each leaf at its final offset and the
     // post-order back-patch in `clone_*` is unchanged. `None` ⇒ keep
     // the legacy whole-frame layout (degenerate tree, or it doesn't fit
-    // the two-arena layout). See `docs/design/cold-read-oracle.md`.
+    // the two-arena layout).
     let (routed_lrs, bloom_leaf_count) = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let budget = routing_budget(old_frame.as_ref(), old_root_off)?;
@@ -537,8 +537,7 @@ struct BudgetNode {
 /// page-aligned `leaf_region_start` BEFORE the real clone. With the
 /// leaf region fixed up front, the clone places each leaf at its final
 /// offset, so the post-order back-patch in `clone_*` stays unchanged
-/// (no placeholder, no relocation pass). See
-/// `docs/design/cold-read-oracle.md`.
+/// (no placeholder, no relocation pass).
 ///
 /// Mirrors filter-mode `clone_subtree` arm-for-arm and
 /// `pack_inner_node`'s tier collapse, so the totals are EXACT. Returns
