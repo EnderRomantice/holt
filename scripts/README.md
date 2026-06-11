@@ -1,5 +1,31 @@
 # scripts/
 
+Both scripts target a Linux + NVMe box. They run on macOS too, but the absolute numbers
+there are `F_NOCACHE` / no-io_uring and are **not** representative — sanity only.
+
+## `ubuntu-bench-rocksdb.sh` — comprehensive holt vs RocksDB at scale
+
+Compares holt against RocksDB on the objstore metadata workload across data scales and
+two cache regimes, matched memory:
+
+- **HOT / large buffer pool** (buffered, "warm service"): pool holds most of the tree;
+  RocksDB buffered. Measures cache-resident reads + writes.
+- **COLD / medium buffer pool** (direct, matched memory): pool a fraction of the tree;
+  RocksDB `set_use_direct_reads` + block cache == `buffer_pool × 512 KB` (the bench
+  matches them), holt reopened so reads are cold. The apples-to-apples cold comparison,
+  plus a holt queue-depth sweep (1/8/16) showing the free-QD scaling.
+
+```sh
+scripts/ubuntu-bench-rocksdb.sh --dir /mnt/nvme/holt-bench               # 10M, 50M
+scripts/ubuntu-bench-rocksdb.sh --dir /mnt/nvme/holt-bench --quick       # 2M, 10M
+scripts/ubuntu-bench-rocksdb.sh --dir /mnt/nvme/holt-bench --scales 20000000 --large-bf 8192
+```
+
+Needs the `comparators` feature (RocksDB → libclang; see `PERF_FINDINGS.md` repro notes).
+50M single-thread preload is long and large-bf at 50M wants ~20 GiB RAM — override
+`--large-bf` or drop the 50M scale on smaller boxes. Reads a report; see the summary
+checklist it prints. Interpretation anchors live in `docs/design/scale-curve-findings.md`.
+
 ## `ubuntu-validate.sh` — real-hardware validation kit
 
 Turns the cold-read / io_uring **projected** wins into **proven** ones. The cold-read

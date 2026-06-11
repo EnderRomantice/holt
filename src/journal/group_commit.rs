@@ -6,8 +6,8 @@
 //! **flusher** drains that prefix into the [`WalWriter`] (unchanged on-disk
 //! format + replay) and fsyncs on the sync path. This replaced an earlier
 //! per-record `Vec` + single crossbeam channel + single batching worker,
-//! which serialized concurrent durable writes (see `docs/design/wal-ring.md`
-//! and `PERF_FINDINGS.md`: ~5–6× faster concurrent durable write, beating
+//! which serialized concurrent durable writes (see
+//! `PERF_FINDINGS.md`: ~5–6× faster concurrent durable write, beating
 //! RocksDB 2.8–5.5× at 1/4/8/16 threads).
 //!
 //! ## Watermarks live in the record-count domain

@@ -24,7 +24,7 @@
 
 pub mod codec;
 // The WAL append coordinator: a lock-free shared ring (`ring`) + a single
-// flusher (`group_commit`). See docs/design/wal-ring.md.
+// flusher (`group_commit`).
 pub(crate) mod group_commit;
 pub mod reader;
 pub(crate) mod ring;

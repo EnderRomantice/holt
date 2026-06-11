@@ -121,7 +121,7 @@ hops (post-R1) and subtree locality. That is the product story.
    work here, not a parallelism win. Optimistic descent only pays off when
    target blobs are disjoint *and* the mutation lands in-place (no split);
    for a path-shaped, growing object-store keyspace neither holds often
-   enough. Code preserved at `docs/experiments/optimistic-write-descent.patch`;
+   enough. The rejected patch lives in this branch's git history;
    do not re-attempt without first making the bail path cheap (skip the
    optimistic attempt when the target node is full / a split is likely)
    or solving the real bottleneck below.
@@ -197,7 +197,7 @@ identical) and fsyncs on the sync path. ONE ordered log → trim-watermark /
 single-pass-replay invariants preserved (unlike the rejected multi-lane
 `wal-commit-sharding`). **This is now the sole WAL backend — the legacy
 channel+worker has been removed (no feature flag).** See `src/journal/ring.rs`
-+ `src/journal/group_commit.rs`, design in `docs/design/wal-ring.md`.
++ `src/journal/group_commit.rs` (the module docs are the design).
 
 Measured A/B (x86, `objstore put`, 50k ops/thread, same machine; RocksDB the
 fixed comparator):
@@ -242,7 +242,7 @@ write) and removed → 1t is now 1.12 Mops/s (p99 14.8µs), 4.1× RocksDB.
 - ~~**Optimistic write descent**~~ / ~~**prefix-sharded-forest**~~ — both
   **RULED OUT by measurement**: the root latch (shared or exclusive) is
   not the bottleneck (no-merge multi-root A/B: 16 roots ≈ 1 root at 16t),
-  so neither helps. Optimistic-descent patch parked in `docs/experiments/`.
+  so neither helps. Optimistic-descent patch lives in this branch's git history.
 - **R2 — BlobNode prefix Bloom** — a per-edge Bloom (a Bloom *extent* in
   the parent, sized ~10 bits/key, not inline) so a negative lookup whose
   key matches a crossing's path prefix is answered without pinning +

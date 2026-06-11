@@ -1,4 +1,4 @@
-//! Lock-free shared WAL ring (see `docs/design/wal-ring.md`).
+//! Lock-free shared WAL ring.
 //!
 //! The append substrate for [`super::group_commit::Journal`]. Replaced the
 //! per-record `Vec` + single crossbeam channel + single batching worker (the
