@@ -1588,6 +1588,7 @@ fn compact_near_full_stays_correct() {
     {
         let mut frame = BlobFrame::wrap(&mut buf_vec);
         let mut seq = 1u64;
+        #[allow(clippy::explicit_counter_loop)]
         for i in 0..4000u32 {
             let k = format!("k{i:05}").into_bytes();
             let v = vec![(i & 0xFF) as u8; 200];
@@ -1777,6 +1778,7 @@ proptest! {
         {
             let mut frame = BlobFrame::wrap(&mut buf_vec);
             let mut seq = 1u64;
+            #[allow(clippy::explicit_counter_loop)]
             for &(b0, b1, vseed, is_del) in &ops {
                 let k = vec![b0, b1];
                 let root = frame.header().root_slot;
