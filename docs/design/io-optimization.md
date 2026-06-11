@@ -212,6 +212,22 @@ Reprioritized after two findings during implementation:
   rule.
 - **(d) WAL/checkpoint io_uring — UBUNTU.** Largest, most durability-sensitive;
   perf only manifests on Linux, and it needs real-I/O crash validation.
+- **io_uring batched read (`pread_many_at`) + `BlobStore::read_blobs` — LANDED,
+  ubuntu-runtime-validation-pending.** The scan read-ahead (c) fans cold child
+  reads out for device queue depth. On the `pread` backend that QD comes free
+  from concurrent lock-free `read_exact_at` (the thread-fanout now lives in
+  `FileBlobStore::read_blobs`, mac-verified). On the io_uring backend, N
+  concurrent `read_blob`s would instead serialise on the per-store ring `Mutex`
+  down to QD=1 — a regression. `read_blobs` closes that by submitting the whole
+  batch as **one ring submission** (`pread_many_at`: chunked into `RING_DEPTH`
+  SQEs, `submit_and_wait`, drain N CQEs with the same `user_data`/seen-bitmap
+  bookkeeping as the proven `pwrite_many_at`). `pin_scan_many` was reworked to
+  probe-cache → batched `read_blobs` → insert, keeping scan-access /
+  pending-delete semantics identical to a serial `pin_scan`. **Compiler-verified
+  on both targets (`cargo check --tests --target aarch64-unknown-linux-gnu
+  --features io-uring`); the syscall path is fully mac-tested; the unsafe ring
+  submission itself (CQE ordering, buffer lifetime, SQ-full, deadlock) is only
+  runtime-validated by running the Linux-gated `uring::tests` on the ubuntu box.**
 
 **Boundary:** the safe, high-value, mac-verifiable IO optimization (routing
 engagement via B/C + the per-blob bloom) is landed. The remaining write-path /
@@ -243,7 +259,7 @@ the gap to close, see "fundamental" below. `HOLT_STRESS_ROCKSDB_DIRECT=true`
 makes the comparison fair: rocksdb cold get 3 µs → 67 µs once the OS page cache
 is removed.)
 
-## (c) Cold-scan I/O read-ahead — precise plan (mac-doable, NOT YET DONE)
+## (c) Cold-scan I/O read-ahead — precise plan (LANDED; io_uring batch ubuntu-runtime-pending)
 
 A cold `range`/`list` reads child blobs **sequentially** (QD=1) — the descent
 pins one child blob, consumes its whole subtree, then the next. No I/O
@@ -251,8 +267,11 @@ read-ahead exists today (the `prefetch_at`/`prefetch_header` calls are
 **CPU-cache** prefetch of in-memory node bodies, not disk reads). Plan:
 
 - Add `BufferManager::pin_scan_many(&[guid]) -> Vec<Option<Arc<CachedBlob>>>`:
-  concurrent `pin_scan` via `std::thread::scope` (QD = batch size). Lock-free
-  pread, same as the proven concurrent-get path.
+  probe the cache on the calling thread, then read the cold misses in one
+  batched `BlobStore::read_blobs` (QD = batch size), then insert. The batch
+  parallelism lives in the store — thread-fanout of lock-free `pread` on the
+  `pread` backend, one ring submission on io_uring — so the same QD holds on
+  both backends without serialising on the io_uring ring `Mutex`.
 - `RangeIter` (range.rs; `KeyRangeIter` just wraps it — one iterator) gains a
   bounded `prefetch: HashMap<BlobGuid, Arc<CachedBlob>>` window. At a directory
   Node whose children are `Blob` crossings, peek the next K child guids from the

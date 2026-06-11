@@ -762,6 +762,91 @@ impl BlobStore for FileBlobStore {
         Ok(())
     }
 
+    /// Batched full-frame read. On `io_uring` every read goes down a
+    /// single ring submission (one `Mutex` acquire, queue depth =
+    /// batch width) instead of N serialised `pread_at` calls; on the
+    /// `pread` path the lock-free positional reads fan out across
+    /// worker threads for the same device parallelism.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
+        debug_assert_eq!(guids.len(), dsts.len());
+        // Resolve offsets up front (lock-free manifest read). A guid
+        // that doesn't resolve is reported in its own slot and left
+        // out of the ring batch, so one bad guid can't sink the rest.
+        let offsets: Vec<Result<u64>> = guids.iter().map(|g| self.offset_of(*g)).collect();
+
+        let mut batch: Vec<(u64, &mut AlignedBlobBuf)> = Vec::with_capacity(dsts.len());
+        for (off, dst) in offsets.iter().zip(dsts.iter_mut()) {
+            if let Ok(off) = off {
+                batch.push((*off, dst));
+            }
+        }
+
+        // The ring batch is all-or-nothing on its first error. For
+        // best-effort read-ahead that's fine: every resolved slot is
+        // marked failed and the caller re-pins those guids one by one,
+        // surfacing the real per-guid status there.
+        let batch_result = if batch.is_empty() {
+            Ok(())
+        } else {
+            let mut ring = self.uring.lock().unwrap();
+            ring.pread_many_at(&mut batch)
+        };
+        drop(batch);
+
+        offsets
+            .into_iter()
+            .map(|off| match off {
+                Err(e) => Err(e),
+                Ok(_) => match &batch_result {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(Error::BlobStoreIo(io::Error::other(format!(
+                        "batched uring read failed: {e}"
+                    )))),
+                },
+            })
+            .collect()
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
+        const FANOUT: usize = 8;
+        debug_assert_eq!(guids.len(), dsts.len());
+        if guids.len() < 2 {
+            return guids
+                .iter()
+                .zip(dsts.iter_mut())
+                .map(|(g, d)| self.read_blob(*g, d))
+                .collect();
+        }
+        // `read_blob` → `read_exact_at` is a lock-free positional read
+        // with no shared state, so fanning the batch across worker
+        // threads gives device queue depth = worker count — the same
+        // parallelism the io_uring path gets from one batched ring
+        // submission.
+        let workers = guids.len().min(FANOUT);
+        let chunk = guids.len().div_ceil(workers);
+        let mut results: Vec<Result<()>> = Vec::with_capacity(guids.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = guids
+                .chunks(chunk)
+                .zip(dsts.chunks_mut(chunk))
+                .map(|(gs, ds)| {
+                    scope.spawn(move || {
+                        gs.iter()
+                            .zip(ds.iter_mut())
+                            .map(|(g, d)| self.read_blob(*g, d))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                results.extend(h.join().expect("read_blobs worker panicked"));
+            }
+        });
+        results
+    }
+
     /// Positional ranged read for page-granular cold lookups. `byte_offset`,
     /// `dst.len()`, and `dst`'s base must be 4 KB-aligned (whole pages) so the
     /// `O_DIRECT` / `F_NOCACHE` read is accepted; the buffer-manager paging

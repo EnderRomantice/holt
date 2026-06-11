@@ -79,6 +79,28 @@ pub trait BlobStore: Send + Sync {
     /// Read blob `guid` into `dst`. `dst.len() == PAGE_SIZE`.
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
 
+    /// Read a batch of full-blob frames: `guids[i]` into `dsts[i]`
+    /// (the slices must be equal length). Returns one `Result` per
+    /// request — best-effort batch semantics, so a failed slot (e.g.
+    /// a not-found guid) does **not** abort the others.
+    ///
+    /// The default loops over [`Self::read_blob`]. Stores that can
+    /// issue the reads with more device parallelism than a serial
+    /// loop override this: Linux `io_uring` submits one ring batch
+    /// (deep read queue from a single SQ owner), and the `pread` file
+    /// store fans the positional reads out across worker threads. The
+    /// buffer manager's cold-scan read-ahead uses this to fetch
+    /// upcoming child blobs at the device's natural queue depth
+    /// instead of one serial round-trip each.
+    fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
+        debug_assert_eq!(guids.len(), dsts.len());
+        guids
+            .iter()
+            .zip(dsts.iter_mut())
+            .map(|(guid, dst)| self.read_blob(*guid, dst))
+            .collect()
+    }
+
     /// Read `dst.len()` bytes starting at `byte_offset` within blob `guid`.
     ///
     /// Enables page-granular cold reads: a point lookup can fetch only the

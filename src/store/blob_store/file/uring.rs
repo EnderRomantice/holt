@@ -20,7 +20,8 @@
 //! `CompletionQueueEntry`, …) are heavily `unsafe`-bound — keeping
 //! them isolated here lets the rest of `FileBlobStore` stay
 //! safe-Rust. The module exports only the store operations:
-//! [`UringContext::pread_at`], [`UringContext::pwrite_at`],
+//! [`UringContext::pread_at`], [`UringContext::pread_many_at`],
+//! [`UringContext::pwrite_at`],
 //! [`UringContext::pwrite_many_at`],
 //! [`UringContext::pwrite_many_and_sync_at`],
 //! [`UringContext::sync_data`],
@@ -175,27 +176,7 @@ impl UringContext {
     /// Synchronous `pread` via `io_uring`: same shape as
     /// [`Self::pwrite_at`].
     pub(super) fn pread_at(&mut self, offset: u64, buf: &mut AlignedBlobBuf) -> io::Result<()> {
-        let entry = if self.fixed_buffers {
-            if let Some(buffer_index) = buf.fixed_buffer_index() {
-                opcode::ReadFixed::new(
-                    self.fixed_fd,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    buffer_index,
-                )
-                .offset(offset)
-                .build()
-            } else {
-                opcode::Read::new(self.fixed_fd, buf.as_mut_ptr(), buf.len() as u32)
-                    .offset(offset)
-                    .build()
-            }
-        } else {
-            opcode::Read::new(self.fixed_fd, buf.as_mut_ptr(), buf.len() as u32)
-                .offset(offset)
-                .build()
-        }
-        .user_data(0);
+        let entry = self.read_entry(offset, buf).user_data(0);
 
         // SAFETY: same argument as `pwrite_at` — `buf` outlives the
         // synchronous `submit_and_wait`.
@@ -222,6 +203,35 @@ impl UringContext {
                 n,
                 buf.len()
             )));
+        }
+        Ok(())
+    }
+
+    /// Synchronous batched `pread` via `io_uring`: the read analogue
+    /// of [`Self::pwrite_many_at`].
+    ///
+    /// One ring submission per `RING_DEPTH`-sized chunk feeds the
+    /// device a deep read queue from a single SQ owner, instead of
+    /// the per-store `Mutex` serialising N independent `pread_at`
+    /// calls down to queue-depth 1. This is what restores cold-scan
+    /// read-ahead parallelism on the `io_uring` backend (on the
+    /// `pread` backend the same queue depth comes for free from
+    /// concurrent lock-free `read_exact_at` calls).
+    ///
+    /// Each `reads[i]` is `(byte_offset, dst)`; every `dst` must be a
+    /// distinct buffer (the kernel writes each independently). Reads
+    /// are submitted in slice order — callers that care about device
+    /// LBA sequencing pre-sort by offset.
+    pub(super) fn pread_many_at(
+        &mut self,
+        reads: &mut [(u64, &mut AlignedBlobBuf)],
+    ) -> io::Result<()> {
+        let total = reads.len();
+        let mut base = 0usize;
+        while base < total {
+            let end = (base + RING_DEPTH_USIZE).min(total);
+            self.submit_read_batch(&mut reads[base..end])?;
+            base = end;
         }
         Ok(())
     }
@@ -275,6 +285,29 @@ impl UringContext {
 
         self.ring.submit_and_wait(chunk.len())?;
         self.drain_write_batch(chunk)
+    }
+
+    fn submit_read_batch(&mut self, chunk: &mut [(u64, &mut AlignedBlobBuf)]) -> io::Result<()> {
+        debug_assert!(!chunk.is_empty());
+        debug_assert!(chunk.len() <= RING_DEPTH_USIZE);
+
+        for (idx, (offset, buf)) in chunk.iter_mut().enumerate() {
+            let entry = self.read_entry(*offset, buf).user_data(idx as u64);
+
+            // SAFETY: every SQE references a buffer borrowed from
+            // `chunk`; this function synchronously waits for all
+            // completions before returning, so all buffers outlive
+            // the kernel writes into them.
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&entry)
+                    .map_err(|_| io::Error::other("uring SQ full"))?;
+            }
+        }
+
+        self.ring.submit_and_wait(chunk.len())?;
+        self.drain_read_batch(chunk)
     }
 
     fn submit_write_stream(&mut self, writes: &[OrderedWrite<'_>]) -> io::Result<()> {
@@ -373,6 +406,24 @@ impl UringContext {
             .build()
     }
 
+    fn read_entry(&self, offset: u64, buf: &mut AlignedBlobBuf) -> squeue::Entry {
+        if self.fixed_buffers {
+            if let Some(buffer_index) = buf.fixed_buffer_index() {
+                return opcode::ReadFixed::new(
+                    self.fixed_fd,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    buffer_index,
+                )
+                .offset(offset)
+                .build();
+            }
+        }
+        opcode::Read::new(self.fixed_fd, buf.as_mut_ptr(), buf.len() as u32)
+            .offset(offset)
+            .build()
+    }
+
     fn fdatasync_entry(&self) -> squeue::Entry {
         opcode::Fsync::new(self.fixed_fd)
             .flags(types::FsyncFlags::DATASYNC)
@@ -419,6 +470,56 @@ impl UringContext {
                 record_err(
                     &mut first_err,
                     io::Error::other(format!("short uring write: wrote {n} of {expected}")),
+                );
+            }
+        }
+
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn drain_read_batch(&mut self, chunk: &[(u64, &mut AlignedBlobBuf)]) -> io::Result<()> {
+        let mut seen = [0u64; CQ_BITMAP_WORDS];
+        let mut first_err: Option<io::Error> = None;
+
+        for _ in 0..chunk.len() {
+            let cqe = self
+                .ring
+                .completion()
+                .next()
+                .ok_or_else(|| io::Error::other("uring CQE missing"))?;
+            let user_data = cqe.user_data();
+            let n = cqe.result();
+
+            let Ok(idx) = usize::try_from(user_data) else {
+                record_err(
+                    &mut first_err,
+                    io::Error::other("uring CQE user_data overflow"),
+                );
+                continue;
+            };
+            if idx >= chunk.len() {
+                record_err(
+                    &mut first_err,
+                    io::Error::other("uring CQE user_data out of batch"),
+                );
+                continue;
+            }
+            if let Err(e) = mark_seen(&mut seen, idx) {
+                record_err(&mut first_err, e);
+                continue;
+            }
+            if n < 0 {
+                record_err(&mut first_err, io::Error::from_raw_os_error(-n));
+                continue;
+            }
+            let expected = chunk[idx].1.len();
+            if (n as usize) != expected {
+                record_err(
+                    &mut first_err,
+                    io::Error::other(format!("short uring read: read {n} of {expected}")),
                 );
             }
         }
@@ -559,4 +660,117 @@ fn mark_seen_dynamic(seen: &mut [u64], idx: usize) -> io::Result<()> {
     }
     *seen_word |= bit;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    fn frame(fill: u8) -> AlignedBlobBuf {
+        let mut buf = AlignedBlobBuf::zeroed();
+        buf.as_mut_slice().fill(fill);
+        buf
+    }
+
+    /// Batched read must drop each completed frame into *its own*
+    /// buffer — submitting out of offset order checks the
+    /// `user_data → buffer` mapping rather than relying on CQEs
+    /// arriving in submission order.
+    #[test]
+    fn pread_many_at_reads_each_frame_into_its_own_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+
+        let mut ring = UringContext::new(&file, None).unwrap();
+
+        let a = frame(0xAA);
+        let b = frame(0xBB);
+        let c = frame(0xCC);
+        let frame_len = a.len() as u64;
+        ring.pwrite_many_at(&[(0, &a), (frame_len, &b), (2 * frame_len, &c)])
+            .unwrap();
+        ring.sync_data().unwrap();
+
+        let mut r0 = AlignedBlobBuf::zeroed();
+        let mut r1 = AlignedBlobBuf::zeroed();
+        let mut r2 = AlignedBlobBuf::zeroed();
+        ring.pread_many_at(&mut [
+            (2 * frame_len, &mut r2),
+            (0, &mut r0),
+            (frame_len, &mut r1),
+        ])
+        .unwrap();
+
+        assert!(r0.as_slice().iter().all(|&x| x == 0xAA));
+        assert!(r1.as_slice().iter().all(|&x| x == 0xBB));
+        assert!(r2.as_slice().iter().all(|&x| x == 0xCC));
+    }
+
+    /// A batch wider than one ring exercises the chunk loop in
+    /// [`UringContext::pread_many_at`].
+    #[test]
+    fn pread_many_at_spans_multiple_ring_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+
+        let mut ring = UringContext::new(&file, None).unwrap();
+
+        let count = RING_DEPTH_USIZE + 5;
+        let frame_len = AlignedBlobBuf::zeroed().len() as u64;
+        let writes: Vec<AlignedBlobBuf> = (0..count).map(|i| frame(i as u8)).collect();
+        let write_refs: Vec<(u64, &AlignedBlobBuf)> = writes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i as u64 * frame_len, b))
+            .collect();
+        ring.pwrite_many_at(&write_refs).unwrap();
+        ring.sync_data().unwrap();
+
+        let mut reads: Vec<AlignedBlobBuf> =
+            (0..count).map(|_| AlignedBlobBuf::zeroed()).collect();
+        let mut read_refs: Vec<(u64, &mut AlignedBlobBuf)> = reads
+            .iter_mut()
+            .enumerate()
+            .map(|(i, b)| (i as u64 * frame_len, b))
+            .collect();
+        ring.pread_many_at(&mut read_refs).unwrap();
+        drop(read_refs);
+
+        for (i, buf) in reads.iter().enumerate() {
+            assert!(
+                buf.as_slice().iter().all(|&x| x == i as u8),
+                "frame {i} mismatched after multi-chunk batched read"
+            );
+        }
+    }
+
+    #[test]
+    fn pread_many_at_empty_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut ring = UringContext::new(&file, None).unwrap();
+        ring.pread_many_at(&mut []).unwrap();
+    }
 }

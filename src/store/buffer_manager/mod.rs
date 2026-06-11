@@ -1097,35 +1097,71 @@ impl BufferManager {
         self.pin_with_access(guid, PinAccess::Scan)
     }
 
-    /// Pin a batch of blobs for scanning, reading the cold ones
-    /// **concurrently** (device queue depth = batch size) instead of one
-    /// serial round-trip each. The range scanner uses this to read-ahead
-    /// upcoming child blobs so their cold reads pipeline — the same
-    /// lock-free-`pread` parallelism the concurrent-get path exploits
-    /// (`pin_scan` is `&self` + `Sync`), driven from one scan thread.
+    /// Pin a batch of blobs for scanning, reading the cold ones in a
+    /// single batched store read (device queue depth = batch size)
+    /// instead of one serial round-trip each. The range scanner uses
+    /// this to read-ahead upcoming child blobs so their cold reads
+    /// pipeline. The parallelism lives in [`BlobStore::read_blobs`]:
+    /// the `pread` store fans the reads across worker threads, the
+    /// `io_uring` store submits them as one ring batch.
     ///
     /// Returns one entry per `guids[i]`, in order: `Some(pin)` or `None`
     /// if pinning that guid failed (not-found / transient read error).
     /// Prefetch is best-effort — a `None` just means the caller pins that
     /// blob normally when it reaches it (surfacing any real error there),
     /// so dropping the error here is safe.
+    ///
+    /// Cache probe and insert run on the calling thread; only the cold
+    /// frame reads are batched. This keeps the scan-access semantics
+    /// (no recency bump, pending-delete re-check before insert)
+    /// identical to a serial run of [`Self::pin_scan`].
     pub(crate) fn pin_scan_many(&self, guids: &[BlobGuid]) -> Vec<Option<Arc<CachedBlob>>> {
-        const FANOUT: usize = 8;
-        if guids.len() < 2 {
-            return guids.iter().map(|&g| self.pin_scan(g).ok()).collect();
-        }
-        let workers = guids.len().min(FANOUT);
-        let chunk = guids.len().div_ceil(workers);
         let mut out: Vec<Option<Arc<CachedBlob>>> = Vec::with_capacity(guids.len());
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = guids
-                .chunks(chunk)
-                .map(|c| scope.spawn(|| c.iter().map(|&g| self.pin_scan(g).ok()).collect::<Vec<_>>()))
-                .collect();
-            for h in handles {
-                out.extend(h.join().expect("pin_scan_many worker panicked"));
+        // Phase 1 — probe the cache on this thread. Hits and
+        // pending-delete guids are finalised now; misses leave a
+        // `None` placeholder and queue a cold read.
+        let mut miss_guids: Vec<BlobGuid> = Vec::new();
+        let mut miss_slots: Vec<usize> = Vec::new();
+        for &guid in guids {
+            if self.is_pending_delete(guid) {
+                out.push(None);
+                continue;
             }
-        });
+            if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Scan) {
+                out.push(Some(entry));
+                continue;
+            }
+            out.push(None);
+            miss_slots.push(out.len() - 1);
+            miss_guids.push(guid);
+        }
+        if miss_guids.is_empty() {
+            return out;
+        }
+
+        // Phase 2 — read the cold frames in one batched store call.
+        // SAFETY: `read_blobs` fills every PAGE_SIZE frame whose slot
+        // it reports `Ok`; we only read a buffer back on `Ok` below.
+        let mut bufs: Vec<AlignedBlobBuf> = (0..miss_guids.len())
+            .map(|_| self.alloc_blob_buf_uninit())
+            .collect();
+        let results = self.store.read_blobs(&miss_guids, &mut bufs);
+
+        // Phase 3 — insert each successful read, mirroring
+        // `pin_with_access`: count the read, re-check pending-delete,
+        // then insert with scan access (idempotent under a racing
+        // insert).
+        for (i, (buf, res)) in bufs.into_iter().zip(results).enumerate() {
+            if res.is_err() {
+                continue;
+            }
+            self.note_full_blob_read(PinAccess::Scan);
+            let guid = miss_guids[i];
+            if self.is_pending_delete(guid) {
+                continue;
+            }
+            out[miss_slots[i]] = Some(self.insert_owned_into_cache(guid, buf, PinAccess::Scan));
+        }
         out
     }
 
