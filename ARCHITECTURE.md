@@ -22,8 +22,8 @@ self-describing and walkable in isolation:
 |                              next free slot (freed)         |
 +-------------------------------------------------------------+
 | Data area (~468 KB, bump-allocated)                         |
-|   Node bodies (8 to 1032 bytes each, NodeType-tagged)       |
-|   Leaf key/value extents (raw bytes, ref'd by Leaf.key_off) |
+|   Node bodies (8 to 520 bytes each, NodeType-tagged)        |
+|   Leaf nodes inline their key + value after a 16 B header   |
 +-------------------------------------------------------------+
 ```
 
@@ -44,14 +44,20 @@ special-casing the crossing.
 
 | ntype | Name      | Size       | Purpose                                        |
 |------:|-----------|-----------:|------------------------------------------------|
-|     1 | Leaf      |    16 B    | `(value_size, tombstone, key_offset, seq)` + bump-allocated extent for key+value bytes |
+|     1 | Leaf      |    16 B*   | `[16 B header: key_fp, tombstone, key_len, value_len, seq]` + inline key + value — one self-describing, variable-size node |
 |     2 | Prefix    |   128 B    | Path-compressed segment (≤112 inline bytes)    |
 |     3 | Blob      |   128 B    | Cross-blob crossing (target_guid + ≤104 inline prefix bytes) |
-|     4 | Node4     |    24 B    | 1..4 children, linear scan                     |
-|     5 | Node16    |    88 B    | 5..16 children, SSE2 / NEON byte search        |
-|     6 | Node48    |   456 B    | 17..48 children, byte→slot index               |
-|     7 | Node256   |  1032 B    | 49..256 children, direct array                 |
+|     4 | Node4     |    16 B    | 1..4 children, linear scan                     |
+|     5 | Node16    |    56 B    | 5..16 children, SSE2 / NEON byte search        |
+|     6 | Node48    |   360 B    | 17..48 children, byte→slot index               |
+|     7 | Node256   |   520 B    | 49..256 children, direct array                 |
 |     8 | EmptyRoot |     8 B    | All-zero sentinel for an empty tree            |
+
+\* `Leaf` is variable-size: the 16 B is the header only; the true body
+is `16 + key_len + value_len`, recovered from the header. The four
+internal nodes store child slot indices as `u16` (slots are 1-based
+into a ≤10240 table), which halves their footprint versus a `u32`
+child array — hence 16 / 56 / 360 / 520 rather than 24 / 88 / 456 / 1032.
 
 The walker descends through `Prefix` and `Node{4,16,48,256}` based
 on the next key byte; terminates at `Leaf`; crosses blobs at
@@ -105,8 +111,8 @@ removed from the source blob, and replaced by a `BlobNode`
 crossing. The walker then retries the insert; the descent now
 follows the new child blob's `header.root_slot`.
 
-To keep spillover from itself OOM'ing, `alloc_node` /
-`alloc_extent` (non-`Blob`) refuse to consume the last 128 bytes
+To keep spillover from itself OOM'ing, `alloc_node` (non-`Blob`)
+refuses to consume the last 128 bytes
 of the data area — exactly one `BlobNode` body's worth.
 `alloc_node(Blob)` is exempt and may consume that reservation,
 guaranteeing spillover can always install its emergency crossing.
@@ -120,8 +126,8 @@ copies the packed image back. The result is a contiguous data
 area with empty free lists and the original GUID preserved.
 Reclaims:
 
-- Leaf key/value extents (no free list — they accumulate on
-  update / delete / spillover-migrate).
+- Dead leaf nodes (variable-size, no free list — they accumulate
+  on resized-value update / delete / spillover-migrate).
 - Stale slot-entry / body-byte pairs whose NodeType free list
   has no live demand.
 
