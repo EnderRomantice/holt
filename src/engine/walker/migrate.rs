@@ -96,9 +96,15 @@ fn make_blob_from_node_with_buf(
         // dummy cursor is unused. Freshly-spilled blobs are born legacy
         // and get the routing layout at their first compaction.
         let mut leaf_cursor = 0u32;
-        cloned_root_off =
-            clone_subtree(src_frame, &mut new_frame, src_off, false, false, &mut leaf_cursor)?
-                .expect("preserve mode never returns None");
+        cloned_root_off = clone_subtree(
+            src_frame,
+            &mut new_frame,
+            src_off,
+            false,
+            false,
+            &mut leaf_cursor,
+        )?
+        .expect("preserve mode never returns None");
         // The EmptyRoot sentinel `BlobFrame::init` seeded at
         // DATA_AREA_START is now unreachable (the cloned root sits
         // after it); abandon-on-free leaves its 8 bytes to be reclaimed
@@ -580,11 +586,13 @@ fn routing_budget(src: BlobFrameRef<'_>, src_off: u32) -> Result<Option<BudgetNo
         }
         NodeType::Prefix => {
             let p = *cast::<Prefix>(body);
-            Ok(routing_budget(src, child_offset(p.child as u16))?.map(|c| BudgetNode {
-                routing_bytes: size_of_node(NodeType::Prefix) + c.routing_bytes,
-                leaf_bytes: c.leaf_bytes,
-                leaf_count: c.leaf_count,
-            }))
+            Ok(
+                routing_budget(src, child_offset(p.child as u16))?.map(|c| BudgetNode {
+                    routing_bytes: size_of_node(NodeType::Prefix) + c.routing_bytes,
+                    leaf_bytes: c.leaf_bytes,
+                    leaf_count: c.leaf_count,
+                }),
+            )
         }
         NodeType::Blob => Ok(Some(BudgetNode {
             routing_bytes: size_of_node(NodeType::Blob),

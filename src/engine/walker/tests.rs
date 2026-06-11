@@ -6,9 +6,7 @@ use super::cast;
 use super::erase::erase;
 use super::insert::insert;
 use super::lookup::{cold_read_routed_into, lookup, lookup_at};
-use super::migrate::{
-    blob_needs_compaction, blob_would_route, compact_blob, make_blob_from_node,
-};
+use super::migrate::{blob_needs_compaction, blob_would_route, compact_blob, make_blob_from_node};
 use super::readers::{
     child_offset, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
@@ -1663,7 +1661,11 @@ fn structural_mutation_demotes_routed_blob_to_legacy() {
         } else {
             vec![i, i ^ 0xFF]
         };
-        assert_eq!(get(&frame, &[b'q', i]).as_deref(), Some(v.as_slice()), "q[{i}]");
+        assert_eq!(
+            get(&frame, &[b'q', i]).as_deref(),
+            Some(v.as_slice()),
+            "q[{i}]"
+        );
     }
 }
 
@@ -1746,7 +1748,13 @@ fn cold_read_routed_matches_oracle() {
         assert_eq!(routed(&k), oracle.get(&k).cloned(), "p[{i}]");
     }
     // Absent: never-existed, prefix-divergent, and tombstoned-then-swept.
-    for k in [&b"q"[..], &b"qq"[..], &b"p"[..], &b"zzz"[..], &[b'q', 200][..]] {
+    for k in [
+        &b"q"[..],
+        &b"qq"[..],
+        &b"p"[..],
+        &b"zzz"[..],
+        &[b'q', 200][..],
+    ] {
         assert_eq!(routed(k), None, "absent {k:?}");
     }
 }

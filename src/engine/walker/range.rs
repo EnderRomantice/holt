@@ -1779,23 +1779,40 @@ impl RangeIter {
                                 // drained, collect the upcoming child-blob guids
                                 // from this (cached) parent so they can be pinned
                                 // concurrently (device queue depth) below.
-                                let prefetch_guids = if child_ntype == NodeType::Blob
-                                    && self.prefetch.is_empty()
-                                {
-                                    collect_blob_child_window(
-                                        frame, top.off, top_ntype, child_off, next_cursor,
-                                    )
-                                } else {
-                                    Vec::new()
-                                };
-                                Some((byte, child_off, child_ntype, next_cursor, version, prefetch_guids))
+                                let prefetch_guids =
+                                    if child_ntype == NodeType::Blob && self.prefetch.is_empty() {
+                                        collect_blob_child_window(
+                                            frame,
+                                            top.off,
+                                            top_ntype,
+                                            child_off,
+                                            next_cursor,
+                                        )
+                                    } else {
+                                        Vec::new()
+                                    };
+                                Some((
+                                    byte,
+                                    child_off,
+                                    child_ntype,
+                                    next_cursor,
+                                    version,
+                                    prefetch_guids,
+                                ))
                             }
                             None => None,
                         }
                     };
                     match result {
                         None => self.pop_frame(),
-                        Some((byte, child_off, child_ntype, next_cursor, version, prefetch_guids)) => {
+                        Some((
+                            byte,
+                            child_off,
+                            child_ntype,
+                            next_cursor,
+                            version,
+                            prefetch_guids,
+                        )) => {
                             // Pin the read-ahead window concurrently (QD =
                             // window size); each held pin is consumed at the
                             // pin point. Best-effort — a failed prefetch just

@@ -469,7 +469,14 @@ fn routed_read_cached(
     }
 
     let mut leaf_read = |off: u64, dst: &mut [u8]| bm.read_blob_range(guid, off, dst);
-    descend_routed(buf, &mut leaf_read, root_off, key, depth, rr.leaf_region_start)
+    descend_routed(
+        buf,
+        &mut leaf_read,
+        root_off,
+        key,
+        depth,
+        rr.leaf_region_start,
+    )
 }
 
 /// Routed-read core, decoupled from the buffer manager via a
@@ -503,7 +510,14 @@ pub(super) fn cold_read_routed_into(
         u64::from(rr.off),
         &mut scratch[rr.off as usize..rr.leaf_region_start as usize],
     )?;
-    descend_routed(scratch, read_range, root_off, key, depth, rr.leaf_region_start)
+    descend_routed(
+        scratch,
+        read_range,
+        root_off,
+        key,
+        depth,
+        rr.leaf_region_start,
+    )
 }
 
 /// One step of the routed descent: the next child offset to visit, or a
@@ -570,7 +584,9 @@ fn routed_step(
             } else {
                 let ci = idx as usize - 1;
                 if ci >= 48 {
-                    return Err(Error::node_corrupt("cold_read_routed: node48 index out of range"));
+                    return Err(Error::node_corrupt(
+                        "cold_read_routed: node48 index out of range",
+                    ));
                 }
                 RoutedStep::Visit(child_offset(n.children[ci]), depth + 1)
             }
@@ -675,7 +691,14 @@ fn descend_routed(
                     .ok_or(Error::node_corrupt("cold_read_routed: leaf body range"))?;
                 leaf_check_owned(body, key)
             } else {
-                descend_routed(scratch, read_range, child_off, key, new_depth, leaf_region_start)
+                descend_routed(
+                    scratch,
+                    read_range,
+                    child_off,
+                    key,
+                    new_depth,
+                    leaf_region_start,
+                )
             }
         }
     }
@@ -692,7 +715,10 @@ fn page_in_leaf(
 ) -> Result<()> {
     let page0 = loff & !(PAGE_4K - 1);
     let hdr_end = page_align_up(loff + size_of::<Leaf>() as u32);
-    read_range(u64::from(page0), &mut scratch[page0 as usize..hdr_end as usize])?;
+    read_range(
+        u64::from(page0),
+        &mut scratch[page0 as usize..hdr_end as usize],
+    )?;
     let (key_len, value_len) = {
         let leaf = cast::<Leaf>(&scratch[loff as usize..loff as usize + size_of::<Leaf>()]);
         (u32::from(leaf.key_len), u32::from(leaf.value_len))
@@ -722,7 +748,9 @@ fn leaf_check_owned(body: &[u8], key: SearchKey<'_>) -> Result<ColdBlobLookup> {
     let key_end = 16 + key_len;
     let value_end = key_end + value_len;
     if value_end > body.len() {
-        return Err(Error::node_corrupt("cold_read_routed: leaf key/value range"));
+        return Err(Error::node_corrupt(
+            "cold_read_routed: leaf key/value range",
+        ));
     }
     if !key.eq_slice(&body[16..key_end]) {
         return Ok(ColdBlobLookup::NotFound);

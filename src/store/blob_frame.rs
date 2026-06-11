@@ -796,7 +796,11 @@ impl<'a> BlobFrame<'a> {
             body_off >= DATA_AREA_START,
             "alloc_leaf_at body_off below data area: {body_off:#x}"
         );
-        debug_assert_eq!(body_off & 7, 0, "alloc_leaf_at body_off must be 8-aligned: {body_off:#x}");
+        debug_assert_eq!(
+            body_off & 7,
+            0,
+            "alloc_leaf_at body_off must be 8-aligned: {body_off:#x}"
+        );
         let h = self.header();
         if h.num_slots >= MAX_SLOTS as u16 {
             return Err(AllocError::OutOfSlots);

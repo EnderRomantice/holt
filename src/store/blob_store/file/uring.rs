@@ -702,12 +702,8 @@ mod tests {
         let mut r0 = AlignedBlobBuf::zeroed();
         let mut r1 = AlignedBlobBuf::zeroed();
         let mut r2 = AlignedBlobBuf::zeroed();
-        ring.pread_many_at(&mut [
-            (2 * frame_len, &mut r2),
-            (0, &mut r0),
-            (frame_len, &mut r1),
-        ])
-        .unwrap();
+        ring.pread_many_at(&mut [(2 * frame_len, &mut r2), (0, &mut r0), (frame_len, &mut r1)])
+            .unwrap();
 
         assert!(r0.as_slice().iter().all(|&x| x == 0xAA));
         assert!(r1.as_slice().iter().all(|&x| x == 0xBB));
@@ -741,8 +737,7 @@ mod tests {
         ring.pwrite_many_at(&write_refs).unwrap();
         ring.sync_data().unwrap();
 
-        let mut reads: Vec<AlignedBlobBuf> =
-            (0..count).map(|_| AlignedBlobBuf::zeroed()).collect();
+        let mut reads: Vec<AlignedBlobBuf> = (0..count).map(|_| AlignedBlobBuf::zeroed()).collect();
         let mut read_refs: Vec<(u64, &mut AlignedBlobBuf)> = reads
             .iter_mut()
             .enumerate()

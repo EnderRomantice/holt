@@ -192,7 +192,7 @@ mod tests {
     fn byte_len_rounds_and_floors() {
         assert_eq!(bloom_byte_len(0, 8), MIN_BLOOM_BYTES);
         assert_eq!(bloom_byte_len(1, 8), MIN_BLOOM_BYTES); // 1B raw → floored
-        // 1000 keys * 8 bpk = 8000 bits = 1000 bytes (already /8).
+                                                           // 1000 keys * 8 bpk = 8000 bits = 1000 bytes (already /8).
         assert_eq!(bloom_byte_len(1000, 8), 1000);
         // Always a whole number of u64 words.
         assert_eq!(bloom_byte_len(123, 8) % 8, 0);
@@ -245,7 +245,10 @@ mod tests {
         }
         // fp/probes < 0.05  ⟺  fp*20 < probes (integer math; math target
         // is ~0.02, the 0.05 ceiling absorbs variance).
-        assert!(fp * 20 < probes, "FPR too high: {fp}/{probes} (expected ~0.02)");
+        assert!(
+            fp * 20 < probes,
+            "FPR too high: {fp}/{probes} (expected ~0.02)"
+        );
     }
 
     #[test]
