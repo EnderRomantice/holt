@@ -7,7 +7,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
-## [Unreleased]
+## [0.7.0] — 2026-06-11
 
 ### Added
 
@@ -30,8 +30,11 @@ fine-grained per-commit history is in `git log`.
 
 ### Changed
 
-- Manifest format `v5` → `v6`: the per-blob routing-region geometry is recorded
-  in the blob header. Reopen of a `v5` store writes `v6` on first checkpoint.
+- **Breaking — on-disk format.** Manifest format `v4` → `v6` (the blob header now
+  records the per-blob routing-region geometry). Older manifests are **not
+  migrated** — the loader rejects any non-`v6` manifest, so a store written by
+  0.6.x cannot be opened by this release (and a `v6` store cannot be opened by
+  0.6.x). Pre-1.0 with no production deployments; recreate the store on upgrade.
 - Compaction builds (and the read path validates) the routing region + bloom;
   structural write-path mutations de-route a blob, and write-cold blobs are
   re-routed lazily by maintenance.
