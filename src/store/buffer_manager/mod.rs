@@ -1097,6 +1097,38 @@ impl BufferManager {
         self.pin_with_access(guid, PinAccess::Scan)
     }
 
+    /// Pin a batch of blobs for scanning, reading the cold ones
+    /// **concurrently** (device queue depth = batch size) instead of one
+    /// serial round-trip each. The range scanner uses this to read-ahead
+    /// upcoming child blobs so their cold reads pipeline — the same
+    /// lock-free-`pread` parallelism the concurrent-get path exploits
+    /// (`pin_scan` is `&self` + `Sync`), driven from one scan thread.
+    ///
+    /// Returns one entry per `guids[i]`, in order: `Some(pin)` or `None`
+    /// if pinning that guid failed (not-found / transient read error).
+    /// Prefetch is best-effort — a `None` just means the caller pins that
+    /// blob normally when it reaches it (surfacing any real error there),
+    /// so dropping the error here is safe.
+    pub(crate) fn pin_scan_many(&self, guids: &[BlobGuid]) -> Vec<Option<Arc<CachedBlob>>> {
+        const FANOUT: usize = 8;
+        if guids.len() < 2 {
+            return guids.iter().map(|&g| self.pin_scan(g).ok()).collect();
+        }
+        let workers = guids.len().min(FANOUT);
+        let chunk = guids.len().div_ceil(workers);
+        let mut out: Vec<Option<Arc<CachedBlob>>> = Vec::with_capacity(guids.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = guids
+                .chunks(chunk)
+                .map(|c| scope.spawn(|| c.iter().map(|&g| self.pin_scan(g).ok()).collect::<Vec<_>>()))
+                .collect();
+            for h in handles {
+                out.extend(h.join().expect("pin_scan_many worker panicked"));
+            }
+        });
+        out
+    }
+
     /// Like [`Self::pin`] but does not bump `cache_hits` /
     /// `cache_misses` and does not refresh the `last_touched`
     /// tick on a hit — used by introspection paths
@@ -1933,6 +1965,33 @@ mod tests {
         // Second read: hit, no growth in cache size.
         bm.read_blob([0xAB; 16], &mut dst).unwrap();
         assert_eq!(bm.cached_count(), 1);
+    }
+
+    #[test]
+    fn pin_scan_many_returns_each_blob_in_order_and_none_for_missing() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..10u8 {
+            inner.write_blob([i; 16], &make_buf(i)).unwrap();
+        }
+        let bm = BufferManager::new(inner, 64);
+
+        // A batch of >1 guids (exercises the concurrent fan-out) with a
+        // missing guid in the middle.
+        let mut guids: Vec<BlobGuid> = (0..10u8).map(|i| [i; 16]).collect();
+        guids.insert(5, [0xFF; 16]);
+
+        let pins = bm.pin_scan_many(&guids);
+        assert_eq!(pins.len(), guids.len());
+        for (g, pin) in guids.iter().zip(&pins) {
+            if *g == [0xFF; 16] {
+                assert!(pin.is_none(), "missing guid must map to None");
+            } else {
+                let pin = pin.as_ref().expect("present guid must be pinned");
+                // make_buf(i) stamped byte 100 = i = g[0]: confirms each
+                // entry is the blob for exactly its guid, in order.
+                assert_eq!(pin.read().as_slice()[100], g[0]);
+            }
+        }
     }
 
     #[test]

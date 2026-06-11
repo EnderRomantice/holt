@@ -20,6 +20,7 @@
 //! rollups it has already returned.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -466,6 +467,7 @@ impl RangeBuilder {
             initialized: false,
             terminated: false,
             stats: ScanStats::default(),
+            prefetch: HashMap::new(),
         }
     }
 }
@@ -730,6 +732,15 @@ pub struct RangeIter {
     initialized: bool,
     terminated: bool,
     stats: ScanStats,
+    /// Cold-scan I/O read-ahead window: child blobs pinned ahead of the
+    /// descent reaching them, so a run of cross-blob children reads at
+    /// device queue depth instead of one serial round-trip each. Filled
+    /// from the (cached) parent when entering a run of `Blob` crossings
+    /// and the window has drained; consumed (removed) at the pin point;
+    /// cleared on restart. Holding the `Arc` keeps each blob resident
+    /// until consumed. Correctness-neutral — a pre-pinned blob is the
+    /// same blob, re-validated by the per-frame `version` check on use.
+    prefetch: HashMap<BlobGuid, Arc<CachedBlob>>,
 }
 
 struct Frame {
@@ -1762,20 +1773,41 @@ impl RangeIter {
                                 {
                                     frame.prefetch_at(sib_off);
                                 }
-                                Some((
-                                    byte,
-                                    child_off,
-                                    ntype_of(frame, child_off)?,
-                                    next_cursor,
-                                    version,
-                                ))
+                                let child_ntype = ntype_of(frame, child_off)?;
+                                // Cold-scan I/O read-ahead: when entering a run
+                                // of cross-blob children and the window has
+                                // drained, collect the upcoming child-blob guids
+                                // from this (cached) parent so they can be pinned
+                                // concurrently (device queue depth) below.
+                                let prefetch_guids = if child_ntype == NodeType::Blob
+                                    && self.prefetch.is_empty()
+                                {
+                                    collect_blob_child_window(
+                                        frame, top.off, top_ntype, child_off, next_cursor,
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                Some((byte, child_off, child_ntype, next_cursor, version, prefetch_guids))
                             }
                             None => None,
                         }
                     };
                     match result {
                         None => self.pop_frame(),
-                        Some((byte, child_off, child_ntype, next_cursor, version)) => {
+                        Some((byte, child_off, child_ntype, next_cursor, version, prefetch_guids)) => {
+                            // Pin the read-ahead window concurrently (QD =
+                            // window size); each held pin is consumed at the
+                            // pin point. Best-effort — a failed prefetch just
+                            // falls back to a normal pin when reached.
+                            if !prefetch_guids.is_empty() {
+                                let pins = self.bm.pin_scan_many(&prefetch_guids);
+                                for (guid, pin) in prefetch_guids.iter().zip(pins) {
+                                    if let Some(pin) = pin {
+                                        self.prefetch.insert(*guid, pin);
+                                    }
+                                }
+                            }
                             self.stack[idx].next = next_cursor;
                             self.curr_key.push(byte);
                             self.stack.push(Frame {
@@ -1824,7 +1856,11 @@ impl RangeIter {
         Ok(true)
     }
 
-    fn pin_scan_or_restart(&self, child_guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
+    fn pin_scan_or_restart(&mut self, child_guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
+        // Consume a read-ahead pin if one was warmed for this child.
+        if let Some(pin) = self.prefetch.remove(&child_guid) {
+            return Ok(Some(pin));
+        }
         match self.bm.pin_scan(child_guid) {
             Ok(pin) => Ok(Some(pin)),
             Err(e) if is_blob_store_not_found(&e) => Ok(None),
@@ -1871,6 +1907,9 @@ impl RangeIter {
         self.curr_key.clear();
         self.cursor_floor = 0;
         self.initialized = false;
+        // Drop any read-ahead pins from the abandoned path so the new
+        // path refills its own window (and we don't hold stale pins).
+        self.prefetch.clear();
     }
 
     fn pop_frame(&mut self) {
@@ -2014,6 +2053,50 @@ fn next_inner_child_ge(
             "range::next_inner_child_ge: not an inner node",
         )),
     }
+}
+
+/// Read the target `BlobGuid` of the `Blob` crossing at `off`, or
+/// `None` if the node there is not a `Blob` (or is undecodable). Reads
+/// only from the already-resident `frame` — no I/O.
+fn blob_child_guid(frame: BlobFrameRef<'_>, off: u32) -> Option<BlobGuid> {
+    if ntype_of(frame, off).ok()? != NodeType::Blob {
+        return None;
+    }
+    let body = frame.body_at_offset(off)?;
+    Some(cast::<BlobNode>(body).child_blob_guid)
+}
+
+/// Collect up to a bounded window of consecutive child-blob guids for a
+/// cold-scan read-ahead: the current `Blob` child at `first_off` plus
+/// following siblings of the parent inner node, stopping at the first
+/// non-`Blob` sibling (the run of cross-blob children has ended). Pure
+/// reads from the cached `frame`; the caller pins the returned guids
+/// concurrently so their cold reads pipeline.
+fn collect_blob_child_window(
+    frame: BlobFrameRef<'_>,
+    parent_off: u32,
+    parent_ntype: NodeType,
+    first_off: u32,
+    mut cursor: u16,
+) -> Vec<BlobGuid> {
+    const DEPTH: usize = 8;
+    let mut guids = Vec::with_capacity(DEPTH);
+    if let Some(g) = blob_child_guid(frame, first_off) {
+        guids.push(g);
+    }
+    while guids.len() < DEPTH {
+        match next_inner_child_from(frame, parent_off, parent_ntype, cursor) {
+            Ok(Some((_, sib_off, next))) => match blob_child_guid(frame, sib_off) {
+                Some(g) => {
+                    guids.push(g);
+                    cursor = next;
+                }
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    guids
 }
 
 /// Given the inner node at byte offset `off` and a cursor `from`,
