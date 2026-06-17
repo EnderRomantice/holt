@@ -1694,6 +1694,18 @@ impl Tree {
     /// Used by [`crate::DB::view`] to capture several trees atomically
     /// under a single coordinated freeze.
     pub(crate) fn snapshot_unlocked(&self, prefix: &[u8]) -> Result<Snapshot> {
+        self.snapshot_unlocked_with_scan_fence(prefix, true)
+    }
+
+    pub(crate) fn snapshot_unlocked_unfenced(&self, prefix: &[u8]) -> Result<Snapshot> {
+        self.snapshot_unlocked_with_scan_fence(prefix, false)
+    }
+
+    fn snapshot_unlocked_with_scan_fence(
+        &self,
+        prefix: &[u8],
+        fence_live_writers: bool,
+    ) -> Result<Snapshot> {
         use crate::store::STRUCTURAL_SEQ;
 
         let snap_root = engine::fresh_blob_guid();
@@ -1719,6 +1731,12 @@ impl Tree {
             Arc::clone(&self.store),
             snap_root,
             root_pin,
+            fence_live_writers.then(|| {
+                (
+                    Arc::clone(&self.maintenance_gate),
+                    Arc::clone(&self.mutation_gate),
+                )
+            }),
         );
         Ok(Snapshot::new(view, Arc::clone(&self.store), epoch))
     }
