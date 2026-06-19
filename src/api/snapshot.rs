@@ -1,13 +1,11 @@
 //! Copy-on-write frame snapshot.
 //!
 //! A [`Snapshot`] is a stable, point-in-time view of a tree (or a
-//! prefix subtree). Unlike [`crate::View`], which eagerly copies every
-//! reachable frame at capture time, a snapshot copies only the root
-//! frame up front and shares all other frames with the live tree. Later
-//! writes *fork* (copy-on-write) the individual frames a snapshot still
-//! references instead of overwriting them in place, so the snapshot
-//! stays stable with 1× read amplification and without MVCC version
-//! chains.
+//! prefix subtree). It copies only the root frame into memory up front
+//! and shares all other frames with the live tree. Later writes *fork*
+//! (copy-on-write) the individual frames a snapshot still references
+//! instead of overwriting them in place, so the snapshot stays stable
+//! with 1× read amplification and without MVCC version chains.
 //!
 //! Creation is O(one frame copy); the per-write cost is zero while no
 //! snapshot is live, and bounded by the root→leaf frame path length on

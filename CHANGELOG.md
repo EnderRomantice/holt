@@ -7,6 +7,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.7.3] — 2026-06-19
+
+### Fixed
+
+- Fixed read-only `view` / `snapshot` captures allocating persistent blob
+  slots. Snapshot roots are now ephemeral in-memory frames; repeated scans or
+  views no longer grow `blobs.dat` unless concurrent live writes actually fork
+  shared frames.
+- Added a regression test that repeatedly captures read views on a file-backed
+  tree and verifies checkpointing does not increase the backing store size.
+
 ## [0.7.2] — 2026-06-18
 
 ### Fixed

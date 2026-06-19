@@ -345,23 +345,28 @@ impl BufferManager {
         self.pin(new_guid)
     }
 
-    /// Copy `src`'s current frame image to a fresh GUID `new_guid`,
-    /// install it, and pin it — the frozen root of a new CoW snapshot.
+    /// Copy `src`'s current frame image to a fresh in-memory GUID
+    /// `new_guid` and pin it — the frozen root of a new CoW snapshot.
     ///
     /// The caller must hold the owning tree's mutation gate exclusively
     /// so the source frame is byte-stable for the copy. The copy keeps
     /// `src`'s entire structure (children are referenced by GUID, so
     /// they stay shared rather than deep-copied); only the self-GUID is
-    /// repatched. The copy's `created_epoch` is irrelevant because a
-    /// snapshot root is read-only and never forked.
+    /// repatched. Snapshot roots are ephemeral: they never enter the
+    /// dirty map and never allocate a persistent store slot. Live writes
+    /// under the snapshot still fork shared child frames through
+    /// [`Self::fork_frame`], so crash recovery only has to reclaim those
+    /// forked-away persistent frames.
     pub(crate) fn install_snapshot_root(
         &self,
         new_guid: BlobGuid,
         src: &CachedBlob,
-        seq: u64,
-    ) -> Result<Arc<CachedBlob>> {
+    ) -> Arc<CachedBlob> {
         let guard = src.read();
-        self.fork_frame(guard.as_slice(), new_guid, seq)
+        let mut buf = self.alloc_blob_buf_zeroed();
+        buf.as_mut_slice().copy_from_slice(guard.as_slice());
+        crate::layout::set_frame_blob_guid(buf.as_mut_slice(), new_guid);
+        self.insert_owned_into_cache(new_guid, buf, PinAccess::Silent)
     }
 
     /// Register a live snapshot rooted at `root_guid`. Bumps the global

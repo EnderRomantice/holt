@@ -1657,7 +1657,7 @@ impl Tree {
         // copy, and so no writer is mid-overwriting a soon-to-be-shared
         // frame at the instant the fork barrier rises.
         let _freeze = self.mutation_gate.enter_exclusive();
-        self.snapshot_unlocked(prefix)
+        Ok(self.snapshot_unlocked(prefix))
     }
 
     /// Reclaim copy-on-write frames left unreachable by a crash that
@@ -1693,11 +1693,11 @@ impl Tree {
     /// gates — the caller must already hold the mutation gate exclusively.
     /// Used by [`crate::DB::view`] to capture several trees atomically
     /// under a single coordinated freeze.
-    pub(crate) fn snapshot_unlocked(&self, prefix: &[u8]) -> Result<Snapshot> {
+    pub(crate) fn snapshot_unlocked(&self, prefix: &[u8]) -> Snapshot {
         self.snapshot_unlocked_with_scan_fence(prefix, true)
     }
 
-    pub(crate) fn snapshot_unlocked_unfenced(&self, prefix: &[u8]) -> Result<Snapshot> {
+    pub(crate) fn snapshot_unlocked_unfenced(&self, prefix: &[u8]) -> Snapshot {
         self.snapshot_unlocked_with_scan_fence(prefix, false)
     }
 
@@ -1705,13 +1705,11 @@ impl Tree {
         &self,
         prefix: &[u8],
         fence_live_writers: bool,
-    ) -> Result<Snapshot> {
+    ) -> Snapshot {
         use crate::store::STRUCTURAL_SEQ;
 
         let snap_root = engine::fresh_blob_guid();
-        let root_pin =
-            self.store
-                .install_snapshot_root(snap_root, &self.root_pin, STRUCTURAL_SEQ)?;
+        let root_pin = self.store.install_snapshot_root(snap_root, &self.root_pin);
         let epoch = self.store.register_snapshot(snap_root);
 
         // Persist the bumped epoch on the live root so a reopened tree
@@ -1738,7 +1736,7 @@ impl Tree {
                 )
             }),
         );
-        Ok(Snapshot::new(view, Arc::clone(&self.store), epoch))
+        Snapshot::new(view, Arc::clone(&self.store), epoch)
     }
 
     /// Return `true` if no live key starts with `prefix`.

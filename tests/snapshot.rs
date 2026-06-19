@@ -485,6 +485,40 @@ fn snapshot_correct_after_reopen() {
     }
 }
 
+#[test]
+fn repeated_read_views_do_not_grow_file_store() {
+    let dir = tempdir().unwrap();
+    let blobs = dir.path().join("blobs.dat");
+    let cfg = || {
+        let mut c = TreeConfig::new(dir.path());
+        c.checkpoint.enabled = false;
+        c.durability = Durability::Wal { sync: false };
+        c
+    };
+
+    let tree = Tree::open(cfg()).unwrap();
+    for i in 0..128u32 {
+        tree.put(format!("k{i:06}").as_bytes(), b"value").unwrap();
+    }
+    tree.checkpoint().unwrap();
+    let before = std::fs::metadata(&blobs).unwrap().len();
+
+    for _ in 0..128 {
+        tree.view(b"", |view| {
+            assert_eq!(view.get(b"k000000")?.as_deref(), Some(&b"value"[..]));
+            Ok(())
+        })
+        .unwrap();
+    }
+    tree.checkpoint().unwrap();
+    let after = std::fs::metadata(&blobs).unwrap().len();
+
+    assert_eq!(
+        after, before,
+        "short-lived read views must not allocate persistent blob slots"
+    );
+}
+
 /// Environment variable carrying the store directory into the
 /// crash-session child processes below.
 const CRASH_LEAK_DIR_ENV: &str = "HOLT_CRASH_LEAK_DIR";
