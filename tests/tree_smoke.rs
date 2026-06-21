@@ -562,7 +562,7 @@ fn empty_key_round_trips() {
 }
 
 // ----------------------------------------------------------------
-// Delete (Stage 2c)
+// Delete
 // ----------------------------------------------------------------
 
 #[test]
@@ -625,7 +625,7 @@ fn delete_keeps_siblings_under_shared_prefix() {
 }
 
 // ----------------------------------------------------------------
-// Rename (Stage 2c)
+// Rename
 // ----------------------------------------------------------------
 
 #[test]
@@ -692,7 +692,7 @@ fn rename_through_shared_prefix() {
 }
 
 // ----------------------------------------------------------------
-// Stage 2d phase A — multi-blob lookup
+// Multi-blob lookup
 //
 // The spillover trigger that creates multi-blob state automatically
 // lands in phase B. For now we hand-construct a 2-blob layout via
@@ -701,7 +701,7 @@ fn rename_through_shared_prefix() {
 // ----------------------------------------------------------------
 
 // ----------------------------------------------------------------
-// Stage 2d phase B — automatic multi-blob spillover
+// Automatic multi-blob spillover
 // ----------------------------------------------------------------
 
 #[test]
@@ -712,13 +712,12 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
     // BlobNode subtree of the current frame to a fresh child blob,
     // then retries.
     //
-    // **Workload note:** until Stage 6's `compactBlob` lands, leaf
-    // extents leak after every same-size update; the bump cursor
-    // is monotonic. So spillover only buys "slot table" room, not
-    // bump-area room — once the root blob has many subtrees
+    // **Workload note:** in-place writes use a monotonic bump cursor
+    // between compactions. Spillover buys "slot table" room, not
+    // immediate bump-area room — once the root blob has many subtrees
     // migrated out, *every* subsequent insert routes through a
     // BlobNode into a child blob and the root blob stays at its
-    // high-water-mark bump cursor.
+    // high-water-mark bump cursor until compaction.
     //
     // We pick a workload size that triggers at least one spillover
     // but doesn't push past the `MAX_SPILLOVER_ATTEMPTS` per-call
@@ -955,13 +954,10 @@ fn multi_blob_rename_round_trip() {
     //      allocated, so spillover never re-triggers)
     //   2. DstExists guard with force=false
     //
-    // Renaming to a brand-new key in the multi-blob state can
-    // cascade further spillovers and stress the
-    // MAX_SPILLOVER_ATTEMPTS budget — that case is gated on
-    // Stage 6 compactBlob (which reclaims the extent leak that
-    // makes the budget tight). Within-existing-keys renames are
-    // the realistic metadata workload anyway (move foo/bar → foo/baz
-    // where both directory entries exist).
+    // Renaming to a brand-new key in the multi-blob state can cascade
+    // further spillovers and stress the MAX_SPILLOVER_ATTEMPTS budget.
+    // Within-existing-keys renames are the realistic metadata workload
+    // anyway (move foo/bar → foo/baz where both directory entries exist).
     let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = TreeBuilder::new("ignored")
         .open_with_blob_store(store.clone())
@@ -1043,9 +1039,9 @@ fn auto_spillover_preserves_data_across_reopen() {
 
 #[test]
 fn optimistic_readers_dont_block_writers() {
-    // Stage 6 phase 2b: BufferManager's per-blob HybridLatch lets
-    // readers walk in optimistic mode (snapshot version → read →
-    // validate → restart on torn) while writers take exclusive.
+    // BufferManager's per-blob HybridLatch lets readers walk in
+    // optimistic mode (snapshot version → read → validate → restart on
+    // torn) while writers take exclusive.
     // This test pounds the same tree from N readers + a writer
     // concurrently and verifies (1) readers never see stale data
     // that doesn't match the stable initial seed, and (2) the

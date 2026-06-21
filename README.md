@@ -34,7 +34,8 @@ compaction stalls, or a single global writer lock.
 - **Page-granular cold reads**: an in-blob routing region clusters a blob's
   internal nodes so a cold point lookup reads only the pages its descent
   touches (~18 KB mean, ~27× less I/O) instead of pinning the whole 512 KB
-  frame, and a per-blob bloom skips even the leaf read on negative lookups.
+  frame. Reusable header/routing pages are cached separately from one-shot
+  leaf pages.
 - **Hardware-aware implementation**: SIMD search paths, hardware CRC32C,
   and Linux `io_uring` support.
 
@@ -79,7 +80,7 @@ use holt::{Durability, KeyPathBuf, TreeBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tree = TreeBuilder::new("/var/lib/app/meta.holt")
-        .buffer_pool_size(512)                       // 512 blobs = 256 MiB
+        .buffer_pool_size(512)                       // 256 MiB total cache budget
         .durability(Durability::Wal { sync: false }) // async group-commit WAL
         .open()?;
 

@@ -137,28 +137,10 @@ pub struct BlobHeader {
     /// compaction, which re-evaluates routability. `0` is the safe
     /// default for every existing blob (`init` zeroes the frame).
     pub routing_unfit: u32,
-    /// Per-blob bloom over this blob's live leaf keys (cold-read stage
-    /// 6). Built at compaction and placed at the **tail of the routing
-    /// region** (`[routing_off, leaf_region_start)`), so the cold routed
-    /// read loads it for free alongside the routing region and a
-    /// within-blob *negative* lookup can answer `NotFound` without the
-    /// one leaf-page read it would otherwise cost. `bloom_len == 0` means
-    /// no bloom (legacy blob, didn't fit, or not yet rebuilt) → always
-    /// read the leaf. `bloom_off` is the absolute byte offset of the
-    /// filter bytes; `bloom_bits_per_key` is the build parameter
-    /// `bloom_contains` needs to recompute the probe count. A bloom only
-    /// ever *skips* a leaf read on a provable miss, so it cannot change
-    /// `get()` semantics.
-    pub bloom_off: u32,
-    pub bloom_len: u32,
-    pub bloom_bits_per_key: u32,
-    _pad_cc: [u8; (HEADER_SIZE as usize) - 0xcc],
+    _pad_c0: [u8; (HEADER_SIZE as usize) - 0xc0],
 }
 
 /// The cold-read routing region recorded in a [`BlobHeader`].
-///
-/// Stage 1 lands the reader; the cold routed-read path (stage 3,
-/// `cold_read_routed`) is its first production consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingRegion {
     /// Byte offset of the contiguous internal-node region within the frame.
@@ -167,7 +149,7 @@ pub struct RoutingRegion {
     /// `>= leaf_region_start` is a leaf (read via a targeted page read);
     /// below it is an internal node inside the routing region. The cold
     /// read loads the whole `[off, leaf_region_start)` span (internal
-    /// nodes + bloom + page-align gap), so the raw `routing_len` is not
+    /// nodes + page-align gap), so the raw `routing_len` is not
     /// carried here — read it from the header if ever needed.
     pub leaf_region_start: u32,
 }
@@ -207,34 +189,6 @@ impl BlobHeader {
             leaf_region_start: lrs,
         })
     }
-
-    /// The per-blob bloom as `(off, len, bits_per_key)`, or `None` when
-    /// there is no usable bloom.
-    ///
-    /// Returns `None` for `bloom_len == 0` (legacy / no bloom) and for
-    /// any bloom whose bytes do not lie wholly inside the routing region
-    /// `[DATA_AREA_START, leaf_region_start)` (the span the cold read
-    /// loads) — a corrupt/torn header is treated as "no bloom", so the
-    /// cold read falls back to the authoritative leaf compare. Never a
-    /// false negative.
-    #[must_use]
-    pub fn bloom_region(&self) -> Option<(u32, u32, u8)> {
-        if self.bloom_len == 0 {
-            return None;
-        }
-        let off = self.bloom_off;
-        let end = off.checked_add(self.bloom_len)?;
-        // The bloom must sit inside the routing span the cold read reads
-        // (after the internal nodes, before the page-aligned leaves).
-        if off < DATA_AREA_START || end > self.leaf_region_start {
-            return None;
-        }
-        let bpk = u8::try_from(self.bloom_bits_per_key).ok()?;
-        if bpk == 0 {
-            return None;
-        }
-        Some((off, self.bloom_len, bpk))
-    }
 }
 
 // Pin every field offset at compile time. Drift breaks the build.
@@ -256,9 +210,6 @@ const _: () = assert!(offset_of!(BlobHeader, routing_off) == 0xb0);
 const _: () = assert!(offset_of!(BlobHeader, routing_len) == 0xb4);
 const _: () = assert!(offset_of!(BlobHeader, leaf_region_start) == 0xb8);
 const _: () = assert!(offset_of!(BlobHeader, routing_unfit) == 0xbc);
-const _: () = assert!(offset_of!(BlobHeader, bloom_off) == 0xc0);
-const _: () = assert!(offset_of!(BlobHeader, bloom_len) == 0xc4);
-const _: () = assert!(offset_of!(BlobHeader, bloom_bits_per_key) == 0xc8);
 
 /// Byte offset of [`BlobHeader::created_epoch`] within a frame buffer.
 pub const CREATED_EPOCH_OFFSET: usize = offset_of!(BlobHeader, created_epoch);

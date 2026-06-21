@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Phase B — COLD regime + corrected sync-durable writes.
 #   E1-cold : positive cold point read (read-amp + space), all 4 engines
-#   E3      : negative (absent) cold point read — per-blob bloom, all 4
+#   E3      : negative (absent) cold point read, all 4 engines
 #   E2      : cold QD sweep (free device queue depth), holt only
 #   E5-sync : sync-durable overwrite/mixed, all 4 (run last; lmdb msync is slow)
 #
@@ -38,7 +38,7 @@ HOLT_STRESS_ENGINES=$ALL HOLT_STRESS_OPS=get \
 "$BIN" objstore > "$OUT/cold_e1_1m_routed.log" 2>&1
 grab "$OUT/cold_e1_1m_routed.log"
 
-# E3 negative (absent keys) @1M, routed — bloom-reject vs leaf-miss.
+# E3 negative (absent keys) @1M, routed — stable routed negative vs leaf-miss.
 echo "=== E3-NEG 1m routed (all 4) ==="
 HOLT_STRESS_N=1000000 HOLT_STRESS_POINT_OPS=50000 HOLT_STRESS_LIST_OPS=1 \
 HOLT_STRESS_BUFFER_POOL=64 HOLT_STRESS_ROCKSDB_DIRECT=1 HOLT_STRESS_DROP_CACHES=1 \

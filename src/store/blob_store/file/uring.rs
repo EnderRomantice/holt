@@ -207,6 +207,50 @@ impl UringContext {
         Ok(())
     }
 
+    /// Synchronous ranged `pread` via `io_uring`.
+    ///
+    /// This is used by cold point lookups, where the caller already
+    /// holds a page-aligned window inside a 512 KiB scratch frame. The
+    /// buffer is not necessarily one of the store's registered full
+    /// frames, so this deliberately uses a normal `READ` SQE against
+    /// the registered file instead of `READ_FIXED`.
+    pub(super) fn pread_slice_at(&mut self, offset: u64, dst: &mut [u8]) -> io::Result<()> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let entry = opcode::Read::new(self.fixed_fd, dst.as_mut_ptr(), dst.len() as u32)
+            .offset(offset)
+            .build()
+            .user_data(0);
+
+        // SAFETY: `dst` is borrowed until the single CQE is drained below.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&entry)
+                .map_err(|_| io::Error::other("uring SQ full"))?;
+        }
+        self.ring.submit_and_wait(1)?;
+
+        let cqe = self
+            .ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::other("uring CQE missing"))?;
+        let n = cqe.result();
+        if n < 0 {
+            return Err(io::Error::from_raw_os_error(-n));
+        }
+        if (n as usize) != dst.len() {
+            return Err(io::Error::other(format!(
+                "short uring range read: read {} of {}",
+                n,
+                dst.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Synchronous batched `pread` via `io_uring`: the read analogue
     /// of [`Self::pwrite_many_at`].
     ///

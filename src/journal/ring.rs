@@ -192,8 +192,8 @@ impl WalRing {
 
     /// True once the flusher has freed enough RAM for `ticket`'s range to be
     /// safely overwritten (gates on `flush_cursor`, decoupled from fsync).
-    /// Stage 5 turns the spin into parking; stage 1 callers size the ring so
-    /// this never trips.
+    /// Callers normally size the ring so this rarely trips; the concurrent
+    /// producer path uses it for explicit backpressure.
     #[inline]
     pub(crate) fn reserve_space_ready(&self, ticket: &ReserveTicket) -> bool {
         ticket.end <= self.flush_cursor.load(Ordering::Acquire) + self.capacity
@@ -516,8 +516,8 @@ mod tests {
     /// committed prefix into the real `WalWriter` produces a byte-for-byte
     /// identical file to the direct (legacy) append path, and that file
     /// replays back to the original inserts in order through the real
-    /// reader. This is the stage-2 golden-file / byte-identical-replay gate;
-    /// it proves `copy_committed_prefix` composes with `append_encoded`'s
+    /// reader. This is the byte-identical replay gate; it proves
+    /// `copy_committed_prefix` composes with `append_encoded`'s
     /// opaque-byte append (incl. records split across the physical wrap) and
     /// the on-disk codec + torn-tail reader — unchanged.
     #[test]
@@ -559,8 +559,7 @@ mod tests {
 
         // Path B — through the ring, drained incrementally into a real
         // WalWriter. Tiny capacity forces physical wrap; the per-record
-        // drain frees ring space so stage-1's no-backpressure ring never
-        // overruns.
+        // drain frees ring space so the small test ring never overruns.
         let path_b = dir.path().join("b.wal");
         {
             let ring = WalRing::with_capacity(256);
@@ -615,8 +614,8 @@ mod tests {
     /// pushes async bytes to the OS promptly — preserving process-crash
     /// durability, unlike a drain-only-at-checkpoint shortcut) while N
     /// producers append concurrently to a small ring with manual
-    /// backpressure (stage-5 preview). After teardown every record replays
-    /// back exactly once through the real reader.
+    /// backpressure. After teardown every record replays back exactly once
+    /// through the real reader.
     #[test]
     fn background_flusher_concurrent_producers_replay() {
         use crate::journal::codec::encode_insert_record;
@@ -632,7 +631,7 @@ mod tests {
         let tree_id = 9u64;
         // 4 KiB ring forces many wraps + reuse for 50KB+ of records; the
         // background flusher frees RAM and producers wait on
-        // reserve_space_ready (stage-5 backpressure, previewed in the test).
+        // reserve_space_ready.
         let ring = Arc::new(WalRing::with_capacity(4096));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bg.wal");

@@ -143,7 +143,7 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
-use super::routing_cache::RoutingCache;
+use super::cold_page_cache::ColdPageCache;
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -222,20 +222,49 @@ enum PinAccess {
     Silent,
 }
 
-/// Byte budget for the resident routing-region cache (cold-read stage
-/// 4). ~32 MB holds the routing regions of thousands of routed blobs
-/// (each ≈ 1–2 pages); a normal working set fits without eviction.
-const ROUTING_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+const COLD_PAGE_CACHE_MIN_BYTES: usize = 4 * 1024 * 1024;
+const COLD_PAGE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const COLD_PAGE_CACHE_ENABLE_AT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct CacheBudget {
+    blob_slots: usize,
+    cold_page_bytes: usize,
+}
+
+impl CacheBudget {
+    fn memory(total_blob_slots: usize) -> Self {
+        Self {
+            blob_slots: total_blob_slots.max(1),
+            cold_page_bytes: 0,
+        }
+    }
+
+    fn file(total_blob_slots: usize) -> Self {
+        let total_blob_slots = total_blob_slots.max(1);
+        let total_bytes = total_blob_slots.saturating_mul(PAGE_SIZE as usize);
+        let cold_page_bytes = if total_bytes < COLD_PAGE_CACHE_ENABLE_AT_BYTES {
+            0
+        } else {
+            (total_bytes / 16).clamp(COLD_PAGE_CACHE_MIN_BYTES, COLD_PAGE_CACHE_MAX_BYTES)
+        };
+        let blob_bytes = total_bytes.saturating_sub(cold_page_bytes);
+        Self {
+            blob_slots: (blob_bytes / PAGE_SIZE as usize).max(1),
+            cold_page_bytes,
+        }
+    }
+}
 
 /// Frequency-aware blob cache; see the module docs.
 pub struct BufferManager {
     store: Arc<dyn BlobStore>,
     alloc_uninit: Arc<dyn Fn() -> AlignedBlobBuf + Send + Sync>,
     capacity: usize,
-    /// Bounded, `compact_times`-validated cache of routed blobs' routing
-    /// regions (cold-read stage 4), so a repeat cold read skips the
-    /// routing-region read.
-    routing_cache: RoutingCache,
+    /// Bounded 4 KiB cache for cold-read header/routing pages.
+    /// Counted inside the user-visible cache budget for file-backed
+    /// trees; disabled for memory/custom stores.
+    cold_pages: ColdPageCache,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -487,10 +516,24 @@ impl BufferManager {
 impl BufferManager {
     /// Wrap `store` with a cache of at most `capacity` blobs
     /// (each blob is 512 KB on the heap). A `capacity` of 0 is
-    /// clamped to 1.
+    /// clamped to 1. Generic/custom stores do not receive a cold-page
+    /// side cache; file-backed trees use [`Self::new_file`].
     #[must_use]
     pub fn new(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
-        Self::new_with_uninit_allocator(store, capacity, || {
+        Self::new_with_budget_and_uninit_allocator(store, CacheBudget::memory(capacity), || {
+            // SAFETY: BufferManager's uninitialized allocations are
+            // filled by read_blob or a full-frame copy before read.
+            unsafe { AlignedBlobBuf::uninit() }
+        })
+    }
+
+    /// Wrap a file-backed store with one unified cache budget. The public
+    /// `capacity` is still expressed in 512 KB blob-frame units; internally
+    /// a bounded slice is reserved for 4 KB cold-read navigation pages and
+    /// the rest becomes resident blob slots.
+    #[must_use]
+    pub(crate) fn new_file(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
+        Self::new_with_budget_and_uninit_allocator(store, CacheBudget::file(capacity), || {
             // SAFETY: BufferManager's uninitialized allocations are
             // filled by read_blob or a full-frame copy before read.
             unsafe { AlignedBlobBuf::uninit() }
@@ -503,6 +546,7 @@ impl BufferManager {
     /// allocation without exposing an uninitialized constructor in
     /// the public BlobStore trait.
     #[must_use]
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub(crate) fn new_with_uninit_allocator<F>(
         store: Arc<dyn BlobStore>,
         capacity: usize,
@@ -511,12 +555,23 @@ impl BufferManager {
     where
         F: Fn() -> AlignedBlobBuf + Send + Sync + 'static,
     {
-        let capacity = capacity.max(1);
+        Self::new_with_budget_and_uninit_allocator(store, CacheBudget::file(capacity), alloc_uninit)
+    }
+
+    fn new_with_budget_and_uninit_allocator<F>(
+        store: Arc<dyn BlobStore>,
+        budget: CacheBudget,
+        alloc_uninit: F,
+    ) -> Self
+    where
+        F: Fn() -> AlignedBlobBuf + Send + Sync + 'static,
+    {
+        let capacity = budget.blob_slots.max(1);
         Self {
             store,
             alloc_uninit: Arc::new(alloc_uninit),
             capacity,
-            routing_cache: RoutingCache::new(ROUTING_CACHE_BUDGET_BYTES),
+            cold_pages: ColdPageCache::new(budget.cold_page_bytes),
             cache: DashMap::with_hasher(GuidBuildHasher),
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
@@ -1211,7 +1266,7 @@ impl BufferManager {
     }
 
     /// Whether `guid` may be served by a cold, page-granular read
-    /// straight from the backing store (the stage-3 routed read).
+    /// straight from the backing store.
     ///
     /// Returns `false` — meaning the caller must fall back to [`pin`]
     /// (which reads the authoritative resident/full-frame image) —
@@ -1229,11 +1284,10 @@ impl BufferManager {
     }
 
     /// Positional, page-granular read from the backing store, bypassing
-    /// the cache and the 512 KB io_uring ring (see
-    /// [`BlobStore::read_blob_range`]). The caller owns 4 KB alignment
-    /// of `byte_offset` and `dst` (length + base). Used by the stage-3
-    /// cold routed read to fetch the header page + routing region + one
-    /// leaf page instead of pinning the whole frame.
+    /// the 512 KiB blob cache. Linux builds route this through the
+    /// file store's `io_uring` backend; other Unix builds use a
+    /// positional `pread`. The caller owns 4 KiB alignment of
+    /// `byte_offset` and `dst` (length + base).
     ///
     /// [`BlobStore::read_blob_range`]: crate::store::blob_store::BlobStore::read_blob_range
     pub(crate) fn read_blob_range(
@@ -1245,22 +1299,19 @@ impl BufferManager {
         self.store.read_blob_range(guid, byte_offset, dst)
     }
 
-    /// Stage-4 routing cache: fill `dst` with `guid`'s cached routing
-    /// region if one is resident at exactly `compact_times` (validated
-    /// against the freshly-read header). Returns `true` on a hit.
-    pub(crate) fn routing_region_cached(
-        &self,
-        guid: BlobGuid,
-        compact_times: u32,
-        dst: &mut [u8],
-    ) -> bool {
-        self.routing_cache.fill(guid, compact_times, dst)
+    /// Fill `dst` with a cached 4 KiB cold-read page. The caller must
+    /// have checked [`Self::cold_read_eligible`] before trusting it.
+    pub(crate) fn cold_page_cached(&self, guid: BlobGuid, page: u16, dst: &mut [u8]) -> bool {
+        self.cold_pages.fill(guid, page, dst)
     }
 
-    /// Cache `guid`'s routing region (`region`) at `compact_times` for
-    /// the next cold read.
-    pub(crate) fn routing_region_store(&self, guid: BlobGuid, compact_times: u32, region: &[u8]) {
-        self.routing_cache.put(guid, compact_times, region);
+    /// Store a clean 4 KiB navigation page for later cold reads.
+    pub(crate) fn cold_page_store(&self, guid: BlobGuid, page: u16, src: &[u8]) {
+        self.cold_pages.put(guid, page, src);
+    }
+
+    fn cold_pages_invalidate(&self, guid: BlobGuid) {
+        self.cold_pages.invalidate(guid);
     }
 
     fn note_full_blob_read(&self, access: PinAccess) {
@@ -1307,6 +1358,7 @@ impl BufferManager {
             // snapshot the bytes it is asked to flush.
             return;
         };
+        self.cold_pages_invalidate(guid);
         let hint_covers_seq = !cached.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if state.has_delete_fence(&guid) {
@@ -1848,6 +1900,7 @@ impl BufferManager {
     /// here; the background eviction thread or the next round's
     /// flush will catch up.
     pub(crate) fn install_new_blob(&self, guid: BlobGuid, mut bytes: AlignedBlobBuf, seq: u64) {
+        self.cold_pages_invalidate(guid);
         // Stamp the creation epoch so copy-on-write snapshots can tell
         // whether a later mutation must fork this frame rather than
         // overwrite it in place.
@@ -1902,6 +1955,7 @@ impl BlobStore for BufferManager {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
+        self.cold_pages_invalidate(guid);
         // Transparent write-through: if cached, refresh the
         // cached image; either way, always write to the inner
         // store in the same call so durability is unchanged.
@@ -1928,6 +1982,9 @@ impl BlobStore for BufferManager {
                 return Err(Self::pending_delete_not_found(*guid));
             }
         }
+        for (guid, _) in writes {
+            self.cold_pages_invalidate(*guid);
+        }
         for (guid, src) in writes {
             if let Some(entry) = self.get_cached_with_access(*guid, PinAccess::Silent) {
                 let mut buf = entry.write();
@@ -1950,6 +2007,7 @@ impl BlobStore for BufferManager {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
+        self.cold_pages_invalidate(guid);
         if !self.evict_from_cache(guid) {
             return Err(Error::Internal(
                 "delete_blob: protected cache image cannot be evicted",
@@ -1993,6 +2051,30 @@ mod tests {
         let mut b = AlignedBlobBuf::zeroed();
         b.as_mut_slice()[100] = byte_at_100;
         b
+    }
+
+    #[test]
+    fn file_cache_budget_splits_cold_pages_inside_total() {
+        let budget = CacheBudget::file(256);
+
+        assert_eq!(budget.cold_page_bytes, 8 * 1024 * 1024);
+        assert_eq!(budget.blob_slots, 240);
+    }
+
+    #[test]
+    fn small_file_cache_budget_preserves_blob_slots() {
+        let budget = CacheBudget::file(16);
+
+        assert_eq!(budget.cold_page_bytes, 0);
+        assert_eq!(budget.blob_slots, 16);
+    }
+
+    #[test]
+    fn memory_cache_budget_disables_cold_pages() {
+        let budget = CacheBudget::memory(256);
+
+        assert_eq!(budget.cold_page_bytes, 0);
+        assert_eq!(budget.blob_slots, 256);
     }
 
     #[test]

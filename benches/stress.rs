@@ -243,7 +243,8 @@ impl StressConfig {
                 .unwrap_or(false),
             // Negative-lookup mode: query keys that share a real key's full
             // prefix but are absent (a trailing sentinel byte). Exercises the
-            // descent + per-blob bloom reject (holt) / leaf-miss (others).
+            // descent + stable routed negative path (holt) / leaf miss
+            // (others).
             negative: env::var("HOLT_STRESS_NEGATIVE")
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_NEGATIVE", s))
@@ -734,7 +735,7 @@ fn make_samples(workload: Workload, n_keys: usize, ops: usize, negative: bool) -
         if negative {
             // Append a sentinel byte: the result shares the real key's full
             // prefix (same descent + same target blob) but is absent, so the
-            // lookup misses at the leaf / per-blob bloom.
+            // lookup misses at the target leaf.
             key.push(0x7E);
         }
         out.push(OpSample {
@@ -1368,7 +1369,7 @@ fn make_rocksdb(dir: &StoreDir, cfg: &StressConfig) -> DB {
     if cfg.rocksdb_direct {
         // Fair cold-read comparison: bypass the OS page cache (as holt
         // does with O_DIRECT/F_NOCACHE) and bound the block cache to
-        // holt's buffer-pool size, so both engines read cold from the
+        // holt's total cache budget, so both engines read cold from the
         // device at matched memory instead of rocksdb serving the whole
         // dataset from the OS page cache.
         opts.set_use_direct_reads(true);
@@ -1402,9 +1403,9 @@ fn make_sqlite_persistent(dir: &StoreDir, cfg: &StressConfig) -> Connection {
     let synchronous = if cfg.wal_sync { "FULL" } else { "OFF" };
     // Matched memory: sqlite's page cache (in its own heap, NOT the OS page
     // cache, so drop_caches cannot clear it) is capped to the same bytes as
-    // holt's buffer pool — buffer_pool_size frames × 512 KiB, expressed as
-    // negative KiB. Without this the cold regime would serve sqlite's working
-    // set from its internal cache.
+    // holt's total cache budget — buffer_pool_size frames × 512 KiB,
+    // expressed as negative KiB. Without this the cold regime would serve
+    // sqlite's working set from its internal cache.
     let cache_kib = cfg.buffer_pool_size.max(1) * 512;
     conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;\n\

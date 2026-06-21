@@ -926,10 +926,9 @@ impl BlobStore for FileBlobStore {
     /// Positional ranged read for page-granular cold lookups. `byte_offset`,
     /// `dst.len()`, and `dst`'s base must be 4 KB-aligned (whole pages) so the
     /// `O_DIRECT` / `F_NOCACHE` read is accepted; the buffer-manager paging
-    /// layer guarantees this. Goes straight through `read_exact_at` (a plain
-    /// positional `pread`) rather than the 512 KB-tuned `io_uring` ring.
+    /// layer guarantees this. Linux `io_uring` builds use the data-file ring;
+    /// other Unix builds use a plain positional `pread`.
     fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
         debug_assert_eq!(
             byte_offset % 4096,
             0,
@@ -941,7 +940,18 @@ impl BlobStore for FileBlobStore {
             "ranged read length must be a 4 KB multiple"
         );
         let offset = self.offset_of(guid)? + byte_offset;
-        self.data_file.read_exact_at(dst, offset)?;
+
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        {
+            let mut ring = self.uring.lock().unwrap();
+            ring.pread_slice_at(offset, dst)?;
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+        {
+            use std::os::unix::fs::FileExt;
+            self.data_file.read_exact_at(dst, offset)?;
+        }
         Ok(())
     }
 

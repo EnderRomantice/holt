@@ -14,7 +14,7 @@ use crate::store::blob_store::BlobStore;
 /// ```ignore
 /// // Persistent (the default):
 /// let tree = holt::TreeBuilder::new("/var/lib/myapp")
-///     .buffer_pool_size(512)
+///     .buffer_pool_size(512) // 256 MiB total cache budget
 ///     .durability(holt::Durability::Wal { sync: true })
 ///     .open()?;
 ///
@@ -45,7 +45,7 @@ impl TreeBuilder {
         self
     }
 
-    /// Set buffer pool size (in number of 512 KB blob frames).
+    /// Set cache budget, expressed in number of 512 KB blob frames.
     pub fn buffer_pool_size(mut self, n: usize) -> Self {
         self.cfg.buffer_pool_size = n;
         self

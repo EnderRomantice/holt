@@ -1,6 +1,6 @@
 //! End-to-end tests for copy-on-write [`Tree::snapshot`].
 //!
-//! Exercises only the public surface. Stage 3 covers snapshot
+//! Exercises only the public surface. Snapshot tests cover
 //! creation, the scoped read path (including across blob-frame
 //! boundaries), epoch advancement, and isolation from *root-local*
 //! live writes — which hold without fork-on-write because the live

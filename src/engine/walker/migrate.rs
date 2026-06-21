@@ -24,8 +24,8 @@ use crate::layout::{
 };
 use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::{
-    bloom_byte_len, decode_child_off, encode_child_off, page_align_up, BlobFrame, BlobFrameRef,
-    BloomBuilder, BufferManager, BLOOM_BITS_PER_KEY, PAGE_4K, SPILLOVER_RESERVATION,
+    decode_child_off, encode_child_off, page_align_up, BlobFrame, BlobFrameRef, BufferManager,
+    PAGE_4K, SPILLOVER_RESERVATION,
 };
 
 use super::cast;
@@ -229,11 +229,10 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
     // post-order back-patch in `clone_*` is unchanged. `None` ⇒ keep
     // the legacy whole-frame layout (degenerate tree, or it doesn't fit
     // the two-arena layout).
-    let (routed_lrs, bloom_leaf_count) = {
+    let routed_lrs = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let budget = routing_budget(old_frame.as_ref(), old_root_off)?;
-        let leaf_count = budget.as_ref().map_or(0, |b| b.leaf_count);
-        (routing_geometry(budget), leaf_count)
+        routing_geometry(budget)
     };
 
     let mut new_buf = buf.zeroed_like();
@@ -290,23 +289,6 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
                         h.routing_len = internal_end - DATA_AREA_START;
                         h.leaf_region_start = lrs;
                         h.space_used = leaf_cursor;
-                    }
-                    // Stage 6: build the per-blob bloom over the freshly
-                    // cloned leaves and place it at the routing-region tail
-                    // ([internal_end, lrs)), so the cold read loads it for
-                    // free with the routing region. Routed-without-bloom is
-                    // a fine fallback if it doesn't fit.
-                    if let Some((boff, blen)) = build_routing_bloom(
-                        &mut new_frame,
-                        internal_end,
-                        lrs,
-                        leaf_cursor,
-                        bloom_leaf_count,
-                    ) {
-                        let h = new_frame.header_mut();
-                        h.bloom_off = boff;
-                        h.bloom_len = blen;
-                        h.bloom_bits_per_key = u32::from(BLOOM_BITS_PER_KEY);
                     }
                 } else if routed_lrs.is_some() {
                     // We INTENDED to route (`routed_lrs` was `Some`) but
@@ -537,9 +519,6 @@ struct BudgetNode {
     routing_bytes: u32,
     /// Bytes the surviving leaves will occupy.
     leaf_bytes: u32,
-    /// Count of surviving leaves — drives the per-blob bloom size
-    /// reserved in the routing region (stage 6).
-    leaf_count: u32,
 }
 
 /// Read-only **pass 0** of the routing-aware compaction: measure the
@@ -575,7 +554,6 @@ fn routing_budget(src: BlobFrameRef<'_>, src_off: u32) -> Result<Option<BudgetNo
         NodeType::EmptyRoot => Ok(Some(BudgetNode {
             routing_bytes: 0,
             leaf_bytes: 0,
-            leaf_count: 0,
         })),
         NodeType::Leaf => {
             let leaf = *cast::<Leaf>(&body[..std::mem::size_of::<Leaf>()]);
@@ -585,7 +563,6 @@ fn routing_budget(src: BlobFrameRef<'_>, src_off: u32) -> Result<Option<BudgetNo
             Ok(Some(BudgetNode {
                 routing_bytes: 0,
                 leaf_bytes: body.len() as u32,
-                leaf_count: 1,
             }))
         }
         NodeType::Prefix => {
@@ -594,14 +571,12 @@ fn routing_budget(src: BlobFrameRef<'_>, src_off: u32) -> Result<Option<BudgetNo
                 routing_budget(src, child_offset(p.child as u16))?.map(|c| BudgetNode {
                     routing_bytes: size_of_node(NodeType::Prefix) + c.routing_bytes,
                     leaf_bytes: c.leaf_bytes,
-                    leaf_count: c.leaf_count,
                 }),
             )
         }
         NodeType::Blob => Ok(Some(BudgetNode {
             routing_bytes: size_of_node(NodeType::Blob),
             leaf_bytes: 0,
-            leaf_count: 0,
         })),
         NodeType::Node4 => {
             let n = *cast::<Node4>(body);
@@ -646,19 +621,16 @@ fn budget_inner(
     let mut survivors = 0usize;
     let mut routing_bytes = 0u32;
     let mut leaf_bytes = 0u32;
-    let mut leaf_count = 0u32;
     for coff in child_offs {
         if let Some(c) = routing_budget(src, coff)? {
             survivors += 1;
             routing_bytes += c.routing_bytes;
             leaf_bytes += c.leaf_bytes;
-            leaf_count += c.leaf_count;
         }
     }
     Ok(packed_inner_size(survivors).map(|self_size| BudgetNode {
         routing_bytes: routing_bytes + self_size,
         leaf_bytes,
-        leaf_count,
     }))
 }
 
@@ -698,82 +670,11 @@ fn routing_geometry(budget: Option<BudgetNode>) -> Option<u32> {
     // routing_bytes that lands DATA_AREA_START + routing_bytes exactly on a
     // page boundary would put `space_used` one sentinel past
     // leaf_region_start and trip the overrun guard.
-    //
-    // The per-blob bloom (stage 6) lives at the tail of the routing
-    // region, between the internal nodes and the page-aligned leaf
-    // region, so reserve its bytes here too. It is read for free with the
-    // routing region. `bloom_reserve_bytes` is recomputed identically in
-    // `compact_blob` from the same `leaf_count`, so placement and
-    // reservation stay in lockstep.
-    let bloom_len = bloom_reserve_bytes(b.leaf_count);
-    let routing_end =
-        DATA_AREA_START + size_of_node(NodeType::EmptyRoot) + b.routing_bytes + bloom_len;
+    let routing_end = DATA_AREA_START + size_of_node(NodeType::EmptyRoot) + b.routing_bytes;
     let lrs = page_align_up(routing_end);
     let fits = u64::from(lrs) + u64::from(b.leaf_bytes) + u64::from(SPILLOVER_RESERVATION)
         <= u64::from(PAGE_SIZE);
     fits.then_some(lrs)
-}
-
-/// Bytes to reserve (and later fill) for the per-blob bloom over
-/// `leaf_count` live leaves. A blob with no leaves gets no bloom. Keep
-/// in lockstep between [`routing_geometry`] (reservation) and
-/// [`compact_blob`] (placement + fill).
-#[inline]
-fn bloom_reserve_bytes(leaf_count: u32) -> u32 {
-    if leaf_count == 0 {
-        return 0;
-    }
-    bloom_byte_len(leaf_count as usize, BLOOM_BITS_PER_KEY) as u32
-}
-
-/// Build the per-blob bloom over the freshly-cloned leaves and write it
-/// at the routing-region tail (`[internal_end, leaf_region_start)`),
-/// returning `(bloom_off, bloom_len)` to stamp into the header.
-///
-/// Hashes each leaf's **stored** key bytes (`[16B hdr][key]…`, key incl.
-/// the ART terminator) — the exact bytes the cold read reconstructs from
-/// its `SearchKey` via `write_to_slice`, so a present key can never be a
-/// bloom false negative. Returns `None` (routed-without-bloom, a fine
-/// fallback) when there are no leaves or the reserved span can't hold the
-/// filter — never fails the compaction.
-fn build_routing_bloom(
-    frame: &mut BlobFrame<'_>,
-    internal_end: u32,
-    leaf_region_start: u32,
-    leaf_cursor: u32,
-    leaf_count: u32,
-) -> Option<(u32, u32)> {
-    let bloom_len = bloom_reserve_bytes(leaf_count);
-    if bloom_len == 0 {
-        return None;
-    }
-    let bloom_off = internal_end;
-    // Must fit between the internal nodes and the page-aligned leaves.
-    if bloom_off.checked_add(bloom_len)? > leaf_region_start {
-        return None;
-    }
-    // Walk the packed leaf arena, hashing each leaf's stored key.
-    let bytes = {
-        let view = frame.as_ref();
-        let mut builder = BloomBuilder::new(leaf_count as usize, BLOOM_BITS_PER_KEY);
-        let hdr = std::mem::size_of::<Leaf>();
-        let mut off = leaf_region_start;
-        while off < leaf_cursor {
-            let body = view.body_at_offset(off)?;
-            let leaf = *cast::<Leaf>(&body[..hdr]);
-            let key_end = hdr + leaf.key_len as usize;
-            if key_end > body.len() {
-                return None; // malformed → routed-without-bloom
-            }
-            builder.add(&body[hdr..key_end]);
-            off = off.checked_add(body.len() as u32)?;
-        }
-        builder.into_bytes()
-    };
-    debug_assert_eq!(bytes.len() as u32, bloom_len);
-    let dst = frame.bytes_at_mut(bloom_off, bloom_len)?;
-    dst.copy_from_slice(&bytes);
-    Some((bloom_off, bloom_len))
 }
 
 // ---------- clone primitives ----------
@@ -1257,9 +1158,6 @@ mod budget_tests {
             let lrs = routing_geometry(Some(BudgetNode {
                 routing_bytes,
                 leaf_bytes: 16 * PAGE_4K,
-                // leaf_count 0 ⇒ no bloom reservation, so this isolates
-                // the init-sentinel page-boundary case the test targets.
-                leaf_count: 0,
             }))
             .expect("substantial routed blob");
             let space_used_after_clone = DATA_AREA_START + sentinel + routing_bytes;

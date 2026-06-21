@@ -556,9 +556,9 @@ impl<'a> BlobFrame<'a> {
         // re-routes); cold reads fall back to the legacy whole-frame path
         // until then. (In-place leaf allocs de-route too — see
         // `alloc_leaf` — but for a different reason: they rewrite a parent
-        // child pointer in the routing region that the resident routing
-        // cache would otherwise serve stale.) During the routing build
-        // itself routing_len is still 0, so this is a no-op.
+        // child pointer in the routing region, so any cached cold-read
+        // navigation page is stale.) During the routing build itself
+        // routing_len is still 0, so this is a no-op.
         if self.header().routing_len != 0 {
             self.header_mut().routing_len = 0;
         }
@@ -748,20 +748,15 @@ impl<'a> BlobFrame<'a> {
         // — leaves are correctly classified above `leaf_region_start` — but
         // linking it rewrites the parent node's child pointer, which lives
         // in the routing region, and a value-grow also repoints the parent
-        // at the relocated leaf. A leaf alloc does NOT bump `compact_times`,
-        // so the resident routing cache (keyed/validated by `compact_times`
-        // alone) would serve a later cold read a STALE routing region
-        // (missing the new child pointer) → a wrong descent / false
-        // negative, plus a stale bloom missing the new key. De-routing
+        // at the relocated leaf. That makes any cold-read navigation page
+        // captured from the old routing region stale. De-routing
         // (`routing_len = 0`) takes the blob off the cold routed path until
         // the next compaction re-routes it; cold reads fall back to the
-        // authoritative full pin meanwhile. `bloom_len` is cleared too so
-        // no stale bloom lingers. The routing build uses `alloc_leaf_at`
-        // (not this path) and runs with `routing_len == 0`, so it is
-        // unaffected.
+        // authoritative full pin meanwhile. The routing build uses
+        // `alloc_leaf_at` (not this path) and runs with `routing_len == 0`,
+        // so it is unaffected.
         if h.routing_len != 0 {
             h.routing_len = 0;
-            h.bloom_len = 0;
         }
 
         Ok(AllocOutcome { slot: new_slot })

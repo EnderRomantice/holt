@@ -8,16 +8,15 @@ use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::engine::simd;
 use crate::engine::{RouteCache, RouteHit};
 use crate::layout::{
-    leaf_body_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
-    BLOB_MAX_INLINE, HEADER_SIZE, PREFIX_MAX_INLINE,
+    leaf_body_size, size_of_node, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48,
+    NodeType, Prefix, BLOB_MAX_INLINE, HEADER_SIZE, PREFIX_MAX_INLINE,
 };
 use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::{
-    bloom_contains, page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup,
-    BLOOM_BITS_PER_KEY, PAGE_4K,
+    page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup, PAGE_4K,
 };
 
 use super::cast;
@@ -410,13 +409,12 @@ where
     let mut child_guid = crossing.child_guid;
     let mut child_depth = crossing.child_depth;
     loop {
-        // Answer cold from the in-blob routing region (stage 3); any
-        // uncertainty falls back to the authoritative full pin. A cold
-        // negative is deliberately treated as uncertainty: the routed
-        // path is an accelerator over partial store reads and cached
-        // summaries, not the source of truth for absence.
+        // Answer cold from the in-blob routing region; any uncertainty
+        // falls back to the authoritative full pin.
+        // `NotFound` only reaches this point after the routed negative
+        // was validated against a stable store image.
         match cold_read_routed(bm, child_guid, key, child_depth) {
-            ColdBlobLookup::Unknown | ColdBlobLookup::NotFound => {
+            ColdBlobLookup::Unknown => {
                 let pin = match bm.pin(child_guid) {
                     Ok(pin) => pin,
                     Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(child_guid) => {
@@ -430,6 +428,7 @@ where
                     depth: child_depth,
                 });
             }
+            ColdBlobLookup::NotFound => return Ok(ColdLookupOrPin::Done(None)),
             ColdBlobLookup::Found { value, seq } => {
                 let out = consume(LookupHit { value: &value, seq });
                 return Ok(ColdLookupOrPin::Done(Some(out)));
@@ -445,7 +444,7 @@ where
     }
 }
 
-// ---------- stage 3: cold routed read ----------
+// ---------- cold routed read ----------
 
 /// Answer a cold point lookup against a **routed** blob by reading only
 /// the header page + routing region + one leaf page via
@@ -454,11 +453,13 @@ where
 /// A pure accelerator: on ANY uncertainty — the blob isn't
 /// cold-eligible (cached/pending-delete/protected), it's in the legacy
 /// whole-frame layout (`routing_len == 0`), a read fails, descent
-/// reaches an unexpected node, or the routed path would answer
-/// `NotFound` — it returns [`ColdBlobLookup::Unknown`] and the caller
-/// falls back to `bm.pin`, which reads the authoritative image. This
-/// means cold reads may fast-return positive hits/crossings, but never
-/// make absence visible from partial store state.
+/// reaches an unexpected node, or the routed negative cannot be
+/// validated — it returns [`ColdBlobLookup::Unknown`] and the caller
+/// falls back to `bm.pin`, which reads the authoritative image.
+///
+/// A returned [`ColdBlobLookup::NotFound`] is stronger than the routed
+/// core's local negative hint: it means the blob stayed cold-eligible
+/// and its header stamp matched before/after the partial read.
 fn cold_read_routed(
     bm: &BufferManager,
     guid: BlobGuid,
@@ -472,16 +473,67 @@ fn cold_read_routed(
     // (the caller only reaches here with a user-style key), so a routed
     // and a full-frame read are byte-for-byte equivalent.
     match routed_read_cached(bm, guid, key, depth) {
-        Ok(ColdBlobLookup::NotFound) | Err(_) => ColdBlobLookup::Unknown,
+        Err(_) => ColdBlobLookup::Unknown,
         Ok(answer) => answer,
     }
 }
 
-/// Routed cold read with the stage-4 resident routing cache: read the
-/// header page, then fill the routing region from the cache (validated
-/// by `compact_times`) or read + cache it, then descend and page in the
-/// one leaf. Errors map to `Unknown` (→ authoritative pin) at the call
-/// site, so this can only avoid I/O, never change semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColdBlobStamp {
+    root_slot: u16,
+    num_slots: u16,
+    space_used: u32,
+    compact_times: u32,
+    dead_bytes: u32,
+    gap_space: u32,
+    tombstone_leaf_cnt: u32,
+    created_epoch: u64,
+    blob_guid: BlobGuid,
+    routing_off: u32,
+    routing_len: u32,
+    leaf_region_start: u32,
+    routing_unfit: u32,
+}
+
+impl ColdBlobStamp {
+    fn new(header: &crate::layout::BlobHeader) -> Self {
+        Self {
+            root_slot: header.root_slot,
+            num_slots: header.num_slots,
+            space_used: header.space_used,
+            compact_times: header.compact_times,
+            dead_bytes: header.dead_bytes,
+            gap_space: header.gap_space,
+            tombstone_leaf_cnt: header.tombstone_leaf_cnt,
+            created_epoch: header.created_epoch,
+            blob_guid: header.blob_guid,
+            routing_off: header.routing_off,
+            routing_len: header.routing_len,
+            leaf_region_start: header.leaf_region_start,
+            routing_unfit: header.routing_unfit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoutedLookup {
+    Unknown,
+    Found {
+        value: Vec<u8>,
+        seq: u64,
+    },
+    Crossing {
+        child_guid: BlobGuid,
+        child_depth: usize,
+    },
+    NegativeHint,
+}
+
+/// Routed cold read with the cold-page cache: cache reusable
+/// header/routing pages at 4 KiB granularity, but keep one-shot leaf
+/// pages out of the cache. A local negative is published only after the
+/// header stamp is re-read and found unchanged while the blob is still
+/// cold-eligible.
 fn routed_read_cached(
     bm: &BufferManager,
     guid: BlobGuid,
@@ -491,34 +543,209 @@ fn routed_read_cached(
     let mut scratch = AlignedBlobBuf::zeroed();
     let buf = scratch.as_mut_slice();
 
-    // Header page → routing geometry + the cache-validation version.
-    bm.read_blob_range(guid, 0, &mut buf[..HEADER_SIZE as usize])?;
-    let (root_off, rr, compact_times) = {
-        let frame = BlobFrameRef::wrap(&buf[..]);
+    let mut pages = ColdPageReader::new(bm, guid, buf);
+    pages.load_range(0, HEADER_SIZE, true)?;
+    let (root_off, rr, stamp) = {
+        let frame = pages.frame();
         let h = frame.header();
         match h.routing_region() {
-            Some(rr) => (decode_child_off(h.root_slot), rr, h.compact_times),
+            Some(rr) => (decode_child_off(h.root_slot), rr, ColdBlobStamp::new(h)),
             None => return Ok(ColdBlobLookup::Unknown), // legacy → full pin
         }
     };
 
-    // Routing region: resident cache hit (skip the read) or read +
-    // populate. `[routing_off, leaf_region_start)` is page-aligned.
-    let (rs, re) = (rr.off as usize, rr.leaf_region_start as usize);
-    if !bm.routing_region_cached(guid, compact_times, &mut buf[rs..re]) {
-        bm.read_blob_range(guid, u64::from(rr.off), &mut buf[rs..re])?;
-        bm.routing_region_store(guid, compact_times, &buf[rs..re]);
+    match descend_routed_paged(&mut pages, root_off, key, depth, rr.leaf_region_start)? {
+        RoutedLookup::Unknown => Ok(ColdBlobLookup::Unknown),
+        RoutedLookup::Found { value, seq } => Ok(ColdBlobLookup::Found { value, seq }),
+        RoutedLookup::Crossing {
+            child_guid,
+            child_depth,
+        } => Ok(ColdBlobLookup::Crossing {
+            child_guid,
+            child_depth,
+        }),
+        RoutedLookup::NegativeHint => {
+            if pages.read_from_store {
+                if validate_cold_negative(bm, guid, stamp, buf)? {
+                    Ok(ColdBlobLookup::NotFound)
+                } else {
+                    Ok(ColdBlobLookup::Unknown)
+                }
+            } else if bm.cold_read_eligible(guid) {
+                Ok(ColdBlobLookup::NotFound)
+            } else {
+                Ok(ColdBlobLookup::Unknown)
+            }
+        }
+    }
+}
+
+const COLD_PAGES_PER_BLOB: usize = (crate::layout::PAGE_SIZE as usize) / (PAGE_4K as usize);
+
+struct ColdPageReader<'a> {
+    bm: &'a BufferManager,
+    guid: BlobGuid,
+    scratch: &'a mut [u8],
+    loaded: [bool; COLD_PAGES_PER_BLOB],
+    read_from_store: bool,
+}
+
+impl<'a> ColdPageReader<'a> {
+    fn new(bm: &'a BufferManager, guid: BlobGuid, scratch: &'a mut [u8]) -> Self {
+        Self {
+            bm,
+            guid,
+            scratch,
+            loaded: [false; COLD_PAGES_PER_BLOB],
+            read_from_store: false,
+        }
     }
 
-    let mut leaf_read = |off: u64, dst: &mut [u8]| bm.read_blob_range(guid, off, dst);
-    descend_routed(
-        buf,
-        &mut leaf_read,
-        root_off,
-        key,
-        depth,
-        rr.leaf_region_start,
-    )
+    fn frame(&self) -> BlobFrameRef<'_> {
+        BlobFrameRef::wrap(&self.scratch[..])
+    }
+
+    fn load_range(&mut self, start: u32, end: u32, admit: bool) -> Result<()> {
+        if end <= start {
+            return Ok(());
+        }
+        if end > crate::layout::PAGE_SIZE {
+            return Err(Error::node_corrupt("cold_read_routed: page range"));
+        }
+        let mut page = (start / PAGE_4K) as u16;
+        let end_page = (page_align_up(end) / PAGE_4K) as u16;
+        while page < end_page {
+            if self.loaded[usize::from(page)] {
+                page += 1;
+                continue;
+            }
+            if admit && self.try_fill_cached_page(page) {
+                page += 1;
+                continue;
+            }
+
+            let run_start = page;
+            let mut run_end = page + 1;
+            while run_end < end_page {
+                if self.loaded[usize::from(run_end)] {
+                    break;
+                }
+                if admit && self.try_fill_cached_page(run_end) {
+                    break;
+                }
+                run_end += 1;
+            }
+
+            self.load_page_run(run_start, run_end, admit)?;
+            page = run_end;
+        }
+        Ok(())
+    }
+
+    fn try_fill_cached_page(&mut self, page: u16) -> bool {
+        let page_usize = usize::from(page);
+        debug_assert!(!self.loaded[page_usize]);
+        let start = page_usize * PAGE_4K as usize;
+        let end = start + PAGE_4K as usize;
+        let dst = &mut self.scratch[start..end];
+        if self.bm.cold_page_cached(self.guid, page, dst) {
+            self.loaded[page_usize] = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn load_page_run(&mut self, start_page: u16, end_page: u16, admit: bool) -> Result<()> {
+        debug_assert!(start_page < end_page);
+        let start = usize::from(start_page) * PAGE_4K as usize;
+        let end = usize::from(end_page) * PAGE_4K as usize;
+        self.bm
+            .read_blob_range(self.guid, start as u64, &mut self.scratch[start..end])?;
+        self.read_from_store = true;
+
+        for page in start_page..end_page {
+            self.loaded[usize::from(page)] = true;
+        }
+
+        if admit && self.bm.cold_read_eligible(self.guid) {
+            for page in start_page..end_page {
+                let page_start = usize::from(page) * PAGE_4K as usize;
+                let page_end = page_start + PAGE_4K as usize;
+                self.bm
+                    .cold_page_store(self.guid, page, &self.scratch[page_start..page_end]);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_cold_negative(
+    bm: &BufferManager,
+    guid: BlobGuid,
+    expected: ColdBlobStamp,
+    scratch: &mut [u8],
+) -> Result<bool> {
+    if !bm.cold_read_eligible(guid) {
+        return Ok(false);
+    }
+    bm.read_blob_range(guid, 0, &mut scratch[..HEADER_SIZE as usize])?;
+    if !bm.cold_read_eligible(guid) {
+        return Ok(false);
+    }
+    let frame = BlobFrameRef::wrap(&scratch[..]);
+    Ok(ColdBlobStamp::new(frame.header()) == expected)
+}
+
+fn descend_routed_paged(
+    pages: &mut ColdPageReader<'_>,
+    off: u32,
+    key: SearchKey<'_>,
+    depth: usize,
+    leaf_region_start: u32,
+) -> Result<RoutedLookup> {
+    if off >= leaf_region_start {
+        page_in_leaf_paged(pages, off)?;
+        let frame = pages.frame();
+        let body = frame
+            .body_at_offset(off)
+            .ok_or(Error::node_corrupt("cold_read_routed: leaf body range"))?;
+        return leaf_check_owned(body, key);
+    }
+
+    page_in_fixed_node(pages, off)?;
+    let step = routed_step(pages.frame(), off, key, depth)?;
+    match step {
+        RoutedStep::Done(answer) => Ok(answer),
+        RoutedStep::Visit(child_off, new_depth) => {
+            descend_routed_paged(pages, child_off, key, new_depth, leaf_region_start)
+        }
+    }
+}
+
+fn page_in_fixed_node(pages: &mut ColdPageReader<'_>, off: u32) -> Result<()> {
+    pages.load_range(off, off + 2, true)?;
+    let ntype = pages.frame().ntype_at(off).ok_or(Error::node_corrupt(
+        "cold_read_routed: undecodable node type",
+    ))?;
+    if ntype == NodeType::Leaf || ntype == NodeType::Invalid {
+        return Ok(());
+    }
+    let end = off
+        .checked_add(size_of_node(ntype))
+        .ok_or(Error::node_corrupt("cold_read_routed: node size overflow"))?;
+    pages.load_range(off, end, true)
+}
+
+fn page_in_leaf_paged(pages: &mut ColdPageReader<'_>, loff: u32) -> Result<()> {
+    let hdr_end = page_align_up(loff + size_of::<Leaf>() as u32);
+    pages.load_range(loff, hdr_end, false)?;
+    let (key_len, value_len) = {
+        let leaf = cast::<Leaf>(&pages.scratch[loff as usize..loff as usize + size_of::<Leaf>()]);
+        (u32::from(leaf.key_len), u32::from(leaf.value_len))
+    };
+    let body_end = page_align_up(loff + leaf_body_size(key_len, value_len));
+    pages.load_range(hdr_end, body_end, false)
 }
 
 /// Routed-read core, decoupled from the buffer manager via a
@@ -552,21 +779,32 @@ pub(super) fn cold_read_routed_into(
         u64::from(rr.off),
         &mut scratch[rr.off as usize..rr.leaf_region_start as usize],
     )?;
-    descend_routed(
+    match descend_routed(
         scratch,
         read_range,
         root_off,
         key,
         depth,
         rr.leaf_region_start,
-    )
+    )? {
+        RoutedLookup::Unknown => Ok(ColdBlobLookup::Unknown),
+        RoutedLookup::Found { value, seq } => Ok(ColdBlobLookup::Found { value, seq }),
+        RoutedLookup::Crossing {
+            child_guid,
+            child_depth,
+        } => Ok(ColdBlobLookup::Crossing {
+            child_guid,
+            child_depth,
+        }),
+        RoutedLookup::NegativeHint => Ok(ColdBlobLookup::NotFound),
+    }
 }
 
 /// One step of the routed descent: the next child offset to visit, or a
 /// terminal answer.
 enum RoutedStep {
     Visit(u32, usize),
-    Done(ColdBlobLookup),
+    Done(RoutedLookup),
 }
 
 /// Resolve the (resident, internal) node at `off` and decide the next
@@ -580,7 +818,7 @@ fn routed_step(
     depth: usize,
 ) -> Result<RoutedStep> {
     let (ntype, body) = resolve_typed(frame, off)?;
-    let not_found = RoutedStep::Done(ColdBlobLookup::NotFound);
+    let not_found = RoutedStep::Done(RoutedLookup::NegativeHint);
     Ok(match ntype {
         NodeType::Prefix => {
             let p = *cast::<Prefix>(body);
@@ -646,7 +884,7 @@ fn routed_step(
             let b = *cast::<BlobNode>(body);
             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
             if key.range_eq(depth, &b.bytes[..plen]) {
-                RoutedStep::Done(ColdBlobLookup::Crossing {
+                RoutedStep::Done(RoutedLookup::Crossing {
                     child_guid: b.child_blob_guid,
                     child_depth: depth + plen,
                 })
@@ -658,54 +896,12 @@ fn routed_step(
         // (off < leaf_region_start) is unexpected — bail to the
         // authoritative full pin.
         NodeType::Leaf | NodeType::EmptyRoot | NodeType::Invalid => {
-            RoutedStep::Done(ColdBlobLookup::Unknown)
+            RoutedStep::Done(RoutedLookup::Unknown)
         }
     })
 }
 
-/// Largest key length the bloom probe materializes on the stack. Longer
-/// keys skip the bloom and read the leaf (rare for metadata keys; only
-/// costs the read it would have anyway — never a false negative).
-const BLOOM_PROBE_MAX_KEY: usize = 1024;
-
-/// Stage 6: consult the per-blob bloom resident in `scratch`'s routing
-/// region for `key`. Returns `true` ONLY when the bloom proves `key` is
-/// absent from this blob, letting the routed core skip the leaf-page
-/// read. The production cold-read wrapper treats that local `NotFound`
-/// as uncertainty and pins the full frame before exposing absence to
-/// callers. `false` means "maybe present" (or there is no usable bloom,
-/// or the key is too long to probe): fall through to the leaf read.
-///
-/// Never a false negative: the filter was built over each leaf's stored
-/// key bytes, and `SearchKey::write_to_slice` reproduces exactly those
-/// bytes (user bytes + ART terminator) here, so a present key always
-/// hashes to set bits.
-fn bloom_rejects(scratch: &[u8], key: SearchKey<'_>) -> bool {
-    let Some((boff, blen, bpk)) = BlobFrameRef::wrap(scratch).header().bloom_region() else {
-        return false; // no bloom ⇒ "maybe" ⇒ read the leaf
-    };
-    // The compactor only ever writes BLOOM_BITS_PER_KEY. An unexpected
-    // value means a corrupt header field (probe count is derived from it,
-    // so a wrong value could under-probe → a false negative); treat it as
-    // "no bloom" and read the leaf. Defensive: the field shares page 0's
-    // first sector with bloom_off/len, so a torn write can't desync them,
-    // but a pure-accelerator must never trust an unexpected value.
-    if bpk != BLOOM_BITS_PER_KEY {
-        return false;
-    }
-    let klen = key.len();
-    if klen > BLOOM_PROBE_MAX_KEY {
-        return false;
-    }
-    let (bs, be) = (boff as usize, (boff + blen) as usize);
-    if be > scratch.len() {
-        return false; // defensive — bloom_region already bounds-checked
-    }
-    let mut kbuf = [0u8; BLOOM_PROBE_MAX_KEY];
-    key.write_to_slice(&mut kbuf[..klen]);
-    !bloom_contains(&scratch[bs..be], bpk, &kbuf[..klen])
-}
-
+#[cfg(test)]
 fn descend_routed(
     scratch: &mut [u8],
     read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
@@ -713,7 +909,7 @@ fn descend_routed(
     key: SearchKey<'_>,
     depth: usize,
     leaf_region_start: u32,
-) -> Result<ColdBlobLookup> {
+) -> Result<RoutedLookup> {
     // The decision is taken (and copied out) under a short frame borrow
     // so we can page in a leaf or recurse with `&mut scratch` after.
     let step = routed_step(BlobFrameRef::wrap(&scratch[..]), off, key, depth)?;
@@ -721,14 +917,6 @@ fn descend_routed(
         RoutedStep::Done(answer) => Ok(answer),
         RoutedStep::Visit(child_off, new_depth) => {
             if child_off >= leaf_region_start {
-                // Stage 6: if the blob's resident bloom proves `key` is
-                // absent, the routed core can avoid the leaf-page read.
-                // The production wrapper maps this local NotFound to
-                // Unknown so only a full-frame pin can publish absence.
-                if bloom_rejects(scratch, key) {
-                    return Ok(ColdBlobLookup::NotFound);
-                }
-                // Leaf: page it in, then run the leaf compare.
                 page_in_leaf(scratch, read_range, child_off)?;
                 let frame = BlobFrameRef::wrap(&scratch[..]);
                 let body = frame
@@ -753,6 +941,7 @@ fn descend_routed(
 /// absolute offset: read the page(s) covering its 16-byte header, then
 /// extend to cover the full `[16B hdr][key][value]` body (a large
 /// value can straddle pages).
+#[cfg(test)]
 fn page_in_leaf(
     scratch: &mut [u8],
     read_range: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
@@ -780,13 +969,13 @@ fn page_in_leaf(
 
 /// Like `leaf_check` but returns an owned [`ColdBlobLookup`] — the value
 /// is copied out of the paged-in buffer, which the caller drops.
-fn leaf_check_owned(body: &[u8], key: SearchKey<'_>) -> Result<ColdBlobLookup> {
+fn leaf_check_owned(body: &[u8], key: SearchKey<'_>) -> Result<RoutedLookup> {
     let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
     if leaf.tombstone != 0 {
-        return Ok(ColdBlobLookup::NotFound);
+        return Ok(RoutedLookup::NegativeHint);
     }
     if leaf.key_fp != 0 && leaf.key_fp != key.fingerprint() {
-        return Ok(ColdBlobLookup::NotFound);
+        return Ok(RoutedLookup::NegativeHint);
     }
     let key_len = leaf.key_len as usize;
     let value_len = leaf.value_len as usize;
@@ -798,9 +987,9 @@ fn leaf_check_owned(body: &[u8], key: SearchKey<'_>) -> Result<ColdBlobLookup> {
         ));
     }
     if !key.eq_slice(&body[16..key_end]) {
-        return Ok(ColdBlobLookup::NotFound);
+        return Ok(RoutedLookup::NegativeHint);
     }
-    Ok(ColdBlobLookup::Found {
+    Ok(RoutedLookup::Found {
         value: body[key_end..value_end].to_vec(),
         seq: leaf.seq,
     })
@@ -994,6 +1183,8 @@ mod tests {
     use super::*;
     use crate::store::blob_store::{BlobStore, MemoryBlobStore};
     use crate::store::BlobFrame;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     fn routed_blob(guid: BlobGuid) -> AlignedBlobBuf {
         let mut buf = AlignedBlobBuf::zeroed();
@@ -1032,8 +1223,166 @@ mod tests {
         buf
     }
 
+    struct HeaderFlipStore {
+        guid: BlobGuid,
+        first: AlignedBlobBuf,
+        second_header: AlignedBlobBuf,
+        header_reads: AtomicUsize,
+        full_reads: AtomicUsize,
+    }
+
+    impl HeaderFlipStore {
+        fn new(guid: BlobGuid, first: AlignedBlobBuf, second_header: AlignedBlobBuf) -> Self {
+            Self {
+                guid,
+                first,
+                second_header,
+                header_reads: AtomicUsize::new(0),
+                full_reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct RangeCountStore {
+        guid: BlobGuid,
+        blob: AlignedBlobBuf,
+        ranges: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl RangeCountStore {
+        fn new(guid: BlobGuid) -> Self {
+            let mut blob = AlignedBlobBuf::zeroed();
+            for (idx, byte) in blob.as_mut_slice().iter_mut().enumerate() {
+                *byte = (idx / PAGE_4K as usize) as u8;
+            }
+            Self {
+                guid,
+                blob,
+                ranges: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BlobStore for RangeCountStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            assert_eq!(guid, self.guid);
+            dst.as_mut_slice().copy_from_slice(self.blob.as_slice());
+            Ok(())
+        }
+
+        fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+            assert_eq!(guid, self.guid);
+            self.ranges.lock().unwrap().push((byte_offset, dst.len()));
+            let off = byte_offset as usize;
+            dst.copy_from_slice(&self.blob.as_slice()[off..off + dst.len()]);
+            Ok(())
+        }
+
+        fn write_blob(&self, _guid: BlobGuid, _src: &AlignedBlobBuf) -> Result<()> {
+            unreachable!("test store is read-only")
+        }
+
+        fn delete_blob(&self, _guid: BlobGuid) -> Result<()> {
+            unreachable!("test store is read-only")
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            Ok(vec![self.guid])
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn needs_flush(&self) -> bool {
+            false
+        }
+    }
+
+    impl BlobStore for HeaderFlipStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            assert_eq!(guid, self.guid);
+            self.full_reads.fetch_add(1, Ordering::Relaxed);
+            dst.as_mut_slice().copy_from_slice(self.first.as_slice());
+            Ok(())
+        }
+
+        fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+            assert_eq!(guid, self.guid);
+            let source = if byte_offset == 0 {
+                let read = self.header_reads.fetch_add(1, Ordering::Relaxed);
+                if read == 0 {
+                    &self.first
+                } else {
+                    &self.second_header
+                }
+            } else {
+                &self.first
+            };
+            let off = byte_offset as usize;
+            dst.copy_from_slice(&source.as_slice()[off..off + dst.len()]);
+            Ok(())
+        }
+
+        fn write_blob(&self, _guid: BlobGuid, _src: &AlignedBlobBuf) -> Result<()> {
+            unreachable!("test store is read-only")
+        }
+
+        fn delete_blob(&self, _guid: BlobGuid) -> Result<()> {
+            unreachable!("test store is read-only")
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            Ok(vec![self.guid])
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn needs_flush(&self) -> bool {
+            false
+        }
+    }
+
     #[test]
-    fn production_cold_read_never_publishes_routed_not_found() {
+    fn cold_page_reader_coalesces_adjacent_misses() {
+        let guid = [0x41; 16];
+        let store = Arc::new(RangeCountStore::new(guid));
+        let store_dyn: Arc<dyn crate::store::blob_store::BlobStore> = store.clone();
+        let bm = BufferManager::new_file(store_dyn, 128);
+
+        let mut scratch = AlignedBlobBuf::zeroed();
+        let mut reader = ColdPageReader::new(&bm, guid, scratch.as_mut_slice());
+        reader
+            .load_range(PAGE_4K, PAGE_4K * 4, true)
+            .expect("first cold range read");
+
+        assert_eq!(
+            *store.ranges.lock().unwrap(),
+            vec![(u64::from(PAGE_4K), (PAGE_4K * 3) as usize)],
+            "adjacent cache misses should be one backing read"
+        );
+        assert_eq!(scratch.as_slice()[PAGE_4K as usize], 1);
+        assert_eq!(scratch.as_slice()[(PAGE_4K * 3) as usize], 3);
+
+        let mut scratch2 = AlignedBlobBuf::zeroed();
+        let mut reader2 = ColdPageReader::new(&bm, guid, scratch2.as_mut_slice());
+        reader2
+            .load_range(PAGE_4K, PAGE_4K * 4, true)
+            .expect("second cold range read");
+
+        assert_eq!(
+            store.ranges.lock().unwrap().len(),
+            1,
+            "page cache should satisfy the second reader"
+        );
+        assert_eq!(scratch2.as_slice()[PAGE_4K as usize], 1);
+        assert_eq!(scratch2.as_slice()[(PAGE_4K * 3) as usize], 3);
+    }
+
+    #[test]
+    fn production_cold_read_validates_routed_not_found() {
         let guid = [0x42; 16];
         let blob = routed_blob(guid);
         let src = blob.as_slice().to_vec();
@@ -1073,9 +1422,35 @@ mod tests {
         assert!(
             matches!(
                 cold_read_routed(&bm, guid, SearchKey::exact(b"absent"), 0),
+                ColdBlobLookup::NotFound
+            ),
+            "stable routed negatives should avoid the full 512 KB pin",
+        );
+    }
+
+    #[test]
+    fn production_cold_read_rejects_stale_routed_not_found() {
+        let guid = [0x43; 16];
+        let blob = routed_blob(guid);
+        let mut derouted = blob.clone();
+        {
+            let mut frame = BlobFrame::wrap(derouted.as_mut_slice());
+            frame.header_mut().routing_len = 0;
+        }
+        let store = Arc::new(HeaderFlipStore::new(guid, blob, derouted));
+        let bm = BufferManager::new(store.clone(), 4);
+
+        assert!(
+            matches!(
+                cold_read_routed(&bm, guid, SearchKey::exact(b"absent"), 0),
                 ColdBlobLookup::Unknown
             ),
-            "production cold reads must fall back to a full pin before reporting absence",
+            "a changed header stamp must force the authoritative full-pin path",
+        );
+        assert_eq!(
+            store.full_reads.load(Ordering::Relaxed),
+            0,
+            "private cold_read_routed reports uncertainty; the caller owns the full pin",
         );
     }
 }

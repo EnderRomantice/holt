@@ -1,4 +1,4 @@
-//! Stage 5c integration tests — `Tree` <-> WAL hookup.
+//! Integration tests for the `Tree` <-> WAL hookup.
 //!
 //! Cover:
 //! - Persistent put/delete/rename round-trip through reopen with
@@ -995,15 +995,13 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
 
         // Wait until the background thread shrinks the WAL back
         // to header-only — i.e. it completed a round where dirty
-        // was empty under the commit gate. Give it generous time;
-        // the test cares about *eventual* truncate, not latency.
+        // was empty under the commit gate. Do not write while
+        // waiting: repeated tick writes can keep slow machines in a
+        // permanently dirty state and make this test self-defeating.
+        // The background checkpointer wakes on its idle interval.
         let header_size_after_truncate = 32u64; // FILE_HEADER_SIZE
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            // Trigger another op so the dirty set isn't always
-            // co-occupied with an in-flight write (the truncate
-            // only fires when dirty is empty under the commit gate).
-            tree.put(b"_tick", b".").unwrap();
             let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
             if wal_len <= header_size_after_truncate + 128 {
                 // Tolerate one or two trailing ops; the test cares
@@ -1335,6 +1333,14 @@ fn cold_read_touches_one_child_blob_after_reopen() {
             "test must force at least one child blob"
         );
         tree.checkpoint().unwrap();
+        for _ in 0..8 {
+            tree.compact().unwrap();
+            tree.checkpoint().unwrap();
+        }
+        assert!(
+            tree.stats().unwrap().total_compactions > 0,
+            "test must route at least one cold child blob",
+        );
     }
 
     let tree = Tree::open(cfg).unwrap();
@@ -1353,16 +1359,17 @@ fn cold_read_touches_one_child_blob_after_reopen() {
         before.bm_point_full_blob_reads,
         after.bm_point_full_blob_reads,
     );
-    // A missing key under an existing prefix resolves against one child
-    // blob too.
+    // A missing key under an existing routed prefix is answered by the
+    // validated routed-negative path, not by pinning the full child blob.
+    let before_miss = tree.stats().unwrap();
     assert!(tree
         .get(b"cold/bucket/table/part-0999/missing")
         .unwrap()
         .is_none());
     let after_miss = tree.stats().unwrap();
-    assert!(
-        after_miss.bm_point_full_blob_reads <= after.bm_point_full_blob_reads + 1,
-        "missing-key get must touch one child blob, not all",
+    assert_eq!(
+        after_miss.bm_point_full_blob_reads, before_miss.bm_point_full_blob_reads,
+        "validated cold miss must not pin the full child blob",
     );
 }
 

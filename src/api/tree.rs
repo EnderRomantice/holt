@@ -409,7 +409,8 @@ impl Tree {
     /// `Storage::File` config.
     ///
     /// The supplied store is **transparently wrapped** with a
-    /// `BufferManager` of `cfg.buffer_pool_size` blobs.
+    /// `BufferManager` whose generic/custom-store cache is capped at
+    /// `cfg.buffer_pool_size` resident blob frames.
     /// `BufferManager` owns the in-memory blob cache; the walker
     /// pins blobs from it for both reads and writes — no separate
     /// root buffer in `Tree`.
@@ -450,7 +451,7 @@ impl Tree {
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
                     let store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir)?);
-                    Arc::new(BufferManager::new(store, cfg.buffer_pool_size))
+                    Arc::new(BufferManager::new_file(store, cfg.buffer_pool_size))
                 }
             }
         };
