@@ -2391,6 +2391,41 @@ fn range_delimiter_rolls_up_common_prefixes_with_dedup() {
 }
 
 #[test]
+fn range_delimiter_rolls_up_at_inner_branch_boundary() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..128u32 {
+        let key = format!("p/a/file-{i:04}").into_bytes();
+        tree.put(&key, b"v").unwrap();
+    }
+    tree.put(b"p/a-meta", b"v").unwrap();
+    for i in 0..32u32 {
+        let key = format!("p/b/file-{i:04}").into_bytes();
+        tree.put(&key, b"v").unwrap();
+    }
+
+    let mut out = Vec::new();
+    let stats = tree
+        .scan_keys(b"p/")
+        .delimiter(b'/')
+        .visit(16, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { key, .. } => out.push(key.to_vec()),
+                KeyRangeEntryRef::CommonPrefix(prefix) => out.push(prefix.to_vec()),
+                _ => panic!("KeyRangeEntryRef got a new variant"),
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        out,
+        vec![b"p/a-meta".to_vec(), b"p/a/".to_vec(), b"p/b/".to_vec()]
+    );
+    assert_eq!(stats.returned, 1);
+    assert_eq!(stats.rollup, 2);
+}
+
+#[test]
 fn range_delimiter_restart_does_not_skip_new_rollup() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"bucket-00/path/file.bin", b"v").unwrap();
@@ -2403,16 +2438,13 @@ fn range_delimiter_restart_does_not_skip_new_rollup() {
     };
     assert_eq!(first, b"bucket-00/".to_vec());
 
-    // Insert a rollup that sorts after the emitted prefix but
-    // before the iterator's old cursor. Restart-on-conflict must
-    // rebuild from the prefix successor of bucket-00/ and still
-    // surface bucket-01/.
-    let restarts_before = tree.stats().unwrap().bm_range_restarts;
+    // Insert a rollup that sorts after the emitted prefix. Whether the
+    // cursor observes it through conflict restart or through the
+    // delimiter rollup reseek path, it must still surface bucket-01/.
     tree.put(b"bucket-01/path/file.bin", b"v").unwrap();
 
     let rest = collect_keys(iter);
     assert_eq!(rest, vec![b"bucket-01/".to_vec(), b"bucket-02/".to_vec()]);
-    assert!(tree.stats().unwrap().bm_range_restarts > restarts_before);
 }
 
 #[test]

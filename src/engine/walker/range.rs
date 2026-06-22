@@ -1287,6 +1287,10 @@ impl RangeIter {
             .is_none_or(|bound| bound.allows(&self.emit_buf))
     }
 
+    fn prepare_branch_rollup(&mut self, byte: u8) -> bool {
+        self.prepare_segment_rollup(std::slice::from_ref(&byte))
+    }
+
     fn segment_rollup_len(&self, segment: &[u8]) -> Option<usize> {
         let delimiter = self.delimiter?;
         let total_len = self.curr_key.len().checked_add(segment.len())?;
@@ -1483,6 +1487,9 @@ impl RangeIter {
                     match result {
                         None => self.pop_frame(),
                         Some((byte, child_off, child_ntype, next_cursor, version)) => {
+                            if self.segment_has_rollup_candidate(std::slice::from_ref(&byte)) {
+                                return Ok(InitResult::Ready);
+                            }
                             self.stack[idx].next = next_cursor;
                             self.curr_key.push(byte);
                             self.stack.push(Frame {
@@ -1513,6 +1520,40 @@ impl RangeIter {
                 return Ok(RangeAdvance::Done);
             };
             let top_ntype = top.ntype;
+            if !matches!(top_ntype, NodeType::EmptyRoot | NodeType::Invalid)
+                && self.prepare_segment_rollup(&[])
+            {
+                let idx = self.stack.len() - 1;
+                let no_tombstones = {
+                    let top = &self.stack[idx];
+                    let guard = top.pin.read();
+                    let version = top.pin.content_version();
+                    if !self.frame_version_still_valid(top, version) {
+                        return Ok(RangeAdvance::Restart);
+                    }
+                    BlobFrameRef::wrap(guard.as_slice())
+                        .header()
+                        .tombstone_leaf_cnt
+                        == 0
+                };
+                if no_tombstones {
+                    if !self.path_is_still_valid() {
+                        return Ok(RangeAdvance::Restart);
+                    }
+                    let common_len = self.emit_buf.len();
+                    while self.curr_key.len() >= common_len && self.stack.len() > self.cursor_floor
+                    {
+                        self.pop_frame();
+                    }
+                    if !self.set_lower_bound_to_emit_successor() {
+                        self.terminated = true;
+                    }
+                    if !self.terminated {
+                        self.reseek_after_emit();
+                    }
+                    return Ok(self.common_prefix_advance_from_emit());
+                }
+            }
             match top_ntype {
                 NodeType::Leaf => {
                     let idx = self.stack.len() - 1;
@@ -1596,13 +1637,16 @@ impl RangeIter {
                                 // whole subtree — `O(leaves_under_rollup)`
                                 // dedup-scans collapse to `O(stack_pops)`.
                                 let common_len = common.len();
-                                while self.curr_key.len() > common_len
+                                while self.curr_key.len() >= common_len
                                     && self.stack.len() > self.cursor_floor
                                 {
                                     self.pop_frame();
                                 }
                                 if !self.set_lower_bound_successor(&common) {
                                     self.terminated = true;
+                                }
+                                if !self.terminated {
+                                    self.reseek_after_emit();
                                 }
                                 self.stats.rollup += 1;
                                 let entry = match self.projection {
@@ -1631,13 +1675,16 @@ impl RangeIter {
                                     return Ok(RangeAdvance::Restart);
                                 }
                                 let common_len = self.emit_buf.len();
-                                while self.curr_key.len() > common_len
+                                while self.curr_key.len() >= common_len
                                     && self.stack.len() > self.cursor_floor
                                 {
                                     self.pop_frame();
                                 }
                                 if !self.set_lower_bound_to_emit_successor() {
                                     self.terminated = true;
+                                }
+                                if !self.terminated {
+                                    self.reseek_after_emit();
                                 }
                                 self.stats.rollup += 1;
                                 return Ok(RangeAdvance::KeyRef(KeyRefKind::CommonPrefix));
@@ -1683,8 +1730,12 @@ impl RangeIter {
                             if !self.path_is_still_valid() {
                                 return Ok(RangeAdvance::Restart);
                             }
+                            let needs_reseek = self.curr_key.len() < self.emit_buf.len();
                             if !self.set_lower_bound_to_emit_successor() {
                                 self.terminated = true;
+                            }
+                            if needs_reseek && !self.terminated {
+                                self.reseek_after_emit();
                             }
                             let entry = self.common_prefix_advance_from_emit();
                             return Ok(entry);
@@ -1742,8 +1793,12 @@ impl RangeIter {
                             if !self.path_is_still_valid() {
                                 return Ok(RangeAdvance::Restart);
                             }
+                            let needs_reseek = self.curr_key.len() < self.emit_buf.len();
                             if !self.set_lower_bound_to_emit_successor() {
                                 self.terminated = true;
+                            }
+                            if needs_reseek && !self.terminated {
+                                self.reseek_after_emit();
                             }
                             let entry = self.common_prefix_advance_from_emit();
                             return Ok(entry);
@@ -1765,6 +1820,7 @@ impl RangeIter {
                             return Ok(RangeAdvance::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
+                        let no_tombstones = frame.header().tombstone_leaf_cnt == 0;
                         let result = next_inner_child_from(frame, top.off, top_ntype, top.next)?;
                         match result {
                             Some((byte, child_off, next_cursor)) => {
@@ -1809,6 +1865,7 @@ impl RangeIter {
                                     child_ntype,
                                     next_cursor,
                                     version,
+                                    no_tombstones,
                                     prefetch_guids,
                                 ))
                             }
@@ -1823,8 +1880,24 @@ impl RangeIter {
                             child_ntype,
                             next_cursor,
                             version,
+                            no_tombstones,
                             prefetch_guids,
                         )) => {
+                            if no_tombstones
+                                && !matches!(child_ntype, NodeType::Blob | NodeType::EmptyRoot)
+                                && self.prepare_branch_rollup(byte)
+                            {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                if !self.set_lower_bound_to_emit_successor() {
+                                    self.terminated = true;
+                                }
+                                if !self.terminated {
+                                    self.reseek_after_emit();
+                                }
+                                return Ok(self.common_prefix_advance_from_emit());
+                            }
                             // Pin the read-ahead window concurrently (QD =
                             // window size); each held pin is consumed at the
                             // pin point. Best-effort — a failed prefetch just
@@ -1949,6 +2022,14 @@ impl RangeIter {
         self.initialized = false;
         // Drop any read-ahead pins from the abandoned path so the new
         // path refills its own window (and we don't hold stale pins).
+        self.prefetch.clear();
+    }
+
+    fn reseek_after_emit(&mut self) {
+        self.stack.clear();
+        self.curr_key.clear();
+        self.cursor_floor = 0;
+        self.initialized = false;
         self.prefetch.clear();
     }
 
