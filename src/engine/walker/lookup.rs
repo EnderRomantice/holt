@@ -531,9 +531,9 @@ enum RoutedLookup {
 
 /// Routed cold read with the cold-page cache: cache reusable
 /// header/routing pages at 4 KiB granularity, but keep one-shot leaf
-/// pages out of the cache. A local negative is published only after the
-/// header stamp is re-read and found unchanged while the blob is still
-/// cold-eligible.
+/// pages out of the cache. A local negative is only a hint; before it
+/// becomes user-visible, the blob is checked with the authoritative
+/// full-frame walker without admitting the frame into the BM.
 fn routed_read_cached(
     bm: &BufferManager,
     guid: BlobGuid,
@@ -564,19 +564,7 @@ fn routed_read_cached(
             child_guid,
             child_depth,
         }),
-        RoutedLookup::NegativeHint => {
-            if pages.read_from_store {
-                if validate_cold_negative(bm, guid, stamp, buf)? {
-                    Ok(ColdBlobLookup::NotFound)
-                } else {
-                    Ok(ColdBlobLookup::Unknown)
-                }
-            } else if bm.cold_read_eligible(guid) {
-                Ok(ColdBlobLookup::NotFound)
-            } else {
-                Ok(ColdBlobLookup::Unknown)
-            }
-        }
+        RoutedLookup::NegativeHint => verify_cold_negative(bm, guid, key, depth, buf, stamp),
     }
 }
 
@@ -587,7 +575,6 @@ struct ColdPageReader<'a> {
     guid: BlobGuid,
     scratch: &'a mut [u8],
     loaded: [bool; COLD_PAGES_PER_BLOB],
-    read_from_store: bool,
 }
 
 impl<'a> ColdPageReader<'a> {
@@ -597,7 +584,6 @@ impl<'a> ColdPageReader<'a> {
             guid,
             scratch,
             loaded: [false; COLD_PAGES_PER_BLOB],
-            read_from_store: false,
         }
     }
 
@@ -662,7 +648,6 @@ impl<'a> ColdPageReader<'a> {
         let end = usize::from(end_page) * PAGE_4K as usize;
         self.bm
             .read_blob_range(self.guid, start as u64, &mut self.scratch[start..end])?;
-        self.read_from_store = true;
 
         for page in start_page..end_page {
             self.loaded[usize::from(page)] = true;
@@ -680,21 +665,38 @@ impl<'a> ColdPageReader<'a> {
     }
 }
 
-fn validate_cold_negative(
+fn verify_cold_negative(
     bm: &BufferManager,
     guid: BlobGuid,
-    expected: ColdBlobStamp,
+    key: SearchKey<'_>,
+    depth: usize,
     scratch: &mut [u8],
-) -> Result<bool> {
+    expected: ColdBlobStamp,
+) -> Result<ColdBlobLookup> {
     if !bm.cold_read_eligible(guid) {
-        return Ok(false);
+        return Ok(ColdBlobLookup::Unknown);
     }
-    bm.read_blob_range(guid, 0, &mut scratch[..HEADER_SIZE as usize])?;
+    bm.read_blob_range(guid, 0, scratch)?;
     if !bm.cold_read_eligible(guid) {
-        return Ok(false);
+        return Ok(ColdBlobLookup::Unknown);
     }
+
     let frame = BlobFrameRef::wrap(&scratch[..]);
-    Ok(ColdBlobStamp::new(frame.header()) == expected)
+    let h = frame.header();
+    if ColdBlobStamp::new(h) != expected {
+        return Ok(ColdBlobLookup::Unknown);
+    }
+    match lookup_at(frame, h.root_slot, key, depth)? {
+        LookupResult::NotFound => Ok(ColdBlobLookup::NotFound),
+        LookupResult::Found(hit) => Ok(ColdBlobLookup::Found {
+            value: hit.value.to_vec(),
+            seq: hit.seq,
+        }),
+        LookupResult::Crossing(crossing) => Ok(ColdBlobLookup::Crossing {
+            child_guid: crossing.child_guid,
+            child_depth: crossing.child_depth,
+        }),
+    }
 }
 
 fn descend_routed_paged(
@@ -1231,6 +1233,14 @@ mod tests {
         full_reads: AtomicUsize,
     }
 
+    struct LeafDropStore {
+        guid: BlobGuid,
+        blob: AlignedBlobBuf,
+        leaf_region_start: u64,
+        full_blob_reads: AtomicUsize,
+        full_range_reads: AtomicUsize,
+    }
+
     impl HeaderFlipStore {
         fn new(guid: BlobGuid, first: AlignedBlobBuf, second_header: AlignedBlobBuf) -> Self {
             Self {
@@ -1239,6 +1249,23 @@ mod tests {
                 second_header,
                 header_reads: AtomicUsize::new(0),
                 full_reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl LeafDropStore {
+        fn new(guid: BlobGuid, blob: AlignedBlobBuf) -> Self {
+            let leaf_region_start = BlobFrameRef::wrap(blob.as_slice())
+                .header()
+                .routing_region()
+                .expect("routed blob")
+                .leaf_region_start as u64;
+            Self {
+                guid,
+                blob,
+                leaf_region_start,
+                full_blob_reads: AtomicUsize::new(0),
+                full_range_reads: AtomicUsize::new(0),
             }
         }
     }
@@ -1321,6 +1348,61 @@ mod tests {
             };
             let off = byte_offset as usize;
             dst.copy_from_slice(&source.as_slice()[off..off + dst.len()]);
+            Ok(())
+        }
+
+        fn write_blob(&self, _guid: BlobGuid, _src: &AlignedBlobBuf) -> Result<()> {
+            unreachable!("test store is read-only")
+        }
+
+        fn delete_blob(&self, _guid: BlobGuid) -> Result<()> {
+            unreachable!("test store is read-only")
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            Ok(vec![self.guid])
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn needs_flush(&self) -> bool {
+            false
+        }
+    }
+
+    impl BlobStore for LeafDropStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            assert_eq!(guid, self.guid);
+            self.full_blob_reads.fetch_add(1, Ordering::Relaxed);
+            dst.as_mut_slice().copy_from_slice(self.blob.as_slice());
+            Ok(())
+        }
+
+        fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+            assert_eq!(guid, self.guid);
+            if byte_offset == 0 && dst.len() == crate::layout::PAGE_SIZE as usize {
+                self.full_range_reads.fetch_add(1, Ordering::Relaxed);
+                dst.copy_from_slice(self.blob.as_slice());
+                return Ok(());
+            }
+            if byte_offset >= self.leaf_region_start {
+                let off = byte_offset as usize;
+                dst.copy_from_slice(&self.blob.as_slice()[off..off + dst.len()]);
+                let leaf_tag = NodeType::Leaf.as_u8();
+                for i in 0..dst.len().saturating_sub(size_of::<Leaf>()) {
+                    if dst[i + 1] == leaf_tag {
+                        dst[i] = dst[i].wrapping_add(1);
+                        if dst[i] == 0 {
+                            dst[i] = 1;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let off = byte_offset as usize;
+            dst.copy_from_slice(&self.blob.as_slice()[off..off + dst.len()]);
             Ok(())
         }
 
@@ -1455,6 +1537,38 @@ mod tests {
             store.full_reads.load(Ordering::Relaxed),
             0,
             "private cold_read_routed reports uncertainty; the caller owns the full pin",
+        );
+    }
+
+    #[test]
+    fn production_cold_read_verifies_negative_without_admitting_full_blob() {
+        let guid = [0x44; 16];
+        let blob = routed_blob(guid);
+        let store = Arc::new(LeafDropStore::new(guid, blob));
+        let store_dyn: Arc<dyn crate::store::blob_store::BlobStore> = store.clone();
+        let bm = BufferManager::new_file(store_dyn, 128, || {
+            // SAFETY: cold verification fills the full frame before
+            // running the authoritative walker over it.
+            unsafe { AlignedBlobBuf::uninit() }
+        });
+
+        match cold_read_routed(&bm, guid, SearchKey::exact(&[b'q', 1]), 0) {
+            ColdBlobLookup::Found { value, seq } => {
+                assert_eq!(value, vec![1, 1 ^ 0xFF]);
+                assert_eq!(seq, 2);
+            }
+            other => panic!("authoritative full-frame verification should rescue hit: {other:?}"),
+        }
+
+        assert_eq!(
+            store.full_blob_reads.load(Ordering::Relaxed),
+            0,
+            "negative verification must not go through bm.pin/read_blob"
+        );
+        assert_eq!(
+            store.full_range_reads.load(Ordering::Relaxed),
+            1,
+            "one full ranged read verifies the local negative hint"
         );
     }
 }

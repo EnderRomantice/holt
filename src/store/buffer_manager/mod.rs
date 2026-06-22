@@ -1833,6 +1833,9 @@ impl BufferManager {
         if !writes.is_empty() {
             self.store.write_blobs_with_data_sync(&writes)?;
         }
+        for idx in &write_indices {
+            self.cold_pages_invalidate(entries[*idx].guid);
+        }
         for idx in write_indices {
             let entry = &entries[idx];
             self.retire_write_through(entry.guid, entry.expected_seq);
@@ -2053,6 +2056,7 @@ impl BlobStore for BufferManager {
 mod tests {
     use super::*;
     use crate::store::blob_store::MemoryBlobStore;
+    use crate::store::PAGE_4K;
 
     fn make_buf(byte_at_100: u8) -> AlignedBlobBuf {
         let mut b = AlignedBlobBuf::zeroed();
@@ -3488,6 +3492,42 @@ mod tests {
         assert_eq!(dst.as_slice()[100], 11);
         inner.read_blob(g2, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 22);
+    }
+
+    #[test]
+    fn write_through_batch_invalidates_cold_pages_before_retire() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0xBC; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new_file(inner.clone(), 128, AlignedBlobBuf::zeroed);
+
+        let old_page = [0xA5; PAGE_4K as usize];
+        let mut dst = [0u8; PAGE_4K as usize];
+        bm.cold_page_store(guid, 0, &old_page);
+        assert!(bm.cold_page_cached(guid, 0, &mut dst));
+        assert_eq!(dst, old_page);
+
+        let pin = bm.pin(guid).unwrap();
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[100] = 0x77;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let bytes = bm.snapshot_bytes(guid).unwrap();
+
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid,
+            bytes,
+            expected_seq: snap[&guid],
+            content_version: None,
+        }])
+        .unwrap();
+
+        assert!(
+            !bm.cold_page_cached(guid, 0, &mut dst),
+            "checkpointed bytes must retire stale cold navigation pages"
+        );
     }
 
     #[test]
