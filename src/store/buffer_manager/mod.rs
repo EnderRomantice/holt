@@ -1487,7 +1487,7 @@ impl BufferManager {
     /// Tag `guid` for **deferred** store deletion at WAL seq
     /// `seq`. Removes the blob from cache + dirty (the cache
     /// image is dead; a lingering dirty entry would chase a
-    /// soon-deleted slot) and queues the `store.delete_blob`
+    /// soon-deleted slot) and queues the delete fence
     /// call for the next checkpoint round.
     ///
     /// Used by the erase walker's `SubtreeGone` branch. The naive
@@ -1500,10 +1500,10 @@ impl BufferManager {
     /// manifest no longer recognises (corruption). Deferring via
     /// this queue closes the window.
     ///
-    /// The checkpoint round drains this set after Sync (data file
-    /// plus initial manifest snapshot durable) and re-Syncs once
-    /// the deletions have been applied — only then can the WAL
-    /// be truncated.
+    /// The checkpoint round drains this set after Sync. User WAL
+    /// deletes remove the blob from the store manifest and then
+    /// re-Sync; `STRUCTURAL_SEQ` deletes only retire the fence and
+    /// leave the old blob as an orphan for a future reachability GC.
     pub fn mark_for_delete(&self, guid: BlobGuid, seq: u64) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if let Some(seq_ref) = state.deleting.get_mut(&guid) {
@@ -1670,12 +1670,13 @@ impl BufferManager {
         self.merge_candidate_total.load(Ordering::Relaxed)
     }
 
-    /// Execute a queued deletion against the inner store.
-    /// Manifest mutation is in-memory; subsequent `store.flush`
-    /// makes it durable. Returns `Ok(false)` when the blob still
-    /// has dirty/flushing state and the caller should requeue the
-    /// delete for a later round.
-    pub(crate) fn execute_pending_delete(&self, guid: BlobGuid) -> Result<bool> {
+    /// Execute a queued delete fence. User WAL deletes mutate the
+    /// inner store manifest; `STRUCTURAL_SEQ` deletes only retire
+    /// the fence because structural merge/compact has no logical
+    /// WAL record proving that no durable parent still references
+    /// the child. Returns `Ok(false)` when the blob still has
+    /// dirty/flushing state and the caller should requeue it.
+    pub(crate) fn execute_pending_delete(&self, guid: BlobGuid, seq: u64) -> Result<bool> {
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected(&guid) {
@@ -1693,7 +1694,9 @@ impl BufferManager {
         } else if self.cache.contains_key(&guid) {
             return Ok(false);
         }
-        self.store.delete_blob(guid)?;
+        if seq != STRUCTURAL_SEQ {
+            self.store.delete_blob(guid)?;
+        }
         self.route_resident.remove(guid);
         self.finish_pending_delete(guid);
         Ok(true)
@@ -1715,6 +1718,26 @@ impl BufferManager {
     /// memory.
     pub(crate) fn store_has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.store.has_blob(guid)
+    }
+
+    /// `true` iff `guid` is visible in the store and the store does
+    /// not owe a data/manifest flush.
+    ///
+    /// Checkpoint dependency ordering uses this before writing a
+    /// parent blob that references an already-stored child. A
+    /// `FileBlobStore` manifest update becomes visible to
+    /// `has_blob` before it is necessarily durable in
+    /// `manifest.log`; treating that as ready can persist a parent
+    /// `BlobNode` that points to a child missing after crash
+    /// recovery. This method is intentionally conservative: any
+    /// pending store flush makes external children ineligible for a
+    /// parent write until the I/O worker has crossed the durability
+    /// boundary.
+    pub(crate) fn store_has_durable_blob(&self, guid: BlobGuid) -> Result<bool> {
+        if !self.store.has_blob(guid)? {
+            return Ok(false);
+        }
+        Ok(!self.store.needs_flush())
     }
 
     /// `true` iff `guid` still has dirty or in-flight checkpoint
@@ -2641,9 +2664,28 @@ mod tests {
         assert!(bm.write_blob(guid, &make_buf(9)).is_err());
         assert!(bm.delete_blob(guid).is_err());
 
-        assert!(bm.execute_pending_delete(guid).unwrap());
+        assert!(bm.execute_pending_delete(guid, 10).unwrap());
         assert_eq!(bm.pending_delete_count(), 0);
         assert!(!inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn structural_pending_delete_retires_fence_without_manifest_delete() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5B; 16];
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+
+        bm.mark_for_delete(guid, STRUCTURAL_SEQ);
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&STRUCTURAL_SEQ));
+        assert!(bm.execute_pending_delete(guid, STRUCTURAL_SEQ).unwrap());
+
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert!(
+            inner.has_blob(guid).unwrap(),
+            "structural orphan cleanup must not mutate the store manifest"
+        );
     }
 
     #[test]
@@ -2657,7 +2699,7 @@ mod tests {
         bm.mark_for_delete(guid, 10);
         let pending = bm.snapshot_pending_deletes();
         assert!(
-            !bm.execute_pending_delete(guid).unwrap(),
+            !bm.execute_pending_delete(guid, 10).unwrap(),
             "delete must wait while an old walker still holds a cached blob pin",
         );
         bm.restore_pending_deletes(pending);
@@ -2676,7 +2718,7 @@ mod tests {
 
         let pending = bm.snapshot_pending_deletes();
         assert_eq!(pending.get(&guid), Some(&10));
-        assert!(bm.execute_pending_delete(guid).unwrap());
+        assert!(bm.execute_pending_delete(guid, 10).unwrap());
         assert_eq!(bm.pending_delete_count(), 0);
         assert!(!inner.has_blob(guid).unwrap());
     }
@@ -3189,7 +3231,7 @@ mod tests {
         let pending = bm.snapshot_pending_deletes();
         assert_eq!(pending.get(&guid), Some(&20));
         assert!(
-            !bm.execute_pending_delete(guid).unwrap(),
+            !bm.execute_pending_delete(guid, 20).unwrap(),
             "delete must wait for the in-flight checkpoint image to retire",
         );
         assert!(inner.has_blob(guid).unwrap());
@@ -3206,7 +3248,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.statuses, vec![WriteThroughStatus::Written]);
         let pending = bm.snapshot_pending_deletes();
-        assert!(bm.execute_pending_delete(guid).unwrap());
+        assert!(bm.execute_pending_delete(guid, 20).unwrap());
         assert!(!inner.has_blob(guid).unwrap());
         assert_eq!(bm.pending_delete_count(), 0);
         assert_eq!(pending.get(&guid), Some(&20));

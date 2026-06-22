@@ -199,6 +199,18 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     let round_start = Instant::now();
 
     // 0. Optional candidate-driven merge pass.
+    //
+    // Merge is the only background checkpoint action that can both
+    // rewrite a parent BlobNode edge and queue the old child for
+    // manifest deletion. Do not run it while older checkpoint epochs
+    // are still in flight: an older parent snapshot may already have
+    // passed content-version validation in the I/O worker, and letting a
+    // later merge delete its child before that epoch is fully retired can
+    // leave a durable parent -> missing-child edge after crash. Plain
+    // dirty epochs may pipeline; structural delete epochs form a barrier.
+    if shared.cfg.auto_merge && shared.bm.merge_candidate_count() != 0 {
+        pipeline.drain(shared)?;
+    }
     let merged = if shared.cfg.auto_merge {
         match run_merge_pass(shared) {
             Ok(n) => n,

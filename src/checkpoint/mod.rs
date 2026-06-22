@@ -117,13 +117,13 @@ pub struct CheckpointConfig {
     /// early checkpoint for a handful of hot blobs.
     pub dirty_blob_threshold: usize,
     /// Drain queued parent-merge candidates at the start of each
-    /// round. The queue is populated by foreground spillovers and
-    /// manual maintenance seeding, so idle rounds avoid walking
-    /// every reachable blob just to rediscover that nothing can
-    /// merge.
+    /// round. Parent merge rewrites structural BlobNode edges and
+    /// queues old child blobs for deferred manifest deletion, so it
+    /// remains opt-in until reachability-safe delete GC is available
+    /// for fully asynchronous checkpoint pipelines.
     ///
-    /// Default `true` — keeping the blob tree in equilibrium
-    /// against split/merge pressure is the whole point.
+    /// Default `false`; foreground split/shape control remains
+    /// enabled, and callers can still run explicit maintenance.
     pub auto_merge: bool,
     /// How often the eviction thread scans the cache.
     /// Default 1 s.
@@ -150,7 +150,7 @@ impl Default for CheckpointConfig {
             enabled: true,
             idle_interval: Duration::from_millis(500),
             dirty_blob_threshold: 512,
-            auto_merge: true,
+            auto_merge: false,
             eviction_interval: Duration::from_secs(1),
             eviction_idle_ticks: 1024,
             io_queue_capacity: 16,

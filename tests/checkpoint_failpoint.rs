@@ -4,15 +4,17 @@
 //! Wraps a real store (`MemoryBlobStore` or `FileBlobStore`)
 //! in a [`FailpointBlobStore`] that can be told to fail the N-th
 //! `delete_blob` / `flush` / `write_blob` call. The tests verify
-//! that:
+//! that structural pending deletes:
 //!
-//! - A failed `store.delete_blob` keeps the entry in
-//!   `pending_deletes` so a subsequent round retries.
-//! - A failed `store.flush` after partial deletes restores the
-//!   already-applied entries so the next round re-Syncs (and
-//!   `delete_blob` retry is idempotent).
-//! - A failed `write_blob` keeps the entry in `dirty` so a
-//!   subsequent round retries the byte flush.
+//! - retire their in-memory fence without calling
+//!   `store.delete_blob`;
+//! - do not issue a post-delete Sync when no manifest delete
+//!   happened;
+//! - stay queued when dirty write or pre-delete Sync fails.
+//!
+//! The write tests also verify that a failed `write_blob` keeps
+//! the entry in `dirty` so a subsequent round retries the byte
+//! flush.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -146,12 +148,12 @@ fn clean_checkpoint_skips_flush_inner() {
     );
 }
 
-/// Build a tree on a failpoint-wrapped memory store and stage
-/// at least one deferred delete in the BM's `pending_deletes`
-/// set via the **merge pass**: insert enough to force spillover,
-/// delete most of one child's keys so it becomes mergeable,
-/// then run `Tree::compact` so phase 2's `merge_blob` queues a
-/// `mark_for_delete` on the now-empty / now-small child.
+/// Build a tree on a failpoint-wrapped memory store and stage at
+/// least one structural deferred delete in the BM's `pending_deletes`
+/// set. This models the background merge path that caused the
+/// nightly crash-soak manifest corruption: the old child blob must
+/// remain in the store manifest because no logical WAL record proves
+/// that every durable parent has stopped referencing it.
 fn setup_with_pending_delete() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, Tree) {
     let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
@@ -160,34 +162,27 @@ fn setup_with_pending_delete() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, 
     cfg.memory_flush_on_write = false;
     let tree = Tree::open_with_blob_store(cfg, fp_dyn).unwrap();
 
-    // Stuff enough data to force at least one spillover, then
-    // delete the bulk of it so the remaining shape is mergeable.
+    // Stuff enough data to force at least one spillover.
     let payload = vec![b'z'; 1024];
     for i in 0..1000u32 {
         let k = format!("k{i:05}");
         tree.put(k.as_bytes(), &payload).unwrap();
     }
-    // Tombstone the lower 95% so the merge pass sees a small
-    // child blob it can fold back into its parent.
+
+    // Make enough children empty, then compact so the maintenance
+    // merge path stages STRUCTURAL_SEQ pending deletes.
     for i in 0..950u32 {
         let k = format!("k{i:05}");
         let _ = tree.delete(k.as_bytes()).unwrap();
     }
-    // `compact` rebuilds each blob (dropping tombstones) and
-    // then runs the merge pass. The merge pass queues
-    // `mark_for_delete` for every folded child — that's our
-    // guaranteed source of pending deletes.
     tree.compact().unwrap();
     (inner, fp, tree)
 }
 
 #[test]
-fn pending_delete_execute_failure_is_retried_next_round() {
+fn structural_pending_delete_skips_manifest_delete_and_post_sync() {
     let (inner, fp, tree) = setup_with_pending_delete();
 
-    // Confirm the workload actually queued at least one
-    // deferred delete — otherwise the test isn't exercising
-    // the path we mean to.
     let stats_before = tree.stats().unwrap();
     assert!(
         stats_before.bm_pending_delete_count > 0,
@@ -195,87 +190,32 @@ fn pending_delete_execute_failure_is_retried_next_round() {
         stats_before.bm_pending_delete_count,
     );
 
-    // Arm: fail the NEXT `delete_blob` call — that's the first
-    // one in `tree.checkpoint`'s deferred-delete phase. The
-    // failpoint is one-shot, so only one entry hits an error;
-    // any further entries in the same round succeed.
+    let flushes_before = fp.flush_count();
+    // If structural cleanup incorrectly runs a post-delete Sync,
+    // this second flush will trip.
+    fp.arm_flush(flushes_before + 2);
+    // If structural cleanup incorrectly mutates the manifest,
+    // this delete failpoint will trip.
     fp.arm_delete(fp.delete_count() + 1);
 
-    // First checkpoint: the failpoint trips. `tree.checkpoint`
-    // restores the failed entries to `pending_deletes` and
-    // surfaces the error.
-    let result1 = tree.checkpoint();
-    assert!(
-        result1.is_err(),
-        "checkpoint must surface the first delete_blob failure",
-    );
-    // The retry-protected entry survives.
-    assert!(
-        tree.stats().unwrap().bm_pending_delete_count > 0,
-        "failed delete entry must stay queued for retry",
-    );
-
-    // Second checkpoint: failpoint disarmed. Drains the
-    // pending-delete set fully.
-    tree.checkpoint().unwrap();
-    assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
-
-    // Final state: store manifest count equals tree blob count
-    // (no orphan slots, no missing slots).
-    let store_blobs = inner.list_blobs().unwrap();
-    let stats = tree.stats().unwrap();
-    assert_eq!(
-        store_blobs.len() as u32,
-        stats.blob_count,
-        "after retry, store manifest count = tree blob count",
-    );
-}
-
-#[test]
-fn pending_delete_sync_failure_keeps_state_for_retry() {
-    // Inject failure into the **second** `store.flush` — the
-    // one that persists the manifest after the deferred-delete
-    // phase. The pre-delete data Sync (step 3 of
-    // `Tree::checkpoint`) should succeed; only the post-delete
-    // Sync trips.
-    let (inner, fp, tree) = setup_with_pending_delete();
-    assert!(
-        tree.stats().unwrap().bm_pending_delete_count > 0,
-        "setup precondition: pending delete queued",
-    );
-
-    // `Tree::checkpoint`'s flush calls in order:
-    //   1. journal flush — but no WAL here, so doesn't hit
-    //      store (no FailpointBlobStore::flush call).
-    //   2. `store.flush` (data Sync, step 3) — call #1.
-    //   3. `store.flush` (manifest Sync, step 5) — call #2.
-    // Arm to fail flush call #2.
-    fp.arm_flush(2);
-    let result1 = tree.checkpoint();
-    assert!(
-        result1.is_err(),
-        "checkpoint must surface the post-delete Sync failure",
-    );
-
-    // The applied-but-unsynced entries must be restored to
-    // pending so the next checkpoint re-Syncs.
-    assert!(
-        tree.stats().unwrap().bm_pending_delete_count > 0,
-        "post-delete Sync failure must restore applied entries to pending",
-    );
-
-    // Second checkpoint: failpoint disarmed. Re-execute
-    // `delete_blob` is idempotent; the trailing Sync now
-    // succeeds.
     tree.checkpoint().unwrap();
     assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
 
     let store_blobs = inner.list_blobs().unwrap();
     let stats = tree.stats().unwrap();
+    assert!(
+        store_blobs.len() as u32 >= stats.blob_count,
+        "structural cleanup may leave orphan blobs, but must not \
+         delete a durable blob that a parent can still reference",
+    );
     assert_eq!(
-        store_blobs.len() as u32,
-        stats.blob_count,
-        "after retry, store manifest count = tree blob count",
+        fp.delete_count(),
+        0,
+        "structural pending delete must not call store.delete_blob",
+    );
+    assert!(
+        fp.flush_count() < flushes_before + 2,
+        "structural pending delete must not trigger a post-delete Sync",
     );
 }
 

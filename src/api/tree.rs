@@ -1839,7 +1839,7 @@ impl Tree {
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         for (guid, seq) in pending {
-            match self.store.execute_pending_delete(guid) {
+            match self.store.execute_pending_delete(guid, seq) {
                 Ok(true) => {}
                 Ok(false) => {
                     failed.insert(guid, seq);
@@ -1896,18 +1896,21 @@ impl Tree {
     ///    deleted slot. Restore pending and return the dirty
     ///    error. The next round will retry the parent write and
     ///    only then process its child's deletion.
-    /// 6. **Apply pending deletes** (manifest mutation
-    ///    in-memory). Each `execute_pending_delete` is idempotent
-    ///    against a missing entry; failures are restored.
-    /// 7. **Post-delete sync** — re-`store.flush` iff any delete
-    ///    actually applied. Failure → restore the
+    /// 6. **Apply pending deletes**. User WAL deletes mutate the
+    ///    manifest in memory; structural deletes only retire their
+    ///    fence and leave orphan cleanup to a future reachability
+    ///    GC. Each `execute_pending_delete` is idempotent against a
+    ///    missing entry; failures are restored.
+    /// 7. **Post-delete sync** — re-`store.flush` iff any manifest
+    ///    delete actually applied. Failure → restore the
     ///    already-applied entries so the truncate gate stays
-    ///    closed and the next round retries the sync (the manifest
-    ///    delete is idempotent on the second pass).
+    ///    closed and the next round retries the sync.
     /// 8. **Conditional WAL truncate** — only if
-    ///    `dirty_count == 0` AND `pending_delete_count == 0`
-    ///    *now*. A racing writer or a restored failure must keep
-    ///    the WAL alive until a future flush.
+    ///    `dirty_count == 0`, `flushing_count == 0`,
+    ///    `pending_delete_count == 0`, and the store reports no
+    ///    deferred flush work *now*. A racing writer, restored
+    ///    failure, or deferred data/manifest sync must keep the WAL
+    ///    alive until a future flush.
     ///
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
@@ -2114,7 +2117,7 @@ impl Tree {
         let mut failed = CheckpointMap::new();
         let mut first_err = None;
         for (guid, seq) in snap_pending {
-            match store.execute_pending_delete(*guid) {
+            match store.execute_pending_delete(*guid, *seq) {
                 Ok(true) => {}
                 Ok(false) => {
                     failed.insert(*guid, *seq);
@@ -2133,12 +2136,17 @@ impl Tree {
         snap_pending: &CheckpointMap,
         pending_failed: &CheckpointMap,
     ) -> Result<()> {
-        let applied_deletes = snap_pending.len() - pending_failed.len();
-        if applied_deletes > 0 {
+        use crate::store::STRUCTURAL_SEQ;
+
+        let applied_manifest_deletes = snap_pending
+            .iter()
+            .filter(|(guid, seq)| **seq != STRUCTURAL_SEQ && !pending_failed.contains_key(*guid))
+            .count();
+        if applied_manifest_deletes > 0 {
             if let Err(e) = store.flush() {
                 let restore_applied: CheckpointMap = snap_pending
                     .iter()
-                    .filter(|(g, _)| !pending_failed.contains_key(*g))
+                    .filter(|(g, seq)| **seq != STRUCTURAL_SEQ && !pending_failed.contains_key(*g))
                     .map(|(g, s)| (*g, *s))
                     .collect();
                 store.restore_pending_deletes(restore_applied);
@@ -2159,6 +2167,7 @@ impl Tree {
                 if store.dirty_count() == 0
                     && store.flushing_count() == 0
                     && store.pending_delete_count() == 0
+                    && !store.needs_flush()
                 {
                     journal.truncate()?;
                 }
@@ -2675,10 +2684,61 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::concurrency::CommitGate;
+    use crate::journal::Journal;
+    use crate::layout::BlobGuid;
+    use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
+    use crate::store::BufferManager;
     use crate::TreeBuilder;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::sync_channel;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    struct FlushPendingStore {
+        inner: MemoryBlobStore,
+        pending: AtomicBool,
+    }
+
+    impl FlushPendingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                pending: AtomicBool::new(true),
+            }
+        }
+
+        fn release_flush(&self) {
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+
+    impl BlobStore for FlushPendingStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> crate::Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> crate::Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> crate::Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.pending.load(Ordering::Acquire)
+        }
+    }
 
     #[test]
     fn strict_prefix_point_keys_round_trip_through_public_api() {
@@ -2807,5 +2867,30 @@ mod tests {
         drop(read_guard);
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn synchronous_checkpoint_truncate_waits_for_store_flush() {
+        let store = Arc::new(FlushPendingStore::new());
+        let bm = Arc::new(BufferManager::new(store.clone(), 8));
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Arc::new(Journal::open_or_create(&journal_dir.path().join("wal.log"), 0).unwrap());
+        journal.submit(vec![1, 2, 3, 4], false).unwrap();
+        assert!(journal.needs_checkpoint());
+
+        let commit_gate = Arc::new(CommitGate::new());
+        super::Tree::maybe_truncate_journal_shared(&bm, Some(&journal), &commit_gate).unwrap();
+        assert!(
+            journal.needs_checkpoint(),
+            "WAL must stay live while the store still owes a flush"
+        );
+
+        store.release_flush();
+        super::Tree::maybe_truncate_journal_shared(&bm, Some(&journal), &commit_gate).unwrap();
+        assert!(
+            !journal.needs_checkpoint(),
+            "WAL should truncate once BM state is clean and store is durable"
+        );
     }
 }

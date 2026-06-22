@@ -30,7 +30,7 @@ use std::time::Duration;
 use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
-use crate::store::{BlobFrameRef, WriteThroughEntry, WriteThroughStatus};
+use crate::store::{BlobFrameRef, WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ};
 
 use super::Shared;
 
@@ -55,8 +55,8 @@ pub(crate) type CheckpointEpochCompletion = Sender<CheckpointEpochReport>;
 /// Work item handed to the I/O thread via the bounded queue.
 pub(crate) enum IoTask {
     /// Commit one checkpoint epoch: write dirty blob images,
-    /// run the pre-delete store sync, apply pending manifest
-    /// deletes, then run the post-delete sync when needed.
+    /// run the pre-delete store sync, apply pending delete fences,
+    /// then run the post-delete sync when a manifest delete applied.
     CommitEpoch {
         epoch: CheckpointEpoch,
         on_done: CheckpointEpochCompletion,
@@ -94,7 +94,7 @@ struct BatchWriteReport {
 struct PendingDeleteReport {
     per_epoch_failed: Vec<HashMap<BlobGuid, u64>>,
     per_epoch_first_err: Vec<Option<Error>>,
-    applied_total: usize,
+    manifest_deleted_total: usize,
 }
 
 const EPOCH_COALESCE_WINDOW: Duration = Duration::from_micros(100);
@@ -210,9 +210,9 @@ fn commit_epoch_batch(
     };
 
     let pending_report = apply_pending_deletes(shared, epochs);
-    if pending_report.applied_total > 0 {
+    if pending_report.manifest_deleted_total > 0 {
         if let Err(e) = shared.bm.flush_inner() {
-            restore_applied_pending(shared, epochs, &pending_report.per_epoch_failed);
+            restore_applied_manifest_deletes(shared, epochs, &pending_report.per_epoch_failed);
             return reports_with_error(&progresses, dirty_flushed_by_epoch, e);
         }
     }
@@ -238,13 +238,17 @@ fn commit_epoch_batch(
 fn apply_pending_deletes(shared: &Arc<Shared>, epochs: &[CheckpointEpoch]) -> PendingDeleteReport {
     let mut per_epoch_failed = Vec::with_capacity(epochs.len());
     let mut per_epoch_first_err = Vec::with_capacity(epochs.len());
-    let mut applied_total = 0usize;
+    let mut manifest_deleted_total = 0usize;
     for epoch in epochs {
         let mut pending_failed = HashMap::new();
         let mut first_pending_err = None;
         for (guid, seq) in &epoch.pending {
-            match shared.bm.execute_pending_delete(*guid) {
-                Ok(true) => {}
+            match shared.bm.execute_pending_delete(*guid, *seq) {
+                Ok(true) => {
+                    if *seq != STRUCTURAL_SEQ {
+                        manifest_deleted_total += 1;
+                    }
+                }
                 Ok(false) => {
                     pending_failed.insert(*guid, *seq);
                 }
@@ -254,7 +258,6 @@ fn apply_pending_deletes(shared: &Arc<Shared>, epochs: &[CheckpointEpoch]) -> Pe
                 }
             }
         }
-        applied_total += epoch.pending.len() - pending_failed.len();
         if !pending_failed.is_empty() {
             shared.bm.restore_pending_deletes(pending_failed.clone());
         }
@@ -264,7 +267,7 @@ fn apply_pending_deletes(shared: &Arc<Shared>, epochs: &[CheckpointEpoch]) -> Pe
     PendingDeleteReport {
         per_epoch_failed,
         per_epoch_first_err,
-        applied_total,
+        manifest_deleted_total,
     }
 }
 
@@ -362,7 +365,7 @@ fn children_ready(
         if remaining_by_guid.contains_key(child) || shared.bm.has_unflushed_blob(*child) {
             return Ok(false);
         }
-        if !shared.bm.store_has_blob(*child)? {
+        if !shared.bm.store_has_durable_blob(*child)? {
             return Ok(false);
         }
     }
@@ -413,7 +416,7 @@ fn reports_without_delete_phase(
         .collect()
 }
 
-fn restore_applied_pending(
+fn restore_applied_manifest_deletes(
     shared: &Arc<Shared>,
     epochs: &[CheckpointEpoch],
     per_epoch_failed: &[HashMap<BlobGuid, u64>],
@@ -424,7 +427,7 @@ fn restore_applied_pending(
             epoch
                 .pending
                 .iter()
-                .filter(|(guid, _)| !failed.contains_key(*guid))
+                .filter(|(guid, seq)| **seq != STRUCTURAL_SEQ && !failed.contains_key(*guid))
                 .map(|(guid, seq)| (*guid, *seq)),
         );
     }
@@ -477,6 +480,7 @@ mod tests {
         write_batches: AtomicUsize,
         flushes: AtomicUsize,
         events: Mutex<Vec<StoreEvent>>,
+        pending_flush: AtomicBool,
         fail_writes: bool,
         fail_flush: bool,
     }
@@ -488,6 +492,7 @@ mod tests {
                 write_batches: AtomicUsize::new(0),
                 flushes: AtomicUsize::new(0),
                 events: Mutex::new(Vec::new()),
+                pending_flush: AtomicBool::new(false),
                 fail_writes: false,
                 fail_flush: false,
             }
@@ -499,6 +504,7 @@ mod tests {
                 write_batches: AtomicUsize::new(0),
                 flushes: AtomicUsize::new(0),
                 events: Mutex::new(Vec::new()),
+                pending_flush: AtomicBool::new(false),
                 fail_writes: true,
                 fail_flush: false,
             }
@@ -510,9 +516,14 @@ mod tests {
                 write_batches: AtomicUsize::new(0),
                 flushes: AtomicUsize::new(0),
                 events: Mutex::new(Vec::new()),
+                pending_flush: AtomicBool::new(false),
                 fail_writes: false,
                 fail_flush: true,
             }
+        }
+
+        fn mark_pending_flush(&self) {
+            self.pending_flush.store(true, Ordering::Release);
         }
     }
 
@@ -522,6 +533,7 @@ mod tests {
         }
 
         fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.pending_flush.store(true, Ordering::Release);
             self.inner.write_blob(guid, src)
         }
 
@@ -535,10 +547,12 @@ mod tests {
                     "injected write failure",
                 )));
             }
+            self.pending_flush.store(true, Ordering::Release);
             self.inner.write_blobs(writes)
         }
 
         fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.pending_flush.store(true, Ordering::Release);
             self.inner.delete_blob(guid)
         }
 
@@ -554,11 +568,13 @@ mod tests {
                     "injected flush failure",
                 )));
             }
-            self.inner.flush()
+            self.inner.flush()?;
+            self.pending_flush.store(false, Ordering::Release);
+            Ok(())
         }
 
         fn needs_flush(&self) -> bool {
-            self.inner.needs_flush()
+            self.pending_flush.load(Ordering::Acquire) || self.inner.needs_flush()
         }
     }
 
@@ -788,6 +804,41 @@ mod tests {
                 StoreEvent::Write(vec![parent]),
                 StoreEvent::Flush,
             ]
+        );
+    }
+
+    #[test]
+    fn checkpoint_defers_parent_when_existing_child_manifest_is_not_durable() {
+        let store = Arc::new(CountingBatchStore::new());
+        let shared = test_shared(Arc::clone(&store));
+        let parent = [0xE3; 16];
+        let child = [0xE4; 16];
+        store
+            .inner
+            .write_blob(child, &child_blob(child, 9))
+            .unwrap();
+        store.mark_pending_flush();
+        let mut epochs = vec![CheckpointEpoch {
+            entries: vec![entry(parent, 1, parent_blob(parent, child))],
+            pending: HashMap::new(),
+        }];
+
+        let reports = commit_epoch_batch(&shared, &mut epochs);
+
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].result.is_ok());
+        assert_eq!(
+            reports[0].dirty_flushed, 0,
+            "parent write must wait until the child's manifest entry is durable"
+        );
+        assert!(
+            store.events.lock().unwrap().is_empty(),
+            "no parent write may be issued while the store owes a manifest flush"
+        );
+        assert_eq!(
+            shared.bm.dirty_count(),
+            1,
+            "deferred parent must be restored to dirty state for the next round"
         );
     }
 }
