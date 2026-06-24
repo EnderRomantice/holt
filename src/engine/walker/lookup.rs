@@ -531,9 +531,10 @@ enum RoutedLookup {
 
 /// Routed cold read with the cold-page cache: cache reusable
 /// header/routing pages at 4 KiB granularity, but keep one-shot leaf
-/// pages out of the cache. A local negative is only a hint; before it
-/// becomes user-visible, the blob is checked with the authoritative
-/// full-frame walker without admitting the frame into the BM.
+/// pages out of the cache. Every routed answer is validated against a
+/// stable cold blob stamp before it becomes user-visible. A local
+/// negative needs the stronger full-frame verification because the
+/// partial descent has not seen the leaf that would disprove it.
 fn routed_read_cached(
     bm: &BufferManager,
     guid: BlobGuid,
@@ -556,14 +557,26 @@ fn routed_read_cached(
 
     match descend_routed_paged(&mut pages, root_off, key, depth, rr.leaf_region_start)? {
         RoutedLookup::Unknown => Ok(ColdBlobLookup::Unknown),
-        RoutedLookup::Found { value, seq } => Ok(ColdBlobLookup::Found { value, seq }),
+        RoutedLookup::Found { value, seq } => {
+            if validate_cold_stamp(bm, guid, buf, stamp)? {
+                Ok(ColdBlobLookup::Found { value, seq })
+            } else {
+                Ok(ColdBlobLookup::Unknown)
+            }
+        }
         RoutedLookup::Crossing {
             child_guid,
             child_depth,
-        } => Ok(ColdBlobLookup::Crossing {
-            child_guid,
-            child_depth,
-        }),
+        } => {
+            if validate_cold_stamp(bm, guid, buf, stamp)? {
+                Ok(ColdBlobLookup::Crossing {
+                    child_guid,
+                    child_depth,
+                })
+            } else {
+                Ok(ColdBlobLookup::Unknown)
+            }
+        }
         RoutedLookup::NegativeHint => verify_cold_negative(bm, guid, key, depth, buf, stamp),
     }
 }
@@ -663,6 +676,23 @@ impl<'a> ColdPageReader<'a> {
         }
         Ok(())
     }
+}
+
+fn validate_cold_stamp(
+    bm: &BufferManager,
+    guid: BlobGuid,
+    scratch: &mut [u8],
+    expected: ColdBlobStamp,
+) -> Result<bool> {
+    if !bm.cold_read_eligible(guid) {
+        return Ok(false);
+    }
+    bm.read_blob_range(guid, 0, &mut scratch[..HEADER_SIZE as usize])?;
+    if !bm.cold_read_eligible(guid) {
+        return Ok(false);
+    }
+    let frame = BlobFrameRef::wrap(&scratch[..]);
+    Ok(ColdBlobStamp::new(frame.header()) == expected)
 }
 
 fn verify_cold_negative(
@@ -1537,6 +1567,32 @@ mod tests {
             store.full_reads.load(Ordering::Relaxed),
             0,
             "private cold_read_routed reports uncertainty; the caller owns the full pin",
+        );
+    }
+
+    #[test]
+    fn production_cold_read_rejects_stale_routed_found() {
+        let guid = [0x45; 16];
+        let blob = routed_blob(guid);
+        let mut derouted = blob.clone();
+        {
+            let mut frame = BlobFrame::wrap(derouted.as_mut_slice());
+            frame.header_mut().routing_len = 0;
+        }
+        let store = Arc::new(HeaderFlipStore::new(guid, blob, derouted));
+        let bm = BufferManager::new(store.clone(), 4);
+
+        assert!(
+            matches!(
+                cold_read_routed(&bm, guid, SearchKey::exact(&[b'q', 1]), 0),
+                ColdBlobLookup::Unknown
+            ),
+            "a changed header stamp must not publish a stale routed hit",
+        );
+        assert_eq!(
+            store.full_reads.load(Ordering::Relaxed),
+            0,
+            "stale positive validation must fall back without bm.pin/read_blob here",
         );
     }
 
