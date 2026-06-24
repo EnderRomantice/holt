@@ -328,13 +328,13 @@ fn try_insert_from_optimistic_route(
     };
     let parent_guard = parent_pin.read();
     let parent_version = parent_pin.content_version();
+    let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+    if !validate_route_edge(frame, key, route)? {
+        drop(parent_guard);
+        cache.invalidate(key, route);
+        return Ok(None);
+    }
     if parent_version != route.parent_version {
-        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
-        if !validate_route_edge(frame, key, route)? {
-            drop(parent_guard);
-            cache.invalidate(key, route);
-            return Ok(None);
-        }
         cache.refresh_parent_version(key, route, parent_version);
     }
     let child_pin = match bm.pin(route.child_guid) {
@@ -609,13 +609,13 @@ fn try_insert_batch_from_route(
     };
     let parent_guard = parent_pin.read();
     let parent_version = parent_pin.content_version();
+    let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+    if !validate_route_edge(frame, first_key, route)? {
+        drop(parent_guard);
+        cache.invalidate(first_key, route);
+        return Ok(None);
+    }
     if parent_version != route.parent_version {
-        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
-        if !validate_route_edge(frame, first_key, route)? {
-            drop(parent_guard);
-            cache.invalidate(first_key, route);
-            return Ok(None);
-        }
         cache.refresh_parent_version(first_key, route, parent_version);
     }
     let child_pin = match bm.pin(route.child_guid) {

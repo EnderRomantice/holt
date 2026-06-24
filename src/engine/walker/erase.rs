@@ -282,13 +282,13 @@ fn try_erase_from_route(
     };
     let parent_guard = parent_pin.read();
     let parent_version = parent_pin.content_version();
+    let frame = BlobFrameRef::wrap(parent_guard.as_slice());
+    if !validate_route_edge(frame, key, route)? {
+        drop(parent_guard);
+        cache.invalidate(key, route);
+        return Ok(None);
+    }
     if parent_version != route.parent_version {
-        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
-        if !validate_route_edge(frame, key, route)? {
-            drop(parent_guard);
-            cache.invalidate(key, route);
-            return Ok(None);
-        }
         cache.refresh_parent_version(key, route, parent_version);
     }
     let child_pin = match bm.pin(route.child_guid) {
