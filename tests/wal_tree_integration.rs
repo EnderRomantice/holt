@@ -1359,17 +1359,90 @@ fn cold_read_touches_one_child_blob_after_reopen() {
         before.bm_point_full_blob_reads,
         after.bm_point_full_blob_reads,
     );
-    // A missing key under an existing routed prefix is answered by the
-    // validated routed-negative path, not by pinning the full child blob.
+    // A missing key under an existing routed prefix may get a routed
+    // local-negative hint, but production lookup must fall back to the
+    // authoritative full child blob before publishing NotFound.
     let before_miss = tree.stats().unwrap();
     assert!(tree
         .get(b"cold/bucket/table/part-0999/missing")
         .unwrap()
         .is_none());
     let after_miss = tree.stats().unwrap();
+    assert!(
+        after_miss.bm_point_full_blob_reads <= before_miss.bm_point_full_blob_reads + 1,
+        "cold miss fallback must pin at most one child blob (before={}, after={})",
+        before_miss.bm_point_full_blob_reads,
+        after_miss.bm_point_full_blob_reads,
+    );
+}
+
+#[test]
+fn db_cold_route_neighbor_get_falls_back_after_local_route_answer() {
+    let dir = tempdir().unwrap();
+    let mut cfg = durable_cfg(dir.path());
+    cfg.buffer_pool_size = 64;
+
+    let key0 = b"db-crash/d15ea5ed500a0001/0000000000000000";
+    let key1 = b"db-crash/d15ea5ed500a0001/0000000000000001";
+    let object0 = b"crash-value:10812959806829638721";
+    let inode0 = b"crash-value:14416686724497167465";
+    let object1 = b"crash-value:3592466528075977345";
+    let inode1 = b"crash-value:2198126064033428708";
+
+    {
+        let db = DB::open(cfg.clone()).unwrap();
+        db.open_or_create_tree("objects").unwrap();
+        db.open_or_create_tree("inodes").unwrap();
+        let filler = vec![b'x'; 1024];
+        for i in 0..1000u32 {
+            let key = format!("db-crash/d15ea5ed500a0001/{i:016x}");
+            let object = if key.as_bytes() == key0 {
+                object0.as_slice()
+            } else if key.as_bytes() == key1 {
+                object1.as_slice()
+            } else {
+                filler.as_slice()
+            };
+            let inode = if key.as_bytes() == key0 {
+                inode0.as_slice()
+            } else if key.as_bytes() == key1 {
+                inode1.as_slice()
+            } else {
+                filler.as_slice()
+            };
+            db.atomic(|batch| {
+                batch.put("objects", key.as_bytes(), object);
+                batch.put("inodes", key.as_bytes(), inode);
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+        for _ in 0..8 {
+            db.compact().unwrap();
+            db.checkpoint().unwrap();
+        }
+    }
+
+    cfg.buffer_pool_size = 1;
+    let db = DB::open(cfg).unwrap();
+    let objects = db.open_tree("objects").unwrap();
+    let inodes = db.open_tree("inodes").unwrap();
+
     assert_eq!(
-        after_miss.bm_point_full_blob_reads, before_miss.bm_point_full_blob_reads,
-        "validated cold miss must not pin the full child blob",
+        objects.get(key0).unwrap().as_deref(),
+        Some(object0.as_slice())
+    );
+    assert_eq!(
+        objects.get(key1).unwrap().as_deref(),
+        Some(object1.as_slice())
+    );
+    assert_eq!(
+        inodes.get(key0).unwrap().as_deref(),
+        Some(inode0.as_slice())
+    );
+    assert_eq!(
+        inodes.get(key1).unwrap().as_deref(),
+        Some(inode1.as_slice())
     );
 }
 

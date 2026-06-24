@@ -7,8 +7,8 @@
 //! Decouples I/O execution from planning so the planner can:
 //! 1. Snapshot bytes under a brief shared read guard, then move on.
 //! 2. Enqueue checkpoint epochs without waiting for data writes.
-//! 3. Let the worker coalesce adjacent epochs into one write/sync
-//!    turn when the queue is already hot.
+//! 3. Keep each epoch's write/sync/report boundary explicit, so
+//!    WAL truncation can advance strictly in checkpoint FIFO order.
 //!
 //! For the current local-`pread`/`pwrite` store the parallelism
 //! gain is modest (single thread, single FD). On Linux with the
@@ -22,10 +22,9 @@
 //! sequence, after the final synchronous round has drained
 //! everything through this same queue.
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::api::errors::{Error, Result};
 use crate::engine;
@@ -66,11 +65,6 @@ pub(crate) enum IoTask {
     Stop,
 }
 
-struct EpochTask {
-    epoch: CheckpointEpoch,
-    on_done: CheckpointEpochCompletion,
-}
-
 #[derive(Clone, Copy)]
 struct EpochProgress {
     dirty_total: usize,
@@ -97,53 +91,17 @@ struct PendingDeleteReport {
     manifest_deleted_total: usize,
 }
 
-const EPOCH_COALESCE_WINDOW: Duration = Duration::from_micros(100);
-const MAX_COALESCED_EPOCHS: usize = 64;
-
 /// Main loop for the I/O thread.
 pub(crate) fn run(shared: &Arc<Shared>, rx: Receiver<IoTask>) {
     while let Ok(task) = rx.recv() {
         match task {
-            IoTask::CommitEpoch { epoch, on_done } => {
-                let mut batch = vec![EpochTask { epoch, on_done }];
-                let stop_after_batch = collect_epoch_batch(&rx, &mut batch);
-                let mut epochs = Vec::with_capacity(batch.len());
-                let mut completions = Vec::with_capacity(batch.len());
-                for task in batch {
-                    epochs.push(task.epoch);
-                    completions.push(task.on_done);
-                }
-                let reports = commit_epoch_batch(shared, &mut epochs);
-                for (on_done, report) in completions.into_iter().zip(reports) {
-                    let _ = on_done.send(report);
-                }
-                if stop_after_batch {
-                    break;
-                }
+            IoTask::CommitEpoch { mut epoch, on_done } => {
+                let mut reports = commit_epoch_batch(shared, std::slice::from_mut(&mut epoch));
+                let _ = on_done.send(reports.remove(0));
             }
             IoTask::Stop => break,
         }
     }
-}
-
-fn collect_epoch_batch(rx: &Receiver<IoTask>, batch: &mut Vec<EpochTask>) -> bool {
-    let mut stop_after_batch = false;
-    match rx.recv_timeout(EPOCH_COALESCE_WINDOW) {
-        Ok(IoTask::CommitEpoch { epoch, on_done }) => batch.push(EpochTask { epoch, on_done }),
-        Ok(IoTask::Stop) | Err(RecvTimeoutError::Disconnected) => return true,
-        Err(RecvTimeoutError::Timeout) => return false,
-    }
-    while batch.len() < MAX_COALESCED_EPOCHS {
-        match rx.try_recv() {
-            Ok(IoTask::CommitEpoch { epoch, on_done }) => batch.push(EpochTask { epoch, on_done }),
-            Ok(IoTask::Stop) | Err(TryRecvError::Disconnected) => {
-                stop_after_batch = true;
-                break;
-            }
-            Err(TryRecvError::Empty) => break,
-        }
-    }
-    stop_after_batch
 }
 
 fn commit_epoch_batch(
@@ -450,7 +408,7 @@ fn reports_with_error(
             applied_deletes: 0,
             result: Err(first_error
                 .take()
-                .unwrap_or(Error::Internal("checkpoint epoch group failed"))),
+                .unwrap_or(Error::Internal("checkpoint epoch write failed"))),
         })
         .collect()
 }
@@ -659,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_epochs_share_one_store_batch_and_sync() {
+    fn epoch_batch_shares_one_store_batch_and_sync() {
         let store = Arc::new(CountingBatchStore::new());
         let shared = test_shared(Arc::clone(&store));
         let first = epoch([0xA1; 16], 1);
@@ -676,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_epochs_preserve_repeated_blob_order() {
+    fn epoch_batch_preserves_repeated_blob_order() {
         let store = Arc::new(CountingBatchStore::new());
         let shared = test_shared(Arc::clone(&store));
         let guid = [0xC1; 16];
@@ -697,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_epoch_write_error_restores_without_sync() {
+    fn epoch_write_error_restores_without_sync() {
         let store = Arc::new(CountingBatchStore::failing_writes());
         let shared = test_shared(Arc::clone(&store));
         let first = epoch([0xB1; 16], 1);
@@ -714,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_epoch_flush_error_restores_dirty_entry() {
+    fn epoch_flush_error_restores_dirty_entry() {
         let store = Arc::new(CountingBatchStore::failing_flush());
         let shared = test_shared(Arc::clone(&store));
         let first = epoch([0xD1; 16], 1);

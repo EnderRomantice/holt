@@ -45,10 +45,12 @@ pub enum ColdBlobLookup {
         value: Vec<u8>,
         seq: u64,
     },
+    #[cfg(test)]
     Crossing {
         child_guid: BlobGuid,
         child_depth: usize,
     },
+    #[cfg(test)]
     NotFound,
 }
 

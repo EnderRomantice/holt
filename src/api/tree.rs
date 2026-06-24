@@ -365,6 +365,21 @@ fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
     }
 }
 
+fn batch_insert_condition(op: &BatchOp) -> Option<engine::InsertCondition> {
+    match op {
+        BatchOp::Put { .. } => Some(engine::InsertCondition::Always),
+        BatchOp::PutIfAbsent { .. } => Some(engine::InsertCondition::IfAbsent),
+        BatchOp::CompareAndPut { expected, .. } => {
+            Some(engine::InsertCondition::IfVersion(expected.as_u64()))
+        }
+        BatchOp::Delete { .. }
+        | BatchOp::DeleteIfVersion { .. }
+        | BatchOp::AssertVersion { .. }
+        | BatchOp::AssertPrefixEmpty { .. }
+        | BatchOp::Rename { .. } => None,
+    }
+}
+
 fn same_shape_insert_run_len(ops: &[BatchOp], start: usize) -> usize {
     let Some((first_key, first_value)) = batch_insert_parts(&ops[start]) else {
         return 0;
@@ -1431,29 +1446,15 @@ impl Tree {
     }
 
     fn apply_batch_insert_run_walker(&self, ops: &[BatchOp], first_seq: u64) -> Result<()> {
+        if ops.len() == 1 {
+            return self.apply_single_insert_batch_op(&ops[0], first_seq);
+        }
+
         let mut items = Vec::with_capacity(ops.len());
         for (idx, op) in ops.iter().enumerate() {
             let seq = first_seq + idx as u64;
-            let (key, value, condition) = match op {
-                BatchOp::Put { key, value } => (key, value, engine::InsertCondition::Always),
-                BatchOp::PutIfAbsent { key, value } => {
-                    (key, value, engine::InsertCondition::IfAbsent)
-                }
-                BatchOp::CompareAndPut {
-                    key,
-                    expected,
-                    value,
-                } => (
-                    key,
-                    value,
-                    engine::InsertCondition::IfVersion(expected.as_u64()),
-                ),
-                BatchOp::Delete { .. }
-                | BatchOp::DeleteIfVersion { .. }
-                | BatchOp::AssertVersion { .. }
-                | BatchOp::AssertPrefixEmpty { .. }
-                | BatchOp::Rename { .. } => unreachable!("not an insert-like batch op"),
-            };
+            let (key, value) = batch_insert_parts(op).expect("not an insert-like batch op");
+            let condition = batch_insert_condition(op).expect("not an insert-like batch op");
             items.push(engine::InsertBatchItem::new(
                 engine::SearchKey::user(key),
                 value,
@@ -1481,6 +1482,28 @@ impl Tree {
                 );
             }
             applied += outcome.applied;
+        }
+        Ok(())
+    }
+
+    fn apply_single_insert_batch_op(&self, op: &BatchOp, seq: u64) -> Result<()> {
+        let (key, value) = batch_insert_parts(op).expect("not an insert-like batch op");
+        let condition = batch_insert_condition(op).expect("not an insert-like batch op");
+        let outcome = engine::insert_multi_conditional(
+            &self.store,
+            &self.root_pin,
+            Some(&self.route_cache),
+            engine::SearchKey::user(key),
+            value,
+            seq,
+            condition,
+        )?;
+        if !outcome.mutated {
+            return Err(Error::Internal("atomic preflight missed insert guard"));
+        }
+        if outcome.root_dirty {
+            self.store
+                .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
         }
         Ok(())
     }
