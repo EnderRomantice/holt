@@ -6,10 +6,10 @@
 //! vs today's whole-512 KB pin. Also reports the structure/value byte
 //! split (sizes a "keep structure resident, page the values" redesign).
 //!
-//! The key→value+crossing summarizer that fed the (now-removed)
-//! `cold.idx` sidecar used to live here too; it went with the sidecar.
-//! The routing region (`compact_blob`) + the cold routed read
-//! (`cold_read_routed`) are the production replacement.
+//! Production cold reads now combine the checkpoint-built cold index
+//! sidecar with the in-blob routing region: the sidecar finds exact
+//! leaf offsets or proves local absence, and the routing region
+//! remains the fallback for blobs that have no sidecar yet.
 //!
 //!   cargo test -p holt --release cold_read_page_touch_ceiling -- --ignored --nocapture
 

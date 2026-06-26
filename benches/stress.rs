@@ -747,15 +747,40 @@ fn make_samples(workload: Workload, n_keys: usize, ops: usize, negative: bool) -
 }
 
 fn preload_holt(tree: &Tree, workload: Workload, n_keys: usize) {
+    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(PRELOAD_BATCH);
     progress("holt", "preload", 0, n_keys);
     for i in 0..n_keys {
         let key = workload.key(i, n_keys);
         let value = workload.value(i, 0);
-        tree.put(&key, &value).expect("holt preload put");
+        batch.push((key, value));
+        if batch.len() == PRELOAD_BATCH {
+            flush_holt_preload_batch(tree, &batch);
+            batch.clear();
+        }
         if should_progress(i + 1, n_keys) {
             progress("holt", "preload", i + 1, n_keys);
         }
     }
+    if !batch.is_empty() {
+        flush_holt_preload_batch(tree, &batch);
+    }
+}
+
+fn flush_holt_preload_batch(tree: &Tree, batch: &[(Vec<u8>, Vec<u8>)]) {
+    let refs: Vec<(&[u8], &[u8])> = batch
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect();
+    let outcomes = tree
+        .put_many_if_absent(&refs)
+        .expect("holt preload put_many_if_absent");
+    debug_assert!(
+        outcomes.iter().all(|outcome| matches!(
+            outcome,
+            holt::PutOutcome::Created
+        )),
+        "preload keys must be unique"
+    );
 }
 
 /// Drive maintenance compaction to a fixpoint so the bulk-loaded,
@@ -1478,7 +1503,7 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         .as_ref()
         .map_or((0, 0, 0), |j| (j.appends, j.batches, j.syncs));
     println!(
-        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
+        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} cold_page_hits={} cold_page_misses={} cold_idx_cache_hits={} cold_idx_cache_misses={} cold_idx_loads={} cold_idx_dir_bytes={} cold_idx_bucket_reads={} cold_idx_bucket_bytes={} cold_idx_inline_hits={} cold_idx_offset_hits={} cold_idx_negative_hits={} cold_idx_crossing_hits={} cold_idx_unknowns={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
         s.blob_count,
         s.total_blob_edges,
         s.leaf_blob_count,
@@ -1495,6 +1520,19 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         s.bm_point_full_blob_reads,
         s.bm_scan_full_blob_reads,
         s.bm_silent_full_blob_reads,
+        s.bm_cold_page_hits,
+        s.bm_cold_page_misses,
+        s.bm_cold_index_cache_hits,
+        s.bm_cold_index_cache_misses,
+        s.bm_cold_index_loads,
+        s.bm_cold_index_dir_read_bytes,
+        s.bm_cold_index_bucket_reads,
+        s.bm_cold_index_bucket_read_bytes,
+        s.bm_cold_index_inline_hits,
+        s.bm_cold_index_offset_hits,
+        s.bm_cold_index_negative_hits,
+        s.bm_cold_index_crossing_hits,
+        s.bm_cold_index_unknowns,
         s.bm_avg_blob_hops(),
         s.bm_max_blob_hops,
         s.bm_spillovers,

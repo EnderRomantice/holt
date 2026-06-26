@@ -1,10 +1,10 @@
-//! Bounded cache for cold-read 4 KiB navigation pages.
+//! Bounded cache for cold-read 4 KiB pages.
 //!
-//! This cache is deliberately page-granular. Cold point lookups reuse
-//! header and routing pages across many random keys without pinning a
-//! full 512 KiB blob or caching an entire routing image. Leaf pages are
-//! intentionally not admitted by the lookup path, so one-shot random
-//! gets cannot evict the reusable navigation working set.
+//! Navigation pages are admitted immediately because they are shared by
+//! many keys in the same blob. Leaf pages use second-touch admission:
+//! one-shot random gets leave only a bounded ghost entry, while repeated
+//! cold hits can reuse the leaf page without pinning the full 512 KiB
+//! blob.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +30,7 @@ struct Page {
 #[derive(Default)]
 struct Shard {
     map: HashMap<PageKey, Page>,
+    ghost: HashMap<PageKey, u64>,
     bytes: usize,
 }
 
@@ -84,7 +85,48 @@ impl ColdPageCache {
         if shard.map.contains_key(&key) {
             return;
         }
-        while shard.bytes + PAGE_BYTES > self.shard_budget_bytes {
+        shard.ghost.remove(&key);
+        Self::insert_page(&mut shard, self.shard_budget_bytes, key, src, &self.clock);
+    }
+
+    pub(crate) fn put_after_second_touch(&self, guid: BlobGuid, page: u16, src: &[u8]) {
+        debug_assert_eq!(src.len(), PAGE_BYTES);
+        if self.shard_budget_bytes == 0 {
+            return;
+        }
+        let mut shard = self.shard(&guid).lock().unwrap();
+        let key = PageKey { guid, page };
+        if shard.map.contains_key(&key) {
+            return;
+        }
+        if shard.ghost.remove(&key).is_none() {
+            let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+            shard.ghost.insert(key, tick);
+            let budget = ((self.shard_budget_bytes / PAGE_BYTES) * 2).max(64);
+            while shard.ghost.len() > budget {
+                let Some(victim) = shard
+                    .ghost
+                    .iter()
+                    .min_by_key(|(_, tick)| **tick)
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                shard.ghost.remove(&victim);
+            }
+            return;
+        }
+        Self::insert_page(&mut shard, self.shard_budget_bytes, key, src, &self.clock);
+    }
+
+    fn insert_page(
+        shard: &mut Shard,
+        shard_budget_bytes: usize,
+        key: PageKey,
+        src: &[u8],
+        clock: &AtomicU64,
+    ) {
+        while shard.bytes + PAGE_BYTES > shard_budget_bytes {
             let Some(victim) = shard
                 .map
                 .iter()
@@ -98,7 +140,7 @@ impl ColdPageCache {
         }
         let mut bytes = Box::new([0u8; PAGE_BYTES]);
         bytes.copy_from_slice(src);
-        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        let tick = clock.fetch_add(1, Ordering::Relaxed);
         shard.map.insert(key, Page { bytes, tick });
         shard.bytes += PAGE_BYTES;
     }
@@ -107,6 +149,7 @@ impl ColdPageCache {
         let mut shard = self.shard(&guid).lock().unwrap();
         let before = shard.map.len();
         shard.map.retain(|key, _| key.guid != guid);
+        shard.ghost.retain(|key, _| key.guid != guid);
         let removed = before - shard.map.len();
         shard.bytes = shard.bytes.saturating_sub(removed * PAGE_BYTES);
     }
@@ -179,5 +222,34 @@ mod tests {
 
         assert!(!cache.fill(g, 1, &mut dst));
         assert!(cache.shards.iter().all(|s| s.lock().unwrap().bytes == 0));
+    }
+
+    #[test]
+    fn second_touch_admits_leaf_page() {
+        let cache = ColdPageCache::new(1 << 20);
+        let g = guid(5);
+        let src = [5u8; PAGE_BYTES];
+        let mut dst = [0u8; PAGE_BYTES];
+
+        cache.put_after_second_touch(g, 7, &src);
+        assert!(!cache.fill(g, 7, &mut dst));
+
+        cache.put_after_second_touch(g, 7, &src);
+        assert!(cache.fill(g, 7, &mut dst));
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn invalidate_drops_leaf_ghosts() {
+        let cache = ColdPageCache::new(1 << 20);
+        let g = guid(6);
+        let src = [6u8; PAGE_BYTES];
+        let mut dst = [0u8; PAGE_BYTES];
+
+        cache.put_after_second_touch(g, 9, &src);
+        cache.invalidate(g);
+        cache.put_after_second_touch(g, 9, &src);
+
+        assert!(!cache.fill(g, 9, &mut dst));
     }
 }

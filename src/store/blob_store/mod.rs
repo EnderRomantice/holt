@@ -41,17 +41,15 @@ use crate::layout::BlobGuid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColdBlobLookup {
     Unknown,
+    NotFound,
     Found {
         value: Vec<u8>,
         seq: u64,
     },
-    #[cfg(test)]
     Crossing {
         child_guid: BlobGuid,
         child_depth: usize,
     },
-    #[cfg(test)]
-    NotFound,
 }
 
 /// A blob-granular storage interface.
@@ -105,12 +103,11 @@ pub trait BlobStore: Send + Sync {
 
     /// Read `dst.len()` bytes starting at `byte_offset` within blob `guid`.
     ///
-    /// Enables page-granular cold reads: a point lookup can fetch only the
-    /// 4 KB pages its descent touches (measured ~18 KB mean) instead of
-    /// pinning the whole 512 KB frame (~27× less cold I/O). For `O_DIRECT`
-    /// backends the caller keeps `byte_offset`, `dst.len()`, and `dst`'s base
-    /// 4 KB-aligned (whole-page reads); the read-whole default below imposes
-    /// no such requirement.
+    /// Enables page-granular fallback reads when a cold-index hit
+    /// points at a value that was too large to inline. For `O_DIRECT`
+    /// backends the caller keeps `byte_offset`, `dst.len()`, and
+    /// `dst`'s base 4 KB-aligned; the read-whole default below
+    /// imposes no such requirement.
     ///
     /// The default reads the entire frame and copies the sub-range — correct
     /// for any store but with no I/O saving. `FileBlobStore` /
@@ -120,6 +117,33 @@ pub trait BlobStore: Send + Sync {
         self.read_blob(guid, &mut full)?;
         let start = byte_offset as usize;
         dst.copy_from_slice(&full.as_slice()[start..start + dst.len()]);
+        Ok(())
+    }
+
+    /// Read a byte range from the optional cold-read sidecar for `guid`.
+    ///
+    /// Sidecars are accelerators only: `None`, corrupt bytes, or a
+    /// stale stamp must make callers fall back to authoritative blob
+    /// reads. Memory/custom stores default to no sidecar support.
+    fn read_cold_index_range(
+        &self,
+        _guid: BlobGuid,
+        _byte_offset: u64,
+        _dst: &mut [u8],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Publish a rebuilt cold-read sidecar for `guid`.
+    ///
+    /// A failure here must not make committed blob data unrecoverable;
+    /// callers may ignore the error after invalidating any cached index.
+    fn publish_cold_index(&self, _guid: BlobGuid, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete the optional cold-read sidecar for `guid`.
+    fn delete_cold_index(&self, _guid: BlobGuid) -> Result<()> {
         Ok(())
     }
 

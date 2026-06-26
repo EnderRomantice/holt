@@ -42,9 +42,9 @@ fn stats_count_rollups_under_delimiter() {
     assert_eq!(rollups, 3);
     assert_eq!(stats.rollup, 3);
     assert_eq!(stats.returned, 0); // every leaf folded away
-                                   // Invariant: each emission is an examined unit (here every dirN/
-                                   // subtree folds at its inner node, so visited == rollup).
-    assert!(stats.visited >= stats.returned + stats.rollup);
+                                   // The delimiter path must fold at the subtree boundary, not scan all
+                                   // 30 leaves and deduplicate afterwards.
+    assert_eq!(stats.visited, stats.rollup);
 }
 
 #[test]

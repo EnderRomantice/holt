@@ -2,9 +2,9 @@
 //!
 //! Available on every Unix platform. The Linux build opens the
 //! packed data file with `O_DIRECT` so the kernel does not cache
-//! pages (the buffer manager *is* the cache); other Unixes drop the
-//! flag (macOS additionally sets `F_NOCACHE` via `fcntl` for an
-//! equivalent effect).
+//! blob frames (the buffer manager *is* the cache). The rebuildable
+//! cold-index sidecar uses buffered positional I/O because it serves
+//! small index records rather than authoritative blob frames.
 //!
 //! Layout on disk:
 //!
@@ -18,6 +18,9 @@
 //!                      is compacted
 //!     manifest.log   — append-only set/delete deltas replayed on
 //!                      open; free slots are rebuilt from holes
+//!     cold.idx       — optional packed cold-read indexes, one slot
+//!                      per blob slot; rebuildable and never part of
+//!                      recovery truth
 //!     store.lock     — zero-byte advisory lock file; held
 //!                      exclusively (flock) for the lifetime of an
 //!                      open instance so a second opener cannot
@@ -30,13 +33,12 @@
 //!   manager pinning thousands of blobs would otherwise need
 //!   thousands of file descriptors. One fd + slot offsets keeps the
 //!   kernel page tables and fs metadata trivial.
-//! - **O_DIRECT / F_NOCACHE** bypasses the page cache: ours *is*
-//!   the cache. The buffer manager owns dirty pages and flushes
-//!   through the store; the kernel must not silently cache
-//!   anything. The packed data file is preallocated in coarse
-//!   chunks (`posix_fallocate` on Linux, `F_PREALLOCATE` on
-//!   macOS) so checkpoint bursts do not repeatedly pay file-growth
-//!   allocation latency.
+//! - **O_DIRECT / F_NOCACHE** bypasses the page cache for
+//!   `blobs.dat`: ours *is* the cache. The buffer manager owns dirty
+//!   pages and flushes through the store. The packed data file is
+//!   preallocated in coarse chunks (`posix_fallocate` on Linux,
+//!   `F_PREALLOCATE` on macOS) so checkpoint bursts do not
+//!   repeatedly pay file-growth allocation latency.
 //! - **4 KB-aligned I/O** (every offset is a multiple of `PAGE_SIZE`
 //!   = 512 KB, every buffer is [`AlignedBlobBuf`] = 4 KB aligned) so
 //!   `O_DIRECT` accepts every submission without `EINVAL`.
@@ -105,6 +107,8 @@ const DIR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MANIFEST_FILENAME: &str = "manifest.bin";
 /// Append-only manifest delta log inside `data_dir`.
 const MANIFEST_LOG_FILENAME: &str = "manifest.log";
+/// Packed rebuildable cold-read index file.
+const COLD_INDEX_FILENAME: &str = "cold.idx";
 /// Filename used as the rename staging target for the manifest.
 const MANIFEST_TMP_FILENAME: &str = "manifest.bin.tmp";
 /// Conservative iovec chunk limit used by the non-uring batch
@@ -141,9 +145,10 @@ const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// reordered to carry a self-describing `node_type @ +1` byte. Both
 /// change the on-blob byte layout, so v3 files are refused on load.
 /// v5 added a per-blob image `generation` to each manifest entry for
-/// the cold-read sidecar. v6 drops it: the sidecar is gone (the in-blob
-/// routing region replaced it), so the field was dead weight. Older
-/// manifests (incl. v5) are refused on load, not migrated.
+/// an older cold-read sidecar design. v6 drops it: the current
+/// packed `cold.idx` sidecar validates against the blob header stamp,
+/// so the manifest generation field was dead weight. Older manifests
+/// (incl. v5) are refused on load, not migrated.
 const MANIFEST_VERSION: u16 = 6;
 /// Per-record magic for `manifest.log`.
 const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
@@ -155,6 +160,8 @@ const MANIFEST_LOG_SET_BODY_SIZE: usize = 16 + 8;
 const MANIFEST_LOG_DELETE_BODY_SIZE: usize = 16;
 const MANIFEST_LOG_MIN_COMPACT_BYTES: u64 = 1024 * 1024;
 const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
+const COLD_INDEX_IO_ALIGN: usize = 512;
+const COLD_INDEX_SLOT_BYTES: usize = PAGE_SIZE as usize;
 
 /// NVMe-backed, O_DIRECT, single-packed-file blob store.
 ///
@@ -173,6 +180,7 @@ pub struct FileBlobStore {
     /// holder never leaves a stale lock behind.
     _dir_lock: File,
     data_file: File,
+    cold_file: File,
     manifest: RwLock<Manifest>,
     /// Tracks whether `manifest.bin` needs a rewrite. Data-only
     /// overwrites of existing blobs leave this false, avoiding
@@ -305,6 +313,11 @@ fn acquire_dir_lock(data_dir: &Path, timeout: Duration) -> Result<File> {
     }
 }
 
+fn align_up(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
+}
+
 impl FileBlobStore {
     /// Open or create a persistent store at `data_dir`.
     ///
@@ -342,10 +355,11 @@ impl FileBlobStore {
         let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
+        let cold_path = data_dir.join(COLD_INDEX_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
         let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
 
-        let custom_flags = {
+        let data_flags = {
             #[cfg(target_os = "linux")]
             {
                 libc::O_DIRECT | libc::O_CLOEXEC
@@ -355,12 +369,19 @@ impl FileBlobStore {
                 libc::O_CLOEXEC
             }
         };
+        let cold_flags = libc::O_CLOEXEC;
         let data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(custom_flags)
+            .custom_flags(data_flags)
             .open(&data_path)?;
+        let cold_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(cold_flags)
+            .open(&cold_path)?;
 
         // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
         // closest equivalent (tells the VFS not to populate the
@@ -390,6 +411,7 @@ impl FileBlobStore {
             data_dir,
             _dir_lock: dir_lock,
             data_file,
+            cold_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -416,10 +438,11 @@ impl FileBlobStore {
         let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
+        let cold_path = data_dir.join(COLD_INDEX_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
         let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
 
-        let custom_flags = {
+        let data_flags = {
             #[cfg(target_os = "linux")]
             {
                 libc::O_DIRECT | libc::O_CLOEXEC
@@ -429,12 +452,19 @@ impl FileBlobStore {
                 libc::O_CLOEXEC
             }
         };
+        let cold_flags = libc::O_CLOEXEC;
         let data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(custom_flags)
+            .custom_flags(data_flags)
             .open(&data_path)?;
+        let cold_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(cold_flags)
+            .open(&cold_path)?;
 
         #[cfg(target_os = "macos")]
         unsafe {
@@ -449,6 +479,7 @@ impl FileBlobStore {
             data_dir,
             _dir_lock: dir_lock,
             data_file,
+            cold_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -478,6 +509,25 @@ impl FileBlobStore {
 
     fn offset_of(&self, guid: BlobGuid) -> Result<u64> {
         Ok(self.entry_of(guid)?.slot * u64::from(PAGE_SIZE))
+    }
+
+    fn cold_index_offset_of(&self, guid: BlobGuid) -> Option<u64> {
+        let m = self.manifest.read().unwrap();
+        m.entries
+            .get(&guid)
+            .map(|entry| entry.slot * u64::from(PAGE_SIZE))
+    }
+
+    fn remove_cold_index_best_effort(&self, guid: BlobGuid) {
+        let _ = self.clear_cold_index_slot(guid);
+    }
+
+    fn clear_cold_index_slot(&self, guid: BlobGuid) -> Result<()> {
+        let Some(offset) = self.cold_index_offset_of(guid) else {
+            return Ok(());
+        };
+        let zeros = [0u8; COLD_INDEX_IO_ALIGN];
+        self.write_cold_index_aligned(offset, &zeros)
     }
 
     fn entry_of(&self, guid: BlobGuid) -> Result<ManifestEntry> {
@@ -693,6 +743,14 @@ impl FileBlobStore {
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
     fn sync_data_file(&self) -> Result<()> {
         self.data_file.sync_data()?;
+        Ok(())
+    }
+
+    fn write_cold_index_aligned(&self, offset: u64, src: &[u8]) -> Result<()> {
+        debug_assert_eq!(offset % COLD_INDEX_IO_ALIGN as u64, 0);
+        debug_assert_eq!(src.len() % COLD_INDEX_IO_ALIGN, 0);
+        use std::os::unix::fs::FileExt;
+        self.cold_file.write_all_at(src, offset)?;
         Ok(())
     }
 
@@ -955,8 +1013,75 @@ impl BlobStore for FileBlobStore {
         Ok(())
     }
 
+    fn read_cold_index_range(
+        &self,
+        guid: BlobGuid,
+        byte_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<bool> {
+        let Some(base_offset) = self.cold_index_offset_of(guid) else {
+            return Ok(false);
+        };
+        if dst.is_empty() {
+            return Ok(true);
+        }
+        let start = usize::try_from(byte_offset)
+            .map_err(|_| Error::BlobStoreIo(io::Error::other("cold index offset")))?;
+        let Some(end) = start.checked_add(dst.len()) else {
+            return Ok(false);
+        };
+        if end > COLD_INDEX_SLOT_BYTES {
+            return Ok(false);
+        }
+        let offset = base_offset + byte_offset;
+
+        use std::os::unix::fs::FileExt;
+        let mut filled = 0;
+        while filled < dst.len() {
+            match self
+                .cold_file
+                .read_at(&mut dst[filled..], offset + filled as u64)
+            {
+                Ok(0) => {
+                    dst[filled..].fill(0);
+                    break;
+                }
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(Error::BlobStoreIo(err)),
+            }
+        }
+        Ok(true)
+    }
+
+    fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8]) -> Result<()> {
+        let Some(base_offset) = self.cold_index_offset_of(guid) else {
+            return Ok(());
+        };
+        if bytes.is_empty() || bytes.len() > COLD_INDEX_SLOT_BYTES {
+            self.clear_cold_index_slot(guid)?;
+            return Ok(());
+        }
+        let aligned_len = align_up(bytes.len(), COLD_INDEX_IO_ALIGN);
+        let mut direct = AlignedBlobBuf::zeroed();
+        direct.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        if aligned_len > COLD_INDEX_IO_ALIGN {
+            self.write_cold_index_aligned(
+                base_offset + COLD_INDEX_IO_ALIGN as u64,
+                &direct.as_mut_slice()[COLD_INDEX_IO_ALIGN..aligned_len],
+            )?;
+        }
+        self.write_cold_index_aligned(base_offset, &direct.as_mut_slice()[..COLD_INDEX_IO_ALIGN])?;
+        Ok(())
+    }
+
+    fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
+        self.clear_cold_index_slot(guid)
+    }
+
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
+        self.remove_cold_index_best_effort(guid);
         let entry = self.assign_write_entry(guid);
         let offset = entry.slot * u64::from(PAGE_SIZE);
         self.ensure_data_capacity(entry.slot.saturating_add(1))?;
@@ -970,6 +1095,9 @@ impl BlobStore for FileBlobStore {
         let io = self.prepare_blob_writes(writes)?;
         if io.is_empty() {
             return Ok(());
+        }
+        for (guid, _) in writes {
+            self.remove_cold_index_best_effort(*guid);
         }
         self.mark_data_write_started();
         self.pwrite_many_at(&io)?;
@@ -985,6 +1113,9 @@ impl BlobStore for FileBlobStore {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
             let io = self.prepare_blob_writes(writes)?;
+            for (guid, _) in writes {
+                self.remove_cold_index_best_effort(*guid);
+            }
             let epoch = self.mark_data_write_started();
             self.pwrite_many_and_sync_at(&io)?;
             self.mark_data_synced(epoch);
@@ -994,6 +1125,9 @@ impl BlobStore for FileBlobStore {
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
         {
             let io = self.prepare_blob_writes(writes)?;
+            for (guid, _) in writes {
+                self.remove_cold_index_best_effort(*guid);
+            }
             self.mark_data_write_started();
             self.pwrite_many_at(&io)?;
             Ok(())
@@ -1001,6 +1135,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+        self.remove_cold_index_best_effort(guid);
         let mut m = self.manifest.write().unwrap();
         if let Some(entry) = m.entries.remove(&guid) {
             m.pending_free_slots.push(entry.slot);
@@ -1921,6 +2056,55 @@ mod tests {
         b.delete_blob(g).unwrap();
         let mut dst = AlignedBlobBuf::zeroed();
         assert!(b.read_blob(g, &mut dst).is_err());
+    }
+
+    #[test]
+    fn cold_index_sidecar_round_trips_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g: BlobGuid = [0x9A; 16];
+        b.write_blob(g, &buf_with(1)).unwrap();
+        b.publish_cold_index(g, b"index-bytes").unwrap();
+        let mut dst = vec![0; b"index-bytes".len()];
+        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert_eq!(dst, b"index-bytes");
+        b.delete_cold_index(g).unwrap();
+        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert_ne!(dst, b"index-bytes");
+    }
+
+    #[test]
+    fn cold_index_publish_overwrites_packed_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g: BlobGuid = [0x9C; 16];
+        b.write_blob(g, &buf_with(1)).unwrap();
+        b.publish_cold_index(g, b"old").unwrap();
+        let mut dst = vec![0; 3];
+        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert_eq!(dst, b"old");
+        b.publish_cold_index(g, b"new").unwrap();
+        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert_eq!(dst, b"new");
+    }
+
+    #[test]
+    fn blob_write_removes_stale_cold_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g: BlobGuid = [0x9B; 16];
+        b.write_blob(g, &buf_with(1)).unwrap();
+        b.publish_cold_index(g, b"stale").unwrap();
+        b.write_blob(g, &buf_with(7)).unwrap();
+        let mut dst = vec![0; b"stale".len()];
+        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert_ne!(dst, b"stale");
     }
 
     #[test]

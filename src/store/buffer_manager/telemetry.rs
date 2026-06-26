@@ -21,6 +21,19 @@ pub(super) struct Telemetry {
     eviction_skips_protected: AtomicU64,
     eviction_skips_route_resident: AtomicU64,
     admission_protects: AtomicU64,
+    cold_page_hits: AtomicU64,
+    cold_page_misses: AtomicU64,
+    cold_index_cache_hits: AtomicU64,
+    cold_index_cache_misses: AtomicU64,
+    cold_index_loads: AtomicU64,
+    cold_index_dir_read_bytes: AtomicU64,
+    cold_index_bucket_reads: AtomicU64,
+    cold_index_bucket_read_bytes: AtomicU64,
+    cold_index_inline_hits: AtomicU64,
+    cold_index_offset_hits: AtomicU64,
+    cold_index_negative_hits: AtomicU64,
+    cold_index_crossing_hits: AtomicU64,
+    cold_index_unknowns: AtomicU64,
 }
 
 impl Telemetry {
@@ -93,6 +106,56 @@ impl Telemetry {
 
     pub(super) fn note_admission_protect(&self) {
         self.admission_protects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_page_hit(&self) {
+        self.cold_page_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_page_miss(&self) {
+        self.cold_page_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_cache_hit(&self) {
+        self.cold_index_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_cache_miss(&self) {
+        self.cold_index_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_load(&self, bytes: u64) {
+        self.cold_index_loads.fetch_add(1, Ordering::Relaxed);
+        self.cold_index_dir_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_bucket_read(&self, bytes: u64) {
+        self.cold_index_bucket_reads.fetch_add(1, Ordering::Relaxed);
+        self.cold_index_bucket_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_inline_hit(&self) {
+        self.cold_index_inline_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_offset_hit(&self) {
+        self.cold_index_offset_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_negative_hit(&self) {
+        self.cold_index_negative_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_crossing_hit(&self) {
+        self.cold_index_crossing_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_unknown(&self) {
+        self.cold_index_unknowns.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn cache_hits(&self) -> u64 {
@@ -169,6 +232,58 @@ impl Telemetry {
 
     pub(super) fn admission_protects(&self) -> u64 {
         self.admission_protects.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_page_hits(&self) -> u64 {
+        self.cold_page_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_page_misses(&self) -> u64 {
+        self.cold_page_misses.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_cache_hits(&self) -> u64 {
+        self.cold_index_cache_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_cache_misses(&self) -> u64 {
+        self.cold_index_cache_misses.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_loads(&self) -> u64 {
+        self.cold_index_loads.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_dir_read_bytes(&self) -> u64 {
+        self.cold_index_dir_read_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_bucket_reads(&self) -> u64 {
+        self.cold_index_bucket_reads.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_bucket_read_bytes(&self) -> u64 {
+        self.cold_index_bucket_read_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_inline_hits(&self) -> u64 {
+        self.cold_index_inline_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_offset_hits(&self) -> u64 {
+        self.cold_index_offset_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_negative_hits(&self) -> u64 {
+        self.cold_index_negative_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_crossing_hits(&self) -> u64 {
+        self.cold_index_crossing_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_unknowns(&self) -> u64 {
+        self.cold_index_unknowns.load(Ordering::Relaxed)
     }
 }
 

@@ -140,10 +140,11 @@ use dashmap::DashMap;
 use guid_hash::GuidBuildHasher;
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{BlobGuid, PAGE_SIZE};
+use crate::layout::{BlobGuid, HEADER_SIZE, PAGE_SIZE};
+use crate::store::{BlobFrameRef, PAGE_4K};
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
-use super::cold_page_cache::ColdPageCache;
+use super::cold::{ColdIndex, ColdIndexCache, ColdIndexStamp, ColdPageCache};
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -222,14 +223,16 @@ enum PinAccess {
     Silent,
 }
 
-const COLD_PAGE_CACHE_MIN_BYTES: usize = 4 * 1024 * 1024;
-const COLD_PAGE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
-const COLD_PAGE_CACHE_ENABLE_AT_BYTES: usize = 64 * 1024 * 1024;
+const COLD_AUX_CACHE_MIN_BYTES: usize = 2 * 1024 * 1024;
+const COLD_AUX_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const COLD_AUX_CACHE_ENABLE_AT_BYTES: usize = 16 * 1024 * 1024;
+const COLD_INDEX_DIRECTORY_PROBE_BYTES: usize = PAGE_4K as usize;
 
 #[derive(Clone, Copy, Debug)]
 struct CacheBudget {
     blob_slots: usize,
     cold_page_bytes: usize,
+    cold_index_bytes: usize,
 }
 
 impl CacheBudget {
@@ -237,23 +240,67 @@ impl CacheBudget {
         Self {
             blob_slots: total_blob_slots.max(1),
             cold_page_bytes: 0,
+            cold_index_bytes: 0,
         }
     }
 
     fn file(total_blob_slots: usize) -> Self {
         let total_blob_slots = total_blob_slots.max(1);
         let total_bytes = total_blob_slots.saturating_mul(PAGE_SIZE as usize);
-        let cold_page_bytes = if total_bytes < COLD_PAGE_CACHE_ENABLE_AT_BYTES {
+        let cold_aux_bytes = if total_bytes < COLD_AUX_CACHE_ENABLE_AT_BYTES {
             0
         } else {
-            (total_bytes / 16).clamp(COLD_PAGE_CACHE_MIN_BYTES, COLD_PAGE_CACHE_MAX_BYTES)
+            (total_bytes / 2).clamp(COLD_AUX_CACHE_MIN_BYTES, COLD_AUX_CACHE_MAX_BYTES)
         };
-        let blob_bytes = total_bytes.saturating_sub(cold_page_bytes);
+        let cold_index_bytes = cold_aux_bytes * 7 / 8;
+        let cold_page_bytes = cold_aux_bytes - cold_index_bytes;
+        let blob_bytes = total_bytes.saturating_sub(cold_aux_bytes);
         Self {
             blob_slots: (blob_bytes / PAGE_SIZE as usize).max(1),
             cold_page_bytes,
+            cold_index_bytes,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BufferStats {
+    pub(crate) dirty_count: usize,
+    pub(crate) pending_delete_count: usize,
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_misses: u64,
+    pub(crate) full_blob_reads: u64,
+    pub(crate) full_blob_read_bytes: u64,
+    pub(crate) point_full_blob_reads: u64,
+    pub(crate) scan_full_blob_reads: u64,
+    pub(crate) silent_full_blob_reads: u64,
+    pub(crate) cold_page_hits: u64,
+    pub(crate) cold_page_misses: u64,
+    pub(crate) cold_index_cache_hits: u64,
+    pub(crate) cold_index_cache_misses: u64,
+    pub(crate) cold_index_loads: u64,
+    pub(crate) cold_index_dir_read_bytes: u64,
+    pub(crate) cold_index_bucket_reads: u64,
+    pub(crate) cold_index_bucket_read_bytes: u64,
+    pub(crate) cold_index_inline_hits: u64,
+    pub(crate) cold_index_offset_hits: u64,
+    pub(crate) cold_index_negative_hits: u64,
+    pub(crate) cold_index_crossing_hits: u64,
+    pub(crate) cold_index_unknowns: u64,
+    pub(crate) optimistic_restarts: u64,
+    pub(crate) range_restarts: u64,
+    pub(crate) walker_ops: u64,
+    pub(crate) walker_blob_hops: u64,
+    pub(crate) max_blob_hops: u64,
+    pub(crate) max_cross_blob_depth: u64,
+    pub(crate) spillovers: u64,
+    pub(crate) merges: u64,
+    pub(crate) route_resident_count: usize,
+    pub(crate) route_resident_demotions: u64,
+    pub(crate) cache_evictions: u64,
+    pub(crate) eviction_skips_protected: u64,
+    pub(crate) eviction_skips_route_resident: u64,
+    pub(crate) admission_protects: u64,
 }
 
 /// Frequency-aware blob cache; see the module docs.
@@ -265,6 +312,12 @@ pub struct BufferManager {
     /// Counted inside the user-visible cache budget for file-backed
     /// trees; disabled for memory/custom stores.
     cold_pages: ColdPageCache,
+    cold_indexes: ColdIndexCache,
+    /// Per-blob invalidation token for checkpoint sidecar and cold
+    /// page reads. Sidecars are validated against the on-disk header
+    /// when loaded; the epoch catches in-process writers/checkpoints
+    /// after that without forcing every cold hit to reread the header.
+    cold_epoch: DashMap<BlobGuid, AtomicU64, GuidBuildHasher>,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -532,8 +585,9 @@ impl BufferManager {
     /// store-specific uninitialized-frame allocator.
     ///
     /// The public `capacity` is expressed in 512 KB blob-frame units.
-    /// Internally, a bounded slice is reserved for 4 KB cold-read
-    /// navigation pages and the rest becomes resident blob slots.
+    /// Internally, a bounded slice is reserved for rebuildable cold-read
+    /// indexes plus 4 KB cold pages; the remainder becomes resident blob
+    /// slots.
     #[must_use]
     pub(crate) fn new_file<F>(store: Arc<dyn BlobStore>, capacity: usize, alloc_uninit: F) -> Self
     where
@@ -556,6 +610,8 @@ impl BufferManager {
             alloc_uninit: Arc::new(alloc_uninit),
             capacity,
             cold_pages: ColdPageCache::new(budget.cold_page_bytes),
+            cold_indexes: ColdIndexCache::new(budget.cold_index_bytes),
+            cold_epoch: DashMap::with_hasher(GuidBuildHasher),
             cache: DashMap::with_hasher(GuidBuildHasher),
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
@@ -594,26 +650,6 @@ impl BufferManager {
 
     pub(crate) fn route_resident_count(&self) -> usize {
         self.route_resident.len()
-    }
-
-    pub(crate) fn route_resident_demotions(&self) -> u64 {
-        self.telemetry.route_resident_demotions()
-    }
-
-    pub(crate) fn cache_evictions(&self) -> u64 {
-        self.telemetry.cache_evictions()
-    }
-
-    pub(crate) fn eviction_skips_protected(&self) -> u64 {
-        self.telemetry.eviction_skips_protected()
-    }
-
-    pub(crate) fn eviction_skips_route_resident(&self) -> u64 {
-        self.telemetry.eviction_skips_route_resident()
-    }
-
-    pub(crate) fn admission_protects(&self) -> u64 {
-        self.telemetry.admission_protects()
     }
 
     pub(crate) fn mark_route_resident(&self, guid: BlobGuid) {
@@ -701,59 +737,45 @@ impl BufferManager {
         self.cache.len()
     }
 
-    /// Cumulative cache lookup hits (`get_cached` found the entry
-    /// without consulting the inner store). Relaxed-ordered;
-    /// reads are observability-only.
-    #[must_use]
-    pub fn cache_hits(&self) -> u64 {
-        self.telemetry.cache_hits()
-    }
-
-    /// Cumulative cache lookup misses — every miss is followed by
-    /// an `inner_store.read_blob` and an `insert_into_cache`.
-    #[must_use]
-    pub fn cache_misses(&self) -> u64 {
-        self.telemetry.cache_misses()
-    }
-
-    /// Successful full-frame reads from the inner store after a
-    /// BufferManager miss. Each read pulls one `PAGE_SIZE` blob.
-    #[must_use]
-    pub fn full_blob_reads(&self) -> u64 {
-        self.telemetry.full_blob_reads()
-    }
-
-    /// Bytes read by successful full-frame inner-store reads.
-    #[must_use]
-    pub fn full_blob_read_bytes(&self) -> u64 {
-        self.full_blob_reads() * PAGE_SIZE as u64
-    }
-
-    /// Full-frame reads caused by point get/put paths.
-    #[must_use]
-    pub fn point_full_blob_reads(&self) -> u64 {
-        self.telemetry.point_full_blob_reads()
-    }
-
-    /// Full-frame reads caused by range/list scan paths.
-    #[must_use]
-    pub fn scan_full_blob_reads(&self) -> u64 {
-        self.telemetry.scan_full_blob_reads()
-    }
-
-    /// Full-frame reads caused by silent introspection paths.
-    #[must_use]
-    pub fn silent_full_blob_reads(&self) -> u64 {
-        self.telemetry.silent_full_blob_reads()
-    }
-
-    /// Cumulative optimistic-read restarts. Bumped by the lookup
-    /// walker every time a `validate()` after a wait-free read
-    /// returns `false` — a concurrent writer lapped the snapshot
-    /// and the walk has to restart from the root.
-    #[must_use]
-    pub fn optimistic_restarts(&self) -> u64 {
-        self.telemetry.optimistic_restarts()
+    pub(crate) fn stats(&self) -> BufferStats {
+        BufferStats {
+            dirty_count: self.dirty_count(),
+            pending_delete_count: self.pending_delete_count(),
+            cache_hits: self.telemetry.cache_hits(),
+            cache_misses: self.telemetry.cache_misses(),
+            full_blob_reads: self.telemetry.full_blob_reads(),
+            full_blob_read_bytes: self.telemetry.full_blob_reads() * PAGE_SIZE as u64,
+            point_full_blob_reads: self.telemetry.point_full_blob_reads(),
+            scan_full_blob_reads: self.telemetry.scan_full_blob_reads(),
+            silent_full_blob_reads: self.telemetry.silent_full_blob_reads(),
+            cold_page_hits: self.telemetry.cold_page_hits(),
+            cold_page_misses: self.telemetry.cold_page_misses(),
+            cold_index_cache_hits: self.telemetry.cold_index_cache_hits(),
+            cold_index_cache_misses: self.telemetry.cold_index_cache_misses(),
+            cold_index_loads: self.telemetry.cold_index_loads(),
+            cold_index_dir_read_bytes: self.telemetry.cold_index_dir_read_bytes(),
+            cold_index_bucket_reads: self.telemetry.cold_index_bucket_reads(),
+            cold_index_bucket_read_bytes: self.telemetry.cold_index_bucket_read_bytes(),
+            cold_index_inline_hits: self.telemetry.cold_index_inline_hits(),
+            cold_index_offset_hits: self.telemetry.cold_index_offset_hits(),
+            cold_index_negative_hits: self.telemetry.cold_index_negative_hits(),
+            cold_index_crossing_hits: self.telemetry.cold_index_crossing_hits(),
+            cold_index_unknowns: self.telemetry.cold_index_unknowns(),
+            optimistic_restarts: self.telemetry.optimistic_restarts(),
+            range_restarts: self.telemetry.range_restarts(),
+            walker_ops: self.telemetry.walker_ops(),
+            walker_blob_hops: self.telemetry.walker_blob_hops(),
+            max_blob_hops: self.telemetry.max_blob_hops(),
+            max_cross_blob_depth: self.telemetry.max_cross_blob_depth(),
+            spillovers: self.telemetry.spillover_count(),
+            merges: self.telemetry.merge_count(),
+            route_resident_count: self.route_resident_count(),
+            route_resident_demotions: self.telemetry.route_resident_demotions(),
+            cache_evictions: self.telemetry.cache_evictions(),
+            eviction_skips_protected: self.telemetry.eviction_skips_protected(),
+            eviction_skips_route_resident: self.telemetry.eviction_skips_route_resident(),
+            admission_protects: self.telemetry.admission_protects(),
+        }
     }
 
     /// Bump the optimistic-restart counter. Called from the
@@ -762,59 +784,8 @@ impl BufferManager {
         self.telemetry.note_optimistic_restart();
     }
 
-    /// Cumulative range-iterator cursor restarts. Bumped when a
-    /// versioned range cursor detects that a writer rewrote a blob
-    /// on its descent path and must rebuild from its monotonic
-    /// lower bound.
-    #[must_use]
-    pub fn range_restarts(&self) -> u64 {
-        self.telemetry.range_restarts()
-    }
-
     pub(crate) fn note_range_restart(&self) {
         self.telemetry.note_range_restart();
-    }
-
-    /// Cumulative mutation walker calls (`insert_multi` /
-    /// `erase_multi`). A `rename` or `atomic` contributes one count per
-    /// inner walker invocation, not one count per public API call.
-    #[must_use]
-    pub fn walker_ops(&self) -> u64 {
-        self.telemetry.walker_ops()
-    }
-
-    /// Total blob hops across mutation walkers. Divide by
-    /// [`Self::walker_ops`] to derive average blob-hop count.
-    #[must_use]
-    pub fn walker_blob_hops(&self) -> u64 {
-        self.telemetry.walker_blob_hops()
-    }
-
-    /// Maximum blob hops observed for a single mutation walker call.
-    #[must_use]
-    pub fn max_blob_hops(&self) -> u64 {
-        self.telemetry.max_blob_hops()
-    }
-
-    /// Largest key-depth at which a mutation walker entered a blob.
-    /// This is a cross-blob boundary-depth signal rather than a full
-    /// per-node ART-depth trace.
-    #[must_use]
-    pub fn max_cross_blob_depth(&self) -> u64 {
-        self.telemetry.max_cross_blob_depth()
-    }
-
-    /// Number of successful foreground spillover events.
-    #[must_use]
-    pub fn spillover_count(&self) -> u64 {
-        self.telemetry.spillover_count()
-    }
-
-    /// Number of `BlobNode` children folded back into parents by
-    /// manual compact or background merge passes.
-    #[must_use]
-    pub fn merge_count(&self) -> u64 {
-        self.telemetry.merge_count()
     }
 
     /// Record one completed mutation walker traversal.
@@ -1290,7 +1261,13 @@ impl BufferManager {
     /// Fill `dst` with a cached 4 KiB cold-read page. The caller must
     /// have checked [`Self::cold_read_eligible`] before trusting it.
     pub(crate) fn cold_page_cached(&self, guid: BlobGuid, page: u16, dst: &mut [u8]) -> bool {
-        self.cold_pages.fill(guid, page, dst)
+        if self.cold_pages.fill(guid, page, dst) {
+            self.telemetry.note_cold_page_hit();
+            true
+        } else {
+            self.telemetry.note_cold_page_miss();
+            false
+        }
     }
 
     /// Store a clean 4 KiB navigation page for later cold reads.
@@ -1298,8 +1275,127 @@ impl BufferManager {
         self.cold_pages.put(guid, page, src);
     }
 
-    fn cold_pages_invalidate(&self, guid: BlobGuid) {
+    /// Store a clean 4 KiB leaf page only after repeated cold touches.
+    pub(crate) fn cold_leaf_page_store(&self, guid: BlobGuid, page: u16, src: &[u8]) {
+        self.cold_pages.put_after_second_touch(guid, page, src);
+    }
+
+    pub(crate) fn cold_index(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
+        self.cold_index_load(guid)
+    }
+
+    fn cold_index_load(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
+        if !self.cold_read_eligible(guid) {
+            return None;
+        }
+        if let Some(index) = self.cold_indexes.get(guid) {
+            self.telemetry.note_cold_index_cache_hit();
+            return Some((index, self.cold_epoch(guid)));
+        }
+        self.telemetry.note_cold_index_cache_miss();
+        let epoch = self.cold_epoch(guid);
+        let mut bytes = vec![0; COLD_INDEX_DIRECTORY_PROBE_BYTES];
+        if !self.store.read_cold_index_range(guid, 0, &mut bytes).ok()? {
+            return None;
+        }
+        let directory_len = ColdIndex::directory_len(&bytes).ok()?;
+        let read_bytes = if directory_len > bytes.len() {
+            let mut rest = vec![0; directory_len - bytes.len()];
+            if !self
+                .store
+                .read_cold_index_range(guid, bytes.len() as u64, &mut rest)
+                .ok()?
+            {
+                return None;
+            }
+            bytes.extend_from_slice(&rest);
+            bytes.len() as u64
+        } else {
+            bytes.truncate(directory_len);
+            COLD_INDEX_DIRECTORY_PROBE_BYTES as u64
+        };
+        let index = ColdIndex::decode_directory(bytes).ok()?;
+        if !self.cold_index_stamp_matches(guid, &index).ok()? {
+            self.cold_indexes.invalidate(guid);
+            return None;
+        }
+        if self.cold_epoch(guid) != epoch || !self.cold_read_eligible(guid) {
+            return None;
+        }
+        self.telemetry.note_cold_index_load(read_bytes);
+        Some((self.cold_indexes.insert(guid, index), epoch))
+    }
+
+    pub(crate) fn read_cold_index_bucket(
+        &self,
+        guid: BlobGuid,
+        index: &ColdIndex,
+        user_key: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> Option<()> {
+        let (off, len) = index.bucket_range(user_key)?;
+        dst.resize(len as usize, 0);
+        self.telemetry.note_cold_index_bucket_read(u64::from(len));
+        if len != 0
+            && !self
+                .store
+                .read_cold_index_range(guid, u64::from(off), dst.as_mut_slice())
+                .ok()?
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    pub(crate) fn note_cold_index_inline_hit(&self) {
+        self.telemetry.note_cold_index_inline_hit();
+    }
+
+    pub(crate) fn note_cold_index_offset_hit(&self) {
+        self.telemetry.note_cold_index_offset_hit();
+    }
+
+    pub(crate) fn note_cold_index_negative_hit(&self) {
+        self.telemetry.note_cold_index_negative_hit();
+    }
+
+    pub(crate) fn note_cold_index_crossing_hit(&self) {
+        self.telemetry.note_cold_index_crossing_hit();
+    }
+
+    pub(crate) fn note_cold_index_unknown(&self) {
+        self.telemetry.note_cold_index_unknown();
+    }
+
+    fn cold_read_invalidate(&self, guid: BlobGuid) {
+        self.bump_cold_epoch(guid);
         self.cold_pages.invalidate(guid);
+        self.cold_indexes.invalidate(guid);
+    }
+
+    pub(crate) fn cold_token_valid(&self, guid: BlobGuid, epoch: u64) -> bool {
+        self.cold_read_eligible(guid) && self.cold_epoch(guid) == epoch
+    }
+
+    fn cold_epoch(&self, guid: BlobGuid) -> u64 {
+        self.cold_epoch
+            .get(&guid)
+            .map_or(0, |entry| entry.load(Ordering::Acquire))
+    }
+
+    fn bump_cold_epoch(&self, guid: BlobGuid) {
+        self.cold_epoch
+            .entry(guid)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn cold_index_stamp_matches(&self, guid: BlobGuid, index: &ColdIndex) -> Result<bool> {
+        let mut scratch = AlignedBlobBuf::zeroed();
+        self.store
+            .read_blob_range(guid, 0, &mut scratch.as_mut_slice()[..HEADER_SIZE as usize])?;
+        let frame = BlobFrameRef::wrap(scratch.as_slice());
+        Ok(ColdIndexStamp::new(frame.header()) == index.stamp())
     }
 
     fn note_full_blob_read(&self, access: PinAccess) {
@@ -1346,7 +1442,7 @@ impl BufferManager {
             // snapshot the bytes it is asked to flush.
             return;
         };
-        self.cold_pages_invalidate(guid);
+        self.cold_read_invalidate(guid);
         let hint_covers_seq = !cached.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if state.has_delete_fence(&guid) {
@@ -1838,7 +1934,9 @@ impl BufferManager {
             self.store.write_blobs_with_data_sync(&writes)?;
         }
         for idx in &write_indices {
-            self.cold_pages_invalidate(entries[*idx].guid);
+            let entry = &entries[*idx];
+            self.cold_read_invalidate(entry.guid);
+            self.try_publish_cold_index(entry.guid, &entry.bytes);
         }
         for idx in write_indices {
             let entry = &entries[idx];
@@ -1884,6 +1982,26 @@ impl BufferManager {
         }
     }
 
+    fn try_publish_cold_index(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) {
+        let frame = BlobFrameRef::wrap(bytes.as_slice());
+        let Ok(encoded) = ColdIndex::build_bytes(frame) else {
+            return;
+        };
+        if self.store.publish_cold_index(guid, &encoded).is_err() {
+            self.cold_indexes.invalidate(guid);
+            return;
+        }
+        let Ok(directory_len) = ColdIndex::directory_len(&encoded[..ColdIndex::HEADER_LEN]) else {
+            self.cold_indexes.invalidate(guid);
+            return;
+        };
+        let Ok(index) = ColdIndex::decode_directory(encoded[..directory_len].to_vec()) else {
+            self.cold_indexes.invalidate(guid);
+            return;
+        };
+        let _ = self.cold_indexes.insert(guid, index);
+    }
+
     /// Forward `flush` to the inner store without touching the
     /// cache. Used by the checkpoint I/O worker between epoch
     /// phases.
@@ -1914,7 +2032,7 @@ impl BufferManager {
     /// here; the background eviction thread or the next round's
     /// flush will catch up.
     pub(crate) fn install_new_blob(&self, guid: BlobGuid, mut bytes: AlignedBlobBuf, seq: u64) {
-        self.cold_pages_invalidate(guid);
+        self.cold_read_invalidate(guid);
         // Stamp the creation epoch so copy-on-write snapshots can tell
         // whether a later mutation must fork this frame rather than
         // overwrite it in place.
@@ -1965,11 +2083,36 @@ impl BlobStore for BufferManager {
         Ok(())
     }
 
+    fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
+        self.store.read_blob_range(guid, byte_offset, dst)
+    }
+
+    fn read_cold_index_range(
+        &self,
+        guid: BlobGuid,
+        byte_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<bool> {
+        self.store.read_cold_index_range(guid, byte_offset, dst)
+    }
+
+    fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8]) -> Result<()> {
+        self.store.publish_cold_index(guid, bytes)
+    }
+
+    fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
+        self.cold_read_invalidate(guid);
+        self.store.delete_cold_index(guid)
+    }
+
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.cold_pages_invalidate(guid);
+        self.cold_read_invalidate(guid);
         // Transparent write-through: if cached, refresh the
         // cached image; either way, always write to the inner
         // store in the same call so durability is unchanged.
@@ -1997,7 +2140,7 @@ impl BlobStore for BufferManager {
             }
         }
         for (guid, _) in writes {
-            self.cold_pages_invalidate(*guid);
+            self.cold_read_invalidate(*guid);
         }
         for (guid, src) in writes {
             if let Some(entry) = self.get_cached_with_access(*guid, PinAccess::Silent) {
@@ -2021,7 +2164,7 @@ impl BlobStore for BufferManager {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.cold_pages_invalidate(guid);
+        self.cold_read_invalidate(guid);
         if !self.evict_from_cache(guid) {
             return Err(Error::Internal(
                 "delete_blob: protected cache image cannot be evicted",
@@ -2059,9 +2202,9 @@ impl BlobStore for BufferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::blob_store::MemoryBlobStore;
-    use crate::store::PAGE_4K;
-    use std::sync::atomic::AtomicBool;
+    use crate::store::blob_store::{FileBlobStore, MemoryBlobStore};
+    use crate::store::{BlobFrame, PAGE_4K};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn make_buf(byte_at_100: u8) -> AlignedBlobBuf {
         let mut b = AlignedBlobBuf::zeroed();
@@ -2126,12 +2269,103 @@ mod tests {
         }
     }
 
+    struct CountingColdStore {
+        inner: FileBlobStore,
+        cold_reads: AtomicUsize,
+    }
+
+    impl CountingColdStore {
+        fn open(path: &std::path::Path) -> Result<Self> {
+            Ok(Self {
+                inner: FileBlobStore::open(path)?,
+                cold_reads: AtomicUsize::new(0),
+            })
+        }
+
+        fn cold_reads(&self) -> usize {
+            self.cold_reads.load(Ordering::Acquire)
+        }
+
+        fn reset_cold_reads(&self) {
+            self.cold_reads.store(0, Ordering::Release);
+        }
+    }
+
+    impl BlobStore for CountingColdStore {
+        fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
+            self.inner.alloc_blob_buf_zeroed()
+        }
+
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn read_blobs(&self, guids: &[BlobGuid], dsts: &mut [AlignedBlobBuf]) -> Vec<Result<()>> {
+            self.inner.read_blobs(guids, dsts)
+        }
+
+        fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+            self.inner.read_blob_range(guid, byte_offset, dst)
+        }
+
+        fn read_cold_index_range(
+            &self,
+            guid: BlobGuid,
+            byte_offset: u64,
+            dst: &mut [u8],
+        ) -> Result<bool> {
+            self.cold_reads.fetch_add(1, Ordering::AcqRel);
+            self.inner.read_cold_index_range(guid, byte_offset, dst)
+        }
+
+        fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8]) -> Result<()> {
+            self.inner.publish_cold_index(guid, bytes)
+        }
+
+        fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_cold_index(guid)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            self.inner.write_blobs(writes)
+        }
+
+        fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            self.inner.write_blobs_with_data_sync(writes)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
     #[test]
-    fn file_cache_budget_splits_cold_pages_inside_total() {
+    fn file_cache_budget_splits_cold_aux_inside_total() {
         let budget = CacheBudget::file(256);
 
         assert_eq!(budget.cold_page_bytes, 8 * 1024 * 1024);
-        assert_eq!(budget.blob_slots, 240);
+        assert_eq!(budget.cold_index_bytes, 56 * 1024 * 1024);
+        assert_eq!(budget.blob_slots, 128);
     }
 
     #[test]
@@ -2139,14 +2373,16 @@ mod tests {
         let budget = CacheBudget::file(16);
 
         assert_eq!(budget.cold_page_bytes, 0);
+        assert_eq!(budget.cold_index_bytes, 0);
         assert_eq!(budget.blob_slots, 16);
     }
 
     #[test]
-    fn memory_cache_budget_disables_cold_pages() {
+    fn memory_cache_budget_disables_cold_aux() {
         let budget = CacheBudget::memory(256);
 
         assert_eq!(budget.cold_page_bytes, 0);
+        assert_eq!(budget.cold_index_bytes, 0);
         assert_eq!(budget.blob_slots, 256);
     }
 
@@ -2226,15 +2462,17 @@ mod tests {
         let first = bm.pin(guid).unwrap();
         assert_eq!(first.read().as_slice()[100], 9);
         drop(first);
-        assert_eq!(bm.cache_misses(), 1);
-        assert_eq!(bm.cache_hits(), 0);
+        let stats = bm.stats();
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.cache_hits, 0);
 
         let second = bm.pin(guid).unwrap();
         assert_eq!(second.read().as_slice()[100], 9);
-        assert_eq!(bm.cache_misses(), 1);
-        assert_eq!(bm.cache_hits(), 1);
-        assert_eq!(bm.full_blob_reads(), 1);
-        assert_eq!(bm.full_blob_read_bytes(), PAGE_SIZE as u64);
+        let stats = bm.stats();
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.full_blob_reads, 1);
+        assert_eq!(stats.full_blob_read_bytes, PAGE_SIZE as u64);
     }
 
     #[test]
@@ -2257,25 +2495,25 @@ mod tests {
         silent[0] = 2;
         drop(bm.pin_silent(silent).unwrap());
 
-        assert_eq!(bm.full_blob_reads(), 3);
-        assert_eq!(bm.full_blob_read_bytes(), 3 * PAGE_SIZE as u64);
-        assert_eq!(bm.point_full_blob_reads(), 1);
-        assert_eq!(bm.scan_full_blob_reads(), 1);
-        assert_eq!(bm.silent_full_blob_reads(), 1);
+        let stats = bm.stats();
+        assert_eq!(stats.full_blob_reads, 3);
+        assert_eq!(stats.full_blob_read_bytes, 3 * PAGE_SIZE as u64);
+        assert_eq!(stats.point_full_blob_reads, 1);
+        assert_eq!(stats.scan_full_blob_reads, 1);
+        assert_eq!(stats.silent_full_blob_reads, 1);
         assert_eq!(
-            bm.cache_misses(),
-            2,
+            stats.cache_misses, 2,
             "silent miss does not count as a public cache miss"
         );
-        assert_eq!(bm.cache_hits(), 0);
+        assert_eq!(stats.cache_hits, 0);
 
         drop(bm.pin([0; 16]).unwrap());
+        let stats = bm.stats();
         assert_eq!(
-            bm.full_blob_reads(),
-            3,
+            stats.full_blob_reads, 3,
             "cache hits must not count as store reads"
         );
-        assert_eq!(bm.cache_hits(), 1);
+        assert_eq!(stats.cache_hits, 1);
     }
 
     #[test]
@@ -2463,7 +2701,7 @@ mod tests {
         bm.mark_route_resident([2; 16]);
 
         assert_eq!(bm.route_resident_count(), 1);
-        assert_eq!(bm.route_resident_demotions(), 1);
+        assert_eq!(bm.stats().route_resident_demotions, 1);
         assert!(!bm.is_route_resident([1; 16]));
         assert!(bm.is_route_resident([2; 16]));
     }
@@ -3577,7 +3815,7 @@ mod tests {
     }
 
     #[test]
-    fn write_through_batch_invalidates_cold_pages_before_retire() {
+    fn write_through_batch_invalidates_cold_read_cache_before_retire() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0xBC; 16];
         inner.write_blob(guid, &make_buf(0)).unwrap();
@@ -3609,6 +3847,92 @@ mod tests {
         assert!(
             !bm.cold_page_cached(guid, 0, &mut dst),
             "checkpointed bytes must retire stale cold navigation pages"
+        );
+    }
+
+    #[test]
+    fn write_through_batch_publishes_cold_index_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::blob_store::FileBlobStore::open(dir.path()).unwrap());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
+        let guid = [0xBD; 16];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        BlobFrame::init(bytes.as_mut_slice(), guid).unwrap();
+
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid,
+            bytes,
+            expected_seq: 1,
+            content_version: None,
+        }])
+        .unwrap();
+
+        let mut sidecar = vec![0; ColdIndex::HEADER_LEN];
+        assert!(
+            store.read_cold_index_range(guid, 0, &mut sidecar).unwrap(),
+            "checkpoint write-through should publish cold index"
+        );
+        let directory_len =
+            ColdIndex::directory_len(&sidecar).expect("published cold index header should parse");
+        if directory_len > ColdIndex::HEADER_LEN {
+            let mut rest = vec![0; directory_len - ColdIndex::HEADER_LEN];
+            assert!(
+                store
+                    .read_cold_index_range(guid, ColdIndex::HEADER_LEN as u64, &mut rest)
+                    .unwrap(),
+                "published cold index directory should be readable"
+            );
+            sidecar.extend_from_slice(&rest);
+        }
+        ColdIndex::decode_directory(sidecar).expect("published cold index should parse");
+    }
+
+    #[test]
+    fn cold_index_load_reads_small_directory_in_one_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CountingColdStore::open(dir.path()).unwrap());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
+        let guid = [0xBE; 16];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        BlobFrame::init(bytes.as_mut_slice(), guid).unwrap();
+
+        bm.write_through_batch(&[WriteThroughEntry {
+            guid,
+            bytes,
+            expected_seq: 1,
+            content_version: None,
+        }])
+        .unwrap();
+        store.flush().unwrap();
+
+        let mut sidecar = vec![0; ColdIndex::HEADER_LEN];
+        assert!(store.read_cold_index_range(guid, 0, &mut sidecar).unwrap());
+        ColdIndex::directory_len(&sidecar).expect("published cold-index header parses");
+
+        store.reset_cold_reads();
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
+
+        assert!(bm.cold_read_eligible(guid));
+        let mut probe = vec![0; COLD_INDEX_DIRECTORY_PROBE_BYTES];
+        assert!(store.read_cold_index_range(guid, 0, &mut probe).unwrap());
+        let directory_len =
+            ColdIndex::directory_len(&probe).expect("probe should parse cold-index header");
+        probe.truncate(directory_len);
+        let index = ColdIndex::decode_directory(probe).expect("probe should decode directory");
+        assert!(
+            bm.cold_index_stamp_matches(guid, &index).unwrap(),
+            "probe-decoded cold index should match the blob header"
+        );
+        store.reset_cold_reads();
+
+        assert!(bm.cold_index(guid).is_some());
+        assert_eq!(
+            store.cold_reads(),
+            1,
+            "small cold-index directories fit in the first 4 KiB probe"
         );
     }
 

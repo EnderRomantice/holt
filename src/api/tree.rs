@@ -37,7 +37,8 @@ use crate::journal::Journal;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::{
-    BlobFrame, BlobFrameRef, BufferManager, CachedBlob, DirtySnapshotEntry, WriteThroughEntry,
+    BlobFrame, BlobFrameRef, BufferManager, BufferStats, CachedBlob, DirtySnapshotEntry,
+    WriteThroughEntry,
 };
 
 use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
@@ -114,62 +115,6 @@ struct BlobStatsAggregate {
     max_blob_fill_per_mille: u32,
     underfilled_child_blobs: u32,
     overfull_child_blobs: u32,
-}
-
-struct BufferStatsSnapshot {
-    dirty_count: usize,
-    pending_delete_count: usize,
-    cache_hits: u64,
-    cache_misses: u64,
-    full_blob_reads: u64,
-    full_blob_read_bytes: u64,
-    point_full_blob_reads: u64,
-    scan_full_blob_reads: u64,
-    silent_full_blob_reads: u64,
-    optimistic_restarts: u64,
-    range_restarts: u64,
-    walker_ops: u64,
-    walker_blob_hops: u64,
-    max_blob_hops: u64,
-    max_cross_blob_depth: u64,
-    spillovers: u64,
-    merges: u64,
-    route_resident_count: usize,
-    route_resident_demotions: u64,
-    cache_evictions: u64,
-    eviction_skips_protected: u64,
-    eviction_skips_route_resident: u64,
-    admission_protects: u64,
-}
-
-impl BufferStatsSnapshot {
-    fn collect(store: &BufferManager) -> Self {
-        Self {
-            dirty_count: store.dirty_count(),
-            pending_delete_count: store.pending_delete_count(),
-            cache_hits: store.cache_hits(),
-            cache_misses: store.cache_misses(),
-            full_blob_reads: store.full_blob_reads(),
-            full_blob_read_bytes: store.full_blob_read_bytes(),
-            point_full_blob_reads: store.point_full_blob_reads(),
-            scan_full_blob_reads: store.scan_full_blob_reads(),
-            silent_full_blob_reads: store.silent_full_blob_reads(),
-            optimistic_restarts: store.optimistic_restarts(),
-            range_restarts: store.range_restarts(),
-            walker_ops: store.walker_ops(),
-            walker_blob_hops: store.walker_blob_hops(),
-            max_blob_hops: store.max_blob_hops(),
-            max_cross_blob_depth: store.max_cross_blob_depth(),
-            spillovers: store.spillover_count(),
-            merges: store.merge_count(),
-            route_resident_count: store.route_resident_count(),
-            route_resident_demotions: store.route_resident_demotions(),
-            cache_evictions: store.cache_evictions(),
-            eviction_skips_protected: store.eviction_skips_protected(),
-            eviction_skips_route_resident: store.eviction_skips_route_resident(),
-            admission_protects: store.admission_protects(),
-        }
-    }
 }
 
 fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
@@ -329,14 +274,9 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
     let mut len = RECORD_HEADER_SIZE + body_prefix_len + RECORD_FOOTER_SIZE;
     let mut i = 0usize;
     while i < ops.len() {
-        if let Some((key, value)) = batch_insert_parts(&ops[i]) {
-            let run = same_shape_insert_run_len(ops, i);
-            if run > 1 {
-                len += 1 + 8 + 4 + 4 + 4 + run * (key.len() + value.len());
-            } else {
-                len += 1 + 8 + 4 + key.len() + 4 + value.len();
-            }
-            i += run;
+        if let Some(plan) = insert_run_plan(ops, i) {
+            len += plan.encoded_len(&ops[i..i + plan.len]);
+            i += plan.len;
             continue;
         }
         len += match &ops[i] {
@@ -350,6 +290,43 @@ fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
         i += 1;
     }
     len
+}
+
+const INSERT_PREFIX_RUN_MIN_PREFIX: usize = 12;
+const INSERT_PREFIX_RUN_MIN_COUNT: usize = 2;
+
+#[derive(Clone, Copy)]
+enum InsertRunEncoding {
+    Fixed { key_len: usize, value_len: usize },
+    Prefix { prefix_len: usize },
+}
+
+#[derive(Clone, Copy)]
+struct InsertRunPlan {
+    len: usize,
+    encoding: InsertRunEncoding,
+}
+
+impl InsertRunPlan {
+    fn encoded_len(self, ops: &[BatchOp]) -> usize {
+        match self.encoding {
+            InsertRunEncoding::Fixed { key_len, value_len } => {
+                if self.len == 1 {
+                    1 + 8 + 4 + key_len + 4 + value_len
+                } else {
+                    1 + 8 + 4 + 4 + 4 + self.len * (key_len + value_len)
+                }
+            }
+            InsertRunEncoding::Prefix { prefix_len } => {
+                let mut len = 1 + 8 + 4 + 4 + prefix_len;
+                for op in ops {
+                    let (key, value) = batch_insert_parts(op).expect("prefix run insert op");
+                    len += 4 + (key.len() - prefix_len) + 4 + value.len();
+                }
+                len
+            }
+        }
+    }
 }
 
 fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
@@ -396,6 +373,72 @@ fn same_shape_insert_run_len(ops: &[BatchOp], start: usize) -> usize {
         }
     }
     end - start
+}
+
+fn insert_run_plan(ops: &[BatchOp], start: usize) -> Option<InsertRunPlan> {
+    let (first_key, first_value) = batch_insert_parts(&ops[start])?;
+    let fixed_len = same_shape_insert_run_len(ops, start);
+    let fixed = InsertRunPlan {
+        len: fixed_len,
+        encoding: InsertRunEncoding::Fixed {
+            key_len: first_key.len(),
+            value_len: first_value.len(),
+        },
+    };
+
+    let Some(prefix) = same_prefix_insert_run(ops, start) else {
+        return Some(fixed);
+    };
+    let prefix_plan = InsertRunPlan {
+        len: prefix.len,
+        encoding: InsertRunEncoding::Prefix {
+            prefix_len: prefix.prefix_len,
+        },
+    };
+
+    let individual_len = ops[start..start + prefix.len]
+        .iter()
+        .map(|op| batch_insert_parts(op).expect("prefix run insert op"))
+        .map(|(key, value)| 1 + 8 + 4 + key.len() + 4 + value.len())
+        .sum::<usize>();
+    if prefix_plan.encoded_len(&ops[start..start + prefix.len]) < individual_len {
+        Some(prefix_plan)
+    } else {
+        Some(fixed)
+    }
+}
+
+struct PrefixInsertRun {
+    len: usize,
+    prefix_len: usize,
+}
+
+fn same_prefix_insert_run(ops: &[BatchOp], start: usize) -> Option<PrefixInsertRun> {
+    let (first_key, _) = batch_insert_parts(&ops[start])?;
+    let mut prefix_len = first_key.len();
+    let mut len = 1usize;
+    let mut end = start + 1;
+    while end < ops.len() {
+        let Some((key, _)) = batch_insert_parts(&ops[end]) else {
+            break;
+        };
+        prefix_len = common_prefix_len(&first_key[..prefix_len], key);
+        if prefix_len < INSERT_PREFIX_RUN_MIN_PREFIX {
+            break;
+        }
+        len += 1;
+        end += 1;
+    }
+    (len >= INSERT_PREFIX_RUN_MIN_COUNT).then_some(PrefixInsertRun { len, prefix_len })
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    let len = left.len().min(right.len());
+    let mut i = 0usize;
+    while i < len && left[i] == right[i] {
+        i += 1;
+    }
+    i
 }
 
 impl Tree {
@@ -1352,23 +1395,37 @@ impl Tree {
         let mut seq_offset = 0u64;
         let mut i = 0usize;
         while i < pending.len() {
-            if batch_insert_parts(&pending[i]).is_some() {
-                let run_len = same_shape_insert_run_len(pending, i);
+            if let Some(plan) = insert_run_plan(pending, i) {
+                let run_len = plan.len;
                 let first_seq = base_seq + seq_offset;
                 self.apply_batch_insert_run_walker(&pending[i..i + run_len], first_seq)?;
                 seq_offset += run_len as u64;
                 if let Some(enc) = enc.as_deref_mut() {
-                    let (key, value) = batch_insert_parts(&pending[i])
-                        .expect("insert run begins with insert-like op");
-                    enc.push_insert_run(
-                        self.tree_id,
-                        run_len,
-                        key.len(),
-                        value.len(),
-                        pending[i..i + run_len]
-                            .iter()
-                            .map(|op| batch_insert_parts(op).expect("same-shape insert run")),
-                    );
+                    match plan.encoding {
+                        InsertRunEncoding::Fixed { key_len, value_len } => {
+                            enc.push_insert_run(
+                                self.tree_id,
+                                run_len,
+                                key_len,
+                                value_len,
+                                pending[i..i + run_len]
+                                    .iter()
+                                    .map(|op| batch_insert_parts(op).expect("insert run op")),
+                            );
+                        }
+                        InsertRunEncoding::Prefix { prefix_len } => {
+                            let (key, _) = batch_insert_parts(&pending[i])
+                                .expect("prefix run begins with insert-like op");
+                            enc.push_insert_prefix_run(
+                                self.tree_id,
+                                &key[..prefix_len],
+                                run_len,
+                                pending[i..i + run_len].iter().map(|op| {
+                                    batch_insert_parts(op).expect("prefix insert run op")
+                                }),
+                            );
+                        }
+                    }
                 }
                 i += run_len;
                 continue;
@@ -2215,7 +2272,7 @@ impl Tree {
     pub fn stats(&self) -> Result<TreeStats> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let aggregate = self.collect_blob_stats_silent()?;
-        let bm = BufferStatsSnapshot::collect(&self.store);
+        let bm: BufferStats = self.store.stats();
         let route = self.route_cache.stats();
         let route_cache = RouteCacheStats {
             entries: route.entries,
@@ -2275,6 +2332,19 @@ impl Tree {
             bm_point_full_blob_reads: bm.point_full_blob_reads,
             bm_scan_full_blob_reads: bm.scan_full_blob_reads,
             bm_silent_full_blob_reads: bm.silent_full_blob_reads,
+            bm_cold_page_hits: bm.cold_page_hits,
+            bm_cold_page_misses: bm.cold_page_misses,
+            bm_cold_index_cache_hits: bm.cold_index_cache_hits,
+            bm_cold_index_cache_misses: bm.cold_index_cache_misses,
+            bm_cold_index_loads: bm.cold_index_loads,
+            bm_cold_index_dir_read_bytes: bm.cold_index_dir_read_bytes,
+            bm_cold_index_bucket_reads: bm.cold_index_bucket_reads,
+            bm_cold_index_bucket_read_bytes: bm.cold_index_bucket_read_bytes,
+            bm_cold_index_inline_hits: bm.cold_index_inline_hits,
+            bm_cold_index_offset_hits: bm.cold_index_offset_hits,
+            bm_cold_index_negative_hits: bm.cold_index_negative_hits,
+            bm_cold_index_crossing_hits: bm.cold_index_crossing_hits,
+            bm_cold_index_unknowns: bm.cold_index_unknowns,
             bm_optimistic_restarts: bm.optimistic_restarts,
             bm_range_restarts: bm.range_restarts,
             bm_walker_ops: bm.walker_ops,

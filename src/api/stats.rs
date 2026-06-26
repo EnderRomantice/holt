@@ -137,6 +137,36 @@ pub struct TreeStats {
     pub bm_scan_full_blob_reads: u64,
     /// Full-frame reads caused by silent stats/maintenance paths.
     pub bm_silent_full_blob_reads: u64,
+    /// 4 KiB cold-page cache hits served without a blob-frame read.
+    pub bm_cold_page_hits: u64,
+    /// 4 KiB cold-page cache misses that fell through to positional
+    /// reads or full-frame fallback.
+    pub bm_cold_page_misses: u64,
+    /// Cold-index directory lookups served from the in-memory index
+    /// cache.
+    pub bm_cold_index_cache_hits: u64,
+    /// Cold-index directory lookups that had to read the sidecar.
+    pub bm_cold_index_cache_misses: u64,
+    /// Cold-index directories loaded from the sidecar.
+    pub bm_cold_index_loads: u64,
+    /// Bytes read while loading cold-index directories.
+    pub bm_cold_index_dir_read_bytes: u64,
+    /// Cold-index bucket reads issued after a positive filter probe.
+    pub bm_cold_index_bucket_reads: u64,
+    /// Bytes read by cold-index bucket reads.
+    pub bm_cold_index_bucket_read_bytes: u64,
+    /// Positive cold reads served directly from inline sidecar values.
+    pub bm_cold_index_inline_hits: u64,
+    /// Positive cold reads that used a sidecar offset plus a leaf-page
+    /// validation read.
+    pub bm_cold_index_offset_hits: u64,
+    /// Negative cold reads proven by a cold-index filter/summary.
+    pub bm_cold_index_negative_hits: u64,
+    /// Cold reads routed to a child blob by a cold-index crossing.
+    pub bm_cold_index_crossing_hits: u64,
+    /// Cold-index probes that could not publish an answer and fell
+    /// back to the authoritative blob path.
+    pub bm_cold_index_unknowns: u64,
     /// Cumulative wait-free read restarts in `Tree::get` — each
     /// one means a concurrent writer lapped an optimistic
     /// snapshot and the lookup walked the tree from scratch.
@@ -283,6 +313,32 @@ pub struct DBStats {
     pub bm_scan_full_blob_reads: u64,
     /// Shared full-frame reads caused by silent stats/maintenance paths.
     pub bm_silent_full_blob_reads: u64,
+    /// Shared 4 KiB cold-page cache hits.
+    pub bm_cold_page_hits: u64,
+    /// Shared 4 KiB cold-page cache misses.
+    pub bm_cold_page_misses: u64,
+    /// Shared cold-index directory cache hits.
+    pub bm_cold_index_cache_hits: u64,
+    /// Shared cold-index directory cache misses.
+    pub bm_cold_index_cache_misses: u64,
+    /// Shared cold-index directory loads.
+    pub bm_cold_index_loads: u64,
+    /// Shared bytes read while loading cold-index directories.
+    pub bm_cold_index_dir_read_bytes: u64,
+    /// Shared cold-index bucket reads.
+    pub bm_cold_index_bucket_reads: u64,
+    /// Shared bytes read by cold-index bucket reads.
+    pub bm_cold_index_bucket_read_bytes: u64,
+    /// Shared inline cold-index hits.
+    pub bm_cold_index_inline_hits: u64,
+    /// Shared offset cold-index hits.
+    pub bm_cold_index_offset_hits: u64,
+    /// Shared negative cold-index hits.
+    pub bm_cold_index_negative_hits: u64,
+    /// Shared cold-index crossing hits.
+    pub bm_cold_index_crossing_hits: u64,
+    /// Shared cold-index fallbacks.
+    pub bm_cold_index_unknowns: u64,
     /// Shared optimistic point-read restarts.
     pub bm_optimistic_restarts: u64,
     /// Shared range cursor restarts.

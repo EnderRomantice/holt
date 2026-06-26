@@ -158,6 +158,7 @@ const TY_ERASE: u8 = 1;
 const TY_RENAME_OBJECT: u8 = 5;
 const TY_BATCH: u8 = 10;
 const TY_BATCH_INSERT_RUN: u8 = 11;
+const TY_BATCH_INSERT_PREFIX_RUN: u8 = 12;
 
 // ---------- CRC32 (IEEE 802.3) ----------
 
@@ -407,6 +408,45 @@ impl<'buf> BatchEncoder<'buf> {
         self.inner_count += count_u32;
     }
 
+    /// Append a compact run of consecutive `Insert` inner ops whose
+    /// keys share a byte prefix. This keeps logical replay identical
+    /// while removing the repeated path prefix from metadata bulk
+    /// creates under one directory/object prefix.
+    pub fn push_insert_prefix_run<'a, I>(
+        &mut self,
+        tree_id: u64,
+        prefix: &[u8],
+        count: usize,
+        items: I,
+    ) where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        let mut iter = items.into_iter();
+        if count == 1 {
+            let (key, value) = iter.next().expect("single prefix run has one item");
+            debug_assert!(iter.next().is_none());
+            self.push_insert(tree_id, key, value);
+            return;
+        }
+
+        let count_u32 = u32::try_from(count).expect("insert prefix run count fits in u32");
+        self.out.reserve(1 + 8 + 4 + 4 + prefix.len());
+        self.out.push(TY_BATCH_INSERT_PREFIX_RUN);
+        self.out.extend_from_slice(&tree_id.to_le_bytes());
+        self.out.extend_from_slice(&count_u32.to_le_bytes());
+        write_bytes(self.out, prefix);
+
+        let mut actual = 0usize;
+        for (key, value) in iter {
+            debug_assert!(key.starts_with(prefix));
+            write_bytes(self.out, &key[prefix.len()..]);
+            write_bytes(self.out, value);
+            actual += 1;
+        }
+        assert_eq!(actual, count, "insert prefix run item count mismatch");
+        self.inner_count += count_u32;
+    }
+
     /// Append one `Erase` inner op.
     pub fn push_erase(&mut self, tree_id: u64, key: &[u8]) {
         self.out.reserve(1 + 8 + 4 + key.len());
@@ -622,11 +662,13 @@ fn decode_body_into(ty: u8, body: &mut &[u8]) -> Result<WalOp> {
                 if inner_ty == TY_BATCH {
                     return Err(sanity("nested Batch is rejected"));
                 }
-                if inner_ty == TY_BATCH_INSERT_RUN {
-                    decode_insert_run(body, count, &mut ops)?;
-                } else {
-                    let inner = decode_body_into(inner_ty, body)?;
-                    ops.push(inner);
+                match inner_ty {
+                    TY_BATCH_INSERT_RUN => decode_insert_run(body, count, &mut ops)?,
+                    TY_BATCH_INSERT_PREFIX_RUN => decode_insert_prefix_run(body, count, &mut ops)?,
+                    _ => {
+                        let inner = decode_body_into(inner_ty, body)?;
+                        ops.push(inner);
+                    }
                 }
             }
             WalOp::Batch { ops }
@@ -656,6 +698,35 @@ fn decode_insert_run(body: &mut &[u8], batch_count: usize, ops: &mut Vec<WalOp>)
             tree_id,
             key: key.to_vec(),
             value: value.to_vec(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_insert_prefix_run(
+    body: &mut &[u8],
+    batch_count: usize,
+    ops: &mut Vec<WalOp>,
+) -> Result<()> {
+    let tree_id = read_u64(body)?;
+    let count = read_u32(body)? as usize;
+    if count == 0 {
+        return Err(sanity("empty BatchInsertPrefixRun is rejected"));
+    }
+    if ops.len().saturating_add(count) > batch_count {
+        return Err(sanity("BatchInsertPrefixRun exceeds batch inner count"));
+    }
+    let prefix = read_bytes(body)?;
+    for _ in 0..count {
+        let suffix = read_bytes(body)?;
+        let value = read_bytes(body)?;
+        let mut key = Vec::with_capacity(prefix.len() + suffix.len());
+        key.extend_from_slice(&prefix);
+        key.extend_from_slice(&suffix);
+        ops.push(WalOp::Insert {
+            tree_id,
+            key,
+            value,
         });
     }
     Ok(())
@@ -1109,6 +1180,87 @@ mod tests {
                     assert_eq!(key, format!("k{:03}", idx + 1).as_bytes());
                     assert_eq!(value, format!("v{}", idx + 1).as_bytes());
                 }
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_insert_prefix_run_round_trips_and_saves_wire_bytes() {
+        let base = 301u64;
+        let prefix = b"bucket/table/date=2026-06-26/";
+
+        let mut compact = Vec::new();
+        {
+            let mut enc = BatchEncoder::begin(&mut compact, base, 0);
+            enc.push_insert_prefix_run(
+                0,
+                prefix,
+                3,
+                [
+                    (
+                        &b"bucket/table/date=2026-06-26/000001.parquet"[..],
+                        &b"m1"[..],
+                    ),
+                    (
+                        &b"bucket/table/date=2026-06-26/000002.parquet"[..],
+                        &b"metadata-2"[..],
+                    ),
+                    (
+                        &b"bucket/table/date=2026-06-26/part-000003.parquet"[..],
+                        &b"m3"[..],
+                    ),
+                ],
+            );
+            assert_eq!(enc.finish(), 3);
+        }
+
+        let mut individual = Vec::new();
+        {
+            let mut enc = BatchEncoder::begin(&mut individual, base, 0);
+            enc.push_insert(0, b"bucket/table/date=2026-06-26/000001.parquet", b"m1");
+            enc.push_insert(
+                0,
+                b"bucket/table/date=2026-06-26/000002.parquet",
+                b"metadata-2",
+            );
+            enc.push_insert(
+                0,
+                b"bucket/table/date=2026-06-26/part-000003.parquet",
+                b"m3",
+            );
+            assert_eq!(enc.finish(), 3);
+        }
+
+        assert!(
+            compact.len() < individual.len(),
+            "prefix insert run should be smaller: compact={}, individual={}",
+            compact.len(),
+            individual.len(),
+        );
+
+        let r = decode_record(&compact).unwrap();
+        match r.op {
+            WalOp::Batch { ops } => {
+                assert_eq!(ops.len(), 3);
+                assert!(matches!(
+                    &ops[0],
+                    WalOp::Insert { key, value, .. }
+                        if key == b"bucket/table/date=2026-06-26/000001.parquet"
+                            && value == b"m1"
+                ));
+                assert!(matches!(
+                    &ops[1],
+                    WalOp::Insert { key, value, .. }
+                        if key == b"bucket/table/date=2026-06-26/000002.parquet"
+                            && value == b"metadata-2"
+                ));
+                assert!(matches!(
+                    &ops[2],
+                    WalOp::Insert { key, value, .. }
+                        if key == b"bucket/table/date=2026-06-26/part-000003.parquet"
+                            && value == b"m3"
+                ));
             }
             other => panic!("expected Batch, got {other:?}"),
         }
