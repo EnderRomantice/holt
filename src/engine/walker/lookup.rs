@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use crate::store::blob_store::AlignedBlobBuf;
 use crate::store::{
-    page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup, ColdIndexAnswer,
-    ColdIndexHit, ColdIndexStamp, PAGE_4K,
+    page_align_up, BlobFrameRef, BufferManager, CachedBlob, ColdBlobLookup, ColdIndex,
+    ColdIndexAnswer, ColdIndexHit, ColdIndexStamp, PAGE_4K,
 };
 
 use super::cast;
@@ -488,7 +488,7 @@ fn cold_read_routed(
         return ColdBlobLookup::Unknown;
     }
     if let Some(user_key) = key.user_bytes() {
-        match cold_read_indexed(bm, guid, user_key, key, depth) {
+        match cold_read_indexed(bm, guid, user_key, depth) {
             ColdBlobLookup::Unknown => {}
             answer => return answer,
         }
@@ -509,7 +509,6 @@ fn cold_read_indexed(
     bm: &BufferManager,
     guid: BlobGuid,
     user_key: &[u8],
-    key: SearchKey<'_>,
     depth: usize,
 ) -> ColdBlobLookup {
     let Some((index, epoch)) = bm.cold_index(guid) else {
@@ -538,54 +537,8 @@ fn cold_read_indexed(
         };
     }
 
-    let Some(bucket_lookup) = COLD_INDEX_BUCKET_BUF.with(|cell| {
-        let mut bucket = cell.borrow_mut();
-        bm.read_cold_index_bucket(guid, &index, user_key, &mut bucket)
-            .map(|()| index.lookup_leaf_in_bucket(user_key, &bucket))
-    }) else {
-        bm.note_cold_index_unknown();
-        return ColdBlobLookup::Unknown;
-    };
-    match bucket_lookup {
-        Ok(Some(ColdIndexHit::Inline { value, seq })) => {
-            return if cold_index_token_valid(bm, guid, epoch) {
-                bm.note_cold_index_inline_hit();
-                ColdBlobLookup::Found { value, seq }
-            } else {
-                ColdBlobLookup::Unknown
-            };
-        }
-        Ok(Some(ColdIndexHit::Offset(off))) => {
-            return with_cold_page_scratch(|scratch| {
-                let mut pages = ColdPageReader::new(bm, guid, scratch.as_mut_slice());
-                if page_in_leaf_paged(&mut pages, off).is_err() {
-                    bm.note_cold_index_unknown();
-                    return ColdBlobLookup::Unknown;
-                }
-                let frame = pages.frame();
-                let Some(body) = frame.body_at_offset(off) else {
-                    bm.note_cold_index_unknown();
-                    return ColdBlobLookup::Unknown;
-                };
-                match leaf_check_owned(body, key) {
-                    Ok(RoutedLookup::Found { value, seq })
-                        if cold_index_token_valid(bm, guid, epoch) =>
-                    {
-                        bm.note_cold_index_offset_hit();
-                        ColdBlobLookup::Found { value, seq }
-                    }
-                    _ => {
-                        bm.note_cold_index_unknown();
-                        ColdBlobLookup::Unknown
-                    }
-                }
-            });
-        }
-        Ok(None) => {}
-        Err(_) => {
-            bm.note_cold_index_unknown();
-            return ColdBlobLookup::Unknown;
-        }
+    if let Some(answer) = cold_index_leaf_hit(bm, guid, &index, epoch, user_key) {
+        return answer;
     }
 
     match index.route_or_absent(user_key, depth) {
@@ -613,6 +566,85 @@ fn cold_read_indexed(
             }
         }
     }
+}
+
+fn cold_index_leaf_hit(
+    bm: &BufferManager,
+    guid: BlobGuid,
+    index: &ColdIndex,
+    epoch: u64,
+    user_key: &[u8],
+) -> Option<ColdBlobLookup> {
+    let Some(bucket_lookup) = COLD_INDEX_BUCKET_BUF.with(|cell| {
+        let mut bucket = cell.borrow_mut();
+        bm.read_cold_index_bucket(guid, index, user_key, &mut bucket)
+            .map(|()| index.lookup_leaf_in_bucket(user_key, &bucket))
+    }) else {
+        bm.note_cold_index_unknown();
+        return Some(ColdBlobLookup::Unknown);
+    };
+    match bucket_lookup {
+        Ok(Some(ColdIndexHit::Inline { value, seq })) => {
+            return if cold_index_token_valid(bm, guid, epoch) {
+                bm.note_cold_index_inline_hit();
+                Some(ColdBlobLookup::Found { value, seq })
+            } else {
+                Some(ColdBlobLookup::Unknown)
+            };
+        }
+        Ok(Some(ColdIndexHit::ColdValue {
+            value_off,
+            value_len,
+            value_crc32,
+            seq,
+        })) => {
+            let mut value = vec![0; value_len as usize];
+            if bm
+                .read_cold_value_range(guid, u64::from(value_off), value.as_mut_slice())
+                .is_none()
+            {
+                bm.note_cold_index_unknown();
+                return Some(ColdBlobLookup::Unknown);
+            }
+            if crc32fast::hash(&value) != value_crc32 {
+                bm.note_cold_index_unknown();
+                return Some(ColdBlobLookup::Unknown);
+            }
+            return if cold_index_token_valid(bm, guid, epoch) {
+                bm.note_cold_index_value_hit(u64::from(value_len));
+                Some(ColdBlobLookup::Found { value, seq })
+            } else {
+                bm.note_cold_index_unknown();
+                Some(ColdBlobLookup::Unknown)
+            };
+        }
+        Ok(Some(ColdIndexHit::BlobOffset {
+            value_off,
+            value_len,
+            seq,
+        })) => {
+            return with_cold_page_scratch(|scratch| {
+                let mut pages = ColdPageReader::new(bm, guid, scratch.as_mut_slice());
+                let Ok(value) = read_value_paged(&mut pages, value_off, value_len) else {
+                    bm.note_cold_index_unknown();
+                    return Some(ColdBlobLookup::Unknown);
+                };
+                if cold_index_token_valid(bm, guid, epoch) {
+                    bm.note_cold_index_offset_hit();
+                    Some(ColdBlobLookup::Found { value, seq })
+                } else {
+                    bm.note_cold_index_unknown();
+                    Some(ColdBlobLookup::Unknown)
+                }
+            });
+        }
+        Ok(None) => {}
+        Err(_) => {
+            bm.note_cold_index_unknown();
+            return Some(ColdBlobLookup::Unknown);
+        }
+    }
+    None
 }
 
 #[inline]
@@ -886,6 +918,23 @@ fn page_in_leaf_paged(pages: &mut ColdPageReader<'_>, loff: u32) -> Result<()> {
     };
     let body_end = page_align_up(loff + leaf_body_size(key_len, value_len));
     pages.load_range(hdr_end, body_end, ColdPageAdmission::Leaf)
+}
+
+fn read_value_paged(
+    pages: &mut ColdPageReader<'_>,
+    value_off: u32,
+    value_len: u32,
+) -> Result<Vec<u8>> {
+    let value_end = value_off
+        .checked_add(value_len)
+        .ok_or(Error::node_corrupt("cold_read_routed: value range"))?;
+    if value_end > crate::layout::PAGE_SIZE {
+        return Err(Error::node_corrupt("cold_read_routed: value range"));
+    }
+    pages.load_range(value_off, value_end, ColdPageAdmission::Leaf)?;
+    let start = value_off as usize;
+    let end = value_end as usize;
+    Ok(pages.scratch[start..end].to_vec())
 }
 
 /// Routed-read core, decoupled from the buffer manager via a
@@ -1321,10 +1370,11 @@ mod tests {
     use super::super::insert::insert;
     use super::super::migrate::compact_blob;
     use super::*;
-    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
-    use crate::store::BlobFrame;
+    use crate::store::blob_store::{BlobStore, FileBlobStore, MemoryBlobStore};
+    use crate::store::{encode_child_off, BlobFrame, WriteThroughEntry};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     fn routed_blob(guid: BlobGuid) -> AlignedBlobBuf {
         let mut buf = AlignedBlobBuf::zeroed();
@@ -1361,6 +1411,25 @@ mod tests {
             "test needs a routed blob",
         );
         buf
+    }
+
+    fn install_exact_leaf(frame: &mut BlobFrame<'_>, key: &[u8], value: &[u8], seq: u64) {
+        let total = leaf_body_size(key.len() as u32, value.len() as u32);
+        let slot = frame.alloc_leaf(total).unwrap().slot;
+        let off = frame.offset_of_slot(slot).unwrap();
+        let body = frame.bytes_at_mut(off, total).unwrap();
+        let leaf = Leaf::live(key.len() as u16, value.len() as u16, seq, 0);
+        let hdr = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref::<Leaf>(&leaf).cast::<u8>(),
+                size_of::<Leaf>(),
+            )
+        };
+        body[..size_of::<Leaf>()].copy_from_slice(hdr);
+        body[size_of::<Leaf>()..size_of::<Leaf>() + key.len()].copy_from_slice(key);
+        let value_start = size_of::<Leaf>() + key.len();
+        body[value_start..value_start + value.len()].copy_from_slice(value);
+        frame.header_mut().root_slot = encode_child_off(off);
     }
 
     struct HeaderFlipStore {
@@ -1557,6 +1626,92 @@ mod tests {
             "third read should reuse leaf pages admitted on the second touch; ranges={:?}",
             *store.ranges.lock().unwrap()
         );
+    }
+
+    #[test]
+    fn cold_index_hit_reads_large_value_from_value_sidecar() {
+        let dir = tempdir().unwrap();
+        let guid = [0x47; 16];
+        let value = vec![0xD3; 4096];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        {
+            BlobFrame::init(bytes.as_mut_slice(), guid).unwrap();
+            let mut frame = BlobFrame::wrap(bytes.as_mut_slice());
+            install_exact_leaf(&mut frame, b"large-value-key\0", &value, 11);
+        }
+
+        let store = Arc::new(FileBlobStore::open(dir.path()).unwrap());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        {
+            let bm = BufferManager::new_file(store_dyn.clone(), 128, AlignedBlobBuf::zeroed);
+            bm.write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 11,
+                content_version: None,
+            }])
+            .unwrap();
+            bm.flush_inner().unwrap();
+        }
+
+        let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
+        match cold_read_routed(&bm, guid, SearchKey::user(b"large-value-key"), 0) {
+            ColdBlobLookup::Found { value: got, seq } => {
+                assert_eq!(got, value);
+                assert_eq!(seq, 11);
+            }
+            other => panic!("large value should come from cold.val: {other:?}"),
+        }
+        let stats = bm.stats();
+        assert_eq!(stats.cold_index_value_hits, 1);
+        assert_eq!(stats.cold_index_value_read_bytes, value.len() as u64);
+        assert_eq!(stats.cold_index_offset_hits, 0);
+    }
+
+    #[test]
+    fn corrupt_cold_value_sidecar_is_not_returned() {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempdir().unwrap();
+        let guid = [0x48; 16];
+        let value = vec![0xB7; 4096];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        {
+            BlobFrame::init(bytes.as_mut_slice(), guid).unwrap();
+            let mut frame = BlobFrame::wrap(bytes.as_mut_slice());
+            install_exact_leaf(&mut frame, b"large-value-key\0", &value, 12);
+        }
+
+        let store = Arc::new(FileBlobStore::open(dir.path()).unwrap());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        {
+            let bm = BufferManager::new_file(store_dyn.clone(), 128, AlignedBlobBuf::zeroed);
+            bm.write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 12,
+                content_version: None,
+            }])
+            .unwrap();
+            bm.flush_inner().unwrap();
+        }
+
+        let cold_values = OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("cold.val"))
+            .unwrap();
+        cold_values.write_at(&[value[0] ^ 0xff], 0).unwrap();
+
+        let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
+        assert_eq!(
+            cold_read_routed(&bm, guid, SearchKey::user(b"large-value-key"), 0),
+            ColdBlobLookup::Unknown,
+            "corrupt advisory sidecar payload must fall back to the authoritative blob"
+        );
+        let stats = bm.stats();
+        assert_eq!(stats.cold_index_value_hits, 0);
+        assert_eq!(stats.cold_index_unknowns, 1);
     }
 
     #[test]

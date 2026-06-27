@@ -5,8 +5,14 @@ use crate::layout::BlobGuid;
 
 #[derive(Clone)]
 pub(crate) enum DeltaEntry {
-    Put { value: Vec<u8>, seq: u64 },
-    Delete { seq: u64 },
+    Put {
+        value: Vec<u8>,
+        seq: u64,
+        creates_key: bool,
+    },
+    Delete {
+        seq: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -26,6 +32,8 @@ pub(crate) struct WriteDelta {
 struct DeltaMaps {
     pending: HashMap<u64, HashMap<Vec<u8>, DeltaOp>>,
     flushing: HashMap<u64, HashMap<Vec<u8>, DeltaOp>>,
+    pending_key_set: HashMap<u64, usize>,
+    flushing_key_set: HashMap<u64, usize>,
 }
 
 impl WriteDelta {
@@ -36,6 +44,7 @@ impl WriteDelta {
         key: &[u8],
         value: &[u8],
         seq: u64,
+        creates_key: bool,
     ) {
         let op = DeltaOp {
             tree_id,
@@ -44,6 +53,7 @@ impl WriteDelta {
             entry: DeltaEntry::Put {
                 value: value.to_vec(),
                 seq,
+                creates_key,
             },
         };
         self.inner.lock().unwrap().insert_pending(op);
@@ -71,11 +81,16 @@ impl WriteDelta {
         self.inner.lock().unwrap().tree_len(tree_id)
     }
 
+    pub(crate) fn tree_key_set_len(&self, tree_id: u64) -> usize {
+        self.inner.lock().unwrap().tree_key_set_len(tree_id)
+    }
+
     pub(crate) fn begin_flush_tree(&self, tree_id: u64) -> Vec<DeltaOp> {
         let mut guard = self.inner.lock().unwrap();
         let Some(tree) = guard.pending.remove(&tree_id) else {
             return Vec::new();
         };
+        guard.pending_key_set.remove(&tree_id);
         let mut out: Vec<_> = tree.into_values().collect();
         sort_tree_ops(&mut out);
         guard.publish_flushing(&out);
@@ -88,6 +103,7 @@ impl WriteDelta {
         for (_, tree) in guard.pending.drain() {
             out.extend(tree.into_values());
         }
+        guard.pending_key_set.clear();
         sort_all_ops(&mut out);
         guard.publish_flushing(&out);
         out
@@ -121,22 +137,45 @@ impl DeltaEntry {
             Self::Put { seq, .. } | Self::Delete { seq } => *seq,
         }
     }
+
+    fn changes_key_set(&self) -> bool {
+        match self {
+            Self::Put { creates_key, .. } => *creates_key,
+            Self::Delete { .. } => true,
+        }
+    }
 }
 
 impl DeltaMaps {
     fn insert_pending(&mut self, op: DeltaOp) {
-        self.pending
-            .entry(op.tree_id)
+        let tree_id = op.tree_id;
+        let changes_key_set = op.entry.changes_key_set();
+        let old = self
+            .pending
+            .entry(tree_id)
             .or_default()
             .insert(op.key.clone(), op);
+        if old.is_some_and(|old| old.entry.changes_key_set()) {
+            decrement_tree_count(&mut self.pending_key_set, tree_id);
+        }
+        if changes_key_set {
+            increment_tree_count(&mut self.pending_key_set, tree_id);
+        }
     }
 
     fn publish_flushing(&mut self, ops: &[DeltaOp]) {
         for op in ops {
-            self.flushing
+            let old = self
+                .flushing
                 .entry(op.tree_id)
                 .or_default()
                 .insert(op.key.clone(), op.clone());
+            if old.is_some_and(|old| old.entry.changes_key_set()) {
+                decrement_tree_count(&mut self.flushing_key_set, op.tree_id);
+            }
+            if op.entry.changes_key_set() {
+                increment_tree_count(&mut self.flushing_key_set, op.tree_id);
+            }
         }
     }
 
@@ -148,7 +187,11 @@ impl DeltaMaps {
             .get(&op.key)
             .is_some_and(|current| current.entry.seq() == op.entry.seq());
         if remove {
-            tree.remove(&op.key);
+            if let Some(removed) = tree.remove(&op.key) {
+                if removed.entry.changes_key_set() {
+                    decrement_tree_count(&mut self.flushing_key_set, op.tree_id);
+                }
+            }
             if tree.is_empty() {
                 self.flushing.remove(&op.tree_id);
             }
@@ -183,17 +226,39 @@ impl DeltaMaps {
         self.pending.get(&tree_id).map_or(0, HashMap::len)
             + self.flushing.get(&tree_id).map_or(0, HashMap::len)
     }
+
+    fn tree_key_set_len(&self, tree_id: u64) -> usize {
+        self.pending_key_set.get(&tree_id).copied().unwrap_or(0)
+            + self.flushing_key_set.get(&tree_id).copied().unwrap_or(0)
+    }
 }
 
 fn map_len(map: &HashMap<u64, HashMap<Vec<u8>, DeltaOp>>) -> usize {
     map.values().map(HashMap::len).sum()
 }
 
+fn increment_tree_count(counts: &mut HashMap<u64, usize>, tree_id: u64) {
+    *counts.entry(tree_id).or_insert(0) += 1;
+}
+
+fn decrement_tree_count(counts: &mut HashMap<u64, usize>, tree_id: u64) {
+    let Some(count) = counts.get_mut(&tree_id) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        counts.remove(&tree_id);
+    }
+}
+
 fn sort_tree_ops(out: &mut [DeltaOp]) {
     out.sort_by(|a, b| {
         let a_seq = a.entry.seq();
         let b_seq = b.entry.seq();
-        a_seq.cmp(&b_seq).then_with(|| a.key.cmp(&b.key))
+        a.root_guid
+            .cmp(&b.root_guid)
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a_seq.cmp(&b_seq))
     });
 }
 
@@ -201,9 +266,112 @@ fn sort_all_ops(out: &mut [DeltaOp]) {
     out.sort_by(|a, b| {
         let a_seq = a.entry.seq();
         let b_seq = b.entry.seq();
-        a_seq
-            .cmp(&b_seq)
-            .then_with(|| a.tree_id.cmp(&b.tree_id))
+        a.tree_id
+            .cmp(&b.tree_id)
+            .then_with(|| a.root_guid.cmp(&b.root_guid))
             .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a_seq.cmp(&b_seq))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(tree_id: u64, root_guid: BlobGuid, key: &[u8], seq: u64) -> DeltaOp {
+        DeltaOp {
+            tree_id,
+            root_guid,
+            key: key.to_vec(),
+            entry: DeltaEntry::Put {
+                value: b"v".to_vec(),
+                seq,
+                creates_key: false,
+            },
+        }
+    }
+
+    #[test]
+    fn begin_flush_all_groups_by_tree_root_and_key() {
+        let delta = WriteDelta::default();
+        delta.stage_put(2, [2; 16], b"z", b"v", 10, false);
+        delta.stage_put(1, [9; 16], b"b", b"v", 11, false);
+        delta.stage_put(1, [1; 16], b"c", b"v", 12, false);
+        delta.stage_put(1, [1; 16], b"a", b"v", 13, false);
+        delta.stage_put(2, [1; 16], b"a", b"v", 14, false);
+
+        let keys: Vec<_> = delta
+            .begin_flush_all()
+            .into_iter()
+            .map(|op| (op.tree_id, op.root_guid[0], op.key, op.entry.seq()))
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                (1, 1, b"a".to_vec(), 13),
+                (1, 1, b"c".to_vec(), 12),
+                (1, 9, b"b".to_vec(), 11),
+                (2, 1, b"a".to_vec(), 14),
+                (2, 2, b"z".to_vec(), 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn begin_flush_tree_groups_by_root_and_coalesces_latest_key() {
+        let delta = WriteDelta::default();
+        delta.stage_put(7, [9; 16], b"b", b"old", 1, false);
+        delta.stage_put(7, [9; 16], b"b", b"new", 4, false);
+        delta.stage_put(7, [1; 16], b"z", b"v", 3, false);
+        delta.stage_put(7, [1; 16], b"a", b"v", 2, false);
+
+        let ops = delta.begin_flush_tree(7);
+        let keys: Vec<_> = ops
+            .iter()
+            .map(|op| (op.root_guid[0], op.key.as_slice(), op.entry.seq()))
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                (1, b"a".as_slice(), 2),
+                (1, b"z".as_slice(), 3),
+                (9, b"b".as_slice(), 4)
+            ]
+        );
+        match &ops[2].entry {
+            DeltaEntry::Put { value, .. } => assert_eq!(value, b"new"),
+            DeltaEntry::Delete { .. } => panic!("latest put should survive coalescing"),
+        }
+    }
+
+    #[test]
+    fn key_set_dirty_count_tracks_coalescing_and_flush_lifecycle() {
+        let delta = WriteDelta::default();
+        delta.stage_put(7, [1; 16], b"a", b"v", 1, false);
+        assert_eq!(delta.tree_key_set_len(7), 0);
+        delta.stage_put(7, [1; 16], b"b", b"v", 2, true);
+        assert_eq!(delta.tree_key_set_len(7), 1);
+        delta.stage_put(7, [1; 16], b"b", b"v2", 3, false);
+        assert_eq!(delta.tree_key_set_len(7), 0);
+        delta.stage_delete(7, [1; 16], b"c", 4);
+        assert_eq!(delta.tree_key_set_len(7), 1);
+        let ops = delta.begin_flush_tree(7);
+        assert_eq!(delta.tree_key_set_len(7), 1);
+        delta.finish_flush(&ops);
+        assert_eq!(delta.tree_key_set_len(7), 0);
+    }
+
+    #[test]
+    fn explicit_sort_keeps_seq_as_final_tiebreaker() {
+        let mut ops = vec![
+            put(1, [1; 16], b"k", 9),
+            put(1, [1; 16], b"k", 7),
+            put(1, [1; 16], b"k", 8),
+        ];
+        sort_tree_ops(&mut ops);
+        let seqs: Vec<_> = ops.iter().map(|op| op.entry.seq()).collect();
+        assert_eq!(seqs, vec![7, 8, 9]);
+    }
 }

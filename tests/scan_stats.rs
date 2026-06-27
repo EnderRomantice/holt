@@ -109,6 +109,50 @@ fn visit_with_outcome_reports_cache_hits() {
 }
 
 #[test]
+fn delimiter_list_dir_cache_serves_rollups_without_leaf_walk() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for d in ["a", "b", "c"] {
+        for i in 0..8u32 {
+            tree.put(format!("bucket/{d}/file-{i:04}").as_bytes(), b"v")
+                .unwrap();
+        }
+    }
+
+    let first = tree
+        .scan_keys(b"bucket/")
+        .delimiter(b'/')
+        .visit_with_outcome(8, |_| Ok(()))
+        .unwrap();
+    assert!(!first.cache_hit);
+    assert_eq!(first.stats.rollup, 3);
+
+    let second = tree
+        .scan_keys(b"bucket/")
+        .delimiter(b'/')
+        .visit_with_outcome(8, |_| Ok(()))
+        .unwrap();
+    assert!(second.cache_hit);
+    assert_eq!(second.stats.rollup, 3);
+    assert_eq!(second.stats.visited, 0);
+}
+
+#[test]
+fn is_prefix_empty_populates_limit_one_prefix_cache() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"dir/child", b"v").unwrap();
+
+    assert!(!tree.is_prefix_empty(b"dir/").unwrap());
+
+    let outcome = tree
+        .scan_keys(b"dir/")
+        .visit_with_outcome(1, |_| Ok(()))
+        .unwrap();
+    assert!(outcome.cache_hit);
+    assert_eq!(outcome.stats.returned, 1);
+    assert_eq!(outcome.stats.visited, 0);
+}
+
+#[test]
 fn prefix_count_can_stop_after_limit() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     for i in 0..20u32 {

@@ -678,6 +678,7 @@ fn insert_batch_in_pinned_blob(
 ) -> Result<InsertBatchOutcome> {
     let mut applied = 0usize;
     let mut dirty = false;
+    let mut dirty_seq = u64::MAX;
     let mut needs_compaction = false;
 
     for item in items {
@@ -709,6 +710,7 @@ fn insert_batch_in_pinned_blob(
                 }
                 applied += 1;
                 dirty = true;
+                dirty_seq = dirty_seq.min(item.seq);
                 bm.note_walker_blob_hops(blob_hops_per_item, depth);
             }
             Ok(InsertStep::Crossing(_))
@@ -725,7 +727,7 @@ fn insert_batch_in_pinned_blob(
         bm.note_compaction_candidate(current_guid);
     }
     if dirty && !is_top_blob {
-        bm.mark_dirty_cached(current_guid, items[0].seq, current_entry);
+        bm.mark_dirty_cached(current_guid, dirty_seq, current_entry);
     }
 
     Ok(InsertBatchOutcome {

@@ -27,9 +27,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::api::atomic::RecordVersion;
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
-use crate::concurrency::Gate;
+use crate::concurrency::{CommitGate, Gate};
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
-use crate::store::{decode_child_off, BlobFrameRef, BufferManager, CachedBlob};
+use crate::store::{decode_child_off, BlobFrameRef, BufferManager, CachedBlob, WriteDeltaKeyState};
 
 use smallvec::SmallVec;
 
@@ -356,8 +356,10 @@ pub struct RangeBuilder {
     bm: Arc<BufferManager>,
     root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
+    tree_id: Option<u64>,
     maintenance_gate: Arc<Gate>,
     mutation_gate: Option<Arc<Gate>>,
+    commit_gate: Option<Arc<CommitGate>>,
     dropped: Option<Arc<AtomicBool>>,
     preflight_error: Option<Error>,
     snapshot_cursor: bool,
@@ -381,8 +383,10 @@ impl RangeBuilder {
             bm,
             root_pin,
             root_guid,
+            tree_id: None,
             maintenance_gate,
             mutation_gate: None,
+            commit_gate: None,
             dropped: None,
             preflight_error: None,
             snapshot_cursor: false,
@@ -399,6 +403,16 @@ impl RangeBuilder {
 
     pub(crate) fn with_mutation_gate(mut self, mutation_gate: Arc<Gate>) -> Self {
         self.mutation_gate = Some(mutation_gate);
+        self
+    }
+
+    pub(crate) fn with_write_delta_flush(
+        mut self,
+        tree_id: u64,
+        commit_gate: Arc<CommitGate>,
+    ) -> Self {
+        self.tree_id = Some(tree_id);
+        self.commit_gate = Some(commit_gate);
         self
     }
 
@@ -422,6 +436,28 @@ impl RangeBuilder {
         } else {
             Ok(())
         }
+    }
+
+    fn flush_write_deltas_if_needed(&self, key_set_only: bool) -> Result<()> {
+        let Some(tree_id) = self.tree_id else {
+            return Ok(());
+        };
+        let dirty = if key_set_only {
+            self.bm.write_delta_key_set_count_for_tree(tree_id)
+        } else {
+            self.bm.write_delta_count_for_tree(tree_id)
+        };
+        if dirty == 0 {
+            return Ok(());
+        }
+        let Some(commit_gate) = &self.commit_gate else {
+            return Ok(());
+        };
+        let _maintenance = self.maintenance_gate.enter_shared();
+        self.ensure_live()?;
+        let _tree_mutation = self.mutation_gate.as_ref().map(|gate| gate.enter_batch());
+        let _commit = commit_gate.enter_writer();
+        self.bm.flush_write_deltas_for_tree(tree_id)
     }
 
     /// Restrict the scan to keys starting with `prefix`. Default:
@@ -571,6 +607,9 @@ impl KeyRangeBuilder {
 
         let mut builder = self;
         builder.inner.ensure_live()?;
+        if builder.inner.preflight_error.is_none() {
+            builder.inner.flush_write_deltas_if_needed(true)?;
+        }
         let prefix = builder.inner.prefix.as_slice();
         let start_after = builder.inner.start_after.as_deref();
         let delimiter = builder.inner.delimiter;
@@ -621,6 +660,8 @@ impl KeyRangeBuilder {
         let epoch_before = builder.epoch.as_ref().map(|e| e.load(Ordering::Acquire));
         let maintenance_gate = Arc::clone(&builder.inner.maintenance_gate);
         let mutation_gate = builder.inner.mutation_gate.clone();
+        let bm = Arc::clone(&builder.inner.bm);
+        let tree_id = builder.inner.tree_id;
         let _maintenance = maintenance_gate.enter_shared();
         let _tree_mutation = mutation_gate.as_ref().map(|gate| gate.enter_shared());
         let mut iter = KeyRangeIter {
@@ -629,6 +670,9 @@ impl KeyRangeBuilder {
                 .into_iter_with_projection(RangeProjection::KeyRefs),
         };
         iter.visit_key_entries_unlocked(limit, |entry| {
+            let Some(entry) = overlay_key_entry(&bm, tree_id, entry) else {
+                return Ok(());
+            };
             if let Some(cached) = cached.as_mut() {
                 cached.push(CachedKeyRangeEntry::from_ref(entry));
             }
@@ -661,11 +705,37 @@ impl KeyRangeBuilder {
     }
 }
 
+fn overlay_key_entry<'a>(
+    bm: &BufferManager,
+    tree_id: Option<u64>,
+    entry: KeyRangeEntryRef<'a>,
+) -> Option<KeyRangeEntryRef<'a>> {
+    let Some(tree_id) = tree_id else {
+        return Some(entry);
+    };
+    let KeyRangeEntryRef::Key { key, version } = entry else {
+        return Some(entry);
+    };
+    match bm.write_delta_key_state(tree_id, key) {
+        Some(WriteDeltaKeyState::Put { seq }) => Some(KeyRangeEntryRef::Key {
+            key,
+            version: RecordVersion::new(seq),
+        }),
+        Some(WriteDeltaKeyState::Delete) => None,
+        None => Some(KeyRangeEntryRef::Key { key, version }),
+    }
+}
+
 impl IntoIterator for KeyRangeBuilder {
     type Item = Result<KeyRangeEntry>;
     type IntoIter = KeyRangeIter;
 
-    fn into_iter(self) -> KeyRangeIter {
+    fn into_iter(mut self) -> KeyRangeIter {
+        if self.inner.preflight_error.is_none() {
+            if let Err(e) = self.inner.flush_write_deltas_if_needed(false) {
+                self.inner.preflight_error = Some(e);
+            }
+        }
         KeyRangeIter {
             inner: self
                 .inner
@@ -880,6 +950,71 @@ fn project_range_leaf(
         value: record_value.map(<[u8]>::to_vec),
         version,
     })
+}
+
+fn subtree_has_live_leaf(frame: BlobFrameRef<'_>, off: u32) -> Result<bool> {
+    let (ntype, body) = resolve_typed(frame, off)?;
+    match ntype {
+        // Cross-blob children need their own blob pin and version
+        // check. Returning false here makes the iterator descend to
+        // the BlobNode branch, where the child frame is validated
+        // before rollup.
+        NodeType::Invalid | NodeType::EmptyRoot | NodeType::Blob => Ok(false),
+        NodeType::Leaf => {
+            let leaf = *cast::<Leaf>(&body[..std::mem::size_of::<Leaf>()]);
+            Ok(leaf.tombstone == 0)
+        }
+        NodeType::Prefix => {
+            let prefix = read_prefix(frame, off)?;
+            subtree_has_live_leaf(frame, child_offset(prefix.child as u16))
+        }
+        NodeType::Node4 => {
+            let node = read_node4(frame, off)?;
+            let count = usize::from(node.count).min(4);
+            for idx in 0..count {
+                if subtree_has_live_leaf(frame, child_offset(node.children[idx]))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        NodeType::Node16 => {
+            let node = read_node16(frame, off)?;
+            let count = usize::from(node.count).min(16);
+            for idx in 0..count {
+                if subtree_has_live_leaf(frame, child_offset(node.children[idx]))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        NodeType::Node48 => {
+            let node = read_node48(frame, off)?;
+            let mut byte = 0usize;
+            while let Some(next_byte) = simd::find_next_nonzero_byte(&node.index, byte) {
+                byte = next_byte + 1;
+                let child_idx = usize::from(node.index[next_byte]).saturating_sub(1);
+                if child_idx >= 48 {
+                    return Err(Error::node_corrupt("range::live_probe: Node48 child"));
+                }
+                if subtree_has_live_leaf(frame, child_offset(node.children[child_idx]))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        NodeType::Node256 => {
+            let node = read_node256(frame, off)?;
+            let mut byte = 0usize;
+            while let Some(next_byte) = simd::find_next_nonzero_u16(&node.children, byte) {
+                byte = next_byte + 1;
+                if subtree_has_live_leaf(frame, child_offset(node.children[next_byte]))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
 }
 
 fn key_at_or_past_prefix_successor(key: &[u8], prefix: &[u8]) -> bool {
@@ -1534,39 +1669,39 @@ impl RangeIter {
                 return Ok(RangeAdvance::Done);
             };
             let top_ntype = top.ntype;
-            if !matches!(top_ntype, NodeType::EmptyRoot | NodeType::Invalid)
-                && self.prepare_segment_rollup(&[])
+            if !matches!(
+                top_ntype,
+                NodeType::EmptyRoot | NodeType::Invalid | NodeType::Blob
+            ) && self.prepare_segment_rollup(&[])
             {
                 let idx = self.stack.len() - 1;
-                let no_tombstones = {
+                let has_live_leaf = {
                     let top = &self.stack[idx];
                     let guard = top.pin.read();
                     let version = top.pin.content_version();
                     if !self.frame_version_still_valid(top, version) {
                         return Ok(RangeAdvance::Restart);
                     }
-                    BlobFrameRef::wrap(guard.as_slice())
-                        .header()
-                        .tombstone_leaf_cnt
-                        == 0
+                    subtree_has_live_leaf(BlobFrameRef::wrap(guard.as_slice()), top.off)?
                 };
-                if no_tombstones {
-                    if !self.path_is_still_valid() {
-                        return Ok(RangeAdvance::Restart);
-                    }
-                    let common_len = self.emit_buf.len();
-                    while self.curr_key.len() >= common_len && self.stack.len() > self.cursor_floor
-                    {
-                        self.pop_frame();
-                    }
-                    if !self.set_lower_bound_to_emit_successor() {
-                        self.terminated = true;
-                    }
-                    if !self.terminated {
-                        self.reseek_after_emit();
-                    }
-                    return Ok(self.common_prefix_advance_from_emit());
+                if !has_live_leaf {
+                    self.pop_frame();
+                    continue;
                 }
+                if !self.path_is_still_valid() {
+                    return Ok(RangeAdvance::Restart);
+                }
+                let common_len = self.emit_buf.len();
+                while self.curr_key.len() >= common_len && self.stack.len() > self.cursor_floor {
+                    self.pop_frame();
+                }
+                if !self.set_lower_bound_to_emit_successor() {
+                    self.terminated = true;
+                }
+                if !self.terminated {
+                    self.reseek_after_emit();
+                }
+                return Ok(self.common_prefix_advance_from_emit());
             }
             match top_ntype {
                 NodeType::Leaf => {
@@ -1717,7 +1852,7 @@ impl RangeIter {
                     if self.stack[idx].next == 0 {
                         let top_pin = self.stack[idx].pin.clone();
                         let top_blob_guid = self.stack[idx].blob_guid;
-                        let (child_off, child_ntype, p_bytes, version, no_tombstones) = {
+                        let (child_off, child_ntype, p_bytes, version, child_has_live) = {
                             let top = &self.stack[idx];
                             let guard = top_pin.read();
                             let version = top_pin.content_version();
@@ -1728,17 +1863,25 @@ impl RangeIter {
                             let p = read_prefix(frame, top.off)?;
                             let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
                             let child_off = child_offset(p.child as u16);
+                            let child_ntype = ntype_of(frame, child_off)?;
+                            let child_has_live = if self.delimiter.is_some()
+                                && !matches!(child_ntype, NodeType::Blob | NodeType::EmptyRoot)
+                            {
+                                subtree_has_live_leaf(frame, child_off)?
+                            } else {
+                                false
+                            };
                             (
                                 child_off,
-                                ntype_of(frame, child_off)?,
+                                child_ntype,
                                 InlinePrefix::from_slice(&p.bytes[..plen]),
                                 version,
-                                frame.header().tombstone_leaf_cnt == 0,
+                                child_has_live,
                             )
                         };
                         self.stack[idx].next = 1;
-                        if no_tombstones
-                            && !matches!(child_ntype, NodeType::Blob | NodeType::EmptyRoot)
+                        if child_has_live
+                            && !matches!(child_ntype, NodeType::Blob)
                             && self.prepare_segment_rollup(p_bytes.as_slice())
                         {
                             if !self.path_is_still_valid() {
@@ -1788,22 +1931,22 @@ impl RangeIter {
                             )
                         };
                         self.stack[idx].next = 1;
+                        let can_rollup = self.prepare_segment_rollup(p_bytes.as_slice());
                         let Some(child_pin) = self.pin_scan_child(child_guid)? else {
                             self.pop_frame();
                             continue;
                         };
                         child_pin.prefetch_header();
-                        let child_can_rollup = {
-                            let guard = child_pin.read();
-                            let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let root_off = decode_child_off(frame.header().root_slot);
-                            frame.header().tombstone_leaf_cnt == 0
-                                && !matches!(
-                                    ntype_of(frame, root_off)?,
-                                    NodeType::EmptyRoot | NodeType::Invalid
-                                )
-                        };
-                        if child_can_rollup && self.prepare_segment_rollup(p_bytes.as_slice()) {
+                        if can_rollup {
+                            let child_can_rollup = {
+                                let guard = child_pin.read();
+                                let frame = BlobFrameRef::wrap(guard.as_slice());
+                                let root_off = decode_child_off(frame.header().root_slot);
+                                subtree_has_live_leaf(frame, root_off)?
+                            };
+                            if !child_can_rollup {
+                                continue;
+                            }
                             if !self.path_is_still_valid() {
                                 return Ok(RangeAdvance::Restart);
                             }
@@ -1834,7 +1977,6 @@ impl RangeIter {
                             return Ok(RangeAdvance::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
-                        let no_tombstones = frame.header().tombstone_leaf_cnt == 0;
                         let result = next_inner_child_from(frame, top.off, top_ntype, top.next)?;
                         match result {
                             Some((byte, child_off, next_cursor)) => {
@@ -1854,6 +1996,13 @@ impl RangeIter {
                                     frame.prefetch_at(sib_off);
                                 }
                                 let child_ntype = ntype_of(frame, child_off)?;
+                                let child_has_live = if self.delimiter.is_some()
+                                    && !matches!(child_ntype, NodeType::Blob | NodeType::EmptyRoot)
+                                {
+                                    subtree_has_live_leaf(frame, child_off)?
+                                } else {
+                                    false
+                                };
                                 // Cold-scan I/O read-ahead: when entering a run
                                 // of cross-blob children and the window has
                                 // drained, collect the upcoming child-blob guids
@@ -1879,7 +2028,7 @@ impl RangeIter {
                                     child_ntype,
                                     next_cursor,
                                     version,
-                                    no_tombstones,
+                                    child_has_live,
                                     prefetch_guids,
                                 ))
                             }
@@ -1894,11 +2043,11 @@ impl RangeIter {
                             child_ntype,
                             next_cursor,
                             version,
-                            no_tombstones,
+                            child_has_live,
                             prefetch_guids,
                         )) => {
-                            if no_tombstones
-                                && !matches!(child_ntype, NodeType::Blob | NodeType::EmptyRoot)
+                            if child_has_live
+                                && !matches!(child_ntype, NodeType::Blob)
                                 && self.prepare_branch_rollup(byte)
                             {
                                 if !self.path_is_still_valid() {

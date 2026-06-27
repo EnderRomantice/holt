@@ -116,7 +116,7 @@ pub struct TreeStats {
     /// queued deletes and deletes already claimed by a checkpoint
     /// epoch but not yet completed.
     pub bm_pending_delete_count: usize,
-    /// Deferred blind writes waiting to be merged into ART blob
+    /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
     /// Cumulative cache lookups served from BM cache without
@@ -160,8 +160,12 @@ pub struct TreeStats {
     pub bm_cold_index_bucket_read_bytes: u64,
     /// Positive cold reads served directly from inline sidecar values.
     pub bm_cold_index_inline_hits: u64,
-    /// Positive cold reads that used a sidecar offset plus a leaf-page
-    /// validation read.
+    /// Positive cold reads served from the cold-value sidecar.
+    pub bm_cold_index_value_hits: u64,
+    /// Bytes read from the cold-value sidecar.
+    pub bm_cold_index_value_read_bytes: u64,
+    /// Positive cold reads that fell back to a blob value offset plus
+    /// page-granular `blobs.dat` reads.
     pub bm_cold_index_offset_hits: u64,
     /// Negative cold reads proven by a cold-index filter/summary.
     pub bm_cold_index_negative_hits: u64,
@@ -302,7 +306,7 @@ pub struct DBStats {
     pub bm_dirty_count: usize,
     /// Number of deferred deletes across every tree.
     pub bm_pending_delete_count: usize,
-    /// Deferred blind writes waiting to be merged into ART blob
+    /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
     /// Shared BufferManager cache hits.
@@ -337,7 +341,11 @@ pub struct DBStats {
     pub bm_cold_index_bucket_read_bytes: u64,
     /// Shared inline cold-index hits.
     pub bm_cold_index_inline_hits: u64,
-    /// Shared offset cold-index hits.
+    /// Shared cold-value sidecar hits.
+    pub bm_cold_index_value_hits: u64,
+    /// Shared bytes read from the cold-value sidecar.
+    pub bm_cold_index_value_read_bytes: u64,
+    /// Shared blob-offset fallback cold-index hits.
     pub bm_cold_index_offset_hits: u64,
     /// Shared negative cold-index hits.
     pub bm_cold_index_negative_hits: u64,

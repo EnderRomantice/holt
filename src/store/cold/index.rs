@@ -11,7 +11,7 @@ use crate::layout::{
 use crate::store::{decode_child_off, BlobFrameRef};
 
 const MAGIC: [u8; 8] = *b"HOLTCI01";
-const VERSION: u16 = 6;
+const VERSION: u16 = 10;
 const HEADER_LEN: usize = 8 + 2 + 2 + 4 + ColdIndexStamp::ENCODED_LEN + 4 + 4 + 4 + 4;
 const BLOOM_BYTES: usize = 2048;
 const BLOOM_BITS: usize = BLOOM_BYTES * 8;
@@ -19,11 +19,14 @@ const BLOOM_PROBES: usize = 4;
 const BUCKET_ENTRY_LEN: usize = 8;
 const BUCKET_CRC_LEN: usize = 4;
 const INLINE_VALUE_MAX: usize = 256;
-const VALUE_NOT_INLINE: u32 = u32::MAX;
 const MAX_INDEX_BYTES: usize = PAGE_SIZE as usize;
+const MAX_VALUE_BYTES: usize = PAGE_SIZE as usize;
 const MIN_BUCKETS: usize = 64;
 const MAX_BUCKETS: usize = 4096;
 const SHARDS: usize = 16;
+const VALUE_INLINE: u32 = 0;
+const VALUE_COLD: u32 = 1;
+const VALUE_BLOB: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ColdIndexStamp {
@@ -134,10 +137,18 @@ struct CrossingEntry {
 
 struct BuildLeaf {
     hash: u64,
-    offset: u32,
+    value_source: u32,
+    value_source_off: u32,
+    value_len: u32,
+    value_crc32: u32,
     key: Box<[u8]>,
     value: Option<Box<[u8]>>,
     seq: u64,
+}
+
+pub(crate) struct ColdIndexBuild {
+    pub(crate) index: Vec<u8>,
+    pub(crate) values: Vec<u8>,
 }
 
 struct DecodedHeader {
@@ -161,17 +172,31 @@ pub(crate) struct ColdIndex {
 }
 
 pub(crate) enum ColdIndexHit {
-    Inline { value: Vec<u8>, seq: u64 },
-    Offset(u32),
+    Inline {
+        value: Vec<u8>,
+        seq: u64,
+    },
+    ColdValue {
+        value_off: u32,
+        value_len: u32,
+        value_crc32: u32,
+        seq: u64,
+    },
+    BlobOffset {
+        value_off: u32,
+        value_len: u32,
+        seq: u64,
+    },
 }
 
 impl ColdIndex {
     pub(crate) const HEADER_LEN: usize = HEADER_LEN;
 
-    pub(crate) fn build_bytes(frame: BlobFrameRef<'_>) -> Result<Vec<u8>> {
+    pub(crate) fn build(frame: BlobFrameRef<'_>) -> Result<ColdIndexBuild> {
         let mut builder = IndexBuilder::default();
         let root = decode_child(frame.header().root_slot)?;
         walk(frame, root, &mut Vec::new(), &mut builder)?;
+        let values = pack_cold_values(&mut builder.leaves)?;
         let bucket_count = choose_bucket_count(builder.leaves.len());
         builder
             .leaves
@@ -218,7 +243,7 @@ impl ColdIndex {
         for block in bucket_blocks {
             out.extend_from_slice(&block);
         }
-        Ok(out)
+        Ok(ColdIndexBuild { index: out, values })
     }
 
     pub(crate) fn directory_len(header: &[u8]) -> Result<usize> {
@@ -338,31 +363,52 @@ impl ColdIndex {
         let mut input = body;
         while !input.is_empty() {
             let hash = take_u64(&mut input)?;
-            let offset = take_u32(&mut input)?;
+            let value_source = take_u32(&mut input)?;
+            let value_source_off = take_u32(&mut input)?;
+            let full_value_len = take_u32(&mut input)?;
+            let value_crc32 = take_u32(&mut input)?;
             let suffix_len = take_u32(&mut input)?;
-            let value_len = take_u32(&mut input)?;
+            let inline_value_len = take_u32(&mut input)?;
             let seq = take_u64(&mut input)?;
             let suffix = take(&mut input, suffix_len as usize)?;
-            let value = if value_len == VALUE_NOT_INLINE {
-                None
-            } else {
-                Some(take(&mut input, value_len as usize)?)
-            };
+            let value = (inline_value_len != 0)
+                .then(|| take(&mut input, inline_value_len as usize))
+                .transpose()?;
             if hash != key_hash {
                 continue;
             }
             if !exact_key_matches_base_and_suffix(user_key, &self.base_prefix, suffix) {
                 continue;
             }
-            if !valid_node_offset(offset) {
-                return Err(Error::node_corrupt("cold index: leaf offset"));
-            }
             return Ok(Some(match value {
                 Some(value) => ColdIndexHit::Inline {
                     value: value.to_vec(),
                     seq,
                 },
-                None => ColdIndexHit::Offset(offset),
+                None => match value_source {
+                    VALUE_COLD => {
+                        if !valid_cold_value_range(value_source_off, full_value_len) {
+                            return Err(Error::node_corrupt("cold index: cold value range"));
+                        }
+                        ColdIndexHit::ColdValue {
+                            value_off: value_source_off,
+                            value_len: full_value_len,
+                            value_crc32,
+                            seq,
+                        }
+                    }
+                    VALUE_BLOB => {
+                        if !valid_blob_value_range(value_source_off, full_value_len) {
+                            return Err(Error::node_corrupt("cold index: blob value range"));
+                        }
+                        ColdIndexHit::BlobOffset {
+                            value_off: value_source_off,
+                            value_len: full_value_len,
+                            seq,
+                        }
+                    }
+                    _ => return Err(Error::node_corrupt("cold index: value source")),
+                },
             }));
         }
         Ok(None)
@@ -702,11 +748,14 @@ fn encode_bucket_blocks(
         }
         let suffix = &leaf.key[base_prefix.len()..];
         put_u64(block, leaf.hash);
-        put_u32(block, leaf.offset);
+        put_u32(block, leaf.value_source);
+        put_u32(block, leaf.value_source_off);
+        put_u32(block, leaf.value_len);
+        put_u32(block, leaf.value_crc32);
         put_u32_checked(block, suffix.len(), "cold index key suffix")?;
         match &leaf.value {
             Some(value) => put_u32_checked(block, value.len(), "cold index value")?,
-            None => put_u32(block, VALUE_NOT_INLINE),
+            None => put_u32(block, 0),
         }
         put_u64(block, leaf.seq);
         block.extend_from_slice(suffix);
@@ -721,6 +770,35 @@ fn encode_bucket_blocks(
     Ok(blocks)
 }
 
+fn pack_cold_values(leaves: &mut [BuildLeaf]) -> Result<Vec<u8>> {
+    let mut values = Vec::new();
+    for leaf in leaves {
+        let Some(value) = leaf.value.as_ref() else {
+            continue;
+        };
+        if value.len() <= INLINE_VALUE_MAX {
+            leaf.value_source = VALUE_INLINE;
+            leaf.value_source_off = 0;
+            continue;
+        }
+        let Some(end) = values.len().checked_add(value.len()) else {
+            leaf.value_source = VALUE_BLOB;
+            continue;
+        };
+        if end > MAX_VALUE_BYTES {
+            leaf.value_source = VALUE_BLOB;
+            leaf.value = None;
+            continue;
+        }
+        leaf.value_source = VALUE_COLD;
+        leaf.value_source_off =
+            u32::try_from(values.len()).map_err(|_| Error::node_corrupt("cold value offset"))?;
+        values.extend_from_slice(value);
+        leaf.value = None;
+    }
+    Ok(values)
+}
+
 fn index_leaf(body: &[u8], off: u32, leaf: Leaf, builder: &mut IndexBuilder) -> Result<()> {
     let key_start = size_of::<Leaf>();
     let key_end = key_start + usize::from(leaf.key_len);
@@ -733,14 +811,18 @@ fn index_leaf(body: &[u8], off: u32, leaf: Leaf, builder: &mut IndexBuilder) -> 
     }
     let key = &body[key_start..key_end];
     let value = &body[key_end..value_end];
-    let value = if value.len() <= INLINE_VALUE_MAX {
-        Some(value.to_vec().into_boxed_slice())
-    } else {
-        None
-    };
+    let value_off = off
+        .checked_add(u32::try_from(key_end).map_err(|_| Error::node_corrupt("cold index value"))?)
+        .ok_or(Error::node_corrupt("cold index value offset"))?;
+    let value_len = u32::from(leaf.value_len);
+    let value_crc32 = crc32fast::hash(value);
+    let value = Some(value.to_vec().into_boxed_slice());
     builder.leaves.push(BuildLeaf {
         hash: hash_exact_key(key),
-        offset: off,
+        value_source: VALUE_BLOB,
+        value_source_off: value_off,
+        value_len,
+        value_crc32,
         key: key.to_vec().into_boxed_slice(),
         value,
         seq: leaf.seq,
@@ -822,8 +904,17 @@ fn fnv64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn valid_node_offset(offset: u32) -> bool {
-    (DATA_AREA_START..PAGE_SIZE).contains(&offset) && offset % 8 == 0
+fn valid_blob_value_range(value_off: u32, value_len: u32) -> bool {
+    (DATA_AREA_START..=PAGE_SIZE).contains(&value_off)
+        && value_off
+            .checked_add(value_len)
+            .is_some_and(|end| end <= PAGE_SIZE)
+}
+
+fn valid_cold_value_range(value_off: u32, value_len: u32) -> bool {
+    value_off
+        .checked_add(value_len)
+        .is_some_and(|end| end <= PAGE_SIZE)
 }
 
 fn guid_shard(guid: BlobGuid) -> usize {
@@ -895,7 +986,7 @@ mod tests {
         value: &[u8],
         seq: u64,
         tombstone: bool,
-    ) {
+    ) -> u32 {
         let total = leaf_body_size(key.len() as u32, value.len() as u32);
         let slot = frame.alloc_leaf(total).unwrap().slot;
         let off = frame.offset_of_slot(slot).unwrap();
@@ -907,6 +998,7 @@ mod tests {
         let value_start = size_of::<Leaf>() + key.len();
         body[value_start..value_start + value.len()].copy_from_slice(value);
         frame.header_mut().root_slot = encode_child_off(off);
+        off
     }
 
     fn install_blob_node(frame: &mut BlobFrame<'_>, prefix: &[u8], child: BlobGuid) {
@@ -948,7 +1040,9 @@ mod tests {
         let guid = [0x11; 16];
         let mut buf = crate::store::blob_store::AlignedBlobBuf::zeroed();
         BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
-        let bytes = ColdIndex::build_bytes(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+            .unwrap()
+            .index;
         let index = decode_dir(&bytes);
         assert_eq!(index.stamp.blob_guid, guid);
         assert!(matches!(
@@ -962,7 +1056,9 @@ mod tests {
         let guid = [0x15; 16];
         let mut buf = crate::store::blob_store::AlignedBlobBuf::zeroed();
         BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
-        let mut bytes = ColdIndex::build_bytes(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        let mut bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+            .unwrap()
+            .index;
         bytes[12..16].copy_from_slice(&(PAGE_SIZE + 1).to_le_bytes());
 
         assert!(ColdIndex::directory_len(&bytes[..ColdIndex::HEADER_LEN]).is_err());
@@ -976,7 +1072,9 @@ mod tests {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
             install_leaf(&mut frame, b"alpha\0", b"one", 1, false);
         }
-        let bytes = ColdIndex::build_bytes(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+            .unwrap()
+            .index;
         let index = decode_dir(&bytes);
         assert!(index.may_have_key(b"alpha"));
         assert!(!index.may_have_key(b"alpha~"));
@@ -994,12 +1092,46 @@ mod tests {
             let mut frame = BlobFrame::init(tomb.as_mut_slice(), guid).unwrap();
             install_leaf(&mut frame, b"beta\0", b"two", 2, true);
         }
-        let bytes = ColdIndex::build_bytes(BlobFrameRef::wrap(tomb.as_slice())).unwrap();
+        let bytes = ColdIndex::build(BlobFrameRef::wrap(tomb.as_slice()))
+            .unwrap()
+            .index;
         let index = decode_dir(&bytes);
         assert!(matches!(
             index.route_or_absent(b"beta", 0),
             ColdIndexAnswer::NotFound
         ));
+    }
+
+    #[test]
+    fn large_value_bucket_stores_cold_value_offset() {
+        let guid = [0x1b; 16];
+        let mut buf = crate::store::blob_store::AlignedBlobBuf::zeroed();
+        let key = b"large-object\0";
+        let value = vec![0x5a; INLINE_VALUE_MAX + 257];
+        {
+            let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
+            install_leaf(&mut frame, key, &value, 42, false);
+        }
+
+        let build = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        assert_eq!(build.values, value);
+        let bytes = build.index;
+        let index = decode_dir(&bytes);
+        match index.lookup_leaf_in_bucket(b"large-object", bucket(&bytes, &index, b"large-object"))
+        {
+            Ok(Some(ColdIndexHit::ColdValue {
+                value_off,
+                value_len,
+                value_crc32,
+                seq,
+            })) => {
+                assert_eq!(value_off, 0);
+                assert_eq!(value_len, value.len() as u32);
+                assert_eq!(value_crc32, crc32fast::hash(&value));
+                assert_eq!(seq, 42);
+            }
+            _ => panic!("large value should be indexed by cold value offset"),
+        }
     }
 
     #[test]
@@ -1010,7 +1142,9 @@ mod tests {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
             install_leaf(&mut frame, b"alpha\0", b"one", 1, false);
         }
-        let bytes = ColdIndex::build_bytes(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+            .unwrap()
+            .index;
         let index = decode_dir(&bytes);
         let block = bucket(&bytes, &index, b"alpha");
         let mut corrupt = block.to_vec();
@@ -1024,14 +1158,20 @@ mod tests {
         let leaves = vec![
             BuildLeaf {
                 hash: hash_exact_key(b"bucket/a/file-0001\0"),
-                offset: DATA_AREA_START,
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 3,
+                value_crc32: crc32fast::hash(b"one"),
                 key: b"bucket/a/file-0001\0".to_vec().into_boxed_slice(),
                 value: Some(b"one".to_vec().into_boxed_slice()),
                 seq: 7,
             },
             BuildLeaf {
                 hash: hash_exact_key(b"bucket/a/file-0002\0"),
-                offset: DATA_AREA_START + 8,
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 3,
+                value_crc32: crc32fast::hash(b"two"),
                 key: b"bucket/a/file-0002\0".to_vec().into_boxed_slice(),
                 value: Some(b"two".to_vec().into_boxed_slice()),
                 seq: 8,
@@ -1103,7 +1243,9 @@ mod tests {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
             install_blob_node(&mut frame, b"bucket/a/", child);
         }
-        let bytes = ColdIndex::build_bytes(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+            .unwrap()
+            .index;
         let index = decode_dir(&bytes);
         assert!(!index.may_have_key(b"bucket/a/object"));
         assert!(matches!(

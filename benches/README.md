@@ -111,6 +111,8 @@ default, then runs high-pressure operation loops:
 - `list_records`: `HOLT_STRESS_LIST_OPS` bounded full key/value
   prefix scans
 - `list_dir`: `HOLT_STRESS_LIST_OPS` delimiter rollups
+- `prefix_empty`: `HOLT_STRESS_LIST_OPS` prefix-existence
+  predicates (`true` iff the prefix has no live key)
 
 The stress harness prints `ns/op`, `Mops/s`, and Holt shape
 telemetry (`blobs`, cross-blob `edges`, `max_depth`, `avg_depth`,
@@ -158,6 +160,13 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 HOLT_STRESS_WAL_SYNC=true \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
+# Force large values so Holt's cold-value sidecar is exercised
+# instead of inline-value hits. If a sidecar payload cannot fit in
+# its bounded blob slot, Holt falls back to page-granular blob reads.
+HOLT_STRESS_VALUE_BYTES=4096 \
+HOLT_STRESS_OPS=get \
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
+
 # Reopen after preload+checkpoint before timing. This starts Holt
 # with an empty BufferManager except for the root pin, and similarly
 # reopens RocksDB/SQLite/sled. Use it for cold-cache or constrained
@@ -169,7 +178,9 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 ```
 
 When running cold-cache or constrained-buffer studies, use the
-`holt_shape` line as the primary Holt-specific diagnostic:
+`holt_shape` line as the primary Holt-specific diagnostic. For
+large-value cold reads, `cold_idx_value_hits` should dominate
+`cold_idx_offset_hits` when the cold-value sidecar is effective.
 `bm_point_reads * 512 KiB / get_ops` shows the average backing-store
 bytes pulled by user point lookups, while `bm_scan_reads` and
 `bm_silent_reads` separate scan-driven churn and post-timing stats
@@ -178,6 +189,23 @@ With `HOLT_STRESS_REOPEN_AFTER_PRELOAD=1`, the harness does not
 call `Tree::stats()` between reopen and timing; stats collection
 pins blobs and would otherwise prewarm the very cold cache being
 measured.
+
+For strict total-memory comparisons on Linux, use the cgroup RSS
+driver. It runs each engine in its own `MemoryMax` cgroup rather
+than only matching per-engine cache knobs:
+
+```sh
+HOLT_CGROUP_MEMORY_MAX=1G \
+HOLT_CGROUP_N=1000000 \
+HOLT_CGROUP_POINT_OPS=100000 \
+HOLT_CGROUP_LIST_OPS=10000 \
+HOLT_CGROUP_ENGINES=holt,rocksdb,sqlite \
+bash benches/eval_cgroup_rss.sh
+```
+
+Use `HOLT_CGROUP_VALUE_BYTES=4096` for large-value cold-read
+studies, and keep `HOLT_CGROUP_OPS=get,list_dir,prefix_empty`
+when testing the metadata read path.
 
 Profile: single-threaded, warm-service, file-backed persistent
 engines with WAL enabled. Holt uses `TreeConfig::new(tempdir)` with

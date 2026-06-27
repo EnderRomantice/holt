@@ -30,6 +30,8 @@ pub(super) struct Telemetry {
     cold_index_bucket_reads: AtomicU64,
     cold_index_bucket_read_bytes: AtomicU64,
     cold_index_inline_hits: AtomicU64,
+    cold_index_value_hits: AtomicU64,
+    cold_index_value_read_bytes: AtomicU64,
     cold_index_offset_hits: AtomicU64,
     cold_index_negative_hits: AtomicU64,
     cold_index_crossing_hits: AtomicU64,
@@ -138,6 +140,12 @@ impl Telemetry {
 
     pub(super) fn note_cold_index_inline_hit(&self) {
         self.cold_index_inline_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_cold_index_value_hit(&self, bytes: u64) {
+        self.cold_index_value_hits.fetch_add(1, Ordering::Relaxed);
+        self.cold_index_value_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(super) fn note_cold_index_offset_hit(&self) {
@@ -268,6 +276,14 @@ impl Telemetry {
 
     pub(super) fn cold_index_inline_hits(&self) -> u64 {
         self.cold_index_inline_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_value_hits(&self) -> u64 {
+        self.cold_index_value_hits.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn cold_index_value_read_bytes(&self) -> u64 {
+        self.cold_index_value_read_bytes.load(Ordering::Relaxed)
     }
 
     pub(super) fn cold_index_offset_hits(&self) -> u64 {

@@ -64,6 +64,8 @@
 //! | `holt_bm_cold_index_bucket_reads_total` | counter | `TreeStats::bm_cold_index_bucket_reads` |
 //! | `holt_bm_cold_index_bucket_read_bytes_total` | counter | `TreeStats::bm_cold_index_bucket_read_bytes` |
 //! | `holt_bm_cold_index_inline_hits_total`  | counter | `TreeStats::bm_cold_index_inline_hits` |
+//! | `holt_bm_cold_index_value_hits_total`   | counter | `TreeStats::bm_cold_index_value_hits` |
+//! | `holt_bm_cold_index_value_read_bytes_total` | counter | `TreeStats::bm_cold_index_value_read_bytes` |
 //! | `holt_bm_cold_index_offset_hits_total`  | counter | `TreeStats::bm_cold_index_offset_hits` |
 //! | `holt_bm_cold_index_negative_hits_total`| counter | `TreeStats::bm_cold_index_negative_hits` |
 //! | `holt_bm_cold_index_crossing_hits_total`| counter | `TreeStats::bm_cold_index_crossing_hits` |
@@ -259,7 +261,7 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     metric(
         &mut out,
         "holt_bm_write_delta_count",
-        "Number of deferred blind writes waiting for ART merge.",
+        "Number of deferred WAL-backed writes waiting for ART merge.",
         "gauge",
         stats.bm_write_delta_count as u64,
     );
@@ -377,8 +379,22 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
+        "holt_bm_cold_index_value_hits_total",
+        "Positive cold reads served from cold-value sidecar payloads.",
+        "counter",
+        stats.bm_cold_index_value_hits,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_index_value_read_bytes_total",
+        "Bytes read from cold-value sidecar payloads.",
+        "counter",
+        stats.bm_cold_index_value_read_bytes,
+    );
+    metric(
+        &mut out,
         "holt_bm_cold_index_offset_hits_total",
-        "Positive cold reads served by cold-index offset plus leaf-page validation.",
+        "Positive cold reads served by blob-offset fallback plus page reads.",
         "counter",
         stats.bm_cold_index_offset_hits,
     );
@@ -781,10 +797,12 @@ mod tests {
             bm_cold_index_bucket_reads: 37,
             bm_cold_index_bucket_read_bytes: 38,
             bm_cold_index_inline_hits: 39,
-            bm_cold_index_offset_hits: 40,
-            bm_cold_index_negative_hits: 41,
-            bm_cold_index_crossing_hits: 42,
-            bm_cold_index_unknowns: 43,
+            bm_cold_index_value_hits: 40,
+            bm_cold_index_value_read_bytes: 41,
+            bm_cold_index_offset_hits: 42,
+            bm_cold_index_negative_hits: 43,
+            bm_cold_index_crossing_hits: 44,
+            bm_cold_index_unknowns: 45,
             bm_optimistic_restarts: 3,
             bm_range_restarts: 2,
             bm_walker_ops: 4,
@@ -862,10 +880,12 @@ mod tests {
         assert!(out.contains("holt_bm_cold_index_bucket_reads_total 37\n"));
         assert!(out.contains("holt_bm_cold_index_bucket_read_bytes_total 38\n"));
         assert!(out.contains("holt_bm_cold_index_inline_hits_total 39\n"));
-        assert!(out.contains("holt_bm_cold_index_offset_hits_total 40\n"));
-        assert!(out.contains("holt_bm_cold_index_negative_hits_total 41\n"));
-        assert!(out.contains("holt_bm_cold_index_crossing_hits_total 42\n"));
-        assert!(out.contains("holt_bm_cold_index_unknowns_total 43\n"));
+        assert!(out.contains("holt_bm_cold_index_value_hits_total 40\n"));
+        assert!(out.contains("holt_bm_cold_index_value_read_bytes_total 41\n"));
+        assert!(out.contains("holt_bm_cold_index_offset_hits_total 42\n"));
+        assert!(out.contains("holt_bm_cold_index_negative_hits_total 43\n"));
+        assert!(out.contains("holt_bm_cold_index_crossing_hits_total 44\n"));
+        assert!(out.contains("holt_bm_cold_index_unknowns_total 45\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
         assert!(out.contains("holt_bm_range_restarts_total 2\n"));
         assert!(out.contains("holt_bm_walker_ops_total 4\n"));

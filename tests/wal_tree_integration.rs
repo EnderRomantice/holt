@@ -1456,6 +1456,44 @@ fn cold_read_touches_one_child_blob_after_reopen() {
 }
 
 #[test]
+fn cold_large_value_read_uses_value_sidecar_after_reopen() {
+    let dir = tempdir().unwrap();
+    let mut cfg = manual_checkpoint_cfg(dir.path());
+    cfg.buffer_pool_size = 1;
+
+    let target_key = b"cold/value/bucket/part-0999/object";
+    let target_value = vec![0xA7; 4096];
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let filler = vec![0x11; 4096];
+        for i in 0..1000u32 {
+            let key = format!("cold/value/bucket/part-{i:04}/object");
+            let value = if key.as_bytes() == target_key {
+                target_value.as_slice()
+            } else {
+                filler.as_slice()
+            };
+            tree.put(key.as_bytes(), value).unwrap();
+        }
+        tree.checkpoint().unwrap();
+        for _ in 0..8 {
+            tree.compact().unwrap();
+            tree.checkpoint().unwrap();
+        }
+        assert!(
+            tree.stats().unwrap().total_compactions > 0,
+            "test must route at least one cold child blob",
+        );
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert_eq!(
+        tree.get(target_key).unwrap().as_deref(),
+        Some(target_value.as_slice())
+    );
+}
+
+#[test]
 fn db_cold_route_neighbor_get_falls_back_after_local_route_answer() {
     let dir = tempdir().unwrap();
     let mut cfg = durable_cfg(dir.path());

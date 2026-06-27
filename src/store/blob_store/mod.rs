@@ -120,7 +120,7 @@ pub trait BlobStore: Send + Sync {
         Ok(())
     }
 
-    /// Read a byte range from the optional cold-read sidecar for `guid`.
+    /// Read a byte range from the optional cold-read index sidecar for `guid`.
     ///
     /// Sidecars are accelerators only: `None`, corrupt bytes, or a
     /// stale stamp must make callers fall back to authoritative blob
@@ -134,11 +134,33 @@ pub trait BlobStore: Send + Sync {
         Ok(false)
     }
 
-    /// Publish a rebuilt cold-read sidecar for `guid`.
+    /// Read a byte range from the optional cold-read value sidecar for `guid`.
     ///
-    /// A failure here must not make committed blob data unrecoverable;
-    /// callers may ignore the error after invalidating any cached index.
-    fn publish_cold_index(&self, _guid: BlobGuid, _bytes: &[u8]) -> Result<()> {
+    /// Value sidecars are addressed by a cold-index entry. They are
+    /// rebuildable accelerators only; absence or corruption must make
+    /// callers fall back to the authoritative blob frame.
+    fn read_cold_value_range(
+        &self,
+        _guid: BlobGuid,
+        _byte_offset: u64,
+        _dst: &mut [u8],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Publish rebuilt cold-read sidecars for `guid`.
+    ///
+    /// `index_bytes` is the routable directory/bucket sidecar;
+    /// `value_bytes` is an optional same-blob payload region used by
+    /// large cold values. A failure here must not make committed blob
+    /// data unrecoverable; callers may ignore the error after
+    /// invalidating any cached index.
+    fn publish_cold_index(
+        &self,
+        _guid: BlobGuid,
+        _index_bytes: &[u8],
+        _value_bytes: &[u8],
+    ) -> Result<()> {
         Ok(())
     }
 

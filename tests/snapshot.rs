@@ -542,8 +542,9 @@ fn crash_leak_cfg(dir: &std::path::Path) -> TreeConfig {
 /// Inside a single process that keeps the leaked instance — and its
 /// exclusive store-directory lock — alive forever; a real crash ends
 /// the process and the kernel drops the flock with it. A child
-/// process reproduces the real semantics: leaked on-disk frames,
-/// released lock.
+/// process reproduces the real semantics: the read snapshot is lost,
+/// the live tree remains authoritative, and GC must not find
+/// snapshot-owned persistent garbage.
 fn run_crash_session(child_test: &str, dir: &std::path::Path) {
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(exe)
@@ -554,12 +555,12 @@ fn run_crash_session(child_test: &str, dir: &std::path::Path) {
     assert!(status.success(), "crash-session child {child_test} failed");
 }
 
-/// Child body for [`gc_reclaims_crash_leaked_snapshot_frames`]:
-/// snapshot + fork, checkpoint so the forks/orphans/snapshot root
-/// persist, then "crash" — forget the snapshot so it never retires
-/// and its in-memory orphan list dies with the process.
+/// Child body for [`crash_leaked_tree_snapshot_does_not_leave_persistent_garbage`]:
+/// snapshot + writes + checkpoint, then "crash" — forget the snapshot
+/// so it never retires. Snapshot roots are in-memory only, so reopen
+/// should see live data without requiring GC cleanup.
 #[test]
-#[ignore = "child-process body for gc_reclaims_crash_leaked_snapshot_frames"]
+#[ignore = "child-process body for crash_leaked_tree_snapshot_does_not_leave_persistent_garbage"]
 fn crash_leak_tree_session() {
     let Some(dir) = std::env::var_os(CRASH_LEAK_DIR_ENV) else {
         return;
@@ -580,7 +581,7 @@ fn crash_leak_tree_session() {
 }
 
 #[test]
-fn gc_reclaims_crash_leaked_snapshot_frames() {
+fn crash_leaked_tree_snapshot_does_not_leave_persistent_garbage() {
     let dir = tempdir().unwrap();
     let cfg = || crash_leak_cfg(dir.path());
 
@@ -588,8 +589,8 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
 
     run_crash_session("crash_leak_tree_session", dir.path());
 
-    // Reopen: the store still carries the leaked orphan frames + the
-    // forgotten snapshot's root, unreachable from the live tree.
+    // Reopen: the forgotten snapshot was not a durable root. Only the
+    // live tree should remain reachable.
     let tree = Tree::open(cfg()).unwrap();
     for i in 0..N {
         assert_eq!(
@@ -600,11 +601,11 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
     }
 
     let freed = tree.gc().unwrap();
-    assert!(
-        freed > 0,
-        "gc should reclaim crash-leaked snapshot frames, freed {freed}",
+    assert_eq!(
+        freed, 0,
+        "ephemeral read snapshots must not leave persistent garbage",
     );
-    // Idempotent: nothing unreachable remains.
+    // Idempotent: GC remains a no-op.
     assert_eq!(tree.gc().unwrap(), 0, "second gc must be a no-op");
     // gc must not have touched live data.
     for i in 0..N {
@@ -616,10 +617,10 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
     }
 }
 
-/// Child body for [`db_gc_reclaims_leak_and_preserves_all_trees`]:
-/// two trees; snapshot + fork + crash on t1.
+/// Child body for [`db_crash_leaked_snapshot_does_not_leave_persistent_garbage`]:
+/// two trees; snapshot + writes + crash on t1.
 #[test]
-#[ignore = "child-process body for db_gc_reclaims_leak_and_preserves_all_trees"]
+#[ignore = "child-process body for db_crash_leaked_snapshot_does_not_leave_persistent_garbage"]
 fn crash_leak_db_session() {
     let Some(dir) = std::env::var_os(CRASH_LEAK_DIR_ENV) else {
         return;
@@ -639,11 +640,11 @@ fn crash_leak_db_session() {
         t1.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
     }
     db.checkpoint().unwrap();
-    std::mem::forget(snap); // crash: t1's forked-away frames leak
+    std::mem::forget(snap); // crash: read snapshot state is process-local
 }
 
 #[test]
-fn db_gc_reclaims_leak_and_preserves_all_trees() {
+fn db_crash_leaked_snapshot_does_not_leave_persistent_garbage() {
     let dir = tempdir().unwrap();
     let cfg = || crash_leak_cfg(dir.path());
 
@@ -654,9 +655,9 @@ fn db_gc_reclaims_leak_and_preserves_all_trees() {
 
     let db = DB::open(cfg()).unwrap();
     let freed = db.gc().unwrap();
-    assert!(
-        freed > 0,
-        "db gc should reclaim crash-leaked frames, freed {freed}",
+    assert_eq!(
+        freed, 0,
+        "ephemeral read snapshots must not leave DB-wide persistent garbage",
     );
     assert_eq!(db.gc().unwrap(), 0, "second db gc must be a no-op");
 

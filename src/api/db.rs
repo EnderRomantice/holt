@@ -582,6 +582,8 @@ impl DB {
             bm_cold_index_bucket_reads: bm.cold_index_bucket_reads,
             bm_cold_index_bucket_read_bytes: bm.cold_index_bucket_read_bytes,
             bm_cold_index_inline_hits: bm.cold_index_inline_hits,
+            bm_cold_index_value_hits: bm.cold_index_value_hits,
+            bm_cold_index_value_read_bytes: bm.cold_index_value_read_bytes,
             bm_cold_index_offset_hits: bm.cold_index_offset_hits,
             bm_cold_index_negative_hits: bm.cold_index_negative_hits,
             bm_cold_index_crossing_hits: bm.cold_index_crossing_hits,

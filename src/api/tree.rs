@@ -47,6 +47,7 @@ const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
 const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
 const SHAPE_UNDERFILLED_CHILD_FILL_PER_MILLE: u32 = 350;
 const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
+const WRITE_DELTA_FLUSH_THRESHOLD: usize = 262_144;
 
 type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 type CheckpointMap = HashMap<BlobGuid, u64>;
@@ -700,7 +701,7 @@ impl Tree {
     fn lookup_record_unlocked(&self, key: &[u8]) -> Result<Option<Record>> {
         if let Some(delta) = self.store.lookup_write_delta(self.tree_id, key) {
             return Ok(match delta {
-                WriteDeltaEntry::Put { value, seq } => Some(Record {
+                WriteDeltaEntry::Put { value, seq, .. } => Some(Record {
                     value,
                     version: RecordVersion::new(seq),
                 }),
@@ -722,8 +723,10 @@ impl Tree {
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
     ///
-    /// Blind hot path: the walker does **not** read or clone the
-    /// existing leaf's value on a same-key update.
+    /// Deferred persistent hot path: the writer checks only whether
+    /// the key-set changes, then appends WAL and stages the value in
+    /// the write delta. It does not read or clone the previous value
+    /// on a same-key update.
     ///
     /// Walks across `BlobNode` crossings. When any blob hits
     /// `AllocError::OutOfSpace`, the walker automatically migrates
@@ -740,8 +743,8 @@ impl Tree {
     /// Per-op `memory_flush_on_write` mode drains the dirty set
     /// inline after the WAL append.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if self.can_stage_blind_write() {
-            self.put_blind_deferred(key, value)
+        if self.can_stage_deferred_write() {
+            self.put_deferred(key, value)
         } else {
             self.put_inner_conditional(key, value, engine::InsertCondition::Always)
                 .map(|_| ())
@@ -823,7 +826,7 @@ impl Tree {
         .map(|outcome| outcome.mutated)
     }
 
-    fn can_stage_blind_write(&self) -> bool {
+    fn can_stage_deferred_write(&self) -> bool {
         self.journal.is_some() && !self.cfg.is_memory() && !self.cfg.memory_flush_on_write
     }
 
@@ -838,30 +841,38 @@ impl Tree {
         self.store.flush_write_deltas_for_tree(self.tree_id)
     }
 
-    fn put_blind_deferred(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn put_deferred(&self, key: &[u8], value: &[u8]) -> Result<()> {
         Self::validate_insert_shape(key, value)?;
         let ack = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_live()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
+            let creates_key = self.get_version(key)?.is_none();
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             let journal = self
                 .journal
                 .as_ref()
-                .expect("can_stage_blind_write requires journal");
+                .expect("can_stage_deferred_write requires journal");
             let _commit = self.commit_gate.enter_writer();
             let mut record =
                 journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
             encode_insert_record(&mut record, seq, self.tree_id, key, value);
             let ack = journal.submit(record, self.cfg.durability.wal_sync())?;
-            self.store
-                .stage_write_delta_put(self.tree_id, self.root_guid, key, value, seq);
+            self.store.stage_write_delta_put(
+                self.tree_id,
+                self.root_guid,
+                key,
+                value,
+                seq,
+                creates_key,
+            );
             ack
         };
         if let Some(ack) = ack {
             ack.wait()?;
         }
+        self.flush_write_delta_debt_if_needed()?;
         Ok(())
     }
 
@@ -938,16 +949,17 @@ impl Tree {
     /// Remove `key`. Returns `Ok(true)` if a leaf was removed,
     /// `Ok(false)` if no leaf matched.
     ///
-    /// Blind hot path: the walker does **not** read or clone the
-    /// existing leaf's value before tombstoning it.
+    /// Deferred persistent hot path: the writer checks only the live
+    /// version before appending WAL and staging a tombstone. It does
+    /// not read or clone the previous value.
     ///
     /// Walks across `BlobNode` crossings. Child-local mutations
     /// are staged through the BM dirty set; any conservative
     /// fallback that unlinks a child blob queues the manifest
     /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        if self.can_stage_blind_write() {
-            self.delete_blind_deferred(key)
+        if self.can_stage_deferred_write() {
+            self.delete_deferred(key)
         } else {
             self.delete_inner_conditional(key, engine::EraseCondition::Always)
                 .map(|outcome| outcome.mutated)
@@ -969,20 +981,20 @@ impl Tree {
         .map(|outcome| outcome.mutated)
     }
 
-    fn delete_blind_deferred(&self, key: &[u8]) -> Result<bool> {
+    fn delete_deferred(&self, key: &[u8]) -> Result<bool> {
         let ack = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_live()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
-            if self.lookup_record_unlocked(key)?.is_none() {
+            if self.get_version(key)?.is_none() {
                 return Ok(false);
             }
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             let journal = self
                 .journal
                 .as_ref()
-                .expect("can_stage_blind_write requires journal");
+                .expect("can_stage_deferred_write requires journal");
             let _commit = self.commit_gate.enter_writer();
             let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
             encode_erase_record(&mut record, seq, self.tree_id, key);
@@ -994,7 +1006,15 @@ impl Tree {
         if let Some(ack) = ack {
             ack.wait()?;
         }
+        self.flush_write_delta_debt_if_needed()?;
         Ok(true)
+    }
+
+    fn flush_write_delta_debt_if_needed(&self) -> Result<()> {
+        if self.store.write_delta_count_for_tree(self.tree_id) >= WRITE_DELTA_FLUSH_THRESHOLD {
+            self.flush_write_delta_for_tree()?;
+        }
+        Ok(())
     }
 
     fn delete_inner_conditional(
@@ -1445,6 +1465,10 @@ impl Tree {
     }
 
     fn projected_prefix_empty(&self, overlay: &BatchOverlay, prefix: &[u8]) -> Result<bool> {
+        if overlay.is_empty() {
+            return self.base_prefix_empty(prefix);
+        }
+
         if overlay
             .iter()
             .any(|(key, record)| record.is_some() && key.starts_with(prefix))
@@ -1463,6 +1487,11 @@ impl Tree {
             }
         }
         Ok(true)
+    }
+
+    fn base_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
+        let mut iter = self.scan_keys(prefix).into_iter();
+        Ok(iter.next_unlocked().transpose()?.is_none())
     }
 
     fn validate_insert_shape(key: &[u8], value: &[u8]) -> Result<()> {
@@ -1740,18 +1769,23 @@ impl Tree {
     /// current cursor. It is, however, monotonic with respect to
     /// already-emitted keys and rollups.
     pub fn range(&self) -> RangeBuilder {
-        let builder = RangeBuilder::new(
+        let builder = self.range_builder_base();
+        match self.flush_write_delta_for_tree() {
+            Ok(()) => builder,
+            Err(e) => builder.with_preflight_error(e),
+        }
+    }
+
+    fn range_builder_base(&self) -> RangeBuilder {
+        RangeBuilder::new(
             Arc::clone(&self.store),
             Arc::clone(&self.root_pin),
             self.root_guid,
             Arc::clone(&self.maintenance_gate),
         )
         .with_mutation_gate(Arc::clone(&self.mutation_gate))
-        .with_liveness(Arc::clone(&self.dropped));
-        match self.flush_write_delta_for_tree() {
-            Ok(()) => builder,
-            Err(e) => builder.with_preflight_error(e),
-        }
+        .with_write_delta_flush(self.tree_id, Arc::clone(&self.commit_gate))
+        .with_liveness(Arc::clone(&self.dropped))
     }
 
     /// Shorthand for `tree.range().prefix(p)` — the
@@ -1772,7 +1806,7 @@ impl Tree {
     /// value bytes. Use it for metadata listing paths that only
     /// need names and compare-and-set versions.
     pub fn range_keys(&self) -> KeyRangeBuilder {
-        KeyRangeBuilder::new(self.range()).with_prefix_list_cache(
+        KeyRangeBuilder::new(self.range_builder_base()).with_prefix_list_cache(
             Arc::clone(&self.prefix_list_cache),
             Arc::clone(&self.next_seq),
         )
@@ -1936,11 +1970,12 @@ impl Tree {
     /// [`AtomicBatch::assert_prefix_empty`] inside [`Self::atomic`] when
     /// the emptiness check must be atomic with subsequent writes.
     pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
-        self.flush_write_delta_for_tree()?;
-        let _maintenance = self.maintenance_gate.enter_shared();
-        self.ensure_live()?;
-        let _tree_mutation = self.mutation_gate.enter_shared();
-        self.projected_prefix_empty(&std::collections::HashMap::new(), prefix)
+        let mut found = false;
+        self.scan_keys(prefix).visit(1, |_| {
+            found = true;
+            Ok(())
+        })?;
+        Ok(!found)
     }
 
     /// Drain the BM dirty map and synchronously push entries to
@@ -2455,6 +2490,8 @@ impl Tree {
             bm_cold_index_bucket_reads: bm.cold_index_bucket_reads,
             bm_cold_index_bucket_read_bytes: bm.cold_index_bucket_read_bytes,
             bm_cold_index_inline_hits: bm.cold_index_inline_hits,
+            bm_cold_index_value_hits: bm.cold_index_value_hits,
+            bm_cold_index_value_read_bytes: bm.cold_index_value_read_bytes,
             bm_cold_index_offset_hits: bm.cold_index_offset_hits,
             bm_cold_index_negative_hits: bm.cold_index_negative_hits,
             bm_cold_index_crossing_hits: bm.cold_index_crossing_hits,

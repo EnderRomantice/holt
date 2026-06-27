@@ -42,8 +42,8 @@ const DEFAULT_LIST_OPS: usize = 1_000_000;
 const DEFAULT_LIST_TAKE: usize = 100;
 const DEFAULT_DIR_TAKE: usize = 8;
 const DEFAULT_BUFFER_POOL: usize = 64;
-#[cfg(feature = "comparators")]
 const PRELOAD_BATCH: usize = 10_000;
+const HOLT_PRELOAD_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const SEED: u64 = 0xD15E_A5ED_2000_0001;
 #[cfg(feature = "comparators")]
 const DEFAULT_ENGINES: &str = "holt,rocksdb,sqlite";
@@ -153,6 +153,7 @@ struct StressConfig {
     list_ops: usize,
     list_take: usize,
     dir_take: usize,
+    value_bytes: Option<usize>,
     buffer_pool_size: usize,
     wal_sync: bool,
     reopen_after_preload: bool,
@@ -188,7 +189,7 @@ impl StressConfig {
             .map(str::to_string)
             .collect();
         let ops = env::var("HOLT_STRESS_OPS")
-            .unwrap_or_else(|_| "get,put,mixed,list,list_records,list_dir".to_string())
+            .unwrap_or_else(|_| "get,put,mixed,list,list_records,list_dir,prefix_empty".to_string())
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -202,6 +203,9 @@ impl StressConfig {
             list_ops: env_usize("HOLT_STRESS_LIST_OPS", DEFAULT_LIST_OPS),
             list_take: env_usize("HOLT_STRESS_LIST_TAKE", DEFAULT_LIST_TAKE),
             dir_take: env_usize("HOLT_STRESS_DIR_TAKE", DEFAULT_DIR_TAKE),
+            value_bytes: env::var("HOLT_STRESS_VALUE_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok()),
             buffer_pool_size: env_usize("HOLT_STRESS_BUFFER_POOL", DEFAULT_BUFFER_POOL),
             wal_sync: env::var("HOLT_STRESS_WAL_SYNC")
                 .as_deref()
@@ -281,13 +285,16 @@ struct OpSample {
 fn main() {
     let cfg = StressConfig::from_env();
     println!(
-        "stress workload={} n_keys={} point_ops={} list_ops={} list_take={} dir_take={} buffer_pool={} engines={} ops={}",
+        "stress workload={} n_keys={} point_ops={} list_ops={} list_take={} dir_take={} value_bytes={} buffer_pool={} engines={} ops={}",
         cfg.workload.name(),
         cfg.n_keys,
         cfg.point_ops,
         cfg.list_ops,
         cfg.list_take,
         cfg.dir_take,
+        cfg.value_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "workload-default".to_string()),
         cfg.buffer_pool_size,
         cfg.engines.join(","),
         cfg.ops.join(","),
@@ -298,7 +305,13 @@ fn main() {
         cfg.data_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "tempdir".to_string())
     );
 
-    let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops, cfg.negative);
+    let samples = make_samples(
+        cfg.workload,
+        cfg.n_keys,
+        cfg.point_ops,
+        cfg.negative,
+        cfg.value_bytes,
+    );
     reject_missing_comparators(&cfg);
     if cfg.selected("holt") {
         run_holt(&cfg, &samples);
@@ -373,7 +386,7 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
     let mut tree = Tree::open(tree_cfg.clone()).expect("holt open");
     if !cfg.skip_preload {
-        preload_holt(&tree, cfg.workload, cfg.n_keys);
+        preload_holt(&tree, cfg.workload, cfg.n_keys, cfg.value_bytes);
         print_holt_shape("preload", &tree);
         tree.checkpoint().expect("holt preload checkpoint");
         print_holt_shape("ready", &tree);
@@ -451,6 +464,19 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
             }),
         );
     }
+    if cfg.selected_op("prefix_empty") {
+        report(
+            "holt",
+            "prefix_empty",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(
+                    tree.is_prefix_empty(cfg.workload.list_prefix())
+                        .expect("holt prefix_empty"),
+                );
+            }),
+        );
+    }
     print_holt_shape("final", &tree);
 }
 
@@ -459,7 +485,7 @@ fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
     let rocksdb_dir = store_dir(cfg, "rocksdb");
     let mut db = make_rocksdb(&rocksdb_dir, cfg);
     if !cfg.skip_preload {
-        preload_rocksdb(&db, cfg.workload, cfg.n_keys);
+        preload_rocksdb(&db, cfg.workload, cfg.n_keys, cfg.value_bytes);
     }
     if cfg.reopen_after_preload {
         db.flush().expect("rocksdb preload flush before reopen");
@@ -522,6 +548,16 @@ fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
             }),
         );
     }
+    if cfg.selected_op("prefix_empty") {
+        report(
+            "rocksdb",
+            "prefix_empty",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(rocksdb_prefix_empty(&db, cfg.workload.list_prefix()));
+            }),
+        );
+    }
 }
 
 #[cfg(feature = "comparators")]
@@ -529,7 +565,7 @@ fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
     let sqlite_dir = store_dir(cfg, "sqlite");
     let mut conn = make_sqlite_persistent(&sqlite_dir, cfg);
     if !cfg.skip_preload {
-        preload_sqlite(&conn, cfg.workload, cfg.n_keys);
+        preload_sqlite(&conn, cfg.workload, cfg.n_keys, cfg.value_bytes);
     }
     if cfg.reopen_after_preload {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -594,6 +630,20 @@ fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
             }),
         );
     }
+    if cfg.selected_op("prefix_empty") {
+        report(
+            "sqlite",
+            "prefix_empty",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(sqlite_prefix_empty(
+                    &conn,
+                    cfg.workload.list_prefix(),
+                    &prefix_upper(cfg.workload.list_prefix()),
+                ));
+            }),
+        );
+    }
 }
 
 #[cfg(feature = "comparators")]
@@ -601,7 +651,7 @@ fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
     let sled_dir = store_dir(cfg, "sled");
     let mut db = make_sled_persistent(&sled_dir);
     if !cfg.skip_preload {
-        preload_sled(&db, cfg.workload, cfg.n_keys);
+        preload_sled(&db, cfg.workload, cfg.n_keys, cfg.value_bytes);
     }
     if cfg.reopen_after_preload {
         db.flush().expect("sled preload flush before reopen");
@@ -652,6 +702,16 @@ fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
             }),
         );
     }
+    if cfg.selected_op("prefix_empty") {
+        report(
+            "sled",
+            "prefix_empty",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(sled_prefix_empty(&db, cfg.workload.list_prefix()));
+            }),
+        );
+    }
 }
 
 /// LMDB (via the `heed` safe wrapper) — the read-optimized embedded
@@ -664,7 +724,7 @@ fn run_lmdb(cfg: &StressConfig, samples: &[OpSample]) {
     let lmdb_dir = store_dir(cfg, "lmdb");
     let mut lmdb = make_lmdb(&lmdb_dir, cfg);
     if !cfg.skip_preload {
-        preload_lmdb(&lmdb, cfg.workload, cfg.n_keys);
+        preload_lmdb(&lmdb, cfg.workload, cfg.n_keys, cfg.value_bytes);
     }
     if cfg.reopen_after_preload {
         lmdb.env
@@ -723,9 +783,25 @@ fn run_lmdb(cfg: &StressConfig, samples: &[OpSample]) {
             }),
         );
     }
+    if cfg.selected_op("prefix_empty") {
+        report(
+            "lmdb",
+            "prefix_empty",
+            cfg.list_ops,
+            time_repeated(cfg.list_ops, || {
+                black_box(lmdb_prefix_empty(&lmdb, cfg.workload.list_prefix()));
+            }),
+        );
+    }
 }
 
-fn make_samples(workload: Workload, n_keys: usize, ops: usize, negative: bool) -> Vec<OpSample> {
+fn make_samples(
+    workload: Workload,
+    n_keys: usize,
+    ops: usize,
+    negative: bool,
+    value_bytes: Option<usize>,
+) -> Vec<OpSample> {
     assert!(n_keys > 0, "HOLT_STRESS_N must be > 0");
     let mut rng = StdRng::seed_from_u64(SEED);
     let mut out = Vec::with_capacity(ops);
@@ -740,22 +816,52 @@ fn make_samples(workload: Workload, n_keys: usize, ops: usize, negative: bool) -
         }
         out.push(OpSample {
             key,
-            value: workload.value(idx, op as u64 + 1),
+            value: make_value(workload, idx, op as u64 + 1, value_bytes),
         });
     }
     out
 }
 
-fn preload_holt(tree: &Tree, workload: Workload, n_keys: usize) {
+fn make_value(
+    workload: Workload,
+    idx: usize,
+    revision: u64,
+    value_bytes: Option<usize>,
+) -> Vec<u8> {
+    let mut value = workload.value(idx, revision);
+    let Some(target) = value_bytes else {
+        return value;
+    };
+    if value.len() >= target {
+        value.truncate(target);
+        return value;
+    }
+    let mut state = (idx as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(revision);
+    while value.len() < target {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        value.extend_from_slice(&state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
+    }
+    value.truncate(target);
+    value
+}
+
+fn preload_holt(tree: &Tree, workload: Workload, n_keys: usize, value_bytes: Option<usize>) {
     let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(PRELOAD_BATCH);
+    let mut batch_bytes = 0usize;
     progress("holt", "preload", 0, n_keys);
     for i in 0..n_keys {
         let key = workload.key(i, n_keys);
-        let value = workload.value(i, 0);
+        let value = make_value(workload, i, 0, value_bytes);
+        batch_bytes += key.len() + value.len();
         batch.push((key, value));
-        if batch.len() == PRELOAD_BATCH {
+        if batch.len() == PRELOAD_BATCH || batch_bytes >= HOLT_PRELOAD_BATCH_BYTES {
             flush_holt_preload_batch(tree, &batch);
             batch.clear();
+            batch_bytes = 0;
         }
         if should_progress(i + 1, n_keys) {
             progress("holt", "preload", i + 1, n_keys);
@@ -831,7 +937,7 @@ fn compact_holt_until_settled(tree: &Tree) {
 }
 
 #[cfg(feature = "comparators")]
-fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize) {
+fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize, value_bytes: Option<usize>) {
     // Preload is always async/fast (a bulk load is not the durable-write
     // experiment); the timed put/mixed phase uses the configured profile.
     let wo = rocksdb_write_opts(false);
@@ -840,7 +946,7 @@ fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize) {
     progress("rocksdb", "preload", 0, n_keys);
     for i in 0..n_keys {
         let key = workload.key(i, n_keys);
-        let value = workload.value(i, 0);
+        let value = make_value(workload, i, 0, value_bytes);
         batch.put(key, value);
         in_batch += 1;
         if in_batch == PRELOAD_BATCH {
@@ -858,7 +964,12 @@ fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize) {
 }
 
 #[cfg(feature = "comparators")]
-fn preload_sqlite(conn: &Connection, workload: Workload, n_keys: usize) {
+fn preload_sqlite(
+    conn: &Connection,
+    workload: Workload,
+    n_keys: usize,
+    value_bytes: Option<usize>,
+) {
     progress("sqlite", "preload", 0, n_keys);
     let tx = conn.unchecked_transaction().expect("sqlite preload tx");
     {
@@ -867,7 +978,7 @@ fn preload_sqlite(conn: &Connection, workload: Workload, n_keys: usize) {
             .expect("sqlite preload stmt");
         for i in 0..n_keys {
             let key = workload.key(i, n_keys);
-            let value = workload.value(i, 0);
+            let value = make_value(workload, i, 0, value_bytes);
             stmt.execute(params![key.as_slice(), value.as_slice()])
                 .expect("sqlite preload insert");
             if should_progress(i + 1, n_keys) {
@@ -879,11 +990,11 @@ fn preload_sqlite(conn: &Connection, workload: Workload, n_keys: usize) {
 }
 
 #[cfg(feature = "comparators")]
-fn preload_sled(db: &SledDb, workload: Workload, n_keys: usize) {
+fn preload_sled(db: &SledDb, workload: Workload, n_keys: usize, value_bytes: Option<usize>) {
     progress("sled", "preload", 0, n_keys);
     for i in 0..n_keys {
         let key = workload.key(i, n_keys);
-        let value = workload.value(i, 0);
+        let value = make_value(workload, i, 0, value_bytes);
         db.insert(key, value).expect("sled preload insert");
         if should_progress(i + 1, n_keys) {
             progress("sled", "preload", i + 1, n_keys);
@@ -892,13 +1003,13 @@ fn preload_sled(db: &SledDb, workload: Workload, n_keys: usize) {
 }
 
 #[cfg(feature = "comparators")]
-fn preload_lmdb(lmdb: &Lmdb, workload: Workload, n_keys: usize) {
+fn preload_lmdb(lmdb: &Lmdb, workload: Workload, n_keys: usize, value_bytes: Option<usize>) {
     progress("lmdb", "preload", 0, n_keys);
     let mut wtxn = lmdb.env.write_txn().expect("lmdb preload wtxn");
     let mut in_batch = 0usize;
     for i in 0..n_keys {
         let key = workload.key(i, n_keys);
-        let value = workload.value(i, 0);
+        let value = make_value(workload, i, 0, value_bytes);
         lmdb.db
             .put(&mut wtxn, key.as_slice(), value.as_slice())
             .expect("lmdb preload put");
@@ -1170,13 +1281,26 @@ fn holt_list_records(tree: &Tree, prefix: &[u8], take: usize) -> usize {
 
 fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0usize;
-    tree.scan_keys(prefix)
+    let outcome = tree
+        .scan_keys(prefix)
         .delimiter(delim)
-        .visit(take, |_| {
+        .visit_with_outcome(take, |_| {
             seen += 1;
             Ok(())
         })
         .expect("holt list_dir");
+    if std::env::var("HOLT_STRESS_SCAN_STATS").is_ok() {
+        eprintln!(
+            "holt_list_dir_stats prefix={} take={} visited={} returned={} rollup={} restarts={} cache_hit={}",
+            String::from_utf8_lossy(prefix),
+            take,
+            outcome.stats.visited,
+            outcome.stats.returned,
+            outcome.stats.rollup,
+            outcome.stats.restarts,
+            outcome.cache_hit
+        );
+    }
     seen
 }
 
@@ -1221,6 +1345,15 @@ fn rocksdb_list_dir(db: &DB, prefix: &[u8], delim: u8, take: usize) -> usize {
     }
     iter.status().expect("rocksdb list_dir iterator status");
     seen
+}
+
+#[cfg(feature = "comparators")]
+fn rocksdb_prefix_empty(db: &DB, prefix: &[u8]) -> bool {
+    let mut iter = db.raw_iterator();
+    iter.seek(prefix);
+    let empty = !iter.key().is_some_and(|key| key.starts_with(prefix));
+    iter.status().expect("rocksdb prefix_empty iterator status");
+    empty
 }
 
 #[cfg(feature = "comparators")]
@@ -1279,6 +1412,18 @@ fn sqlite_list_dir(
 }
 
 #[cfg(feature = "comparators")]
+fn sqlite_prefix_empty(conn: &Connection, prefix: &[u8], upper: &[u8]) -> bool {
+    let mut stmt = conn
+        .prepare_cached("SELECT 1 FROM kv WHERE k >= ? AND k < ? LIMIT 1")
+        .expect("sqlite prefix_empty stmt");
+    let found: Option<i64> = stmt
+        .query_row(params![prefix, upper], |row| row.get(0))
+        .optional()
+        .expect("sqlite prefix_empty query");
+    found.is_none()
+}
+
+#[cfg(feature = "comparators")]
 fn sled_list_plain(db: &SledDb, prefix: &[u8], take: usize) -> usize {
     let mut seen = 0usize;
     for item in db.scan_prefix(prefix) {
@@ -1314,6 +1459,11 @@ fn sled_list_dir(db: &SledDb, prefix: &[u8], delim: u8, take: usize) -> usize {
         }
     }
     seen
+}
+
+#[cfg(feature = "comparators")]
+fn sled_prefix_empty(db: &SledDb, prefix: &[u8]) -> bool {
+    db.scan_prefix(prefix).next().is_none()
 }
 
 #[cfg(feature = "comparators")]
@@ -1362,6 +1512,16 @@ fn lmdb_list_dir(lmdb: &Lmdb, prefix: &[u8], delim: u8, take: usize) -> usize {
         cursor = next_seek.unwrap_or_else(|| key_successor(key));
     }
     seen
+}
+
+#[cfg(feature = "comparators")]
+fn lmdb_prefix_empty(lmdb: &Lmdb, prefix: &[u8]) -> bool {
+    let rtxn = lmdb.env.read_txn().expect("lmdb prefix_empty rtxn");
+    let mut iter = lmdb
+        .db
+        .prefix_iter(&rtxn, prefix)
+        .expect("lmdb prefix_empty prefix_iter");
+    iter.next().is_none()
 }
 
 #[cfg(feature = "comparators")]
@@ -1503,7 +1663,7 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         .as_ref()
         .map_or((0, 0, 0), |j| (j.appends, j.batches, j.syncs));
     println!(
-        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} cold_page_hits={} cold_page_misses={} cold_idx_cache_hits={} cold_idx_cache_misses={} cold_idx_loads={} cold_idx_dir_bytes={} cold_idx_bucket_reads={} cold_idx_bucket_bytes={} cold_idx_inline_hits={} cold_idx_offset_hits={} cold_idx_negative_hits={} cold_idx_crossing_hits={} cold_idx_unknowns={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
+        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} cold_page_hits={} cold_page_misses={} cold_idx_cache_hits={} cold_idx_cache_misses={} cold_idx_loads={} cold_idx_dir_bytes={} cold_idx_bucket_reads={} cold_idx_bucket_bytes={} cold_idx_inline_hits={} cold_idx_value_hits={} cold_idx_value_bytes={} cold_idx_offset_hits={} cold_idx_negative_hits={} cold_idx_crossing_hits={} cold_idx_unknowns={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} journal_appends={} journal_batches={} journal_syncs={}",
         s.blob_count,
         s.total_blob_edges,
         s.leaf_blob_count,
@@ -1529,6 +1689,8 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         s.bm_cold_index_bucket_reads,
         s.bm_cold_index_bucket_read_bytes,
         s.bm_cold_index_inline_hits,
+        s.bm_cold_index_value_hits,
+        s.bm_cold_index_value_read_bytes,
         s.bm_cold_index_offset_hits,
         s.bm_cold_index_negative_hits,
         s.bm_cold_index_crossing_hits,

@@ -159,6 +159,12 @@ use write_delta::{DeltaEntry, DeltaOp, WriteDelta};
 
 pub(crate) use write_delta::DeltaEntry as WriteDeltaEntry;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteDeltaKeyState {
+    Put { seq: u64 },
+    Delete,
+}
+
 /// Sentinel seq for dirty / pending-delete entries that originate
 /// from purely structural mutations (compact, merge pass) — they
 /// have no corresponding WAL record and so must not pin the WAL
@@ -288,6 +294,8 @@ pub(crate) struct BufferStats {
     pub(crate) cold_index_bucket_reads: u64,
     pub(crate) cold_index_bucket_read_bytes: u64,
     pub(crate) cold_index_inline_hits: u64,
+    pub(crate) cold_index_value_hits: u64,
+    pub(crate) cold_index_value_read_bytes: u64,
     pub(crate) cold_index_offset_hits: u64,
     pub(crate) cold_index_negative_hits: u64,
     pub(crate) cold_index_crossing_hits: u64,
@@ -349,7 +357,7 @@ pub struct BufferManager {
     /// one short critical section with no global dirty mutex on the
     /// persistent write hot path.
     mutation: [Mutex<MutationState>; BOOKKEEPING_SHARDS],
-    /// Deferred blind point writes. These are logical WAL-backed
+    /// Deferred point writes. These are logical WAL-backed
     /// mutations that have been acknowledged to the caller but not
     /// merged into ART blob frames yet. Reads consult both pending and
     /// in-flight flush entries before the base tree, so checkpoint can
@@ -773,6 +781,8 @@ impl BufferManager {
             cold_index_bucket_reads: self.telemetry.cold_index_bucket_reads(),
             cold_index_bucket_read_bytes: self.telemetry.cold_index_bucket_read_bytes(),
             cold_index_inline_hits: self.telemetry.cold_index_inline_hits(),
+            cold_index_value_hits: self.telemetry.cold_index_value_hits(),
+            cold_index_value_read_bytes: self.telemetry.cold_index_value_read_bytes(),
             cold_index_offset_hits: self.telemetry.cold_index_offset_hits(),
             cold_index_negative_hits: self.telemetry.cold_index_negative_hits(),
             cold_index_crossing_hits: self.telemetry.cold_index_crossing_hits(),
@@ -1364,8 +1374,28 @@ impl BufferManager {
         Some(())
     }
 
+    pub(crate) fn read_cold_value_range(
+        &self,
+        guid: BlobGuid,
+        byte_offset: u64,
+        dst: &mut [u8],
+    ) -> Option<()> {
+        if !self
+            .store
+            .read_cold_value_range(guid, byte_offset, dst)
+            .ok()?
+        {
+            return None;
+        }
+        Some(())
+    }
+
     pub(crate) fn note_cold_index_inline_hit(&self) {
         self.telemetry.note_cold_index_inline_hit();
+    }
+
+    pub(crate) fn note_cold_index_value_hit(&self, bytes: u64) {
+        self.telemetry.note_cold_index_value_hit(bytes);
     }
 
     pub(crate) fn note_cold_index_offset_hit(&self) {
@@ -1425,10 +1455,12 @@ impl BufferManager {
 
     // ---------- dirty tracking ----------
 
-    /// Stage a WAL-backed blind put without immediately reading and
-    /// mutating its target blob. The latest staged op for the same
-    /// `(tree_id, key)` wins; checkpoint later merges the logical op
-    /// into ART frames under `CommitGate` before it may truncate WAL.
+    /// Stage a WAL-backed put without immediately mutating its target
+    /// blob. `creates_key` records whether key-only scans must flush
+    /// before answering prefix predicates. The latest staged op for
+    /// the same `(tree_id, key)` wins; checkpoint later merges the
+    /// logical op into ART frames under `CommitGate` before it may
+    /// truncate WAL.
     pub(crate) fn stage_write_delta_put(
         &self,
         tree_id: u64,
@@ -1436,12 +1468,13 @@ impl BufferManager {
         key: &[u8],
         value: &[u8],
         seq: u64,
+        creates_key: bool,
     ) {
         self.write_delta
-            .stage_put(tree_id, root_guid, key, value, seq);
+            .stage_put(tree_id, root_guid, key, value, seq, creates_key);
     }
 
-    /// Stage a WAL-backed blind delete. See
+    /// Stage a WAL-backed delete. See
     /// [`Self::stage_write_delta_put`].
     pub(crate) fn stage_write_delta_delete(
         &self,
@@ -1463,6 +1496,21 @@ impl BufferManager {
 
     pub(crate) fn write_delta_count_for_tree(&self, tree_id: u64) -> usize {
         self.write_delta.tree_len(tree_id)
+    }
+
+    pub(crate) fn write_delta_key_set_count_for_tree(&self, tree_id: u64) -> usize {
+        self.write_delta.tree_key_set_len(tree_id)
+    }
+
+    pub(crate) fn write_delta_key_state(
+        &self,
+        tree_id: u64,
+        key: &[u8],
+    ) -> Option<WriteDeltaKeyState> {
+        self.write_delta.get(tree_id, key).map(|entry| match entry {
+            DeltaEntry::Put { seq, .. } => WriteDeltaKeyState::Put { seq },
+            DeltaEntry::Delete { .. } => WriteDeltaKeyState::Delete,
+        })
     }
 
     pub(crate) fn flush_write_deltas(&self) -> Result<()> {
@@ -1491,24 +1539,25 @@ impl BufferManager {
 
     fn apply_write_delta_ops_inner(&self, ops: &[DeltaOp]) -> Result<()> {
         let mut root_pins: HashMap<BlobGuid, Arc<CachedBlob>> = HashMap::new();
-        for op in ops {
+        let mut i = 0usize;
+        while i < ops.len() {
+            let op = &ops[i];
             let root_pin = match root_pins.entry(op.root_guid) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => Arc::clone(entry.insert(self.pin(op.root_guid)?)),
             };
             match &op.entry {
-                DeltaEntry::Put { value, seq } => {
-                    let outcome = engine::insert_multi(
-                        self,
-                        &root_pin,
-                        None,
-                        engine::SearchKey::user(&op.key),
-                        value,
-                        *seq,
-                    )?;
-                    if outcome.root_dirty {
-                        self.mark_dirty_cached(op.root_guid, *seq, root_pin.as_ref());
+                DeltaEntry::Put { .. } => {
+                    let mut end = i + 1;
+                    while end < ops.len()
+                        && ops[end].tree_id == op.tree_id
+                        && ops[end].root_guid == op.root_guid
+                        && matches!(ops[end].entry, DeltaEntry::Put { .. })
+                    {
+                        end += 1;
                     }
+                    self.apply_write_delta_put_run(op.root_guid, &root_pin, &ops[i..end])?;
+                    i = end;
                 }
                 DeltaEntry::Delete { seq } => {
                     let outcome = engine::erase_multi(
@@ -1521,8 +1570,48 @@ impl BufferManager {
                     if outcome.mutated && outcome.root_dirty {
                         self.mark_dirty_cached(op.root_guid, *seq, root_pin.as_ref());
                     }
+                    i += 1;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn apply_write_delta_put_run(
+        &self,
+        root_guid: BlobGuid,
+        root_pin: &Arc<CachedBlob>,
+        ops: &[DeltaOp],
+    ) -> Result<()> {
+        let mut items = Vec::with_capacity(ops.len());
+        for op in ops {
+            let DeltaEntry::Put { value, seq, .. } = &op.entry else {
+                return Err(Error::Internal("write-delta put run contained non-put op"));
+            };
+            items.push(engine::InsertBatchItem::new(
+                engine::SearchKey::user(&op.key),
+                value,
+                *seq,
+                engine::InsertCondition::Always,
+            ));
+        }
+
+        let mut applied = 0usize;
+        while applied < items.len() {
+            let outcome =
+                engine::insert_multi_batch_conditional(self, root_pin, None, &items[applied..])?;
+            if outcome.applied == 0 {
+                return Err(Error::Internal("write-delta batch flush made no progress"));
+            }
+            if outcome.root_dirty {
+                let dirty_seq = items[applied..applied + outcome.applied]
+                    .iter()
+                    .map(|item| item.seq)
+                    .min()
+                    .unwrap_or(u64::MAX);
+                self.mark_dirty_cached(root_guid, dirty_seq, root_pin.as_ref());
+            }
+            applied += outcome.applied;
         }
         Ok(())
     }
@@ -2103,18 +2192,23 @@ impl BufferManager {
 
     fn try_publish_cold_index(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) {
         let frame = BlobFrameRef::wrap(bytes.as_slice());
-        let Ok(encoded) = ColdIndex::build_bytes(frame) else {
+        let Ok(build) = ColdIndex::build(frame) else {
             return;
         };
-        if self.store.publish_cold_index(guid, &encoded).is_err() {
+        if self
+            .store
+            .publish_cold_index(guid, &build.index, &build.values)
+            .is_err()
+        {
             self.cold_indexes.invalidate(guid);
             return;
         }
-        let Ok(directory_len) = ColdIndex::directory_len(&encoded[..ColdIndex::HEADER_LEN]) else {
+        let Ok(directory_len) = ColdIndex::directory_len(&build.index[..ColdIndex::HEADER_LEN])
+        else {
             self.cold_indexes.invalidate(guid);
             return;
         };
-        let Ok(index) = ColdIndex::decode_directory(encoded[..directory_len].to_vec()) else {
+        let Ok(index) = ColdIndex::decode_directory(build.index[..directory_len].to_vec()) else {
             self.cold_indexes.invalidate(guid);
             return;
         };
@@ -2218,8 +2312,8 @@ impl BlobStore for BufferManager {
         self.store.read_cold_index_range(guid, byte_offset, dst)
     }
 
-    fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8]) -> Result<()> {
-        self.store.publish_cold_index(guid, bytes)
+    fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
+        self.store.publish_cold_index(guid, bytes, values)
     }
 
     fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
@@ -2437,8 +2531,17 @@ mod tests {
             self.inner.read_cold_index_range(guid, byte_offset, dst)
         }
 
-        fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8]) -> Result<()> {
-            self.inner.publish_cold_index(guid, bytes)
+        fn read_cold_value_range(
+            &self,
+            guid: BlobGuid,
+            byte_offset: u64,
+            dst: &mut [u8],
+        ) -> Result<bool> {
+            self.inner.read_cold_value_range(guid, byte_offset, dst)
+        }
+
+        fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
+            self.inner.publish_cold_index(guid, bytes, values)
         }
 
         fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
