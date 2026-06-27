@@ -335,6 +335,16 @@ impl ColdIndex {
         bloom_may_have(&self.bloom, hash_user_key(user_key))
     }
 
+    pub(crate) fn has_indexed_leaf(&self) -> bool {
+        self.buckets
+            .iter()
+            .any(|bucket| bucket.len as usize > BUCKET_CRC_LEN)
+    }
+
+    pub(crate) fn base_prefix(&self) -> &[u8] {
+        &self.base_prefix
+    }
+
     pub(crate) fn stamp(&self) -> ColdIndexStamp {
         self.stamp
     }

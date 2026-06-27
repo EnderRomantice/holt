@@ -1418,6 +1418,27 @@ impl RangeIter {
         self.segment_rollup_len(segment).is_some()
     }
 
+    fn segment_has_allowed_rollup_candidate(&self, segment: &[u8]) -> bool {
+        let Some(candidate) = self.rollup_key_from_segment(segment) else {
+            return false;
+        };
+        self.lower_bound
+            .as_ref()
+            .is_none_or(|bound| bound.allows(&candidate))
+    }
+
+    fn rollup_key_from_segment(&self, segment: &[u8]) -> Option<Vec<u8>> {
+        let common_len = self.segment_rollup_len(segment)?;
+        let mut candidate = Vec::with_capacity(common_len);
+        if common_len <= self.curr_key.len() {
+            candidate.extend_from_slice(&self.curr_key[..common_len]);
+        } else {
+            candidate.extend_from_slice(&self.curr_key);
+            candidate.extend_from_slice(&segment[..common_len - self.curr_key.len()]);
+        }
+        Some(candidate)
+    }
+
     fn prepare_segment_rollup(&mut self, segment: &[u8]) -> bool {
         let Some(common_len) = self.segment_rollup_len(segment) else {
             return false;
@@ -1434,6 +1455,56 @@ impl RangeIter {
         self.lower_bound
             .as_ref()
             .is_none_or(|bound| bound.allows(&self.emit_buf))
+    }
+
+    fn prepare_cold_blob_rollup(
+        &mut self,
+        child_guid: BlobGuid,
+        blob_prefix: &[u8],
+    ) -> Option<u64> {
+        let (index, epoch) = self.bm.cold_index_for_liveness(child_guid)?;
+        if !index.has_indexed_leaf() {
+            return None;
+        }
+        if self.prepare_segment_rollup(blob_prefix) {
+            return Some(epoch);
+        }
+        let base_prefix = index.base_prefix();
+        if base_prefix.is_empty() {
+            return None;
+        }
+        let segment = self.cold_rollup_segment(blob_prefix, base_prefix);
+        self.prepare_segment_rollup(&segment).then_some(epoch)
+    }
+
+    fn cold_blob_rollup_candidate_key(
+        &self,
+        child_guid: BlobGuid,
+        blob_prefix: &[u8],
+    ) -> Option<Vec<u8>> {
+        let (index, epoch) = self.bm.cold_index_for_liveness(child_guid)?;
+        if !index.has_indexed_leaf() || !self.bm.cold_liveness_token_valid(child_guid, epoch) {
+            return None;
+        }
+        if let Some(candidate) = self.rollup_key_from_segment(blob_prefix) {
+            return Some(candidate);
+        }
+        let base_prefix = index.base_prefix();
+        if base_prefix.is_empty() {
+            return None;
+        }
+        let segment = self.cold_rollup_segment(blob_prefix, base_prefix);
+        self.rollup_key_from_segment(&segment)
+    }
+
+    fn cold_rollup_segment(&self, blob_prefix: &[u8], base_prefix: &[u8]) -> Vec<u8> {
+        if base_prefix.starts_with(&self.curr_key) {
+            return base_prefix[self.curr_key.len()..].to_vec();
+        }
+        let mut segment = Vec::with_capacity(blob_prefix.len() + base_prefix.len());
+        segment.extend_from_slice(blob_prefix);
+        segment.extend_from_slice(base_prefix);
+        segment
     }
 
     fn prepare_branch_rollup(&mut self, byte: u8) -> bool {
@@ -1536,7 +1607,7 @@ impl RangeIter {
                             self.pop_frame();
                         }
                         SegmentRelation::Continue | SegmentRelation::Min => {
-                            if self.segment_has_rollup_candidate(p_bytes.as_slice()) {
+                            if self.segment_has_allowed_rollup_candidate(p_bytes.as_slice()) {
                                 return Ok(InitResult::Ready);
                             }
                             self.stack[idx].next = 1;
@@ -1585,8 +1656,22 @@ impl RangeIter {
                             self.pop_frame();
                         }
                         SegmentRelation::Continue | SegmentRelation::Min => {
-                            if self.segment_has_rollup_candidate(p_bytes.as_slice()) {
+                            if self.segment_has_allowed_rollup_candidate(p_bytes.as_slice()) {
                                 return Ok(InitResult::Ready);
+                            }
+                            if let Some(candidate) =
+                                self.cold_blob_rollup_candidate_key(child_guid, p_bytes.as_slice())
+                            {
+                                if self
+                                    .lower_bound
+                                    .as_ref()
+                                    .is_none_or(|bound| bound.allows(&candidate))
+                                {
+                                    return Ok(InitResult::Ready);
+                                }
+                                self.stack[idx].next = 1;
+                                self.pop_frame();
+                                continue;
                             }
                             self.stack[idx].next = 1;
                             if !self.push_in_other_blob(child_guid, p_bytes.as_slice())? {
@@ -1932,6 +2017,23 @@ impl RangeIter {
                         };
                         self.stack[idx].next = 1;
                         let can_rollup = self.prepare_segment_rollup(p_bytes.as_slice());
+                        let cold_rollup_epoch =
+                            self.prepare_cold_blob_rollup(child_guid, p_bytes.as_slice());
+                        if let Some(epoch) = cold_rollup_epoch {
+                            if self.bm.cold_liveness_token_valid(child_guid, epoch) {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                let needs_reseek = self.curr_key.len() < self.emit_buf.len();
+                                if !self.set_lower_bound_to_emit_successor() {
+                                    self.terminated = true;
+                                }
+                                if needs_reseek && !self.terminated {
+                                    self.reseek_after_emit();
+                                }
+                                return Ok(self.common_prefix_advance_from_emit());
+                            }
+                        }
                         let Some(child_pin) = self.pin_scan_child(child_guid)? else {
                             self.pop_frame();
                             continue;
@@ -2003,13 +2105,24 @@ impl RangeIter {
                                 } else {
                                     false
                                 };
+                                let child_blob_rollup = child_ntype == NodeType::Blob
+                                    && frame.body_at_offset(child_off).is_some_and(|body| {
+                                        let b = cast::<BlobNode>(body);
+                                        let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
+                                        self.segment_has_rollup_candidate(&b.bytes[..plen])
+                                    });
                                 // Cold-scan I/O read-ahead: when entering a run
                                 // of cross-blob children and the window has
                                 // drained, collect the upcoming child-blob guids
                                 // from this (cached) parent so they can be pinned
-                                // concurrently (device queue depth) below.
+                                // concurrently (device queue depth) below. Do not
+                                // prefetch a child whose BlobNode already proves a
+                                // delimiter rollup; the iterator can emit the
+                                // CommonPrefix from the parent plus cold-index
+                                // liveness and avoid the child blob read entirely.
                                 let prefetch_guids = if !self.snapshot_cursor
                                     && child_ntype == NodeType::Blob
+                                    && !child_blob_rollup
                                     && self.prefetch.is_empty()
                                 {
                                     collect_blob_child_window(

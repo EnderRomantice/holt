@@ -1,6 +1,7 @@
 //! Per-scan [`ScanStats`] — visited / returned / rollup / restarts.
 
 use holt::{KeyRangeEntry, Tree, TreeConfig};
+use tempfile::tempdir;
 
 #[test]
 fn stats_count_returned_and_visited() {
@@ -134,6 +135,45 @@ fn delimiter_list_dir_cache_serves_rollups_without_leaf_walk() {
     assert!(second.cache_hit);
     assert_eq!(second.stats.rollup, 3);
     assert_eq!(second.stats.visited, 0);
+}
+
+#[test]
+fn cold_delimiter_rollup_uses_blobnode_summary_without_scan_pin() {
+    let dir = tempdir().unwrap();
+    let cfg = TreeConfig::new(dir.path());
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let value = vec![7u8; 128];
+        for d in 0..8u32 {
+            for i in 0..800u32 {
+                tree.put(format!("bucket/dir-{d}/file-{i:04}").as_bytes(), &value)
+                    .unwrap();
+            }
+        }
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let mut rollups = 0usize;
+    let mut prefixes = Vec::new();
+    let outcome = tree
+        .scan_keys(b"bucket/")
+        .delimiter(b'/')
+        .visit_with_outcome(8, |entry| {
+            if let holt::KeyRangeEntryRef::CommonPrefix(prefix) = entry {
+                rollups += 1;
+                prefixes.push(prefix.to_vec());
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rollups, 8, "prefixes={prefixes:?}");
+    assert_eq!(outcome.stats.rollup, 8);
+    let full_blob_reads = tree.stats().unwrap().bm_scan_full_blob_reads;
+    assert!(
+        full_blob_reads < rollups as u64,
+        "cold delimiter rollup should use BlobNode/cold-index liveness instead of pinning every child blob; full_blob_reads={full_blob_reads}, rollups={rollups}",
+    );
 }
 
 #[test]

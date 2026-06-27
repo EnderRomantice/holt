@@ -234,6 +234,12 @@ enum PinAccess {
     Silent,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ColdSidecarPolicy {
+    PointRead,
+    Liveness,
+}
+
 const COLD_AUX_CACHE_MIN_BYTES: usize = 2 * 1024 * 1024;
 const COLD_AUX_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const COLD_AUX_CACHE_ENABLE_AT_BYTES: usize = 16 * 1024 * 1024;
@@ -1259,14 +1265,7 @@ impl BufferManager {
     ///
     /// [`pin`]: Self::pin
     pub(crate) fn cold_read_eligible(&self, guid: BlobGuid) -> bool {
-        if self.store.needs_flush()
-            || self.is_pending_delete(guid)
-            || self.cache.contains_key(&guid)
-        {
-            return false;
-        }
-        let state = self.mutation_shard(guid).lock().unwrap();
-        !state.is_protected_or_pending(&guid)
+        self.cold_sidecar_eligible(guid, ColdSidecarPolicy::PointRead)
     }
 
     /// Positional, page-granular read from the backing store, bypassing
@@ -1308,11 +1307,19 @@ impl BufferManager {
     }
 
     pub(crate) fn cold_index(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
-        self.cold_index_load(guid)
+        self.cold_index_load(guid, ColdSidecarPolicy::PointRead)
     }
 
-    fn cold_index_load(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
-        if !self.cold_read_eligible(guid) {
+    pub(crate) fn cold_index_for_liveness(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
+        self.cold_index_load(guid, ColdSidecarPolicy::Liveness)
+    }
+
+    fn cold_index_load(
+        &self,
+        guid: BlobGuid,
+        policy: ColdSidecarPolicy,
+    ) -> Option<(Arc<ColdIndex>, u64)> {
+        if !self.cold_sidecar_eligible(guid, policy) {
             return None;
         }
         if let Some(index) = self.cold_indexes.get(guid) {
@@ -1346,7 +1353,7 @@ impl BufferManager {
             self.cold_indexes.invalidate(guid);
             return None;
         }
-        if self.cold_epoch(guid) != epoch || !self.cold_read_eligible(guid) {
+        if self.cold_epoch(guid) != epoch || !self.cold_sidecar_eligible(guid, policy) {
             return None;
         }
         self.telemetry.note_cold_index_load(read_bytes);
@@ -1422,6 +1429,22 @@ impl BufferManager {
 
     pub(crate) fn cold_token_valid(&self, guid: BlobGuid, epoch: u64) -> bool {
         self.cold_read_eligible(guid) && self.cold_epoch(guid) == epoch
+    }
+
+    pub(crate) fn cold_liveness_token_valid(&self, guid: BlobGuid, epoch: u64) -> bool {
+        self.cold_sidecar_eligible(guid, ColdSidecarPolicy::Liveness)
+            && self.cold_epoch(guid) == epoch
+    }
+
+    fn cold_sidecar_eligible(&self, guid: BlobGuid, policy: ColdSidecarPolicy) -> bool {
+        if self.store.needs_flush() || self.is_pending_delete(guid) {
+            return false;
+        }
+        if policy == ColdSidecarPolicy::PointRead && self.cache.contains_key(&guid) {
+            return false;
+        }
+        let state = self.mutation_shard(guid).lock().unwrap();
+        !state.is_protected_or_pending(&guid)
     }
 
     fn cold_epoch(&self, guid: BlobGuid) -> u64 {
