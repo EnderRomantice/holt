@@ -391,6 +391,21 @@ fn cold_lookup_or_pin<R, F>(
 where
     F: FnMut(LookupHit<'_>) -> R,
 {
+    match bm.pin_cached(crossing.child_guid) {
+        Ok(Some(pin)) => {
+            pin.prefetch_header();
+            return Ok(ColdLookupOrPin::Pin {
+                pin,
+                depth: crossing.child_depth,
+            });
+        }
+        Ok(None) => {}
+        Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) => {
+            return Ok(ColdLookupOrPin::Restart);
+        }
+        Err(e) => return Err(e),
+    }
+
     // Only exact point lookups (a user-style key) take the cold path;
     // range/prefix/non-exact searches pin directly.
     if key.user_bytes().is_none() {

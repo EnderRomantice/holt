@@ -689,13 +689,9 @@ impl Tree {
             });
         }
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(
-            &self.store,
-            &self.root_pin,
-            Some(&self.route_cache),
-            search,
-            |hit| RecordVersion::new(hit.seq),
-        )
+        engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| {
+            RecordVersion::new(hit.seq)
+        })
     }
 
     fn lookup_record_unlocked(&self, key: &[u8]) -> Result<Option<Record>> {
@@ -709,16 +705,10 @@ impl Tree {
             });
         }
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(
-            &self.store,
-            &self.root_pin,
-            Some(&self.route_cache),
-            search,
-            |hit| Record {
-                value: hit.value.to_vec(),
-                version: RecordVersion::new(hit.seq),
-            },
-        )
+        engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| Record {
+            value: hit.value.to_vec(),
+            version: RecordVersion::new(hit.seq),
+        })
     }
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.

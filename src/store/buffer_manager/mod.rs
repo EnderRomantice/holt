@@ -1171,6 +1171,20 @@ impl BufferManager {
         self.pin_with_access(guid, PinAccess::Point)
     }
 
+    /// Pin only if the blob is already resident in the hot blob cache.
+    ///
+    /// Point lookup uses this before trying the cold-read accelerator:
+    /// resident blobs are authoritative and should not pay sidecar
+    /// eligibility/index checks. A miss returns `Ok(None)` without
+    /// reading the backing store, so callers can decide whether to use
+    /// cold-index/page reads or fall back to a full [`Self::pin`].
+    pub(crate) fn pin_cached(&self, guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
+        Ok(self.get_cached_with_access(guid, PinAccess::Point))
+    }
+
     /// Pin for range/list scans. Hits and misses remain visible in
     /// cache telemetry, but scan access does not refresh
     /// recency. This keeps large directory/object-list walks from

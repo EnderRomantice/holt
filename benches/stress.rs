@@ -1663,7 +1663,7 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         .as_ref()
         .map_or((0, 0, 0), |j| (j.appends, j.batches, j.syncs));
     println!(
-        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} cold_tokens={} cold_idx_cache_entries={} cold_idx_cache_bytes={} cold_idx_cache_budget={} cold_page_cache_entries={} cold_page_cache_bytes={} cold_page_cache_ghosts={} cold_page_cache_budget={} cold_page_hits={} cold_page_misses={} cold_idx_cache_hits={} cold_idx_cache_misses={} cold_idx_loads={} cold_idx_dir_bytes={} cold_idx_bucket_reads={} cold_idx_bucket_bytes={} cold_idx_inline_hits={} cold_idx_value_hits={} cold_idx_value_bytes={} cold_idx_offset_hits={} cold_idx_negative_hits={} cold_idx_crossing_hits={} cold_idx_unknowns={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} store_live_blobs={} store_next_slot={} store_reusable_slots={} store_pending_free_slots={} store_data_bytes={} store_data_high_water={} store_cold_idx_bytes={} store_cold_idx_high_water={} store_cold_val_bytes={} store_cold_val_high_water={} manifest_log_bytes={} journal_appends={} journal_batches={} journal_syncs={}",
+        "holt_shape {label} blobs={} edges={} leaves={} max_depth={} avg_depth={:.2} avg_fill={:.3} max_fill={:.3} underfilled={} overfull={} bm_dirty={} bm_pending_delete={} bm_write_delta={} bm_hits={} bm_misses={} bm_reads={} bm_read_bytes={} bm_point_reads={} bm_scan_reads={} bm_silent_reads={} cold_tokens={} cold_idx_cache_entries={} cold_idx_cache_bytes={} cold_idx_cache_budget={} cold_page_cache_entries={} cold_page_cache_bytes={} cold_page_cache_ghosts={} cold_page_cache_budget={} cold_page_hits={} cold_page_misses={} cold_idx_cache_hits={} cold_idx_cache_misses={} cold_idx_loads={} cold_idx_dir_bytes={} cold_idx_bucket_reads={} cold_idx_bucket_bytes={} cold_idx_inline_hits={} cold_idx_value_hits={} cold_idx_value_bytes={} cold_idx_offset_hits={} cold_idx_negative_hits={} cold_idx_crossing_hits={} cold_idx_unknowns={} avg_hops={:.2} max_hops={} spillovers={} merges={} route_resident={} route_demotions={} route_entries={} route_hits={} route_misses={} route_learns={} route_invalidations={} store_live_blobs={} store_next_slot={} store_reusable_slots={} store_pending_free_slots={} store_data_bytes={} store_data_high_water={} store_cold_idx_bytes={} store_cold_idx_high_water={} store_cold_val_bytes={} store_cold_val_high_water={} manifest_log_bytes={} journal_appends={} journal_batches={} journal_syncs={}",
         s.blob_count,
         s.total_blob_edges,
         s.leaf_blob_count,
@@ -1673,6 +1673,9 @@ fn print_holt_shape(label: &str, tree: &Tree) {
         s.max_blob_fill_ratio(),
         s.underfilled_child_blobs,
         s.overfull_child_blobs,
+        s.bm_dirty_count,
+        s.bm_pending_delete_count,
+        s.bm_write_delta_count,
         s.bm_cache_hits,
         s.bm_cache_misses,
         s.bm_full_blob_reads,

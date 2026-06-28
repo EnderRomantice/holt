@@ -1157,7 +1157,7 @@ fn stats_reflects_inserts() {
 }
 
 #[test]
-fn point_get_uses_route_cache_on_multi_blob_tree() {
+fn point_get_skips_route_cache_on_multi_blob_tree() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let value = vec![0xAB; 256];
     for i in 0..2400u32 {
@@ -1177,9 +1177,10 @@ fn point_get_uses_route_cache_on_multi_blob_tree() {
         Some(&value[..]),
     );
     let after_first = tree.stats().unwrap().route_cache;
-    assert!(
-        after_first.hits > before.hits || after_first.learns > before.learns,
-        "first read should either hit an existing route or learn one",
+    assert_eq!(
+        (after_first.hits, after_first.learns),
+        (before.hits, before.learns),
+        "point get should use the normal root walker, not the route-cache hit path",
     );
 
     assert_eq!(
@@ -1189,9 +1190,10 @@ fn point_get_uses_route_cache_on_multi_blob_tree() {
         Some(&value[..]),
     );
     let after_second = tree.stats().unwrap().route_cache;
-    assert!(
-        after_second.hits > after_first.hits,
-        "second read under the same routed prefix should hit the route cache",
+    assert_eq!(
+        (after_second.hits, after_second.learns),
+        (after_first.hits, after_first.learns),
+        "repeated point get should not re-enter route-cache lookup",
     );
 }
 
