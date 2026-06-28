@@ -65,6 +65,41 @@ pub struct RouteCacheStats {
     pub invalidations: u64,
 }
 
+/// Store-level space and slot counters.
+///
+/// For file-backed trees these counters describe the packed files
+/// underneath the buffer manager. For memory/custom stores unsupported
+/// fields stay zero.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreStats {
+    /// Number of live blob GUIDs in the store manifest.
+    pub live_blobs: usize,
+    /// Number of manifest slots currently assigned to live blobs.
+    pub live_slots: u64,
+    /// Next never-used manifest slot. This is the packed-file
+    /// high-water mark; deleted slots below it may be reusable.
+    pub next_slot: u64,
+    /// Manifest slots that are durably free and may be reused.
+    pub reusable_slots: u64,
+    /// Slots removed from the live manifest but not yet durable in a
+    /// manifest snapshot/log flush.
+    pub pending_free_slots: u64,
+    /// Current size of `blobs.dat` on disk, including preallocation.
+    pub data_file_bytes: u64,
+    /// Logical high-water bytes implied by `next_slot`.
+    pub data_high_water_bytes: u64,
+    /// Current size of the cold-index sidecar file.
+    pub cold_index_file_bytes: u64,
+    /// Logical high-water bytes for the cold-index sidecar.
+    pub cold_index_high_water_bytes: u64,
+    /// Current size of the cold-value sidecar file.
+    pub cold_value_file_bytes: u64,
+    /// Logical high-water bytes for the cold-value sidecar.
+    pub cold_value_high_water_bytes: u64,
+    /// Current durable manifest delta log size.
+    pub manifest_log_bytes: u64,
+}
+
 /// Tree-wide aggregate counters from [`Tree::stats`](crate::Tree::stats).
 ///
 /// `blobs` carries the per-blob breakdown in BFS order from the
@@ -119,6 +154,22 @@ pub struct TreeStats {
     /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
+    /// Cold invalidation tokens retained by the BufferManager.
+    pub bm_cold_token_count: usize,
+    /// Cold-index directories currently cached in memory.
+    pub bm_cold_index_cache_entries: usize,
+    /// Bytes used by cached cold-index directories.
+    pub bm_cold_index_cache_bytes: usize,
+    /// Configured memory budget for cached cold-index directories.
+    pub bm_cold_index_cache_budget_bytes: usize,
+    /// 4 KiB cold-read pages currently cached in memory.
+    pub bm_cold_page_cache_entries: usize,
+    /// Bytes used by cached 4 KiB cold-read pages.
+    pub bm_cold_page_cache_bytes: usize,
+    /// Ghost entries used by second-touch admission for leaf pages.
+    pub bm_cold_page_cache_ghost_entries: usize,
+    /// Configured memory budget for cached 4 KiB cold-read pages.
+    pub bm_cold_page_cache_budget_bytes: usize,
     /// Cumulative cache lookups served from BM cache without
     /// going to the inner store. Read by external observers to
     /// derive a hit rate (`bm_cache_hits / (bm_cache_hits +
@@ -222,6 +273,8 @@ pub struct TreeStats {
     /// Cache overflows where TinyLFU kept a hotter resident victim
     /// instead of evicting it for a one-hit point-miss candidate.
     pub bm_admission_protects: u64,
+    /// Store-level packed-file and sidecar space counters.
+    pub store: StoreStats,
     /// Root route-cache counters for large path-shaped trees.
     pub route_cache: RouteCacheStats,
     /// WAL replay telemetry captured during `Tree::open`.
@@ -309,6 +362,22 @@ pub struct DBStats {
     /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
+    /// Cold invalidation tokens retained by the shared BufferManager.
+    pub bm_cold_token_count: usize,
+    /// Shared cold-index directories currently cached in memory.
+    pub bm_cold_index_cache_entries: usize,
+    /// Shared bytes used by cached cold-index directories.
+    pub bm_cold_index_cache_bytes: usize,
+    /// Shared memory budget for cached cold-index directories.
+    pub bm_cold_index_cache_budget_bytes: usize,
+    /// Shared 4 KiB cold-read pages currently cached in memory.
+    pub bm_cold_page_cache_entries: usize,
+    /// Shared bytes used by cached 4 KiB cold-read pages.
+    pub bm_cold_page_cache_bytes: usize,
+    /// Shared cold-page ghost entries used by second-touch admission.
+    pub bm_cold_page_cache_ghost_entries: usize,
+    /// Shared memory budget for cached 4 KiB cold-read pages.
+    pub bm_cold_page_cache_budget_bytes: usize,
     /// Shared BufferManager cache hits.
     pub bm_cache_hits: u64,
     /// Shared BufferManager cache misses.
@@ -381,6 +450,8 @@ pub struct DBStats {
     pub bm_eviction_skips_route_resident: u64,
     /// TinyLFU admission rejections in the shared cache.
     pub bm_admission_protects: u64,
+    /// Shared store-level packed-file and sidecar space counters.
+    pub store: StoreStats,
     /// WAL replay telemetry captured while opening the DB.
     pub open: OpenStats,
     /// Shared WAL/journal counters, or `None` for memory DBs.

@@ -13,7 +13,7 @@
 mod blob_frame;
 pub(crate) mod blob_store;
 mod buffer_manager;
-mod cold;
+mod cold_read;
 
 pub(crate) use blob_frame::{
     decode_child_off, encode_child_off, page_align_up, PAGE_4K, SPILLOVER_RESERVATION,
@@ -25,4 +25,4 @@ pub(crate) use buffer_manager::{
     WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,
 };
 pub use buffer_manager::{BufferManager, CachedBlob};
-pub(crate) use cold::{ColdIndex, ColdIndexAnswer, ColdIndexHit, ColdIndexStamp};
+pub(crate) use cold_read::{ColdIndex, ColdIndexAnswer, ColdIndexHit, ColdIndexStamp};

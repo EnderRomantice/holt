@@ -2430,32 +2430,6 @@ impl Tree {
             evictions: route.evictions,
             invalidations: route.invalidations,
         };
-        let journal = self.journal.as_ref().map(|j| {
-            let s = j.stats();
-            JournalStats {
-                appends: s.appends,
-                batches: s.batches,
-                syncs: s.syncs,
-                queued_work: s.queued_work,
-                written_work: s.written_work,
-                flushed_work: s.flushed_work,
-                checkpointed_work: s.checkpointed_work,
-                pending_work: s.pending_work,
-                checkpoint_debt: s.checkpoint_debt,
-            }
-        });
-        let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
-            rounds_attempted: ck.rounds_attempted(),
-            rounds_succeeded: ck.rounds_succeeded(),
-            rounds_failed: ck.rounds_failed(),
-            blobs_flushed: ck.blobs_flushed(),
-            merges_total: ck.merges_total(),
-            truncates: ck.truncates(),
-            evictions: ck.evictions(),
-            last_dirty_count: ck.last_dirty_count(),
-            last_pending_delete_count: ck.last_pending_delete_count(),
-            last_round_micros: ck.last_round_micros(),
-        });
         Ok(TreeStats {
             blob_count: aggregate.blobs.len() as u32,
             total_space_used: aggregate.total_space_used,
@@ -2474,6 +2448,14 @@ impl Tree {
             bm_dirty_count: bm.dirty_count,
             bm_pending_delete_count: bm.pending_delete_count,
             bm_write_delta_count: bm.write_delta_count,
+            bm_cold_token_count: bm.cold_token_count,
+            bm_cold_index_cache_entries: bm.cold_index_cache_entries,
+            bm_cold_index_cache_bytes: bm.cold_index_cache_bytes,
+            bm_cold_index_cache_budget_bytes: bm.cold_index_cache_budget_bytes,
+            bm_cold_page_cache_entries: bm.cold_page_cache_entries,
+            bm_cold_page_cache_bytes: bm.cold_page_cache_bytes,
+            bm_cold_page_cache_ghost_entries: bm.cold_page_cache_ghost_entries,
+            bm_cold_page_cache_budget_bytes: bm.cold_page_cache_budget_bytes,
             bm_cache_hits: bm.cache_hits,
             bm_cache_misses: bm.cache_misses,
             bm_full_blob_reads: bm.full_blob_reads,
@@ -2510,10 +2492,43 @@ impl Tree {
             bm_eviction_skips_protected: bm.eviction_skips_protected,
             bm_eviction_skips_route_resident: bm.eviction_skips_route_resident,
             bm_admission_protects: bm.admission_protects,
+            store: bm.store,
             route_cache,
             open: self.open_stats,
-            journal,
-            checkpointer,
+            journal: self.journal_stats(),
+            checkpointer: self.checkpointer_stats(),
+        })
+    }
+
+    fn journal_stats(&self) -> Option<JournalStats> {
+        self.journal.as_ref().map(|j| {
+            let s = j.stats();
+            JournalStats {
+                appends: s.appends,
+                batches: s.batches,
+                syncs: s.syncs,
+                queued_work: s.queued_work,
+                written_work: s.written_work,
+                flushed_work: s.flushed_work,
+                checkpointed_work: s.checkpointed_work,
+                pending_work: s.pending_work,
+                checkpoint_debt: s.checkpoint_debt,
+            }
+        })
+    }
+
+    fn checkpointer_stats(&self) -> Option<CheckpointerStats> {
+        self.checkpointer.as_ref().map(|ck| CheckpointerStats {
+            rounds_attempted: ck.rounds_attempted(),
+            rounds_succeeded: ck.rounds_succeeded(),
+            rounds_failed: ck.rounds_failed(),
+            blobs_flushed: ck.blobs_flushed(),
+            merges_total: ck.merges_total(),
+            truncates: ck.truncates(),
+            evictions: ck.evictions(),
+            last_dirty_count: ck.last_dirty_count(),
+            last_pending_delete_count: ck.last_pending_delete_count(),
+            last_round_micros: ck.last_round_micros(),
         })
     }
 

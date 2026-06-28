@@ -35,6 +35,7 @@ pub use file::FileBlobStore;
 pub use memory::MemoryBlobStore;
 
 use crate::api::errors::Result;
+use crate::api::stats::StoreStats;
 use crate::layout::BlobGuid;
 
 #[doc(hidden)]
@@ -222,5 +223,11 @@ pub trait BlobStore: Send + Sync {
     /// `true` iff `guid` exists. Default impl scans `list_blobs`.
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.list_blobs().map(|v| v.contains(&guid))
+    }
+
+    /// Store-level space counters. Implementations that do not expose
+    /// packed-file or sidecar state may return zeros.
+    fn store_stats(&self) -> StoreStats {
+        StoreStats::default()
     }
 }

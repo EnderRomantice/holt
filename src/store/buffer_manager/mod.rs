@@ -138,6 +138,7 @@ use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 
+use crate::api::stats::StoreStats;
 use guid_hash::GuidBuildHasher;
 
 use crate::api::errors::{Error, Result};
@@ -146,7 +147,7 @@ use crate::layout::{BlobGuid, HEADER_SIZE, PAGE_SIZE};
 use crate::store::{BlobFrameRef, PAGE_4K};
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
-use super::cold::{ColdIndex, ColdIndexCache, ColdIndexStamp, ColdPageCache};
+use super::cold_read::{ColdIndex, ColdIndexCache, ColdIndexStamp, ColdPageCache};
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -284,6 +285,14 @@ impl CacheBudget {
 pub(crate) struct BufferStats {
     pub(crate) dirty_count: usize,
     pub(crate) pending_delete_count: usize,
+    pub(crate) cold_token_count: usize,
+    pub(crate) cold_index_cache_entries: usize,
+    pub(crate) cold_index_cache_bytes: usize,
+    pub(crate) cold_index_cache_budget_bytes: usize,
+    pub(crate) cold_page_cache_entries: usize,
+    pub(crate) cold_page_cache_bytes: usize,
+    pub(crate) cold_page_cache_ghost_entries: usize,
+    pub(crate) cold_page_cache_budget_bytes: usize,
     pub(crate) cache_hits: u64,
     pub(crate) cache_misses: u64,
     pub(crate) full_blob_reads: u64,
@@ -321,6 +330,7 @@ pub(crate) struct BufferStats {
     pub(crate) eviction_skips_route_resident: u64,
     pub(crate) admission_protects: u64,
     pub(crate) write_delta_count: usize,
+    pub(crate) store: StoreStats,
 }
 
 /// Frequency-aware blob cache; see the module docs.
@@ -335,9 +345,14 @@ pub struct BufferManager {
     cold_indexes: ColdIndexCache,
     /// Per-blob invalidation token for checkpoint sidecar and cold
     /// page reads. Sidecars are validated against the on-disk header
-    /// when loaded; the epoch catches in-process writers/checkpoints
+    /// when loaded; the token catches in-process writers/checkpoints
     /// after that without forcing every cold hit to reread the header.
-    cold_epoch: DashMap<BlobGuid, AtomicU64, GuidBuildHasher>,
+    cold_tokens: DashMap<BlobGuid, AtomicU64, GuidBuildHasher>,
+    /// Monotonic source for cold invalidation tokens. A removed GUID
+    /// that is later reintroduced receives a fresh token instead of
+    /// reusing `0`, so stale sidecar observations cannot become valid
+    /// through token-map GC.
+    cold_token_clock: AtomicU64,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -564,6 +579,7 @@ impl BufferManager {
         drop(state);
         self.decrement_candidate_totals(removed);
         let _ = self.store.delete_blob(guid);
+        self.remove_cold_token_if_unreachable(guid);
     }
 
     /// GUIDs of every live snapshot's frozen root frame.
@@ -639,7 +655,8 @@ impl BufferManager {
             capacity,
             cold_pages: ColdPageCache::new(budget.cold_page_bytes),
             cold_indexes: ColdIndexCache::new(budget.cold_index_bytes),
-            cold_epoch: DashMap::with_hasher(GuidBuildHasher),
+            cold_tokens: DashMap::with_hasher(GuidBuildHasher),
+            cold_token_clock: AtomicU64::new(1),
             cache: DashMap::with_hasher(GuidBuildHasher),
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
@@ -768,9 +785,19 @@ impl BufferManager {
     }
 
     pub(crate) fn stats(&self) -> BufferStats {
+        let cold_index_cache = self.cold_indexes.snapshot();
+        let cold_page_cache = self.cold_pages.snapshot();
         BufferStats {
             dirty_count: self.dirty_count(),
             pending_delete_count: self.pending_delete_count(),
+            cold_token_count: self.cold_tokens.len(),
+            cold_index_cache_entries: cold_index_cache.entries,
+            cold_index_cache_bytes: cold_index_cache.bytes,
+            cold_index_cache_budget_bytes: cold_index_cache.budget_bytes,
+            cold_page_cache_entries: cold_page_cache.entries,
+            cold_page_cache_bytes: cold_page_cache.bytes,
+            cold_page_cache_ghost_entries: cold_page_cache.ghost_entries,
+            cold_page_cache_budget_bytes: cold_page_cache.budget_bytes,
             cache_hits: self.telemetry.cache_hits(),
             cache_misses: self.telemetry.cache_misses(),
             full_blob_reads: self.telemetry.full_blob_reads(),
@@ -808,6 +835,7 @@ impl BufferManager {
             eviction_skips_route_resident: self.telemetry.eviction_skips_route_resident(),
             admission_protects: self.telemetry.admission_protects(),
             write_delta_count: self.write_delta.len(),
+            store: self.store.store_stats(),
         }
     }
 
@@ -1324,10 +1352,10 @@ impl BufferManager {
         }
         if let Some(index) = self.cold_indexes.get(guid) {
             self.telemetry.note_cold_index_cache_hit();
-            return Some((index, self.cold_epoch(guid)));
+            return self.cold_token(guid).map(|token| (index, token));
         }
         self.telemetry.note_cold_index_cache_miss();
-        let epoch = self.cold_epoch(guid);
+        let token = self.ensure_cold_token(guid);
         let mut bytes = vec![0; COLD_INDEX_DIRECTORY_PROBE_BYTES];
         if !self.store.read_cold_index_range(guid, 0, &mut bytes).ok()? {
             return None;
@@ -1353,11 +1381,11 @@ impl BufferManager {
             self.cold_indexes.invalidate(guid);
             return None;
         }
-        if self.cold_epoch(guid) != epoch || !self.cold_sidecar_eligible(guid, policy) {
+        if self.cold_token(guid) != Some(token) || !self.cold_sidecar_eligible(guid, policy) {
             return None;
         }
         self.telemetry.note_cold_index_load(read_bytes);
-        Some((self.cold_indexes.insert(guid, index), epoch))
+        Some((self.cold_indexes.insert(guid, index), token))
     }
 
     pub(crate) fn read_cold_index_bucket(
@@ -1422,22 +1450,25 @@ impl BufferManager {
     }
 
     fn cold_read_invalidate(&self, guid: BlobGuid) {
-        self.bump_cold_epoch(guid);
+        self.bump_cold_token(guid);
         self.cold_pages.invalidate(guid);
         self.cold_indexes.invalidate(guid);
     }
 
-    pub(crate) fn cold_token_valid(&self, guid: BlobGuid, epoch: u64) -> bool {
-        self.cold_read_eligible(guid) && self.cold_epoch(guid) == epoch
+    pub(crate) fn cold_token_valid(&self, guid: BlobGuid, token: u64) -> bool {
+        self.cold_read_eligible(guid) && self.cold_token(guid) == Some(token)
     }
 
-    pub(crate) fn cold_liveness_token_valid(&self, guid: BlobGuid, epoch: u64) -> bool {
+    pub(crate) fn cold_liveness_token_valid(&self, guid: BlobGuid, token: u64) -> bool {
         self.cold_sidecar_eligible(guid, ColdSidecarPolicy::Liveness)
-            && self.cold_epoch(guid) == epoch
+            && self.cold_token(guid) == Some(token)
     }
 
     fn cold_sidecar_eligible(&self, guid: BlobGuid, policy: ColdSidecarPolicy) -> bool {
         if self.store.needs_flush() || self.is_pending_delete(guid) {
+            return false;
+        }
+        if !self.store.has_blob(guid).unwrap_or(false) {
             return false;
         }
         if policy == ColdSidecarPolicy::PointRead && self.cache.contains_key(&guid) {
@@ -1447,17 +1478,52 @@ impl BufferManager {
         !state.is_protected_or_pending(&guid)
     }
 
-    fn cold_epoch(&self, guid: BlobGuid) -> u64 {
-        self.cold_epoch
+    fn cold_token(&self, guid: BlobGuid) -> Option<u64> {
+        self.cold_tokens
             .get(&guid)
-            .map_or(0, |entry| entry.load(Ordering::Acquire))
+            .map(|entry| entry.load(Ordering::Acquire))
     }
 
-    fn bump_cold_epoch(&self, guid: BlobGuid) {
-        self.cold_epoch
+    fn ensure_cold_token(&self, guid: BlobGuid) -> u64 {
+        if let Some(entry) = self.cold_tokens.get(&guid) {
+            return entry.load(Ordering::Acquire);
+        }
+        let token = self.next_cold_token();
+        let entry = self
+            .cold_tokens
             .entry(guid)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::AcqRel);
+            .or_insert_with(|| AtomicU64::new(token));
+        entry.load(Ordering::Acquire)
+    }
+
+    fn bump_cold_token(&self, guid: BlobGuid) {
+        let token = self.next_cold_token();
+        self.cold_tokens
+            .entry(guid)
+            .or_insert_with(|| AtomicU64::new(token))
+            .store(token, Ordering::Release);
+    }
+
+    fn next_cold_token(&self) -> u64 {
+        self.cold_token_clock.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn remove_cold_token_if_unreachable(&self, guid: BlobGuid) {
+        if self.cache.contains_key(&guid) {
+            return;
+        }
+        {
+            let state = self.mutation_shard(guid).lock().unwrap();
+            if state.is_protected_or_pending(&guid) {
+                return;
+            }
+        }
+        if self.store.has_blob(guid).unwrap_or(true) {
+            return;
+        }
+        self.cold_pages.invalidate(guid);
+        self.cold_indexes.invalidate(guid);
+        self.cold_tokens.remove(&guid);
     }
 
     fn cold_index_stamp_matches(&self, guid: BlobGuid, index: &ColdIndex) -> Result<bool> {
@@ -2030,6 +2096,7 @@ impl BufferManager {
         }
         self.route_resident.remove(guid);
         self.finish_pending_delete(guid);
+        self.remove_cold_token_if_unreachable(guid);
         Ok(true)
     }
 
@@ -2406,7 +2473,9 @@ impl BlobStore for BufferManager {
                 "delete_blob: protected cache image cannot be evicted",
             ));
         }
-        self.store.delete_blob(guid)
+        self.store.delete_blob(guid)?;
+        self.remove_cold_token_if_unreachable(guid);
+        Ok(())
     }
 
     fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
@@ -2432,6 +2501,10 @@ impl BlobStore for BufferManager {
             return Ok(true);
         }
         self.store.has_blob(guid)
+    }
+
+    fn store_stats(&self) -> StoreStats {
+        self.store.store_stats()
     }
 }
 
@@ -2602,6 +2675,10 @@ mod tests {
         fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
             self.inner.has_blob(guid)
         }
+
+        fn store_stats(&self) -> StoreStats {
+            self.inner.store_stats()
+        }
     }
 
     #[test]
@@ -2649,6 +2726,41 @@ mod tests {
             bm.cold_read_eligible(guid),
             "once the store is durable and the blob is not cached/protected, cold reads may proceed",
         );
+    }
+
+    #[test]
+    fn cold_tokens_are_removed_after_final_delete() {
+        let guid = [0xC1; 16];
+        let inner = Arc::new(MemoryBlobStore::new());
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let store: Arc<dyn BlobStore> = inner.clone();
+        let bm = BufferManager::new(store, 4);
+
+        let token = bm.ensure_cold_token(guid);
+        assert!(bm.cold_token_valid(guid, token));
+        assert_eq!(bm.stats().cold_token_count, 1);
+
+        bm.delete_blob(guid).unwrap();
+        assert_eq!(bm.stats().cold_token_count, 0);
+        assert!(!bm.cold_token_valid(guid, token));
+    }
+
+    #[test]
+    fn reintroduced_guid_gets_fresh_cold_token() {
+        let guid = [0xC2; 16];
+        let inner = Arc::new(MemoryBlobStore::new());
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store: Arc<dyn BlobStore> = inner.clone();
+        let bm = BufferManager::new(store, 4);
+
+        let first = bm.ensure_cold_token(guid);
+        bm.delete_blob(guid).unwrap();
+        inner.write_blob(guid, &make_buf(2)).unwrap();
+        let second = bm.ensure_cold_token(guid);
+
+        assert_ne!(first, second);
+        assert!(!bm.cold_token_valid(guid, first));
+        assert!(bm.cold_token_valid(guid, second));
     }
 
     #[test]

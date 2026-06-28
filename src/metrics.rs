@@ -48,6 +48,26 @@
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
 //! | `holt_bm_write_delta_count`             | gauge   | `TreeStats::bm_write_delta_count`      |
+//! | `holt_bm_cold_token_count`              | gauge   | `TreeStats::bm_cold_token_count`       |
+//! | `holt_bm_cold_index_cache_entries`      | gauge   | `TreeStats::bm_cold_index_cache_entries` |
+//! | `holt_bm_cold_index_cache_bytes`        | gauge   | `TreeStats::bm_cold_index_cache_bytes` |
+//! | `holt_bm_cold_index_cache_budget_bytes` | gauge   | `TreeStats::bm_cold_index_cache_budget_bytes` |
+//! | `holt_bm_cold_page_cache_entries`       | gauge   | `TreeStats::bm_cold_page_cache_entries` |
+//! | `holt_bm_cold_page_cache_bytes`         | gauge   | `TreeStats::bm_cold_page_cache_bytes`  |
+//! | `holt_bm_cold_page_cache_ghost_entries` | gauge   | `TreeStats::bm_cold_page_cache_ghost_entries` |
+//! | `holt_bm_cold_page_cache_budget_bytes`  | gauge   | `TreeStats::bm_cold_page_cache_budget_bytes` |
+//! | `holt_store_live_blobs`                 | gauge   | `TreeStats::store.live_blobs`          |
+//! | `holt_store_live_slots`                 | gauge   | `TreeStats::store.live_slots`          |
+//! | `holt_store_next_slot`                  | gauge   | `TreeStats::store.next_slot`           |
+//! | `holt_store_reusable_slots`             | gauge   | `TreeStats::store.reusable_slots`      |
+//! | `holt_store_pending_free_slots`         | gauge   | `TreeStats::store.pending_free_slots`  |
+//! | `holt_store_data_file_bytes`            | gauge   | `TreeStats::store.data_file_bytes`     |
+//! | `holt_store_data_high_water_bytes`      | gauge   | `TreeStats::store.data_high_water_bytes` |
+//! | `holt_store_cold_index_file_bytes`      | gauge   | `TreeStats::store.cold_index_file_bytes` |
+//! | `holt_store_cold_index_high_water_bytes` | gauge  | `TreeStats::store.cold_index_high_water_bytes` |
+//! | `holt_store_cold_value_file_bytes`      | gauge   | `TreeStats::store.cold_value_file_bytes` |
+//! | `holt_store_cold_value_high_water_bytes` | gauge  | `TreeStats::store.cold_value_high_water_bytes` |
+//! | `holt_store_manifest_log_bytes`         | gauge   | `TreeStats::store.manifest_log_bytes`  |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
 //! | `holt_bm_full_blob_reads_total`         | counter | `TreeStats::bm_full_blob_reads`        |
@@ -264,6 +284,146 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Number of deferred WAL-backed writes waiting for ART merge.",
         "gauge",
         stats.bm_write_delta_count as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_token_count",
+        "Cold-read invalidation tokens retained by the buffer manager.",
+        "gauge",
+        stats.bm_cold_token_count as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_index_cache_entries",
+        "Cold-index directories currently cached in memory.",
+        "gauge",
+        stats.bm_cold_index_cache_entries as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_index_cache_bytes",
+        "Bytes used by cached cold-index directories.",
+        "gauge",
+        stats.bm_cold_index_cache_bytes as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_index_cache_budget_bytes",
+        "Memory budget for cached cold-index directories.",
+        "gauge",
+        stats.bm_cold_index_cache_budget_bytes as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_page_cache_entries",
+        "4 KiB cold-read pages currently cached in memory.",
+        "gauge",
+        stats.bm_cold_page_cache_entries as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_page_cache_bytes",
+        "Bytes used by cached cold-read pages.",
+        "gauge",
+        stats.bm_cold_page_cache_bytes as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_page_cache_ghost_entries",
+        "Cold leaf-page ghost entries used by second-touch admission.",
+        "gauge",
+        stats.bm_cold_page_cache_ghost_entries as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_cold_page_cache_budget_bytes",
+        "Memory budget for cached 4 KiB cold-read pages.",
+        "gauge",
+        stats.bm_cold_page_cache_budget_bytes as u64,
+    );
+    metric(
+        &mut out,
+        "holt_store_live_blobs",
+        "Live blob GUIDs in the store manifest.",
+        "gauge",
+        stats.store.live_blobs as u64,
+    );
+    metric(
+        &mut out,
+        "holt_store_live_slots",
+        "Manifest slots currently assigned to live blobs.",
+        "gauge",
+        stats.store.live_slots,
+    );
+    metric(
+        &mut out,
+        "holt_store_next_slot",
+        "Next never-used manifest slot.",
+        "gauge",
+        stats.store.next_slot,
+    );
+    metric(
+        &mut out,
+        "holt_store_reusable_slots",
+        "Durably free manifest slots available for reuse.",
+        "gauge",
+        stats.store.reusable_slots,
+    );
+    metric(
+        &mut out,
+        "holt_store_pending_free_slots",
+        "Manifest slots deleted in memory but not yet durably reusable.",
+        "gauge",
+        stats.store.pending_free_slots,
+    );
+    metric(
+        &mut out,
+        "holt_store_data_file_bytes",
+        "Current size of blobs.dat, including preallocation.",
+        "gauge",
+        stats.store.data_file_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_data_high_water_bytes",
+        "Logical blobs.dat high-water bytes implied by next_slot.",
+        "gauge",
+        stats.store.data_high_water_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_cold_index_file_bytes",
+        "Current size of the cold-index sidecar file.",
+        "gauge",
+        stats.store.cold_index_file_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_cold_index_high_water_bytes",
+        "Logical cold-index sidecar high-water bytes implied by next_slot.",
+        "gauge",
+        stats.store.cold_index_high_water_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_cold_value_file_bytes",
+        "Current size of the cold-value sidecar file.",
+        "gauge",
+        stats.store.cold_value_file_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_cold_value_high_water_bytes",
+        "Logical cold-value sidecar high-water bytes implied by next_slot.",
+        "gauge",
+        stats.store.cold_value_high_water_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_manifest_log_bytes",
+        "Durable manifest delta-log bytes.",
+        "gauge",
+        stats.store.manifest_log_bytes,
     );
     metric(
         &mut out,
@@ -760,7 +920,37 @@ fn metric_f64(out: &mut String, name: &str, help: &str, ty: &str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CheckpointerStats, JournalStats, OpenStats, RouteCacheStats, TreeStats};
+    use crate::{
+        CheckpointerStats, JournalStats, OpenStats, RouteCacheStats, StoreStats, TreeStats,
+    };
+
+    fn store_fixture() -> StoreStats {
+        StoreStats {
+            live_blobs: 54,
+            live_slots: 55,
+            next_slot: 60,
+            reusable_slots: 5,
+            pending_free_slots: 2,
+            data_file_bytes: 61,
+            data_high_water_bytes: 62,
+            cold_index_file_bytes: 63,
+            cold_index_high_water_bytes: 64,
+            cold_value_file_bytes: 65,
+            cold_value_high_water_bytes: 66,
+            manifest_log_bytes: 67,
+        }
+    }
+
+    fn route_cache_fixture() -> RouteCacheStats {
+        RouteCacheStats {
+            entries: 6,
+            hits: 70,
+            misses: 8,
+            learns: 9,
+            evictions: 2,
+            invalidations: 1,
+        }
+    }
 
     fn stats_fixture(with_journal: bool, with_checkpointer: bool) -> TreeStats {
         TreeStats {
@@ -781,6 +971,14 @@ mod tests {
             bm_dirty_count: 2,
             bm_pending_delete_count: 1,
             bm_write_delta_count: 3,
+            bm_cold_token_count: 46,
+            bm_cold_index_cache_entries: 47,
+            bm_cold_index_cache_bytes: 48,
+            bm_cold_index_cache_budget_bytes: 49,
+            bm_cold_page_cache_entries: 50,
+            bm_cold_page_cache_bytes: 51,
+            bm_cold_page_cache_ghost_entries: 52,
+            bm_cold_page_cache_budget_bytes: 53,
             bm_cache_hits: 1_000,
             bm_cache_misses: 25,
             bm_full_blob_reads: 20,
@@ -817,14 +1015,8 @@ mod tests {
             bm_eviction_skips_protected: 13,
             bm_eviction_skips_route_resident: 14,
             bm_admission_protects: 15,
-            route_cache: RouteCacheStats {
-                entries: 6,
-                hits: 70,
-                misses: 8,
-                learns: 9,
-                evictions: 2,
-                invalidations: 1,
-            },
+            store: store_fixture(),
+            route_cache: route_cache_fixture(),
             open: OpenStats {
                 wal_replay_records: 21,
                 wal_replay_bytes: 4096,
@@ -865,6 +1057,26 @@ mod tests {
         assert!(out.contains("holt_blob_count 3\n"));
         // Monotonic counters keep the `_total` suffix...
         assert!(out.contains("holt_bm_write_delta_count 3\n"));
+        assert!(out.contains("holt_bm_cold_token_count 46\n"));
+        assert!(out.contains("holt_bm_cold_index_cache_entries 47\n"));
+        assert!(out.contains("holt_bm_cold_index_cache_bytes 48\n"));
+        assert!(out.contains("holt_bm_cold_index_cache_budget_bytes 49\n"));
+        assert!(out.contains("holt_bm_cold_page_cache_entries 50\n"));
+        assert!(out.contains("holt_bm_cold_page_cache_bytes 51\n"));
+        assert!(out.contains("holt_bm_cold_page_cache_ghost_entries 52\n"));
+        assert!(out.contains("holt_bm_cold_page_cache_budget_bytes 53\n"));
+        assert!(out.contains("holt_store_live_blobs 54\n"));
+        assert!(out.contains("holt_store_live_slots 55\n"));
+        assert!(out.contains("holt_store_next_slot 60\n"));
+        assert!(out.contains("holt_store_reusable_slots 5\n"));
+        assert!(out.contains("holt_store_pending_free_slots 2\n"));
+        assert!(out.contains("holt_store_data_file_bytes 61\n"));
+        assert!(out.contains("holt_store_data_high_water_bytes 62\n"));
+        assert!(out.contains("holt_store_cold_index_file_bytes 63\n"));
+        assert!(out.contains("holt_store_cold_index_high_water_bytes 64\n"));
+        assert!(out.contains("holt_store_cold_value_file_bytes 65\n"));
+        assert!(out.contains("holt_store_cold_value_high_water_bytes 66\n"));
+        assert!(out.contains("holt_store_manifest_log_bytes 67\n"));
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_full_blob_reads_total 20\n"));
         assert!(out.contains("holt_bm_full_blob_read_bytes_total 10485760\n"));

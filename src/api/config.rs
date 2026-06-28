@@ -69,11 +69,11 @@ pub struct TreeConfig {
     /// Where the tree's data lives.
     pub storage: Storage,
     /// Cache budget, expressed in 512 KB blob-frame units. File-backed
-    /// trees split this single budget between resident blob frames and
-    /// a small 4 KB cold-navigation-page cache. Memory/custom stores use
-    /// the full budget for resident blob frames. File-backed trees
-    /// default to 256 (= 128 MiB total budget); memory trees default to
-    /// 64 (= 32 MiB).
+    /// trees split this single total budget between resident blob frames,
+    /// the cold-index directory cache, and a small 4 KB cold-read page
+    /// cache. Memory/custom stores use the full budget for resident blob
+    /// frames. File-backed trees default to 256 (= 128 MiB total budget);
+    /// memory trees default to 64 (= 32 MiB).
     pub buffer_pool_size: usize,
     /// Who owns durability and how recovery works. Defaults to
     /// `Durability::Wal { sync: false }` (group-commit WAL).

@@ -411,7 +411,7 @@ where
     // Answer cold from the checkpoint-built sidecar or, if that is
     // unavailable, from the in-blob routing region. Any uncertainty falls
     // back to the authoritative full pin. Exact hits, negatives, and
-    // crossings are published only while the blob's cold epoch is stable.
+    // crossings are published only while the blob's cold token is stable.
     match cold_read_chain(bm, crossing.child_guid, key, crossing.child_depth) {
         ColdBlobLookup::Unknown => {
             let pin = match bm.pin(crossing.child_guid) {
@@ -476,7 +476,7 @@ fn cold_read_chain(
 /// falls back to the in-blob routed layout. Any remaining uncertainty
 /// falls through to `bm.pin`, which reads the authoritative image.
 /// Exact sidecar hits and misses are returned only while the
-/// BufferManager cold epoch observed at sidecar load is still valid.
+/// BufferManager cold token observed at sidecar load is still valid.
 ///
 fn cold_read_routed(
     bm: &BufferManager,
@@ -511,13 +511,13 @@ fn cold_read_indexed(
     user_key: &[u8],
     depth: usize,
 ) -> ColdBlobLookup {
-    let Some((index, epoch)) = bm.cold_index(guid) else {
+    let Some((index, token)) = bm.cold_index(guid) else {
         bm.note_cold_index_unknown();
         return ColdBlobLookup::Unknown;
     };
 
     if let Some((child_guid, child_depth)) = index.crossing(user_key, depth) {
-        return if cold_index_token_valid(bm, guid, epoch) {
+        return if cold_index_token_valid(bm, guid, token) {
             bm.note_cold_index_crossing_hit();
             ColdBlobLookup::Crossing {
                 child_guid,
@@ -529,7 +529,7 @@ fn cold_read_indexed(
     }
 
     if !index.may_have_key(user_key) {
-        return if cold_index_token_valid(bm, guid, epoch) {
+        return if cold_index_token_valid(bm, guid, token) {
             bm.note_cold_index_negative_hit();
             ColdBlobLookup::NotFound
         } else {
@@ -537,13 +537,13 @@ fn cold_read_indexed(
         };
     }
 
-    if let Some(answer) = cold_index_leaf_hit(bm, guid, &index, epoch, user_key) {
+    if let Some(answer) = cold_index_leaf_hit(bm, guid, &index, token, user_key) {
         return answer;
     }
 
     match index.route_or_absent(user_key, depth) {
         ColdIndexAnswer::NotFound => {
-            if cold_index_token_valid(bm, guid, epoch) {
+            if cold_index_token_valid(bm, guid, token) {
                 bm.note_cold_index_negative_hit();
                 ColdBlobLookup::NotFound
             } else {
@@ -555,7 +555,7 @@ fn cold_read_indexed(
             child_depth,
             ..
         } => {
-            if cold_index_token_valid(bm, guid, epoch) {
+            if cold_index_token_valid(bm, guid, token) {
                 bm.note_cold_index_crossing_hit();
                 ColdBlobLookup::Crossing {
                     child_guid,
@@ -572,7 +572,7 @@ fn cold_index_leaf_hit(
     bm: &BufferManager,
     guid: BlobGuid,
     index: &ColdIndex,
-    epoch: u64,
+    token: u64,
     user_key: &[u8],
 ) -> Option<ColdBlobLookup> {
     let Some(bucket_lookup) = COLD_INDEX_BUCKET_BUF.with(|cell| {
@@ -585,7 +585,7 @@ fn cold_index_leaf_hit(
     };
     match bucket_lookup {
         Ok(Some(ColdIndexHit::Inline { value, seq })) => {
-            return if cold_index_token_valid(bm, guid, epoch) {
+            return if cold_index_token_valid(bm, guid, token) {
                 bm.note_cold_index_inline_hit();
                 Some(ColdBlobLookup::Found { value, seq })
             } else {
@@ -610,7 +610,7 @@ fn cold_index_leaf_hit(
                 bm.note_cold_index_unknown();
                 return Some(ColdBlobLookup::Unknown);
             }
-            return if cold_index_token_valid(bm, guid, epoch) {
+            return if cold_index_token_valid(bm, guid, token) {
                 bm.note_cold_index_value_hit(u64::from(value_len));
                 Some(ColdBlobLookup::Found { value, seq })
             } else {
@@ -629,7 +629,7 @@ fn cold_index_leaf_hit(
                     bm.note_cold_index_unknown();
                     return Some(ColdBlobLookup::Unknown);
                 };
-                if cold_index_token_valid(bm, guid, epoch) {
+                if cold_index_token_valid(bm, guid, token) {
                     bm.note_cold_index_offset_hit();
                     Some(ColdBlobLookup::Found { value, seq })
                 } else {
@@ -648,8 +648,8 @@ fn cold_index_leaf_hit(
 }
 
 #[inline]
-fn cold_index_token_valid(bm: &BufferManager, guid: BlobGuid, epoch: u64) -> bool {
-    let valid = bm.cold_token_valid(guid, epoch);
+fn cold_index_token_valid(bm: &BufferManager, guid: BlobGuid, token: u64) -> bool {
+    let valid = bm.cold_token_valid(guid, token);
     if !valid {
         bm.note_cold_index_unknown();
     }

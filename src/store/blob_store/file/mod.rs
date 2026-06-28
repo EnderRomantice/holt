@@ -91,6 +91,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::api::errors::{Error, Result};
+use crate::api::stats::StoreStats;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -837,6 +838,10 @@ fn slots_for_len(len: u64) -> u64 {
     len.saturating_add(page - 1) / page
 }
 
+fn file_len(file: &File) -> u64 {
+    file.metadata().map_or(0, |m| m.len())
+}
+
 fn round_up_slots(required_slots: u64) -> u64 {
     let chunk = if required_slots >= DATA_PREALLOC_LARGE_AT_SLOTS {
         DATA_PREALLOC_LARGE_CHUNK_SLOTS
@@ -1266,6 +1271,38 @@ impl BlobStore for FileBlobStore {
         Ok(m.entries.keys().copied().collect())
     }
 
+    fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+        Ok(self.manifest.read().unwrap().entries.contains_key(&guid))
+    }
+
+    fn store_stats(&self) -> StoreStats {
+        let (live_blobs, next_slot, reusable_slots, pending_free_slots, manifest_log_bytes) = {
+            let m = self.manifest.read().unwrap();
+            (
+                m.entries.len(),
+                m.next_slot,
+                m.reusable_slots.len(),
+                m.pending_free_slots.len() as u64,
+                m.log_bytes,
+            )
+        };
+        let high_water = next_slot.saturating_mul(u64::from(PAGE_SIZE));
+        StoreStats {
+            live_blobs,
+            live_slots: live_blobs as u64,
+            next_slot,
+            reusable_slots,
+            pending_free_slots,
+            data_file_bytes: file_len(&self.data_file),
+            data_high_water_bytes: high_water,
+            cold_index_file_bytes: file_len(&self.cold_file),
+            cold_index_high_water_bytes: high_water,
+            cold_value_file_bytes: file_len(&self.cold_value_file),
+            cold_value_high_water_bytes: high_water,
+            manifest_log_bytes,
+        }
+    }
+
     fn flush(&self) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
         // Order matters: data must be on disk before the manifest
@@ -1640,6 +1677,16 @@ impl ReusableSlots {
         self.singles.append(slots);
     }
 
+    fn len(&self) -> u64 {
+        let singles = self.singles.len() as u64;
+        let ranges = self
+            .ranges
+            .iter()
+            .map(|range| range.end.saturating_sub(range.next).saturating_add(1))
+            .sum::<u64>();
+        singles.saturating_add(ranges)
+    }
+
     fn reconstruct(next_slot: u64, used_slots: &[u64]) -> Result<Self> {
         let mut sorted = used_slots.to_vec();
         sorted.sort_unstable();
@@ -1916,6 +1963,53 @@ mod tests {
         assert!(b.needs_flush());
         b.flush().unwrap();
         assert!(!b.needs_flush());
+    }
+
+    #[test]
+    fn store_stats_track_slots_and_sidecar_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g1: BlobGuid = [0x45; 16];
+        let g2: BlobGuid = [0x46; 16];
+
+        let empty = b.store_stats();
+        assert_eq!(empty.live_blobs, 0);
+        assert_eq!(empty.next_slot, 0);
+        assert_eq!(empty.data_high_water_bytes, 0);
+
+        b.write_blob(g1, &buf_with(1)).unwrap();
+        b.flush().unwrap();
+        let written = b.store_stats();
+        assert_eq!(written.live_blobs, 1);
+        assert_eq!(written.live_slots, 1);
+        assert_eq!(written.next_slot, 1);
+        assert_eq!(written.data_high_water_bytes, u64::from(PAGE_SIZE));
+        assert!(written.data_file_bytes >= u64::from(PAGE_SIZE));
+
+        b.delete_blob(g1).unwrap();
+        let pending_delete = b.store_stats();
+        assert_eq!(pending_delete.live_blobs, 0);
+        assert_eq!(pending_delete.pending_free_slots, 1);
+        assert_eq!(pending_delete.reusable_slots, 0);
+
+        b.flush().unwrap();
+        let reusable = b.store_stats();
+        assert_eq!(reusable.pending_free_slots, 0);
+        assert_eq!(reusable.reusable_slots, 1);
+
+        b.write_blob(g2, &buf_with(2)).unwrap();
+        b.flush().unwrap();
+        b.publish_cold_index(g2, &[0xAB; 512], &[0xCD; 512])
+            .unwrap();
+        let sidecar = b.store_stats();
+        assert_eq!(sidecar.live_blobs, 1);
+        assert_eq!(sidecar.next_slot, 1, "flushed free slot should be reused");
+        assert!(sidecar.cold_index_file_bytes >= 512);
+        assert!(sidecar.cold_value_file_bytes >= 512);
+        assert_eq!(sidecar.cold_index_high_water_bytes, u64::from(PAGE_SIZE));
+        assert_eq!(sidecar.cold_value_high_water_bytes, u64::from(PAGE_SIZE));
     }
 
     #[test]

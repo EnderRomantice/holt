@@ -440,6 +440,13 @@ pub(crate) struct ColdIndexCache {
     shard_budget_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ColdIndexCacheStats {
+    pub(crate) entries: usize,
+    pub(crate) bytes: usize,
+    pub(crate) budget_bytes: usize,
+}
+
 #[derive(Default)]
 struct IndexShard {
     entries: HashMap<BlobGuid, CacheEntry>,
@@ -510,6 +517,19 @@ impl ColdIndexCache {
         if let Some(old) = shard.entries.remove(&guid) {
             shard.bytes = shard.bytes.saturating_sub(old.bytes);
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> ColdIndexCacheStats {
+        let mut out = ColdIndexCacheStats {
+            budget_bytes: self.shard_budget_bytes.saturating_mul(SHARDS),
+            ..ColdIndexCacheStats::default()
+        };
+        for shard in &self.shards {
+            let shard = shard.lock().unwrap();
+            out.entries += shard.entries.len();
+            out.bytes += shard.bytes;
+        }
+        out
     }
 
     fn shard(&self, guid: BlobGuid) -> &Mutex<IndexShard> {

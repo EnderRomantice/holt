@@ -36,7 +36,6 @@
 
 use std::mem::size_of;
 
-mod cold;
 mod cow;
 mod erase;
 mod insert;

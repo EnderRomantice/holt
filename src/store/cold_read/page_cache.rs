@@ -40,6 +40,14 @@ pub(crate) struct ColdPageCache {
     clock: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ColdPageCacheStats {
+    pub(crate) entries: usize,
+    pub(crate) bytes: usize,
+    pub(crate) ghost_entries: usize,
+    pub(crate) budget_bytes: usize,
+}
+
 impl ColdPageCache {
     pub(crate) fn new(total_budget_bytes: usize) -> Self {
         let shard_budget_bytes = if total_budget_bytes == 0 {
@@ -152,6 +160,20 @@ impl ColdPageCache {
         shard.ghost.retain(|key, _| key.guid != guid);
         let removed = before - shard.map.len();
         shard.bytes = shard.bytes.saturating_sub(removed * PAGE_BYTES);
+    }
+
+    pub(crate) fn snapshot(&self) -> ColdPageCacheStats {
+        let mut out = ColdPageCacheStats {
+            budget_bytes: self.shard_budget_bytes.saturating_mul(SHARDS),
+            ..ColdPageCacheStats::default()
+        };
+        for shard in &self.shards {
+            let shard = shard.lock().unwrap();
+            out.entries += shard.map.len();
+            out.bytes += shard.bytes;
+            out.ghost_entries += shard.ghost.len();
+        }
+        out
     }
 }
 

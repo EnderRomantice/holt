@@ -9,6 +9,7 @@ use std::io;
 use std::sync::RwLock;
 
 use crate::api::errors::{Error, Result};
+use crate::api::stats::StoreStats;
 use crate::layout::BlobGuid;
 
 use super::{AlignedBlobBuf, BlobStore};
@@ -101,6 +102,20 @@ impl BlobStore for MemoryBlobStore {
 
     fn needs_flush(&self) -> bool {
         false
+    }
+
+    fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+        Ok(self.inner.read().unwrap().contains_key(&guid))
+    }
+
+    fn store_stats(&self) -> StoreStats {
+        let live = self.inner.read().unwrap().len();
+        StoreStats {
+            live_blobs: live,
+            live_slots: live as u64,
+            next_slot: live as u64,
+            ..StoreStats::default()
+        }
     }
 }
 
