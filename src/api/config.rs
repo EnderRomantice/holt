@@ -70,7 +70,7 @@ pub struct TreeConfig {
     pub storage: Storage,
     /// Cache budget, expressed in 512 KB blob-frame units. File-backed
     /// trees split this single total budget between resident blob frames,
-    /// the cold-index directory cache, and a small 4 KB cold-read page
+    /// the read-index directory cache, and a small 4 KB indexed-read page
     /// cache. Memory/custom stores use the full budget for resident blob
     /// frames. File-backed trees default to 256 (= 128 MiB total budget);
     /// memory trees default to 64 (= 32 MiB).

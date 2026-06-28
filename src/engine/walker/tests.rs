@@ -5,7 +5,7 @@
 use super::cast;
 use super::erase::erase;
 use super::insert::insert;
-use super::lookup::{cold_read_routed_into, lookup, lookup_at};
+use super::lookup::{indexed_read_into, lookup, lookup_at};
 use super::migrate::{blob_needs_compaction, blob_would_route, compact_blob, make_blob_from_node};
 use super::readers::{
     child_offset, read_node16, read_node256, read_node4, read_node48, read_prefix,
@@ -1307,12 +1307,12 @@ fn routing_equals_full_descend_and_oracle() {
 }
 
 /// An in-place leaf append after routing must de-route the blob so a
-/// cold read can't use stale navigation pages. The appended key did not
+/// indexed read can't use stale navigation pages. The appended key did not
 /// exist when the routed layout was built; after de-routing the cold
 /// accelerator returns `Unknown` and the caller falls back to a full pin.
 #[test]
-fn leaf_append_after_routing_deroutes_cold_path() {
-    use crate::store::ColdBlobLookup;
+fn leaf_append_after_routing_deroutes_indexed_path() {
+    use crate::store::IndexedBlobLookup;
     let (mut buf_vec, _) = fresh_blob();
     {
         let mut frame = BlobFrame::wrap(&mut buf_vec);
@@ -1354,7 +1354,7 @@ fn leaf_append_after_routing_deroutes_cold_path() {
     // The append must have de-routed the blob: it rewrote a parent child
     // pointer in the routing region, which cached cold navigation pages
     // would otherwise serve stale. De-routing zeroes routing_len so the
-    // cold read falls back to a full pin.
+    // indexed read falls back to a full pin.
     {
         let h = BlobFrame::wrap(buf.as_mut_slice());
         let h = h.header();
@@ -1365,25 +1365,25 @@ fn leaf_append_after_routing_deroutes_cold_path() {
     }
 
     let src = buf.as_slice().to_vec();
-    let routed = |k: &[u8]| -> ColdBlobLookup {
+    let routed = |k: &[u8]| -> IndexedBlobLookup {
         let mut scratch = AlignedBlobBuf::zeroed();
         let mut read = |off: u64, dst: &mut [u8]| -> crate::api::errors::Result<()> {
             let o = off as usize;
             dst.copy_from_slice(&src[o..o + dst.len()]);
             Ok(())
         };
-        cold_read_routed_into(scratch.as_mut_slice(), &mut read, SearchKey::exact(k), 0).unwrap()
+        indexed_read_into(scratch.as_mut_slice(), &mut read, SearchKey::exact(k), 0).unwrap()
     };
     // The appended key must be findable or force the authoritative full
     // pin. A stale routed NotFound would be a correctness bug.
     match routed(&new_key) {
-        ColdBlobLookup::Found { value, .. } => assert_eq!(value, vec![0xCD, 0xCD]),
-        ColdBlobLookup::Unknown => {}
+        IndexedBlobLookup::Found { value, .. } => assert_eq!(value, vec![0xCD, 0xCD]),
+        IndexedBlobLookup::Unknown => {}
         other => panic!("appended key wrongly resolved {other:?}"),
     }
     // A still-present old key likewise must not be lost.
     match routed(&[b'q', 1]) {
-        ColdBlobLookup::Found { .. } | ColdBlobLookup::Unknown => {}
+        IndexedBlobLookup::Found { .. } | IndexedBlobLookup::Unknown => {}
         other => panic!("present key wrongly resolved {other:?}"),
     }
 }
@@ -1563,7 +1563,7 @@ fn structural_mutation_demotes_routed_blob_to_legacy() {
     // Insert under a brand-new first byte: the root Prefix('q') must split,
     // allocating a new internal node — which must invalidate the routing
     // layout (a new internal node would otherwise land above
-    // leaf_region_start and be misread as a leaf on a cold read).
+    // leaf_region_start and be misread as a leaf on a indexed read).
     {
         let mut frame = BlobFrame::wrap(buf.as_mut_slice());
         let root = frame.header().root_slot;
@@ -1597,8 +1597,8 @@ fn structural_mutation_demotes_routed_blob_to_legacy() {
 /// straddling (> 4 KB) leaves, without the buffer-manager/eviction
 /// machinery.
 #[test]
-fn cold_read_routed_matches_oracle() {
-    use crate::store::ColdBlobLookup;
+fn indexed_read_matches_oracle() {
+    use crate::store::IndexedBlobLookup;
     let (mut buf_vec, _) = fresh_blob();
     let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     {
@@ -1642,7 +1642,7 @@ fn cold_read_routed_matches_oracle() {
 
     // The walker `insert` used by `put` stores keys via SearchKey::exact
     // (no ART terminator), so query the routed read the same way — the
-    // production cold path carries the user-style key its leaves were
+    // production indexed path carries the user-style key its leaves were
     // written with (api/tree.rs uses SearchKey::user throughout).
     let routed = |k: &[u8]| -> Option<Vec<u8>> {
         let mut scratch = AlignedBlobBuf::zeroed();
@@ -1651,11 +1651,10 @@ fn cold_read_routed_matches_oracle() {
             dst.copy_from_slice(&src[o..o + dst.len()]);
             Ok(())
         };
-        match cold_read_routed_into(scratch.as_mut_slice(), &mut read, SearchKey::exact(k), 0)
-            .unwrap()
+        match indexed_read_into(scratch.as_mut_slice(), &mut read, SearchKey::exact(k), 0).unwrap()
         {
-            ColdBlobLookup::Found { value, .. } => Some(value),
-            ColdBlobLookup::NotFound => None,
+            IndexedBlobLookup::Found { value, .. } => Some(value),
+            IndexedBlobLookup::NotFound => None,
             _ => panic!("unexpected cold result for {k:?}"),
         }
     };

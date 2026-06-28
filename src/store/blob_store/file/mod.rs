@@ -3,8 +3,8 @@
 //! Available on every Unix platform. The Linux build opens the
 //! packed data file with `O_DIRECT` so the kernel does not cache
 //! blob frames (the buffer manager *is* the cache). The rebuildable
-//! cold-index sidecar uses buffered positional I/O because it serves
-//! small index records rather than authoritative blob frames.
+//! read index uses buffered positional I/O because it serves small
+//! index records rather than authoritative blob frames.
 //!
 //! Layout on disk:
 //!
@@ -18,12 +18,12 @@
 //!                      is compacted
 //!     manifest.log   — append-only set/delete deltas replayed on
 //!                      open; free slots are rebuilt from holes
-//!     cold.idx       — optional packed cold-read indexes, one slot
+//!     read.idx       — optional packed read indexes, one slot
 //!                      per blob slot; rebuildable and never part of
 //!                      recovery truth
-//!     cold.val       — optional packed cold-read value payloads, one
+//!     value.seg      — optional packed read value payloads, one
 //!                      slot per blob slot; referenced only by
-//!                      `cold.idx` entries and rebuildable
+//!                      `read.idx` entries and rebuildable
 //!     store.lock     — zero-byte advisory lock file; held
 //!                      exclusively (flock) for the lifetime of an
 //!                      open instance so a second opener cannot
@@ -50,12 +50,12 @@
 //!   instead of rewriting the whole map. When the log grows well
 //!   past the snapshot size it compacts into `manifest.bin` via
 //!   tmp+rename and truncates the log.
-//! - **Cold sidecars** are fixed-slot and rebuildable. `cold.idx`
-//!   and `cold.val` share the same manifest slot as `blobs.dat`.
-//!   Rewriting or deleting a blob clears the sidecar header before
+//! - **Read accelerators** are fixed-slot and rebuildable. `read.idx`
+//!   and `value.seg` share the same manifest slot as `blobs.dat`.
+//!   Rewriting or deleting a blob clears the read-index header before
 //!   the authoritative frame changes; checkpoint publication writes
 //!   value bytes first and the index header last. Slot reuse is the
-//!   reclamation mechanism, avoiding an append-only cold-value GC.
+//!   reclamation mechanism, avoiding an append-only value-segment GC.
 //!
 //! ## I/O store
 //!
@@ -117,10 +117,10 @@ const DIR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MANIFEST_FILENAME: &str = "manifest.bin";
 /// Append-only manifest delta log inside `data_dir`.
 const MANIFEST_LOG_FILENAME: &str = "manifest.log";
-/// Packed rebuildable cold-read index file.
-const COLD_INDEX_FILENAME: &str = "cold.idx";
-/// Packed rebuildable cold-read value file.
-const COLD_VALUE_FILENAME: &str = "cold.val";
+/// Packed rebuildable read-index file.
+const READ_INDEX_FILENAME: &str = "read.idx";
+/// Packed rebuildable read-value segment file.
+const VALUE_SEGMENT_FILENAME: &str = "value.seg";
 /// Filename used as the rename staging target for the manifest.
 const MANIFEST_TMP_FILENAME: &str = "manifest.bin.tmp";
 /// Conservative iovec chunk limit used by the non-uring batch
@@ -157,10 +157,10 @@ const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// reordered to carry a self-describing `node_type @ +1` byte. Both
 /// change the on-blob byte layout, so v3 files are refused on load.
 /// v5 added a per-blob image `generation` to each manifest entry for
-/// an older cold-read sidecar design. v6 drops it: the current
-/// packed `cold.idx` sidecar validates against the blob header stamp,
-/// so the manifest generation field was dead weight. Older manifests
-/// (incl. v5) are refused on load, not migrated.
+/// an older read-accelerator design. v6 drops it: the current packed
+/// read index validates against the blob header stamp, so the
+/// manifest generation field was dead weight. Older manifests (incl.
+/// v5) are refused on load, not migrated.
 const MANIFEST_VERSION: u16 = 6;
 /// Per-record magic for `manifest.log`.
 const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
@@ -172,10 +172,10 @@ const MANIFEST_LOG_SET_BODY_SIZE: usize = 16 + 8;
 const MANIFEST_LOG_DELETE_BODY_SIZE: usize = 16;
 const MANIFEST_LOG_MIN_COMPACT_BYTES: u64 = 1024 * 1024;
 const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
-const COLD_INDEX_IO_ALIGN: usize = 512;
-const COLD_INDEX_SLOT_BYTES: usize = PAGE_SIZE as usize;
-const COLD_VALUE_IO_ALIGN: usize = 512;
-const COLD_VALUE_SLOT_BYTES: usize = PAGE_SIZE as usize;
+const READ_INDEX_IO_ALIGN: usize = 512;
+const READ_INDEX_SLOT_BYTES: usize = PAGE_SIZE as usize;
+const VALUE_SEGMENT_IO_ALIGN: usize = 512;
+const VALUE_SEGMENT_SLOT_BYTES: usize = PAGE_SIZE as usize;
 
 /// NVMe-backed, O_DIRECT, single-packed-file blob store.
 ///
@@ -194,8 +194,8 @@ pub struct FileBlobStore {
     /// holder never leaves a stale lock behind.
     _dir_lock: File,
     data_file: File,
-    cold_file: File,
-    cold_value_file: File,
+    read_index_file: File,
+    value_segment_file: File,
     manifest: RwLock<Manifest>,
     /// Tracks whether `manifest.bin` needs a rewrite. Data-only
     /// overwrites of existing blobs leave this false, avoiding
@@ -370,8 +370,8 @@ impl FileBlobStore {
         let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
-        let cold_path = data_dir.join(COLD_INDEX_FILENAME);
-        let cold_value_path = data_dir.join(COLD_VALUE_FILENAME);
+        let read_index_path = data_dir.join(READ_INDEX_FILENAME);
+        let value_segment_path = data_dir.join(VALUE_SEGMENT_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
         let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
 
@@ -385,25 +385,25 @@ impl FileBlobStore {
                 libc::O_CLOEXEC
             }
         };
-        let cold_flags = libc::O_CLOEXEC;
+        let index_flags = libc::O_CLOEXEC;
         let data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .custom_flags(data_flags)
             .open(&data_path)?;
-        let cold_file = OpenOptions::new()
+        let read_index_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(cold_flags)
-            .open(&cold_path)?;
-        let cold_value_file = OpenOptions::new()
+            .custom_flags(index_flags)
+            .open(&read_index_path)?;
+        let value_segment_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(cold_flags)
-            .open(&cold_value_path)?;
+            .custom_flags(index_flags)
+            .open(&value_segment_path)?;
 
         // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
         // closest equivalent (tells the VFS not to populate the
@@ -433,8 +433,8 @@ impl FileBlobStore {
             data_dir,
             _dir_lock: dir_lock,
             data_file,
-            cold_file,
-            cold_value_file,
+            read_index_file,
+            value_segment_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -461,8 +461,8 @@ impl FileBlobStore {
         let dir_lock = acquire_dir_lock(&data_dir, DIR_LOCK_ACQUIRE_TIMEOUT)?;
 
         let data_path = data_dir.join(DATA_FILENAME);
-        let cold_path = data_dir.join(COLD_INDEX_FILENAME);
-        let cold_value_path = data_dir.join(COLD_VALUE_FILENAME);
+        let read_index_path = data_dir.join(READ_INDEX_FILENAME);
+        let value_segment_path = data_dir.join(VALUE_SEGMENT_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
         let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
 
@@ -476,25 +476,25 @@ impl FileBlobStore {
                 libc::O_CLOEXEC
             }
         };
-        let cold_flags = libc::O_CLOEXEC;
+        let index_flags = libc::O_CLOEXEC;
         let data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .custom_flags(data_flags)
             .open(&data_path)?;
-        let cold_file = OpenOptions::new()
+        let read_index_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(cold_flags)
-            .open(&cold_path)?;
-        let cold_value_file = OpenOptions::new()
+            .custom_flags(index_flags)
+            .open(&read_index_path)?;
+        let value_segment_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(cold_flags)
-            .open(&cold_value_path)?;
+            .custom_flags(index_flags)
+            .open(&value_segment_path)?;
 
         #[cfg(target_os = "macos")]
         unsafe {
@@ -509,8 +509,8 @@ impl FileBlobStore {
             data_dir,
             _dir_lock: dir_lock,
             data_file,
-            cold_file,
-            cold_value_file,
+            read_index_file,
+            value_segment_file,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -542,43 +542,43 @@ impl FileBlobStore {
         Ok(self.entry_of(guid)?.slot * u64::from(PAGE_SIZE))
     }
 
-    fn cold_index_offset_of(&self, guid: BlobGuid) -> Option<u64> {
+    fn read_index_offset_of(&self, guid: BlobGuid) -> Option<u64> {
         let m = self.manifest.read().unwrap();
         m.entries
             .get(&guid)
             .map(|entry| entry.slot * u64::from(PAGE_SIZE))
     }
 
-    fn cold_value_offset_of(&self, guid: BlobGuid) -> Option<u64> {
+    fn value_segment_offset_of(&self, guid: BlobGuid) -> Option<u64> {
         let m = self.manifest.read().unwrap();
         m.entries
             .get(&guid)
             .map(|entry| entry.slot * u64::from(PAGE_SIZE))
     }
 
-    fn remove_cold_sidecars_best_effort(&self, guid: BlobGuid) {
-        let _ = self.clear_cold_sidecar_slots(guid);
+    fn remove_read_accelerators_best_effort(&self, guid: BlobGuid) {
+        let _ = self.clear_read_accelerator_slots(guid);
     }
 
-    fn clear_cold_sidecar_slots(&self, guid: BlobGuid) -> Result<()> {
-        self.clear_cold_index_slot(guid)?;
-        self.clear_cold_value_slot(guid)
+    fn clear_read_accelerator_slots(&self, guid: BlobGuid) -> Result<()> {
+        self.clear_read_index_slot(guid)?;
+        self.clear_value_segment_slot(guid)
     }
 
-    fn clear_cold_index_slot(&self, guid: BlobGuid) -> Result<()> {
-        let Some(offset) = self.cold_index_offset_of(guid) else {
+    fn clear_read_index_slot(&self, guid: BlobGuid) -> Result<()> {
+        let Some(offset) = self.read_index_offset_of(guid) else {
             return Ok(());
         };
-        let zeros = [0u8; COLD_INDEX_IO_ALIGN];
-        self.write_cold_index_aligned(offset, &zeros)
+        let zeros = [0u8; READ_INDEX_IO_ALIGN];
+        self.write_read_index_aligned(offset, &zeros)
     }
 
-    fn clear_cold_value_slot(&self, guid: BlobGuid) -> Result<()> {
-        let Some(offset) = self.cold_value_offset_of(guid) else {
+    fn clear_value_segment_slot(&self, guid: BlobGuid) -> Result<()> {
+        let Some(offset) = self.value_segment_offset_of(guid) else {
             return Ok(());
         };
-        let zeros = [0u8; COLD_VALUE_IO_ALIGN];
-        self.write_cold_value_aligned(offset, &zeros)
+        let zeros = [0u8; VALUE_SEGMENT_IO_ALIGN];
+        self.write_value_segment_aligned(offset, &zeros)
     }
 
     fn entry_of(&self, guid: BlobGuid) -> Result<ManifestEntry> {
@@ -797,19 +797,19 @@ impl FileBlobStore {
         Ok(())
     }
 
-    fn write_cold_index_aligned(&self, offset: u64, src: &[u8]) -> Result<()> {
-        debug_assert_eq!(offset % COLD_INDEX_IO_ALIGN as u64, 0);
-        debug_assert_eq!(src.len() % COLD_INDEX_IO_ALIGN, 0);
+    fn write_read_index_aligned(&self, offset: u64, src: &[u8]) -> Result<()> {
+        debug_assert_eq!(offset % READ_INDEX_IO_ALIGN as u64, 0);
+        debug_assert_eq!(src.len() % READ_INDEX_IO_ALIGN, 0);
         use std::os::unix::fs::FileExt;
-        self.cold_file.write_all_at(src, offset)?;
+        self.read_index_file.write_all_at(src, offset)?;
         Ok(())
     }
 
-    fn write_cold_value_aligned(&self, offset: u64, src: &[u8]) -> Result<()> {
-        debug_assert_eq!(offset % COLD_VALUE_IO_ALIGN as u64, 0);
-        debug_assert_eq!(src.len() % COLD_VALUE_IO_ALIGN, 0);
+    fn write_value_segment_aligned(&self, offset: u64, src: &[u8]) -> Result<()> {
+        debug_assert_eq!(offset % VALUE_SEGMENT_IO_ALIGN as u64, 0);
+        debug_assert_eq!(src.len() % VALUE_SEGMENT_IO_ALIGN, 0);
         use std::os::unix::fs::FileExt;
-        self.cold_value_file.write_all_at(src, offset)?;
+        self.value_segment_file.write_all_at(src, offset)?;
         Ok(())
     }
 
@@ -1076,24 +1076,19 @@ impl BlobStore for FileBlobStore {
         Ok(())
     }
 
-    fn read_cold_index_range(
-        &self,
-        guid: BlobGuid,
-        byte_offset: u64,
-        dst: &mut [u8],
-    ) -> Result<bool> {
-        let Some(base_offset) = self.cold_index_offset_of(guid) else {
+    fn read_index_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<bool> {
+        let Some(base_offset) = self.read_index_offset_of(guid) else {
             return Ok(false);
         };
         if dst.is_empty() {
             return Ok(true);
         }
         let start = usize::try_from(byte_offset)
-            .map_err(|_| Error::BlobStoreIo(io::Error::other("cold index offset")))?;
+            .map_err(|_| Error::BlobStoreIo(io::Error::other("read index offset")))?;
         let Some(end) = start.checked_add(dst.len()) else {
             return Ok(false);
         };
-        if end > COLD_INDEX_SLOT_BYTES {
+        if end > READ_INDEX_SLOT_BYTES {
             return Ok(false);
         }
         let offset = base_offset + byte_offset;
@@ -1102,7 +1097,7 @@ impl BlobStore for FileBlobStore {
         let mut filled = 0;
         while filled < dst.len() {
             match self
-                .cold_file
+                .read_index_file
                 .read_at(&mut dst[filled..], offset + filled as u64)
             {
                 Ok(0) => {
@@ -1117,24 +1112,24 @@ impl BlobStore for FileBlobStore {
         Ok(true)
     }
 
-    fn read_cold_value_range(
+    fn read_value_segment_range(
         &self,
         guid: BlobGuid,
         byte_offset: u64,
         dst: &mut [u8],
     ) -> Result<bool> {
-        let Some(base_offset) = self.cold_value_offset_of(guid) else {
+        let Some(base_offset) = self.value_segment_offset_of(guid) else {
             return Ok(false);
         };
         if dst.is_empty() {
             return Ok(true);
         }
         let start = usize::try_from(byte_offset)
-            .map_err(|_| Error::BlobStoreIo(io::Error::other("cold value offset")))?;
+            .map_err(|_| Error::BlobStoreIo(io::Error::other("value segment offset")))?;
         let Some(end) = start.checked_add(dst.len()) else {
             return Ok(false);
         };
-        if end > COLD_VALUE_SLOT_BYTES {
+        if end > VALUE_SEGMENT_SLOT_BYTES {
             return Ok(false);
         }
 
@@ -1143,7 +1138,7 @@ impl BlobStore for FileBlobStore {
         let mut filled = 0;
         while filled < dst.len() {
             match self
-                .cold_value_file
+                .value_segment_file
                 .read_at(&mut dst[filled..], offset + filled as u64)
             {
                 Ok(0) => {
@@ -1158,51 +1153,51 @@ impl BlobStore for FileBlobStore {
         Ok(true)
     }
 
-    fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8], value_bytes: &[u8]) -> Result<()> {
-        let Some(base_offset) = self.cold_index_offset_of(guid) else {
+    fn publish_read_index(&self, guid: BlobGuid, bytes: &[u8], value_bytes: &[u8]) -> Result<()> {
+        let Some(base_offset) = self.read_index_offset_of(guid) else {
             return Ok(());
         };
-        let Some(value_base_offset) = self.cold_value_offset_of(guid) else {
+        let Some(value_base_offset) = self.value_segment_offset_of(guid) else {
             return Ok(());
         };
         if bytes.is_empty()
-            || bytes.len() > COLD_INDEX_SLOT_BYTES
-            || value_bytes.len() > COLD_VALUE_SLOT_BYTES
+            || bytes.len() > READ_INDEX_SLOT_BYTES
+            || value_bytes.len() > VALUE_SEGMENT_SLOT_BYTES
         {
-            self.clear_cold_sidecar_slots(guid)?;
+            self.clear_read_accelerator_slots(guid)?;
             return Ok(());
         }
 
         if !value_bytes.is_empty() {
-            let aligned_value_len = align_up(value_bytes.len(), COLD_VALUE_IO_ALIGN);
+            let aligned_value_len = align_up(value_bytes.len(), VALUE_SEGMENT_IO_ALIGN);
             let mut direct = AlignedBlobBuf::zeroed();
             direct.as_mut_slice()[..value_bytes.len()].copy_from_slice(value_bytes);
-            self.write_cold_value_aligned(
+            self.write_value_segment_aligned(
                 value_base_offset,
                 &direct.as_mut_slice()[..aligned_value_len],
             )?;
         }
 
-        let aligned_len = align_up(bytes.len(), COLD_INDEX_IO_ALIGN);
+        let aligned_len = align_up(bytes.len(), READ_INDEX_IO_ALIGN);
         let mut direct = AlignedBlobBuf::zeroed();
         direct.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        if aligned_len > COLD_INDEX_IO_ALIGN {
-            self.write_cold_index_aligned(
-                base_offset + COLD_INDEX_IO_ALIGN as u64,
-                &direct.as_mut_slice()[COLD_INDEX_IO_ALIGN..aligned_len],
+        if aligned_len > READ_INDEX_IO_ALIGN {
+            self.write_read_index_aligned(
+                base_offset + READ_INDEX_IO_ALIGN as u64,
+                &direct.as_mut_slice()[READ_INDEX_IO_ALIGN..aligned_len],
             )?;
         }
-        self.write_cold_index_aligned(base_offset, &direct.as_mut_slice()[..COLD_INDEX_IO_ALIGN])?;
+        self.write_read_index_aligned(base_offset, &direct.as_mut_slice()[..READ_INDEX_IO_ALIGN])?;
         Ok(())
     }
 
-    fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
-        self.clear_cold_sidecar_slots(guid)
+    fn delete_read_index(&self, guid: BlobGuid) -> Result<()> {
+        self.clear_read_accelerator_slots(guid)
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        self.remove_cold_sidecars_best_effort(guid);
+        self.remove_read_accelerators_best_effort(guid);
         let entry = self.assign_write_entry(guid);
         let offset = entry.slot * u64::from(PAGE_SIZE);
         self.ensure_data_capacity(entry.slot.saturating_add(1))?;
@@ -1218,7 +1213,7 @@ impl BlobStore for FileBlobStore {
             return Ok(());
         }
         for (guid, _) in writes {
-            self.remove_cold_sidecars_best_effort(*guid);
+            self.remove_read_accelerators_best_effort(*guid);
         }
         self.mark_data_write_started();
         self.pwrite_many_at(&io)?;
@@ -1235,7 +1230,7 @@ impl BlobStore for FileBlobStore {
         {
             let io = self.prepare_blob_writes(writes)?;
             for (guid, _) in writes {
-                self.remove_cold_sidecars_best_effort(*guid);
+                self.remove_read_accelerators_best_effort(*guid);
             }
             let epoch = self.mark_data_write_started();
             self.pwrite_many_and_sync_at(&io)?;
@@ -1247,7 +1242,7 @@ impl BlobStore for FileBlobStore {
         {
             let io = self.prepare_blob_writes(writes)?;
             for (guid, _) in writes {
-                self.remove_cold_sidecars_best_effort(*guid);
+                self.remove_read_accelerators_best_effort(*guid);
             }
             self.mark_data_write_started();
             self.pwrite_many_at(&io)?;
@@ -1256,7 +1251,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
-        self.remove_cold_sidecars_best_effort(guid);
+        self.remove_read_accelerators_best_effort(guid);
         let mut m = self.manifest.write().unwrap();
         if let Some(entry) = m.entries.remove(&guid) {
             m.pending_free_slots.push(entry.slot);
@@ -1295,10 +1290,10 @@ impl BlobStore for FileBlobStore {
             pending_free_slots,
             data_file_bytes: file_len(&self.data_file),
             data_high_water_bytes: high_water,
-            cold_index_file_bytes: file_len(&self.cold_file),
-            cold_index_high_water_bytes: high_water,
-            cold_value_file_bytes: file_len(&self.cold_value_file),
-            cold_value_high_water_bytes: high_water,
+            read_index_file_bytes: file_len(&self.read_index_file),
+            read_index_high_water_bytes: high_water,
+            value_segment_file_bytes: file_len(&self.value_segment_file),
+            value_segment_high_water_bytes: high_water,
             manifest_log_bytes,
         }
     }
@@ -1966,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn store_stats_track_slots_and_sidecar_space() {
+    fn store_stats_track_slots_and_read_index_space() {
         let dir = tempfile::tempdir().unwrap();
         let Some(b) = try_open(dir.path()) else {
             return;
@@ -2001,15 +1996,15 @@ mod tests {
 
         b.write_blob(g2, &buf_with(2)).unwrap();
         b.flush().unwrap();
-        b.publish_cold_index(g2, &[0xAB; 512], &[0xCD; 512])
+        b.publish_read_index(g2, &[0xAB; 512], &[0xCD; 512])
             .unwrap();
-        let sidecar = b.store_stats();
-        assert_eq!(sidecar.live_blobs, 1);
-        assert_eq!(sidecar.next_slot, 1, "flushed free slot should be reused");
-        assert!(sidecar.cold_index_file_bytes >= 512);
-        assert!(sidecar.cold_value_file_bytes >= 512);
-        assert_eq!(sidecar.cold_index_high_water_bytes, u64::from(PAGE_SIZE));
-        assert_eq!(sidecar.cold_value_high_water_bytes, u64::from(PAGE_SIZE));
+        let stats = b.store_stats();
+        assert_eq!(stats.live_blobs, 1);
+        assert_eq!(stats.next_slot, 1, "flushed free slot should be reused");
+        assert!(stats.read_index_file_bytes >= 512);
+        assert!(stats.value_segment_file_bytes >= 512);
+        assert_eq!(stats.read_index_high_water_bytes, u64::from(PAGE_SIZE));
+        assert_eq!(stats.value_segment_high_water_bytes, u64::from(PAGE_SIZE));
     }
 
     #[test]
@@ -2269,65 +2264,65 @@ mod tests {
     }
 
     #[test]
-    fn cold_index_sidecar_round_trips_and_deletes() {
+    fn read_index_round_trips_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let Some(b) = try_open(dir.path()) else {
             return;
         };
         let g: BlobGuid = [0x9A; 16];
         b.write_blob(g, &buf_with(1)).unwrap();
-        b.publish_cold_index(g, b"index-bytes", b"value-bytes")
+        b.publish_read_index(g, b"index-bytes", b"value-bytes")
             .unwrap();
         let mut dst = vec![0; b"index-bytes".len()];
-        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert!(b.read_index_range(g, 0, &mut dst).unwrap());
         assert_eq!(dst, b"index-bytes");
         let mut value = vec![0; b"value-bytes".len()];
-        assert!(b.read_cold_value_range(g, 0, &mut value).unwrap());
+        assert!(b.read_value_segment_range(g, 0, &mut value).unwrap());
         assert_eq!(value, b"value-bytes");
-        b.delete_cold_index(g).unwrap();
-        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        b.delete_read_index(g).unwrap();
+        assert!(b.read_index_range(g, 0, &mut dst).unwrap());
         assert_ne!(dst, b"index-bytes");
-        assert!(b.read_cold_value_range(g, 0, &mut value).unwrap());
+        assert!(b.read_value_segment_range(g, 0, &mut value).unwrap());
         assert_ne!(value, b"value-bytes");
     }
 
     #[test]
-    fn cold_index_publish_overwrites_packed_slot() {
+    fn read_index_publish_overwrites_packed_slot() {
         let dir = tempfile::tempdir().unwrap();
         let Some(b) = try_open(dir.path()) else {
             return;
         };
         let g: BlobGuid = [0x9C; 16];
         b.write_blob(g, &buf_with(1)).unwrap();
-        b.publish_cold_index(g, b"old", b"old-value").unwrap();
+        b.publish_read_index(g, b"old", b"old-value").unwrap();
         let mut dst = vec![0; 3];
-        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert!(b.read_index_range(g, 0, &mut dst).unwrap());
         assert_eq!(dst, b"old");
         let mut value = vec![0; 9];
-        assert!(b.read_cold_value_range(g, 0, &mut value).unwrap());
+        assert!(b.read_value_segment_range(g, 0, &mut value).unwrap());
         assert_eq!(value, b"old-value");
-        b.publish_cold_index(g, b"new", b"new-value").unwrap();
-        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        b.publish_read_index(g, b"new", b"new-value").unwrap();
+        assert!(b.read_index_range(g, 0, &mut dst).unwrap());
         assert_eq!(dst, b"new");
-        assert!(b.read_cold_value_range(g, 0, &mut value).unwrap());
+        assert!(b.read_value_segment_range(g, 0, &mut value).unwrap());
         assert_eq!(value, b"new-value");
     }
 
     #[test]
-    fn blob_write_removes_stale_cold_index() {
+    fn blob_write_removes_stale_read_index() {
         let dir = tempfile::tempdir().unwrap();
         let Some(b) = try_open(dir.path()) else {
             return;
         };
         let g: BlobGuid = [0x9B; 16];
         b.write_blob(g, &buf_with(1)).unwrap();
-        b.publish_cold_index(g, b"stale", b"stale-value").unwrap();
+        b.publish_read_index(g, b"stale", b"stale-value").unwrap();
         b.write_blob(g, &buf_with(7)).unwrap();
         let mut dst = vec![0; b"stale".len()];
-        assert!(b.read_cold_index_range(g, 0, &mut dst).unwrap());
+        assert!(b.read_index_range(g, 0, &mut dst).unwrap());
         assert_ne!(dst, b"stale");
         let mut value = vec![0; b"stale-value".len()];
-        assert!(b.read_cold_value_range(g, 0, &mut value).unwrap());
+        assert!(b.read_value_segment_range(g, 0, &mut value).unwrap());
         assert_ne!(value, b"stale-value");
     }
 
@@ -2366,7 +2361,7 @@ mod range_read_test {
     use crate::store::blob_store::{AlignedBlobBuf, BlobStore};
     use crate::{Tree, TreeConfig};
 
-    // Page-granular reads (the cold-read I/O optimization) must reconstruct
+    // Page-granular reads (the indexed-read I/O optimization) must reconstruct
     // every real blob byte-for-byte vs the whole-frame read — on both the
     // O_DIRECT (Linux) and F_NOCACHE (macOS) paths.
     #[test]

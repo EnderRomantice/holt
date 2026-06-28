@@ -160,8 +160,8 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 HOLT_STRESS_WAL_SYNC=true \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
-# Force large values so Holt's cold-value sidecar is exercised
-# instead of inline-value hits. If a sidecar payload cannot fit in
+# Force large values so Holt's value-segment index is exercised
+# instead of inline-value hits. If a index payload cannot fit in
 # its bounded blob slot, Holt falls back to page-granular blob reads.
 HOLT_STRESS_VALUE_BYTES=4096 \
 HOLT_STRESS_OPS=get \
@@ -179,8 +179,8 @@ cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 
 When running cold-cache or constrained-buffer studies, use the
 `holt_shape` line as the primary Holt-specific diagnostic. For
-large-value cold reads, `cold_idx_value_hits` should dominate
-`cold_idx_offset_hits` when the cold-value sidecar is effective.
+large-value indexed reads, `read_idx_value_hits` should dominate
+`read_idx_offset_hits` when the value-segment index is effective.
 `bm_point_reads * 512 KiB / get_ops` shows the average backing-store
 bytes pulled by user point lookups, while `bm_scan_reads` and
 `bm_silent_reads` separate scan-driven churn and post-timing stats
@@ -203,7 +203,7 @@ HOLT_CGROUP_ENGINES=holt,rocksdb,sqlite \
 bash benches/eval_cgroup_rss.sh
 ```
 
-Use `HOLT_CGROUP_VALUE_BYTES=4096` for large-value cold-read
+Use `HOLT_CGROUP_VALUE_BYTES=4096` for large-value indexed-read
 studies, and keep `HOLT_CGROUP_OPS=get,list_dir,prefix_empty`
 when testing the metadata read path.
 

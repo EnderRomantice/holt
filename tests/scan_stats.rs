@@ -138,7 +138,7 @@ fn delimiter_list_dir_cache_serves_rollups_without_leaf_walk() {
 }
 
 #[test]
-fn cold_delimiter_rollup_uses_blobnode_summary_without_scan_pin() {
+fn indexed_delimiter_rollup_uses_blobnode_summary_without_scan_pin() {
     let dir = tempdir().unwrap();
     let cfg = TreeConfig::new(dir.path());
     {
@@ -172,7 +172,48 @@ fn cold_delimiter_rollup_uses_blobnode_summary_without_scan_pin() {
     let full_blob_reads = tree.stats().unwrap().bm_scan_full_blob_reads;
     assert!(
         full_blob_reads < rollups as u64,
-        "cold delimiter rollup should use BlobNode/cold-index liveness instead of pinning every child blob; full_blob_reads={full_blob_reads}, rollups={rollups}",
+        "cold delimiter rollup should use BlobNode/read-index liveness instead of pinning every child blob; full_blob_reads={full_blob_reads}, rollups={rollups}",
+    );
+}
+
+#[test]
+fn indexed_component_summary_rolls_child_blob_directories_with_one_routing_pin() {
+    let dir = tempdir().unwrap();
+    let cfg = TreeConfig::new(dir.path());
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let value = vec![9u8; 128];
+        for d in 0..8u32 {
+            for i in 0..900u32 {
+                tree.put(format!("bucket/a{d}/file-{i:04}").as_bytes(), &value)
+                    .unwrap();
+            }
+        }
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    let mut prefixes = Vec::new();
+    let outcome = tree
+        .scan_keys(b"bucket/")
+        .delimiter(b'/')
+        .visit_with_outcome(8, |entry| {
+            if let holt::KeyRangeEntryRef::CommonPrefix(prefix) = entry {
+                prefixes.push(prefix.to_vec());
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(outcome.stats.rollup, 8, "prefixes={prefixes:?}");
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.bm_scan_full_blob_reads <= 1,
+        "component summary should emit child directory rollups with at most one routing pin; full_blob_reads={}",
+        stats.bm_scan_full_blob_reads,
+    );
+    assert!(
+        stats.bm_read_index_loads > 0 || stats.bm_read_index_cache_hits > 0,
+        "component summary should be served from read-index liveness"
     );
 }
 

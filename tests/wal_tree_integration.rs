@@ -1388,7 +1388,7 @@ fn tree_stats_does_not_perturb_cache_counters_or_lru() {
 }
 
 #[test]
-fn cold_read_touches_one_child_blob_after_reopen() {
+fn indexed_read_touches_one_child_blob_after_reopen() {
     let dir = tempdir().unwrap();
     let mut cfg = manual_checkpoint_cfg(dir.path());
     cfg.buffer_pool_size = 1;
@@ -1456,7 +1456,7 @@ fn cold_read_touches_one_child_blob_after_reopen() {
 }
 
 #[test]
-fn cold_large_value_read_uses_value_sidecar_after_reopen() {
+fn indexed_large_value_read_uses_value_segment_after_reopen() {
     let dir = tempdir().unwrap();
     let mut cfg = manual_checkpoint_cfg(dir.path());
     cfg.buffer_pool_size = 1;
@@ -1494,7 +1494,7 @@ fn cold_large_value_read_uses_value_sidecar_after_reopen() {
 }
 
 #[test]
-fn db_cold_route_neighbor_get_falls_back_after_local_route_answer() {
+fn db_indexed_route_neighbor_get_falls_back_after_local_route_answer() {
     let dir = tempdir().unwrap();
     let mut cfg = durable_cfg(dir.path());
     cfg.buffer_pool_size = 64;

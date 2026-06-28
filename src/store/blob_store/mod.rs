@@ -40,7 +40,7 @@ use crate::layout::BlobGuid;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ColdBlobLookup {
+pub enum IndexedBlobLookup {
     Unknown,
     NotFound,
     Found {
@@ -104,7 +104,7 @@ pub trait BlobStore: Send + Sync {
 
     /// Read `dst.len()` bytes starting at `byte_offset` within blob `guid`.
     ///
-    /// Enables page-granular fallback reads when a cold-index hit
+    /// Enables page-granular fallback reads when a read-index hit
     /// points at a value that was too large to inline. For `O_DIRECT`
     /// backends the caller keeps `byte_offset`, `dst.len()`, and
     /// `dst`'s base 4 KB-aligned; the read-whole default below
@@ -121,12 +121,12 @@ pub trait BlobStore: Send + Sync {
         Ok(())
     }
 
-    /// Read a byte range from the optional cold-read index sidecar for `guid`.
+    /// Read a byte range from the optional read index for `guid`.
     ///
-    /// Sidecars are accelerators only: `None`, corrupt bytes, or a
+    /// Read indexes are accelerators only: `None`, corrupt bytes, or a
     /// stale stamp must make callers fall back to authoritative blob
-    /// reads. Memory/custom stores default to no sidecar support.
-    fn read_cold_index_range(
+    /// reads. Memory/custom stores default to no read-index support.
+    fn read_index_range(
         &self,
         _guid: BlobGuid,
         _byte_offset: u64,
@@ -135,12 +135,12 @@ pub trait BlobStore: Send + Sync {
         Ok(false)
     }
 
-    /// Read a byte range from the optional cold-read value sidecar for `guid`.
+    /// Read a byte range from the optional value segment for `guid`.
     ///
-    /// Value sidecars are addressed by a cold-index entry. They are
+    /// Value segments are addressed by read-index entries. They are
     /// rebuildable accelerators only; absence or corruption must make
     /// callers fall back to the authoritative blob frame.
-    fn read_cold_value_range(
+    fn read_value_segment_range(
         &self,
         _guid: BlobGuid,
         _byte_offset: u64,
@@ -149,14 +149,14 @@ pub trait BlobStore: Send + Sync {
         Ok(false)
     }
 
-    /// Publish rebuilt cold-read sidecars for `guid`.
+    /// Publish rebuilt read-index bytes for `guid`.
     ///
-    /// `index_bytes` is the routable directory/bucket sidecar;
+    /// `index_bytes` is the routable directory/bucket index;
     /// `value_bytes` is an optional same-blob payload region used by
-    /// large cold values. A failure here must not make committed blob
+    /// large value segments. A failure here must not make committed blob
     /// data unrecoverable; callers may ignore the error after
     /// invalidating any cached index.
-    fn publish_cold_index(
+    fn publish_read_index(
         &self,
         _guid: BlobGuid,
         _index_bytes: &[u8],
@@ -165,8 +165,8 @@ pub trait BlobStore: Send + Sync {
         Ok(())
     }
 
-    /// Delete the optional cold-read sidecar for `guid`.
-    fn delete_cold_index(&self, _guid: BlobGuid) -> Result<()> {
+    /// Delete the optional read index for `guid`.
+    fn delete_read_index(&self, _guid: BlobGuid) -> Result<()> {
         Ok(())
     }
 
@@ -226,7 +226,7 @@ pub trait BlobStore: Send + Sync {
     }
 
     /// Store-level space counters. Implementations that do not expose
-    /// packed-file or sidecar state may return zeros.
+    /// packed-file or read-index state may return zeros.
     fn store_stats(&self) -> StoreStats {
         StoreStats::default()
     }

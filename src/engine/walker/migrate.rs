@@ -141,7 +141,7 @@ pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
 }
 
 /// Whether compacting `frame` **now** would produce a routed
-/// (page-granular cold-read) layout.
+/// (page-granular indexed-read) layout.
 ///
 /// A read-only pass-0 measurement ([`routing_budget`] +
 /// [`routing_geometry`]) — no allocation, no mutation. The maintenance
@@ -640,9 +640,9 @@ fn budget_inner(
 /// between the routing arena and the leaf region. For a blob with only
 /// a handful of leaves that gap dominates `space_used` — it would make
 /// a compaction that genuinely reclaimed bytes *look* like growth, and
-/// such tiny blobs barely benefit from page-granular cold reads anyway.
+/// such tiny blobs barely benefit from page-granular indexed reads anyway.
 /// Below this threshold a blob keeps the legacy whole-frame layout.
-/// (The cold-read win for larger blobs is independent of this — it
+/// (The indexed-read win for larger blobs is independent of this — it
 /// always replaces a 512 KB frame read with a routing region + one leaf
 /// page.)
 const ROUTE_MIN_LEAF_BYTES: u32 = 2 * PAGE_4K;

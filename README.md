@@ -31,7 +31,7 @@ compaction stalls, or a single global writer lock.
   manifest replay, and reopen recovery.
 - **Concurrent hot path**: optimistic reads and per-blob latching for
   disjoint subtrees.
-- **Page-granular cold reads**: an in-blob routing region clusters a blob's
+- **Page-granular indexed reads**: an in-blob routing region clusters a blob's
   internal nodes so a cold point lookup reads only the pages its descent
   touches (~18 KB mean, ~27× less I/O) instead of pinning the whole 512 KB
   frame. Reusable header/routing pages are cached separately from one-shot
@@ -158,8 +158,8 @@ checkpointing:
 
 - WAL records make acknowledged mutations replayable.
 - Checkpoints flush dirty blob frames and compact the manifest.
-- Cold point reads are served page-granularly from the in-blob routing
-  region (built at compaction); it is a read accelerator, never the source
+- Indexed point reads are served page-granularly from the in-blob routing
+  region (built at compaction); it is an accelerator, never the source
   of truth.
 - `Durability::Wal { sync: false }` is the default throughput mode.
   Use `sync: true` when every committed mutation must force WAL sync.

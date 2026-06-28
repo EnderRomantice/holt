@@ -147,7 +147,7 @@ use crate::layout::{BlobGuid, HEADER_SIZE, PAGE_SIZE};
 use crate::store::{BlobFrameRef, PAGE_4K};
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
-use super::cold_read::{ColdIndex, ColdIndexCache, ColdIndexStamp, ColdPageCache};
+use super::read_index::{ReadIndex, ReadIndexCache, ReadIndexStamp, ReadPageCache};
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -236,47 +236,47 @@ enum PinAccess {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum ColdSidecarPolicy {
+enum ReadIndexPolicy {
     PointRead,
     Liveness,
 }
 
-const COLD_AUX_CACHE_MIN_BYTES: usize = 2 * 1024 * 1024;
-const COLD_AUX_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
-const COLD_AUX_CACHE_ENABLE_AT_BYTES: usize = 16 * 1024 * 1024;
-const COLD_INDEX_DIRECTORY_PROBE_BYTES: usize = PAGE_4K as usize;
+const READ_AUX_CACHE_MIN_BYTES: usize = 2 * 1024 * 1024;
+const READ_AUX_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const READ_AUX_CACHE_ENABLE_AT_BYTES: usize = 16 * 1024 * 1024;
+const READ_INDEX_DIRECTORY_PROBE_BYTES: usize = PAGE_4K as usize;
 
 #[derive(Clone, Copy, Debug)]
 struct CacheBudget {
     blob_slots: usize,
-    cold_page_bytes: usize,
-    cold_index_bytes: usize,
+    read_page_bytes: usize,
+    read_index_bytes: usize,
 }
 
 impl CacheBudget {
     fn memory(total_blob_slots: usize) -> Self {
         Self {
             blob_slots: total_blob_slots.max(1),
-            cold_page_bytes: 0,
-            cold_index_bytes: 0,
+            read_page_bytes: 0,
+            read_index_bytes: 0,
         }
     }
 
     fn file(total_blob_slots: usize) -> Self {
         let total_blob_slots = total_blob_slots.max(1);
         let total_bytes = total_blob_slots.saturating_mul(PAGE_SIZE as usize);
-        let cold_aux_bytes = if total_bytes < COLD_AUX_CACHE_ENABLE_AT_BYTES {
+        let read_aux_bytes = if total_bytes < READ_AUX_CACHE_ENABLE_AT_BYTES {
             0
         } else {
-            (total_bytes / 2).clamp(COLD_AUX_CACHE_MIN_BYTES, COLD_AUX_CACHE_MAX_BYTES)
+            (total_bytes / 2).clamp(READ_AUX_CACHE_MIN_BYTES, READ_AUX_CACHE_MAX_BYTES)
         };
-        let cold_index_bytes = cold_aux_bytes * 7 / 8;
-        let cold_page_bytes = cold_aux_bytes - cold_index_bytes;
-        let blob_bytes = total_bytes.saturating_sub(cold_aux_bytes);
+        let read_index_bytes = read_aux_bytes * 7 / 8;
+        let read_page_bytes = read_aux_bytes - read_index_bytes;
+        let blob_bytes = total_bytes.saturating_sub(read_aux_bytes);
         Self {
             blob_slots: (blob_bytes / PAGE_SIZE as usize).max(1),
-            cold_page_bytes,
-            cold_index_bytes,
+            read_page_bytes,
+            read_index_bytes,
         }
     }
 }
@@ -285,14 +285,14 @@ impl CacheBudget {
 pub(crate) struct BufferStats {
     pub(crate) dirty_count: usize,
     pub(crate) pending_delete_count: usize,
-    pub(crate) cold_token_count: usize,
-    pub(crate) cold_index_cache_entries: usize,
-    pub(crate) cold_index_cache_bytes: usize,
-    pub(crate) cold_index_cache_budget_bytes: usize,
-    pub(crate) cold_page_cache_entries: usize,
-    pub(crate) cold_page_cache_bytes: usize,
-    pub(crate) cold_page_cache_ghost_entries: usize,
-    pub(crate) cold_page_cache_budget_bytes: usize,
+    pub(crate) read_index_token_count: usize,
+    pub(crate) read_index_cache_entries: usize,
+    pub(crate) read_index_cache_bytes: usize,
+    pub(crate) read_index_cache_budget_bytes: usize,
+    pub(crate) read_page_cache_entries: usize,
+    pub(crate) read_page_cache_bytes: usize,
+    pub(crate) read_page_cache_ghost_entries: usize,
+    pub(crate) read_page_cache_budget_bytes: usize,
     pub(crate) cache_hits: u64,
     pub(crate) cache_misses: u64,
     pub(crate) full_blob_reads: u64,
@@ -300,21 +300,21 @@ pub(crate) struct BufferStats {
     pub(crate) point_full_blob_reads: u64,
     pub(crate) scan_full_blob_reads: u64,
     pub(crate) silent_full_blob_reads: u64,
-    pub(crate) cold_page_hits: u64,
-    pub(crate) cold_page_misses: u64,
-    pub(crate) cold_index_cache_hits: u64,
-    pub(crate) cold_index_cache_misses: u64,
-    pub(crate) cold_index_loads: u64,
-    pub(crate) cold_index_dir_read_bytes: u64,
-    pub(crate) cold_index_bucket_reads: u64,
-    pub(crate) cold_index_bucket_read_bytes: u64,
-    pub(crate) cold_index_inline_hits: u64,
-    pub(crate) cold_index_value_hits: u64,
-    pub(crate) cold_index_value_read_bytes: u64,
-    pub(crate) cold_index_offset_hits: u64,
-    pub(crate) cold_index_negative_hits: u64,
-    pub(crate) cold_index_crossing_hits: u64,
-    pub(crate) cold_index_unknowns: u64,
+    pub(crate) read_page_hits: u64,
+    pub(crate) read_page_misses: u64,
+    pub(crate) read_index_cache_hits: u64,
+    pub(crate) read_index_cache_misses: u64,
+    pub(crate) read_index_loads: u64,
+    pub(crate) read_index_dir_read_bytes: u64,
+    pub(crate) read_index_bucket_reads: u64,
+    pub(crate) read_index_bucket_read_bytes: u64,
+    pub(crate) read_index_inline_hits: u64,
+    pub(crate) read_index_value_hits: u64,
+    pub(crate) read_index_value_read_bytes: u64,
+    pub(crate) read_index_offset_hits: u64,
+    pub(crate) read_index_negative_hits: u64,
+    pub(crate) read_index_crossing_hits: u64,
+    pub(crate) read_index_unknowns: u64,
     pub(crate) optimistic_restarts: u64,
     pub(crate) range_restarts: u64,
     pub(crate) walker_ops: u64,
@@ -338,21 +338,21 @@ pub struct BufferManager {
     store: Arc<dyn BlobStore>,
     alloc_uninit: Arc<dyn Fn() -> AlignedBlobBuf + Send + Sync>,
     capacity: usize,
-    /// Bounded 4 KiB cache for cold-read header/routing pages.
+    /// Bounded 4 KiB cache for indexed-read header/routing pages.
     /// Counted inside the user-visible cache budget for file-backed
     /// trees; disabled for memory/custom stores.
-    cold_pages: ColdPageCache,
-    cold_indexes: ColdIndexCache,
-    /// Per-blob invalidation token for checkpoint sidecar and cold
-    /// page reads. Sidecars are validated against the on-disk header
+    read_pages: ReadPageCache,
+    read_indexes: ReadIndexCache,
+    /// Per-blob invalidation token for read-index and indexed page reads.
+    /// Read indexes are validated against the on-disk header
     /// when loaded; the token catches in-process writers/checkpoints
     /// after that without forcing every cold hit to reread the header.
-    cold_tokens: DashMap<BlobGuid, AtomicU64, GuidBuildHasher>,
+    read_index_tokens: DashMap<BlobGuid, AtomicU64, GuidBuildHasher>,
     /// Monotonic source for cold invalidation tokens. A removed GUID
     /// that is later reintroduced receives a fresh token instead of
-    /// reusing `0`, so stale sidecar observations cannot become valid
+    /// reusing `0`, so stale read-index observations cannot become valid
     /// through token-map GC.
-    cold_token_clock: AtomicU64,
+    read_index_token_clock: AtomicU64,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -579,7 +579,7 @@ impl BufferManager {
         drop(state);
         self.decrement_candidate_totals(removed);
         let _ = self.store.delete_blob(guid);
-        self.remove_cold_token_if_unreachable(guid);
+        self.remove_read_index_token_if_unreachable(guid);
     }
 
     /// GUIDs of every live snapshot's frozen root frame.
@@ -613,7 +613,7 @@ impl BufferManager {
 impl BufferManager {
     /// Wrap `store` with a cache of at most `capacity` blobs
     /// (each blob is 512 KB on the heap). A `capacity` of 0 is
-    /// clamped to 1. Generic/custom stores do not receive a cold-page
+    /// clamped to 1. Generic/custom stores do not receive a read-page
     /// side cache; file-backed trees call [`Self::new_file`] with their
     /// store-specific allocator.
     #[must_use]
@@ -629,8 +629,8 @@ impl BufferManager {
     /// store-specific uninitialized-frame allocator.
     ///
     /// The public `capacity` is expressed in 512 KB blob-frame units.
-    /// Internally, a bounded slice is reserved for rebuildable cold-read
-    /// indexes plus 4 KB cold pages; the remainder becomes resident blob
+    /// Internally, a bounded slice is reserved for rebuildable indexed-read
+    /// indexes plus 4 KB read pages; the remainder becomes resident blob
     /// slots.
     #[must_use]
     pub(crate) fn new_file<F>(store: Arc<dyn BlobStore>, capacity: usize, alloc_uninit: F) -> Self
@@ -653,10 +653,10 @@ impl BufferManager {
             store,
             alloc_uninit: Arc::new(alloc_uninit),
             capacity,
-            cold_pages: ColdPageCache::new(budget.cold_page_bytes),
-            cold_indexes: ColdIndexCache::new(budget.cold_index_bytes),
-            cold_tokens: DashMap::with_hasher(GuidBuildHasher),
-            cold_token_clock: AtomicU64::new(1),
+            read_pages: ReadPageCache::new(budget.read_page_bytes),
+            read_indexes: ReadIndexCache::new(budget.read_index_bytes),
+            read_index_tokens: DashMap::with_hasher(GuidBuildHasher),
+            read_index_token_clock: AtomicU64::new(1),
             cache: DashMap::with_hasher(GuidBuildHasher),
             admission: TinyLFU::new(),
             route_resident: RouteResidency::new(capacity),
@@ -785,19 +785,19 @@ impl BufferManager {
     }
 
     pub(crate) fn stats(&self) -> BufferStats {
-        let cold_index_cache = self.cold_indexes.snapshot();
-        let cold_page_cache = self.cold_pages.snapshot();
+        let read_index_cache = self.read_indexes.snapshot();
+        let read_page_cache = self.read_pages.snapshot();
         BufferStats {
             dirty_count: self.dirty_count(),
             pending_delete_count: self.pending_delete_count(),
-            cold_token_count: self.cold_tokens.len(),
-            cold_index_cache_entries: cold_index_cache.entries,
-            cold_index_cache_bytes: cold_index_cache.bytes,
-            cold_index_cache_budget_bytes: cold_index_cache.budget_bytes,
-            cold_page_cache_entries: cold_page_cache.entries,
-            cold_page_cache_bytes: cold_page_cache.bytes,
-            cold_page_cache_ghost_entries: cold_page_cache.ghost_entries,
-            cold_page_cache_budget_bytes: cold_page_cache.budget_bytes,
+            read_index_token_count: self.read_index_tokens.len(),
+            read_index_cache_entries: read_index_cache.entries,
+            read_index_cache_bytes: read_index_cache.bytes,
+            read_index_cache_budget_bytes: read_index_cache.budget_bytes,
+            read_page_cache_entries: read_page_cache.entries,
+            read_page_cache_bytes: read_page_cache.bytes,
+            read_page_cache_ghost_entries: read_page_cache.ghost_entries,
+            read_page_cache_budget_bytes: read_page_cache.budget_bytes,
             cache_hits: self.telemetry.cache_hits(),
             cache_misses: self.telemetry.cache_misses(),
             full_blob_reads: self.telemetry.full_blob_reads(),
@@ -805,21 +805,21 @@ impl BufferManager {
             point_full_blob_reads: self.telemetry.point_full_blob_reads(),
             scan_full_blob_reads: self.telemetry.scan_full_blob_reads(),
             silent_full_blob_reads: self.telemetry.silent_full_blob_reads(),
-            cold_page_hits: self.telemetry.cold_page_hits(),
-            cold_page_misses: self.telemetry.cold_page_misses(),
-            cold_index_cache_hits: self.telemetry.cold_index_cache_hits(),
-            cold_index_cache_misses: self.telemetry.cold_index_cache_misses(),
-            cold_index_loads: self.telemetry.cold_index_loads(),
-            cold_index_dir_read_bytes: self.telemetry.cold_index_dir_read_bytes(),
-            cold_index_bucket_reads: self.telemetry.cold_index_bucket_reads(),
-            cold_index_bucket_read_bytes: self.telemetry.cold_index_bucket_read_bytes(),
-            cold_index_inline_hits: self.telemetry.cold_index_inline_hits(),
-            cold_index_value_hits: self.telemetry.cold_index_value_hits(),
-            cold_index_value_read_bytes: self.telemetry.cold_index_value_read_bytes(),
-            cold_index_offset_hits: self.telemetry.cold_index_offset_hits(),
-            cold_index_negative_hits: self.telemetry.cold_index_negative_hits(),
-            cold_index_crossing_hits: self.telemetry.cold_index_crossing_hits(),
-            cold_index_unknowns: self.telemetry.cold_index_unknowns(),
+            read_page_hits: self.telemetry.read_page_hits(),
+            read_page_misses: self.telemetry.read_page_misses(),
+            read_index_cache_hits: self.telemetry.read_index_cache_hits(),
+            read_index_cache_misses: self.telemetry.read_index_cache_misses(),
+            read_index_loads: self.telemetry.read_index_loads(),
+            read_index_dir_read_bytes: self.telemetry.read_index_dir_read_bytes(),
+            read_index_bucket_reads: self.telemetry.read_index_bucket_reads(),
+            read_index_bucket_read_bytes: self.telemetry.read_index_bucket_read_bytes(),
+            read_index_inline_hits: self.telemetry.read_index_inline_hits(),
+            read_index_value_hits: self.telemetry.read_index_value_hits(),
+            read_index_value_read_bytes: self.telemetry.read_index_value_read_bytes(),
+            read_index_offset_hits: self.telemetry.read_index_offset_hits(),
+            read_index_negative_hits: self.telemetry.read_index_negative_hits(),
+            read_index_crossing_hits: self.telemetry.read_index_crossing_hits(),
+            read_index_unknowns: self.telemetry.read_index_unknowns(),
             optimistic_restarts: self.telemetry.optimistic_restarts(),
             range_restarts: self.telemetry.range_restarts(),
             walker_ops: self.telemetry.walker_ops(),
@@ -1173,11 +1173,11 @@ impl BufferManager {
 
     /// Pin only if the blob is already resident in the hot blob cache.
     ///
-    /// Point lookup uses this before trying the cold-read accelerator:
-    /// resident blobs are authoritative and should not pay sidecar
+    /// Point lookup uses this before trying the read index:
+    /// resident blobs are authoritative and should not pay read-index
     /// eligibility/index checks. A miss returns `Ok(None)` without
     /// reading the backing store, so callers can decide whether to use
-    /// cold-index/page reads or fall back to a full [`Self::pin`].
+    /// read-index/page reads or fall back to a full [`Self::pin`].
     pub(crate) fn pin_cached(&self, guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
@@ -1196,7 +1196,7 @@ impl BufferManager {
     /// Pin a batch of blobs for scanning, reading the cold ones in a
     /// single batched store read (device queue depth = batch size)
     /// instead of one serial round-trip each. The range scanner uses
-    /// this to read-ahead upcoming child blobs so their cold reads
+    /// this to read-ahead upcoming child blobs so their indexed reads
     /// pipeline. The parallelism lives in [`BlobStore::read_blobs`]:
     /// the `pread` store fans the reads across worker threads, the
     /// `io_uring` store submits them as one ring batch.
@@ -1215,7 +1215,7 @@ impl BufferManager {
         let mut out: Vec<Option<Arc<CachedBlob>>> = Vec::with_capacity(guids.len());
         // Phase 1 — probe the cache on this thread. Hits and
         // pending-delete guids are finalised now; misses leave a
-        // `None` placeholder and queue a cold read.
+        // `None` placeholder and queue a indexed read.
         let mut miss_guids: Vec<BlobGuid> = Vec::new();
         let mut miss_slots: Vec<usize> = Vec::new();
         for &guid in guids {
@@ -1306,8 +1306,8 @@ impl BufferManager {
     /// protected/pending a structural op.
     ///
     /// [`pin`]: Self::pin
-    pub(crate) fn cold_read_eligible(&self, guid: BlobGuid) -> bool {
-        self.cold_sidecar_eligible(guid, ColdSidecarPolicy::PointRead)
+    pub(crate) fn indexed_read_eligible(&self, guid: BlobGuid) -> bool {
+        self.read_index_eligible(guid, ReadIndexPolicy::PointRead)
     }
 
     /// Positional, page-granular read from the backing store, bypassing
@@ -1326,60 +1326,60 @@ impl BufferManager {
         self.store.read_blob_range(guid, byte_offset, dst)
     }
 
-    /// Fill `dst` with a cached 4 KiB cold-read page. The caller must
-    /// have checked [`Self::cold_read_eligible`] before trusting it.
-    pub(crate) fn cold_page_cached(&self, guid: BlobGuid, page: u16, dst: &mut [u8]) -> bool {
-        if self.cold_pages.fill(guid, page, dst) {
-            self.telemetry.note_cold_page_hit();
+    /// Fill `dst` with a cached 4 KiB indexed-read page. The caller must
+    /// have checked [`Self::indexed_read_eligible`] before trusting it.
+    pub(crate) fn read_page_cached(&self, guid: BlobGuid, page: u16, dst: &mut [u8]) -> bool {
+        if self.read_pages.fill(guid, page, dst) {
+            self.telemetry.note_read_page_hit();
             true
         } else {
-            self.telemetry.note_cold_page_miss();
+            self.telemetry.note_read_page_miss();
             false
         }
     }
 
-    /// Store a clean 4 KiB navigation page for later cold reads.
-    pub(crate) fn cold_page_store(&self, guid: BlobGuid, page: u16, src: &[u8]) {
-        self.cold_pages.put(guid, page, src);
+    /// Store a clean 4 KiB navigation page for later indexed reads.
+    pub(crate) fn read_page_store(&self, guid: BlobGuid, page: u16, src: &[u8]) {
+        self.read_pages.put(guid, page, src);
     }
 
-    /// Store a clean 4 KiB leaf page only after repeated cold touches.
-    pub(crate) fn cold_leaf_page_store(&self, guid: BlobGuid, page: u16, src: &[u8]) {
-        self.cold_pages.put_after_second_touch(guid, page, src);
+    /// Store a clean 4 KiB leaf page only after repeated indexed reads.
+    pub(crate) fn read_leaf_page_store(&self, guid: BlobGuid, page: u16, src: &[u8]) {
+        self.read_pages.put_after_second_touch(guid, page, src);
     }
 
-    pub(crate) fn cold_index(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
-        self.cold_index_load(guid, ColdSidecarPolicy::PointRead)
+    pub(crate) fn read_index(&self, guid: BlobGuid) -> Option<(Arc<ReadIndex>, u64)> {
+        self.read_index_load(guid, ReadIndexPolicy::PointRead)
     }
 
-    pub(crate) fn cold_index_for_liveness(&self, guid: BlobGuid) -> Option<(Arc<ColdIndex>, u64)> {
-        self.cold_index_load(guid, ColdSidecarPolicy::Liveness)
+    pub(crate) fn read_index_for_liveness(&self, guid: BlobGuid) -> Option<(Arc<ReadIndex>, u64)> {
+        self.read_index_load(guid, ReadIndexPolicy::Liveness)
     }
 
-    fn cold_index_load(
+    fn read_index_load(
         &self,
         guid: BlobGuid,
-        policy: ColdSidecarPolicy,
-    ) -> Option<(Arc<ColdIndex>, u64)> {
-        if !self.cold_sidecar_eligible(guid, policy) {
+        policy: ReadIndexPolicy,
+    ) -> Option<(Arc<ReadIndex>, u64)> {
+        if !self.read_index_eligible(guid, policy) {
             return None;
         }
-        if let Some(index) = self.cold_indexes.get(guid) {
-            self.telemetry.note_cold_index_cache_hit();
-            return self.cold_token(guid).map(|token| (index, token));
+        if let Some(index) = self.read_indexes.get(guid) {
+            self.telemetry.note_read_index_cache_hit();
+            return self.read_index_token(guid).map(|token| (index, token));
         }
-        self.telemetry.note_cold_index_cache_miss();
-        let token = self.ensure_cold_token(guid);
-        let mut bytes = vec![0; COLD_INDEX_DIRECTORY_PROBE_BYTES];
-        if !self.store.read_cold_index_range(guid, 0, &mut bytes).ok()? {
+        self.telemetry.note_read_index_cache_miss();
+        let token = self.ensure_read_index_token(guid);
+        let mut bytes = vec![0; READ_INDEX_DIRECTORY_PROBE_BYTES];
+        if !self.store.read_index_range(guid, 0, &mut bytes).ok()? {
             return None;
         }
-        let directory_len = ColdIndex::directory_len(&bytes).ok()?;
+        let directory_len = ReadIndex::directory_len(&bytes).ok()?;
         let read_bytes = if directory_len > bytes.len() {
             let mut rest = vec![0; directory_len - bytes.len()];
             if !self
                 .store
-                .read_cold_index_range(guid, bytes.len() as u64, &mut rest)
+                .read_index_range(guid, bytes.len() as u64, &mut rest)
                 .ok()?
             {
                 return None;
@@ -1388,34 +1388,34 @@ impl BufferManager {
             bytes.len() as u64
         } else {
             bytes.truncate(directory_len);
-            COLD_INDEX_DIRECTORY_PROBE_BYTES as u64
+            READ_INDEX_DIRECTORY_PROBE_BYTES as u64
         };
-        let index = ColdIndex::decode_directory(bytes).ok()?;
-        if !self.cold_index_stamp_matches(guid, &index).ok()? {
-            self.cold_indexes.invalidate(guid);
+        let index = ReadIndex::decode_directory(bytes).ok()?;
+        if !self.read_index_stamp_matches(guid, &index).ok()? {
+            self.read_indexes.invalidate(guid);
             return None;
         }
-        if self.cold_token(guid) != Some(token) || !self.cold_sidecar_eligible(guid, policy) {
+        if self.read_index_token(guid) != Some(token) || !self.read_index_eligible(guid, policy) {
             return None;
         }
-        self.telemetry.note_cold_index_load(read_bytes);
-        Some((self.cold_indexes.insert(guid, index), token))
+        self.telemetry.note_read_index_load(read_bytes);
+        Some((self.read_indexes.insert(guid, index), token))
     }
 
-    pub(crate) fn read_cold_index_bucket(
+    pub(crate) fn read_index_bucket(
         &self,
         guid: BlobGuid,
-        index: &ColdIndex,
+        index: &ReadIndex,
         user_key: &[u8],
         dst: &mut Vec<u8>,
     ) -> Option<()> {
         let (off, len) = index.bucket_range(user_key)?;
         dst.resize(len as usize, 0);
-        self.telemetry.note_cold_index_bucket_read(u64::from(len));
+        self.telemetry.note_read_index_bucket_read(u64::from(len));
         if len != 0
             && !self
                 .store
-                .read_cold_index_range(guid, u64::from(off), dst.as_mut_slice())
+                .read_index_range(guid, u64::from(off), dst.as_mut_slice())
                 .ok()?
         {
             return None;
@@ -1423,7 +1423,7 @@ impl BufferManager {
         Some(())
     }
 
-    pub(crate) fn read_cold_value_range(
+    pub(crate) fn read_value_segment_range(
         &self,
         guid: BlobGuid,
         byte_offset: u64,
@@ -1431,7 +1431,7 @@ impl BufferManager {
     ) -> Option<()> {
         if !self
             .store
-            .read_cold_value_range(guid, byte_offset, dst)
+            .read_value_segment_range(guid, byte_offset, dst)
             .ok()?
         {
             return None;
@@ -1439,90 +1439,90 @@ impl BufferManager {
         Some(())
     }
 
-    pub(crate) fn note_cold_index_inline_hit(&self) {
-        self.telemetry.note_cold_index_inline_hit();
+    pub(crate) fn note_read_index_inline_hit(&self) {
+        self.telemetry.note_read_index_inline_hit();
     }
 
-    pub(crate) fn note_cold_index_value_hit(&self, bytes: u64) {
-        self.telemetry.note_cold_index_value_hit(bytes);
+    pub(crate) fn note_read_index_value_hit(&self, bytes: u64) {
+        self.telemetry.note_read_index_value_hit(bytes);
     }
 
-    pub(crate) fn note_cold_index_offset_hit(&self) {
-        self.telemetry.note_cold_index_offset_hit();
+    pub(crate) fn note_read_index_offset_hit(&self) {
+        self.telemetry.note_read_index_offset_hit();
     }
 
-    pub(crate) fn note_cold_index_negative_hit(&self) {
-        self.telemetry.note_cold_index_negative_hit();
+    pub(crate) fn note_read_index_negative_hit(&self) {
+        self.telemetry.note_read_index_negative_hit();
     }
 
-    pub(crate) fn note_cold_index_crossing_hit(&self) {
-        self.telemetry.note_cold_index_crossing_hit();
+    pub(crate) fn note_read_index_crossing_hit(&self) {
+        self.telemetry.note_read_index_crossing_hit();
     }
 
-    pub(crate) fn note_cold_index_unknown(&self) {
-        self.telemetry.note_cold_index_unknown();
+    pub(crate) fn note_read_index_unknown(&self) {
+        self.telemetry.note_read_index_unknown();
     }
 
-    fn cold_read_invalidate(&self, guid: BlobGuid) {
-        self.bump_cold_token(guid);
-        self.cold_pages.invalidate(guid);
-        self.cold_indexes.invalidate(guid);
+    fn invalidate_indexed_reads(&self, guid: BlobGuid) {
+        self.bump_read_index_token(guid);
+        self.read_pages.invalidate(guid);
+        self.read_indexes.invalidate(guid);
     }
 
-    pub(crate) fn cold_token_valid(&self, guid: BlobGuid, token: u64) -> bool {
-        self.cold_read_eligible(guid) && self.cold_token(guid) == Some(token)
+    pub(crate) fn read_index_token_valid(&self, guid: BlobGuid, token: u64) -> bool {
+        self.indexed_read_eligible(guid) && self.read_index_token(guid) == Some(token)
     }
 
-    pub(crate) fn cold_liveness_token_valid(&self, guid: BlobGuid, token: u64) -> bool {
-        self.cold_sidecar_eligible(guid, ColdSidecarPolicy::Liveness)
-            && self.cold_token(guid) == Some(token)
+    pub(crate) fn read_index_liveness_token_valid(&self, guid: BlobGuid, token: u64) -> bool {
+        self.read_index_eligible(guid, ReadIndexPolicy::Liveness)
+            && self.read_index_token(guid) == Some(token)
     }
 
-    fn cold_sidecar_eligible(&self, guid: BlobGuid, policy: ColdSidecarPolicy) -> bool {
+    fn read_index_eligible(&self, guid: BlobGuid, policy: ReadIndexPolicy) -> bool {
         if self.store.needs_flush() || self.is_pending_delete(guid) {
             return false;
         }
         if !self.store.has_blob(guid).unwrap_or(false) {
             return false;
         }
-        if policy == ColdSidecarPolicy::PointRead && self.cache.contains_key(&guid) {
+        if policy == ReadIndexPolicy::PointRead && self.cache.contains_key(&guid) {
             return false;
         }
         let state = self.mutation_shard(guid).lock().unwrap();
         !state.is_protected_or_pending(&guid)
     }
 
-    fn cold_token(&self, guid: BlobGuid) -> Option<u64> {
-        self.cold_tokens
+    fn read_index_token(&self, guid: BlobGuid) -> Option<u64> {
+        self.read_index_tokens
             .get(&guid)
             .map(|entry| entry.load(Ordering::Acquire))
     }
 
-    fn ensure_cold_token(&self, guid: BlobGuid) -> u64 {
-        if let Some(entry) = self.cold_tokens.get(&guid) {
+    fn ensure_read_index_token(&self, guid: BlobGuid) -> u64 {
+        if let Some(entry) = self.read_index_tokens.get(&guid) {
             return entry.load(Ordering::Acquire);
         }
-        let token = self.next_cold_token();
+        let token = self.next_read_index_token();
         let entry = self
-            .cold_tokens
+            .read_index_tokens
             .entry(guid)
             .or_insert_with(|| AtomicU64::new(token));
         entry.load(Ordering::Acquire)
     }
 
-    fn bump_cold_token(&self, guid: BlobGuid) {
-        let token = self.next_cold_token();
-        self.cold_tokens
+    fn bump_read_index_token(&self, guid: BlobGuid) {
+        let token = self.next_read_index_token();
+        self.read_index_tokens
             .entry(guid)
             .or_insert_with(|| AtomicU64::new(token))
             .store(token, Ordering::Release);
     }
 
-    fn next_cold_token(&self) -> u64 {
-        self.cold_token_clock.fetch_add(1, Ordering::AcqRel) + 1
+    fn next_read_index_token(&self) -> u64 {
+        self.read_index_token_clock.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn remove_cold_token_if_unreachable(&self, guid: BlobGuid) {
+    fn remove_read_index_token_if_unreachable(&self, guid: BlobGuid) {
         if self.cache.contains_key(&guid) {
             return;
         }
@@ -1535,17 +1535,17 @@ impl BufferManager {
         if self.store.has_blob(guid).unwrap_or(true) {
             return;
         }
-        self.cold_pages.invalidate(guid);
-        self.cold_indexes.invalidate(guid);
-        self.cold_tokens.remove(&guid);
+        self.read_pages.invalidate(guid);
+        self.read_indexes.invalidate(guid);
+        self.read_index_tokens.remove(&guid);
     }
 
-    fn cold_index_stamp_matches(&self, guid: BlobGuid, index: &ColdIndex) -> Result<bool> {
+    fn read_index_stamp_matches(&self, guid: BlobGuid, index: &ReadIndex) -> Result<bool> {
         let mut scratch = AlignedBlobBuf::zeroed();
         self.store
             .read_blob_range(guid, 0, &mut scratch.as_mut_slice()[..HEADER_SIZE as usize])?;
         let frame = BlobFrameRef::wrap(scratch.as_slice());
-        Ok(ColdIndexStamp::new(frame.header()) == index.stamp())
+        Ok(ReadIndexStamp::new(frame.header()) == index.stamp())
     }
 
     fn note_full_blob_read(&self, access: PinAccess) {
@@ -1753,7 +1753,7 @@ impl BufferManager {
             // snapshot the bytes it is asked to flush.
             return;
         };
-        self.cold_read_invalidate(guid);
+        self.invalidate_indexed_reads(guid);
         let hint_covers_seq = !cached.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if state.has_delete_fence(&guid) {
@@ -2110,7 +2110,7 @@ impl BufferManager {
         }
         self.route_resident.remove(guid);
         self.finish_pending_delete(guid);
-        self.remove_cold_token_if_unreachable(guid);
+        self.remove_read_index_token_if_unreachable(guid);
         Ok(true)
     }
 
@@ -2247,8 +2247,8 @@ impl BufferManager {
         }
         for idx in &write_indices {
             let entry = &entries[*idx];
-            self.cold_read_invalidate(entry.guid);
-            self.try_publish_cold_index(entry.guid, &entry.bytes);
+            self.invalidate_indexed_reads(entry.guid);
+            self.try_publish_read_index(entry.guid, &entry.bytes);
         }
         for idx in write_indices {
             let entry = &entries[idx];
@@ -2294,29 +2294,29 @@ impl BufferManager {
         }
     }
 
-    fn try_publish_cold_index(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) {
+    fn try_publish_read_index(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) {
         let frame = BlobFrameRef::wrap(bytes.as_slice());
-        let Ok(build) = ColdIndex::build(frame) else {
+        let Ok(build) = ReadIndex::build(frame) else {
             return;
         };
         if self
             .store
-            .publish_cold_index(guid, &build.index, &build.values)
+            .publish_read_index(guid, &build.index, &build.values)
             .is_err()
         {
-            self.cold_indexes.invalidate(guid);
+            self.read_indexes.invalidate(guid);
             return;
         }
-        let Ok(directory_len) = ColdIndex::directory_len(&build.index[..ColdIndex::HEADER_LEN])
+        let Ok(directory_len) = ReadIndex::directory_len(&build.index[..ReadIndex::HEADER_LEN])
         else {
-            self.cold_indexes.invalidate(guid);
+            self.read_indexes.invalidate(guid);
             return;
         };
-        let Ok(index) = ColdIndex::decode_directory(build.index[..directory_len].to_vec()) else {
-            self.cold_indexes.invalidate(guid);
+        let Ok(index) = ReadIndex::decode_directory(build.index[..directory_len].to_vec()) else {
+            self.read_indexes.invalidate(guid);
             return;
         };
-        let _ = self.cold_indexes.insert(guid, index);
+        let _ = self.read_indexes.insert(guid, index);
     }
 
     /// Forward `flush` to the inner store without touching the
@@ -2349,7 +2349,7 @@ impl BufferManager {
     /// here; the background eviction thread or the next round's
     /// flush will catch up.
     pub(crate) fn install_new_blob(&self, guid: BlobGuid, mut bytes: AlignedBlobBuf, seq: u64) {
-        self.cold_read_invalidate(guid);
+        self.invalidate_indexed_reads(guid);
         // Stamp the creation epoch so copy-on-write snapshots can tell
         // whether a later mutation must fork this frame rather than
         // overwrite it in place.
@@ -2407,29 +2407,24 @@ impl BlobStore for BufferManager {
         self.store.read_blob_range(guid, byte_offset, dst)
     }
 
-    fn read_cold_index_range(
-        &self,
-        guid: BlobGuid,
-        byte_offset: u64,
-        dst: &mut [u8],
-    ) -> Result<bool> {
-        self.store.read_cold_index_range(guid, byte_offset, dst)
+    fn read_index_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<bool> {
+        self.store.read_index_range(guid, byte_offset, dst)
     }
 
-    fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
-        self.store.publish_cold_index(guid, bytes, values)
+    fn publish_read_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
+        self.store.publish_read_index(guid, bytes, values)
     }
 
-    fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
-        self.cold_read_invalidate(guid);
-        self.store.delete_cold_index(guid)
+    fn delete_read_index(&self, guid: BlobGuid) -> Result<()> {
+        self.invalidate_indexed_reads(guid);
+        self.store.delete_read_index(guid)
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.cold_read_invalidate(guid);
+        self.invalidate_indexed_reads(guid);
         // Transparent write-through: if cached, refresh the
         // cached image; either way, always write to the inner
         // store in the same call so durability is unchanged.
@@ -2457,7 +2452,7 @@ impl BlobStore for BufferManager {
             }
         }
         for (guid, _) in writes {
-            self.cold_read_invalidate(*guid);
+            self.invalidate_indexed_reads(*guid);
         }
         for (guid, src) in writes {
             if let Some(entry) = self.get_cached_with_access(*guid, PinAccess::Silent) {
@@ -2481,14 +2476,14 @@ impl BlobStore for BufferManager {
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.cold_read_invalidate(guid);
+        self.invalidate_indexed_reads(guid);
         if !self.evict_from_cache(guid) {
             return Err(Error::Internal(
                 "delete_blob: protected cache image cannot be evicted",
             ));
         }
         self.store.delete_blob(guid)?;
-        self.remove_cold_token_if_unreachable(guid);
+        self.remove_read_index_token_if_unreachable(guid);
         Ok(())
     }
 
@@ -2592,29 +2587,29 @@ mod tests {
         }
     }
 
-    struct CountingColdStore {
+    struct CountingReadIndexStore {
         inner: FileBlobStore,
-        cold_reads: AtomicUsize,
+        index_reads: AtomicUsize,
     }
 
-    impl CountingColdStore {
+    impl CountingReadIndexStore {
         fn open(path: &std::path::Path) -> Result<Self> {
             Ok(Self {
                 inner: FileBlobStore::open(path)?,
-                cold_reads: AtomicUsize::new(0),
+                index_reads: AtomicUsize::new(0),
             })
         }
 
-        fn cold_reads(&self) -> usize {
-            self.cold_reads.load(Ordering::Acquire)
+        fn index_reads(&self) -> usize {
+            self.index_reads.load(Ordering::Acquire)
         }
 
-        fn reset_cold_reads(&self) {
-            self.cold_reads.store(0, Ordering::Release);
+        fn reset_index_reads(&self) {
+            self.index_reads.store(0, Ordering::Release);
         }
     }
 
-    impl BlobStore for CountingColdStore {
+    impl BlobStore for CountingReadIndexStore {
         fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
             self.inner.alloc_blob_buf_zeroed()
         }
@@ -2631,31 +2626,31 @@ mod tests {
             self.inner.read_blob_range(guid, byte_offset, dst)
         }
 
-        fn read_cold_index_range(
+        fn read_index_range(
             &self,
             guid: BlobGuid,
             byte_offset: u64,
             dst: &mut [u8],
         ) -> Result<bool> {
-            self.cold_reads.fetch_add(1, Ordering::AcqRel);
-            self.inner.read_cold_index_range(guid, byte_offset, dst)
+            self.index_reads.fetch_add(1, Ordering::AcqRel);
+            self.inner.read_index_range(guid, byte_offset, dst)
         }
 
-        fn read_cold_value_range(
+        fn read_value_segment_range(
             &self,
             guid: BlobGuid,
             byte_offset: u64,
             dst: &mut [u8],
         ) -> Result<bool> {
-            self.inner.read_cold_value_range(guid, byte_offset, dst)
+            self.inner.read_value_segment_range(guid, byte_offset, dst)
         }
 
-        fn publish_cold_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
-            self.inner.publish_cold_index(guid, bytes, values)
+        fn publish_read_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
+            self.inner.publish_read_index(guid, bytes, values)
         }
 
-        fn delete_cold_index(&self, guid: BlobGuid) -> Result<()> {
-            self.inner.delete_cold_index(guid)
+        fn delete_read_index(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_read_index(guid)
         }
 
         fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
@@ -2699,8 +2694,8 @@ mod tests {
     fn file_cache_budget_splits_cold_aux_inside_total() {
         let budget = CacheBudget::file(256);
 
-        assert_eq!(budget.cold_page_bytes, 8 * 1024 * 1024);
-        assert_eq!(budget.cold_index_bytes, 56 * 1024 * 1024);
+        assert_eq!(budget.read_page_bytes, 8 * 1024 * 1024);
+        assert_eq!(budget.read_index_bytes, 56 * 1024 * 1024);
         assert_eq!(budget.blob_slots, 128);
     }
 
@@ -2708,8 +2703,8 @@ mod tests {
     fn small_file_cache_budget_preserves_blob_slots() {
         let budget = CacheBudget::file(16);
 
-        assert_eq!(budget.cold_page_bytes, 0);
-        assert_eq!(budget.cold_index_bytes, 0);
+        assert_eq!(budget.read_page_bytes, 0);
+        assert_eq!(budget.read_index_bytes, 0);
         assert_eq!(budget.blob_slots, 16);
     }
 
@@ -2717,13 +2712,13 @@ mod tests {
     fn memory_cache_budget_disables_cold_aux() {
         let budget = CacheBudget::memory(256);
 
-        assert_eq!(budget.cold_page_bytes, 0);
-        assert_eq!(budget.cold_index_bytes, 0);
+        assert_eq!(budget.read_page_bytes, 0);
+        assert_eq!(budget.read_index_bytes, 0);
         assert_eq!(budget.blob_slots, 256);
     }
 
     #[test]
-    fn cold_read_eligible_waits_for_store_flush() {
+    fn indexed_read_eligible_waits_for_store_flush() {
         let guid = [0xCE; 16];
         let inner = Arc::new(FlushPendingStore::new());
         inner.write_blob(guid, &make_buf(7)).unwrap();
@@ -2731,50 +2726,50 @@ mod tests {
         let bm = BufferManager::new_file(store, 128, AlignedBlobBuf::zeroed);
 
         assert!(
-            !bm.cold_read_eligible(guid),
-            "partial cold reads must not bypass a store with unflushed data or manifest state",
+            !bm.indexed_read_eligible(guid),
+            "partial indexed reads must not bypass a store with unflushed data or manifest state",
         );
 
         inner.flush().unwrap();
         assert!(
-            bm.cold_read_eligible(guid),
-            "once the store is durable and the blob is not cached/protected, cold reads may proceed",
+            bm.indexed_read_eligible(guid),
+            "once the store is durable and the blob is not cached/protected, indexed reads may proceed",
         );
     }
 
     #[test]
-    fn cold_tokens_are_removed_after_final_delete() {
+    fn read_index_tokens_are_removed_after_final_delete() {
         let guid = [0xC1; 16];
         let inner = Arc::new(MemoryBlobStore::new());
         inner.write_blob(guid, &make_buf(7)).unwrap();
         let store: Arc<dyn BlobStore> = inner.clone();
         let bm = BufferManager::new(store, 4);
 
-        let token = bm.ensure_cold_token(guid);
-        assert!(bm.cold_token_valid(guid, token));
-        assert_eq!(bm.stats().cold_token_count, 1);
+        let token = bm.ensure_read_index_token(guid);
+        assert!(bm.read_index_token_valid(guid, token));
+        assert_eq!(bm.stats().read_index_token_count, 1);
 
         bm.delete_blob(guid).unwrap();
-        assert_eq!(bm.stats().cold_token_count, 0);
-        assert!(!bm.cold_token_valid(guid, token));
+        assert_eq!(bm.stats().read_index_token_count, 0);
+        assert!(!bm.read_index_token_valid(guid, token));
     }
 
     #[test]
-    fn reintroduced_guid_gets_fresh_cold_token() {
+    fn reintroduced_guid_gets_fresh_read_index_token() {
         let guid = [0xC2; 16];
         let inner = Arc::new(MemoryBlobStore::new());
         inner.write_blob(guid, &make_buf(1)).unwrap();
         let store: Arc<dyn BlobStore> = inner.clone();
         let bm = BufferManager::new(store, 4);
 
-        let first = bm.ensure_cold_token(guid);
+        let first = bm.ensure_read_index_token(guid);
         bm.delete_blob(guid).unwrap();
         inner.write_blob(guid, &make_buf(2)).unwrap();
-        let second = bm.ensure_cold_token(guid);
+        let second = bm.ensure_read_index_token(guid);
 
         assert_ne!(first, second);
-        assert!(!bm.cold_token_valid(guid, first));
-        assert!(bm.cold_token_valid(guid, second));
+        assert!(!bm.read_index_token_valid(guid, first));
+        assert!(bm.read_index_token_valid(guid, second));
     }
 
     #[test]
@@ -4186,7 +4181,7 @@ mod tests {
     }
 
     #[test]
-    fn write_through_batch_invalidates_cold_read_cache_before_retire() {
+    fn write_through_batch_invalidates_indexed_read_cache_before_retire() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0xBC; 16];
         inner.write_blob(guid, &make_buf(0)).unwrap();
@@ -4194,8 +4189,8 @@ mod tests {
 
         let old_page = [0xA5; PAGE_4K as usize];
         let mut dst = [0u8; PAGE_4K as usize];
-        bm.cold_page_store(guid, 0, &old_page);
-        assert!(bm.cold_page_cached(guid, 0, &mut dst));
+        bm.read_page_store(guid, 0, &old_page);
+        assert!(bm.read_page_cached(guid, 0, &mut dst));
         assert_eq!(dst, old_page);
 
         let pin = bm.pin(guid).unwrap();
@@ -4216,13 +4211,13 @@ mod tests {
         .unwrap();
 
         assert!(
-            !bm.cold_page_cached(guid, 0, &mut dst),
-            "checkpointed bytes must retire stale cold navigation pages"
+            !bm.read_page_cached(guid, 0, &mut dst),
+            "checkpointed bytes must retire stale indexed navigation pages"
         );
     }
 
     #[test]
-    fn write_through_batch_publishes_cold_index_sidecar() {
+    fn write_through_batch_publishes_read_index() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::blob_store::FileBlobStore::open(dir.path()).unwrap());
         let store_dyn: Arc<dyn BlobStore> = store.clone();
@@ -4239,30 +4234,30 @@ mod tests {
         }])
         .unwrap();
 
-        let mut sidecar = vec![0; ColdIndex::HEADER_LEN];
+        let mut index_bytes = vec![0; ReadIndex::HEADER_LEN];
         assert!(
-            store.read_cold_index_range(guid, 0, &mut sidecar).unwrap(),
-            "checkpoint write-through should publish cold index"
+            store.read_index_range(guid, 0, &mut index_bytes).unwrap(),
+            "checkpoint write-through should publish read index"
         );
-        let directory_len =
-            ColdIndex::directory_len(&sidecar).expect("published cold index header should parse");
-        if directory_len > ColdIndex::HEADER_LEN {
-            let mut rest = vec![0; directory_len - ColdIndex::HEADER_LEN];
+        let directory_len = ReadIndex::directory_len(&index_bytes)
+            .expect("published read index header should parse");
+        if directory_len > ReadIndex::HEADER_LEN {
+            let mut rest = vec![0; directory_len - ReadIndex::HEADER_LEN];
             assert!(
                 store
-                    .read_cold_index_range(guid, ColdIndex::HEADER_LEN as u64, &mut rest)
+                    .read_index_range(guid, ReadIndex::HEADER_LEN as u64, &mut rest)
                     .unwrap(),
-                "published cold index directory should be readable"
+                "published read index directory should be readable"
             );
-            sidecar.extend_from_slice(&rest);
+            index_bytes.extend_from_slice(&rest);
         }
-        ColdIndex::decode_directory(sidecar).expect("published cold index should parse");
+        ReadIndex::decode_directory(index_bytes).expect("published read index should parse");
     }
 
     #[test]
-    fn cold_index_load_reads_small_directory_in_one_probe() {
+    fn read_index_load_reads_small_directory_in_one_probe() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(CountingColdStore::open(dir.path()).unwrap());
+        let store = Arc::new(CountingReadIndexStore::open(dir.path()).unwrap());
         let store_dyn: Arc<dyn BlobStore> = store.clone();
         let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
         let guid = [0xBE; 16];
@@ -4278,32 +4273,32 @@ mod tests {
         .unwrap();
         store.flush().unwrap();
 
-        let mut sidecar = vec![0; ColdIndex::HEADER_LEN];
-        assert!(store.read_cold_index_range(guid, 0, &mut sidecar).unwrap());
-        ColdIndex::directory_len(&sidecar).expect("published cold-index header parses");
+        let mut index_bytes = vec![0; ReadIndex::HEADER_LEN];
+        assert!(store.read_index_range(guid, 0, &mut index_bytes).unwrap());
+        ReadIndex::directory_len(&index_bytes).expect("published read-index header parses");
 
-        store.reset_cold_reads();
+        store.reset_index_reads();
         let store_dyn: Arc<dyn BlobStore> = store.clone();
         let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
 
-        assert!(bm.cold_read_eligible(guid));
-        let mut probe = vec![0; COLD_INDEX_DIRECTORY_PROBE_BYTES];
-        assert!(store.read_cold_index_range(guid, 0, &mut probe).unwrap());
+        assert!(bm.indexed_read_eligible(guid));
+        let mut probe = vec![0; READ_INDEX_DIRECTORY_PROBE_BYTES];
+        assert!(store.read_index_range(guid, 0, &mut probe).unwrap());
         let directory_len =
-            ColdIndex::directory_len(&probe).expect("probe should parse cold-index header");
+            ReadIndex::directory_len(&probe).expect("probe should parse read-index header");
         probe.truncate(directory_len);
-        let index = ColdIndex::decode_directory(probe).expect("probe should decode directory");
+        let index = ReadIndex::decode_directory(probe).expect("probe should decode directory");
         assert!(
-            bm.cold_index_stamp_matches(guid, &index).unwrap(),
-            "probe-decoded cold index should match the blob header"
+            bm.read_index_stamp_matches(guid, &index).unwrap(),
+            "probe-decoded read index should match the blob header"
         );
-        store.reset_cold_reads();
+        store.reset_index_reads();
 
-        assert!(bm.cold_index(guid).is_some());
+        assert!(bm.read_index(guid).is_some());
         assert_eq!(
-            store.cold_reads(),
+            store.index_reads(),
             1,
-            "small cold-index directories fit in the first 4 KiB probe"
+            "small read-index directories fit in the first 4 KiB probe"
         );
     }
 

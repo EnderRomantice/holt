@@ -28,7 +28,7 @@ fn run_churn() -> Result<u64, String> {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = TreeConfig::new(dir.path());
     cfg.durability = Durability::Wal { sync: false };
-    // Small pool → eviction + the cold-read route cache are engaged, and
+    // Small pool → eviction + the indexed-read route cache are engaged, and
     // delete churn keeps the merge pass de-routing blobs.
     cfg.buffer_pool_size = 128;
     let tree = Arc::new(Tree::open(cfg).map_err(|e| format!("open: {e}"))?);

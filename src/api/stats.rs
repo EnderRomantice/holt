@@ -88,14 +88,14 @@ pub struct StoreStats {
     pub data_file_bytes: u64,
     /// Logical high-water bytes implied by `next_slot`.
     pub data_high_water_bytes: u64,
-    /// Current size of the cold-index sidecar file.
-    pub cold_index_file_bytes: u64,
-    /// Logical high-water bytes for the cold-index sidecar.
-    pub cold_index_high_water_bytes: u64,
-    /// Current size of the cold-value sidecar file.
-    pub cold_value_file_bytes: u64,
-    /// Logical high-water bytes for the cold-value sidecar.
-    pub cold_value_high_water_bytes: u64,
+    /// Current size of the read-index file.
+    pub read_index_file_bytes: u64,
+    /// Logical high-water bytes for the read-index.
+    pub read_index_high_water_bytes: u64,
+    /// Current size of the value segment file.
+    pub value_segment_file_bytes: u64,
+    /// Logical high-water bytes for the value segment.
+    pub value_segment_high_water_bytes: u64,
     /// Current durable manifest delta log size.
     pub manifest_log_bytes: u64,
 }
@@ -154,22 +154,22 @@ pub struct TreeStats {
     /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
-    /// Cold invalidation tokens retained by the BufferManager.
-    pub bm_cold_token_count: usize,
-    /// Cold-index directories currently cached in memory.
-    pub bm_cold_index_cache_entries: usize,
-    /// Bytes used by cached cold-index directories.
-    pub bm_cold_index_cache_bytes: usize,
-    /// Configured memory budget for cached cold-index directories.
-    pub bm_cold_index_cache_budget_bytes: usize,
-    /// 4 KiB cold-read pages currently cached in memory.
-    pub bm_cold_page_cache_entries: usize,
-    /// Bytes used by cached 4 KiB cold-read pages.
-    pub bm_cold_page_cache_bytes: usize,
+    /// Read-index invalidation tokens retained by the BufferManager.
+    pub bm_read_index_token_count: usize,
+    /// Read-index directories currently cached in memory.
+    pub bm_read_index_cache_entries: usize,
+    /// Bytes used by cached read-index directories.
+    pub bm_read_index_cache_bytes: usize,
+    /// Configured memory budget for cached read-index directories.
+    pub bm_read_index_cache_budget_bytes: usize,
+    /// 4 KiB indexed-read pages currently cached in memory.
+    pub bm_read_page_cache_entries: usize,
+    /// Bytes used by cached 4 KiB indexed-read pages.
+    pub bm_read_page_cache_bytes: usize,
     /// Ghost entries used by second-touch admission for leaf pages.
-    pub bm_cold_page_cache_ghost_entries: usize,
-    /// Configured memory budget for cached 4 KiB cold-read pages.
-    pub bm_cold_page_cache_budget_bytes: usize,
+    pub bm_read_page_cache_ghost_entries: usize,
+    /// Configured memory budget for cached 4 KiB indexed-read pages.
+    pub bm_read_page_cache_budget_bytes: usize,
     /// Cumulative cache lookups served from BM cache without
     /// going to the inner store. Read by external observers to
     /// derive a hit rate (`bm_cache_hits / (bm_cache_hits +
@@ -191,40 +191,40 @@ pub struct TreeStats {
     pub bm_scan_full_blob_reads: u64,
     /// Full-frame reads caused by silent stats/maintenance paths.
     pub bm_silent_full_blob_reads: u64,
-    /// 4 KiB cold-page cache hits served without a blob-frame read.
-    pub bm_cold_page_hits: u64,
-    /// 4 KiB cold-page cache misses that fell through to positional
+    /// 4 KiB read-page cache hits served without a blob-frame read.
+    pub bm_read_page_hits: u64,
+    /// 4 KiB read-page cache misses that fell through to positional
     /// reads or full-frame fallback.
-    pub bm_cold_page_misses: u64,
-    /// Cold-index directory lookups served from the in-memory index
+    pub bm_read_page_misses: u64,
+    /// Read-index directory lookups served from the in-memory index
     /// cache.
-    pub bm_cold_index_cache_hits: u64,
-    /// Cold-index directory lookups that had to read the sidecar.
-    pub bm_cold_index_cache_misses: u64,
-    /// Cold-index directories loaded from the sidecar.
-    pub bm_cold_index_loads: u64,
-    /// Bytes read while loading cold-index directories.
-    pub bm_cold_index_dir_read_bytes: u64,
-    /// Cold-index bucket reads issued after a positive filter probe.
-    pub bm_cold_index_bucket_reads: u64,
-    /// Bytes read by cold-index bucket reads.
-    pub bm_cold_index_bucket_read_bytes: u64,
-    /// Positive cold reads served directly from inline sidecar values.
-    pub bm_cold_index_inline_hits: u64,
-    /// Positive cold reads served from the cold-value sidecar.
-    pub bm_cold_index_value_hits: u64,
-    /// Bytes read from the cold-value sidecar.
-    pub bm_cold_index_value_read_bytes: u64,
-    /// Positive cold reads that fell back to a blob value offset plus
+    pub bm_read_index_cache_hits: u64,
+    /// Read-index directory lookups that had to read the index file.
+    pub bm_read_index_cache_misses: u64,
+    /// Read-index directories loaded from the index file.
+    pub bm_read_index_loads: u64,
+    /// Bytes read while loading read-index directories.
+    pub bm_read_index_dir_read_bytes: u64,
+    /// Read-index bucket reads issued after a positive filter probe.
+    pub bm_read_index_bucket_reads: u64,
+    /// Bytes read by read-index bucket reads.
+    pub bm_read_index_bucket_read_bytes: u64,
+    /// Positive indexed reads served directly from inline read-index values.
+    pub bm_read_index_inline_hits: u64,
+    /// Positive indexed reads served from the value segment.
+    pub bm_read_index_value_hits: u64,
+    /// Bytes read from the value segment.
+    pub bm_read_index_value_read_bytes: u64,
+    /// Positive indexed reads that fell back to a blob value offset plus
     /// page-granular `blobs.dat` reads.
-    pub bm_cold_index_offset_hits: u64,
-    /// Negative cold reads proven by a cold-index filter/summary.
-    pub bm_cold_index_negative_hits: u64,
-    /// Cold reads routed to a child blob by a cold-index crossing.
-    pub bm_cold_index_crossing_hits: u64,
-    /// Cold-index probes that could not publish an answer and fell
+    pub bm_read_index_offset_hits: u64,
+    /// Negative indexed reads proven by a read-index filter/summary.
+    pub bm_read_index_negative_hits: u64,
+    /// Indexed reads routed to a child blob by a read-index crossing.
+    pub bm_read_index_crossing_hits: u64,
+    /// Read-index probes that could not publish an answer and fell
     /// back to the authoritative blob path.
-    pub bm_cold_index_unknowns: u64,
+    pub bm_read_index_unknowns: u64,
     /// Cumulative wait-free read restarts in `Tree::get` — each
     /// one means a concurrent writer lapped an optimistic
     /// snapshot and the lookup walked the tree from scratch.
@@ -273,7 +273,7 @@ pub struct TreeStats {
     /// Cache overflows where TinyLFU kept a hotter resident victim
     /// instead of evicting it for a one-hit point-miss candidate.
     pub bm_admission_protects: u64,
-    /// Store-level packed-file and sidecar space counters.
+    /// Store-level packed-file and read-index space counters.
     pub store: StoreStats,
     /// Root route-cache counters for large path-shaped trees.
     pub route_cache: RouteCacheStats,
@@ -362,22 +362,22 @@ pub struct DBStats {
     /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
-    /// Cold invalidation tokens retained by the shared BufferManager.
-    pub bm_cold_token_count: usize,
-    /// Shared cold-index directories currently cached in memory.
-    pub bm_cold_index_cache_entries: usize,
-    /// Shared bytes used by cached cold-index directories.
-    pub bm_cold_index_cache_bytes: usize,
-    /// Shared memory budget for cached cold-index directories.
-    pub bm_cold_index_cache_budget_bytes: usize,
-    /// Shared 4 KiB cold-read pages currently cached in memory.
-    pub bm_cold_page_cache_entries: usize,
-    /// Shared bytes used by cached 4 KiB cold-read pages.
-    pub bm_cold_page_cache_bytes: usize,
-    /// Shared cold-page ghost entries used by second-touch admission.
-    pub bm_cold_page_cache_ghost_entries: usize,
-    /// Shared memory budget for cached 4 KiB cold-read pages.
-    pub bm_cold_page_cache_budget_bytes: usize,
+    /// Read-index invalidation tokens retained by the shared BufferManager.
+    pub bm_read_index_token_count: usize,
+    /// Shared read-index directories currently cached in memory.
+    pub bm_read_index_cache_entries: usize,
+    /// Shared bytes used by cached read-index directories.
+    pub bm_read_index_cache_bytes: usize,
+    /// Shared memory budget for cached read-index directories.
+    pub bm_read_index_cache_budget_bytes: usize,
+    /// Shared 4 KiB indexed-read pages currently cached in memory.
+    pub bm_read_page_cache_entries: usize,
+    /// Shared bytes used by cached 4 KiB indexed-read pages.
+    pub bm_read_page_cache_bytes: usize,
+    /// Shared read-page ghost entries used by second-touch admission.
+    pub bm_read_page_cache_ghost_entries: usize,
+    /// Shared memory budget for cached 4 KiB indexed-read pages.
+    pub bm_read_page_cache_budget_bytes: usize,
     /// Shared BufferManager cache hits.
     pub bm_cache_hits: u64,
     /// Shared BufferManager cache misses.
@@ -392,36 +392,36 @@ pub struct DBStats {
     pub bm_scan_full_blob_reads: u64,
     /// Shared full-frame reads caused by silent stats/maintenance paths.
     pub bm_silent_full_blob_reads: u64,
-    /// Shared 4 KiB cold-page cache hits.
-    pub bm_cold_page_hits: u64,
-    /// Shared 4 KiB cold-page cache misses.
-    pub bm_cold_page_misses: u64,
-    /// Shared cold-index directory cache hits.
-    pub bm_cold_index_cache_hits: u64,
-    /// Shared cold-index directory cache misses.
-    pub bm_cold_index_cache_misses: u64,
-    /// Shared cold-index directory loads.
-    pub bm_cold_index_loads: u64,
-    /// Shared bytes read while loading cold-index directories.
-    pub bm_cold_index_dir_read_bytes: u64,
-    /// Shared cold-index bucket reads.
-    pub bm_cold_index_bucket_reads: u64,
-    /// Shared bytes read by cold-index bucket reads.
-    pub bm_cold_index_bucket_read_bytes: u64,
-    /// Shared inline cold-index hits.
-    pub bm_cold_index_inline_hits: u64,
-    /// Shared cold-value sidecar hits.
-    pub bm_cold_index_value_hits: u64,
-    /// Shared bytes read from the cold-value sidecar.
-    pub bm_cold_index_value_read_bytes: u64,
-    /// Shared blob-offset fallback cold-index hits.
-    pub bm_cold_index_offset_hits: u64,
-    /// Shared negative cold-index hits.
-    pub bm_cold_index_negative_hits: u64,
-    /// Shared cold-index crossing hits.
-    pub bm_cold_index_crossing_hits: u64,
-    /// Shared cold-index fallbacks.
-    pub bm_cold_index_unknowns: u64,
+    /// Shared 4 KiB read-page cache hits.
+    pub bm_read_page_hits: u64,
+    /// Shared 4 KiB read-page cache misses.
+    pub bm_read_page_misses: u64,
+    /// Shared read-index directory cache hits.
+    pub bm_read_index_cache_hits: u64,
+    /// Shared read-index directory cache misses.
+    pub bm_read_index_cache_misses: u64,
+    /// Shared read-index directory loads.
+    pub bm_read_index_loads: u64,
+    /// Shared bytes read while loading read-index directories.
+    pub bm_read_index_dir_read_bytes: u64,
+    /// Shared read-index bucket reads.
+    pub bm_read_index_bucket_reads: u64,
+    /// Shared bytes read by read-index bucket reads.
+    pub bm_read_index_bucket_read_bytes: u64,
+    /// Shared inline read-index hits.
+    pub bm_read_index_inline_hits: u64,
+    /// Shared value segment hits.
+    pub bm_read_index_value_hits: u64,
+    /// Shared bytes read from the value segment.
+    pub bm_read_index_value_read_bytes: u64,
+    /// Shared blob-offset fallback read-index hits.
+    pub bm_read_index_offset_hits: u64,
+    /// Shared negative read-index hits.
+    pub bm_read_index_negative_hits: u64,
+    /// Shared read-index crossing hits.
+    pub bm_read_index_crossing_hits: u64,
+    /// Shared read-index fallbacks.
+    pub bm_read_index_unknowns: u64,
     /// Shared optimistic point-read restarts.
     pub bm_optimistic_restarts: u64,
     /// Shared range cursor restarts.
@@ -450,7 +450,7 @@ pub struct DBStats {
     pub bm_eviction_skips_route_resident: u64,
     /// TinyLFU admission rejections in the shared cache.
     pub bm_admission_protects: u64,
-    /// Shared store-level packed-file and sidecar space counters.
+    /// Shared store-level packed-file and read-index space counters.
     pub store: StoreStats,
     /// WAL replay telemetry captured while opening the DB.
     pub open: OpenStats,

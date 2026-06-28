@@ -112,7 +112,7 @@ pub struct BlobHeader {
     _pad_90: [u8; 0x10],
     /// 128-bit blob identifier.
     pub blob_guid: BlobGuid,
-    /// Page-granular cold-read routing region. When a blob is compacted into the
+    /// Page-granular indexed-read routing region. When a blob is compacted into the
     /// routing layout, every internal node is clustered into
     /// `[routing_off, routing_off + routing_len)` and leaves are page-aligned
     /// at/after `leaf_region_start`, so a cold lookup reads the small routing
@@ -140,7 +140,7 @@ pub struct BlobHeader {
     _pad_c0: [u8; (HEADER_SIZE as usize) - 0xc0],
 }
 
-/// The cold-read routing region recorded in a [`BlobHeader`].
+/// The indexed-read routing region recorded in a [`BlobHeader`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingRegion {
     /// Byte offset of the contiguous internal-node region within the frame.
@@ -155,7 +155,7 @@ pub struct RoutingRegion {
 }
 
 impl BlobHeader {
-    /// The cold-read routing region, or `None` if this blob is in the legacy
+    /// The indexed-read routing region, or `None` if this blob is in the legacy
     /// whole-frame layout (descend over the entire 512 KB frame).
     ///
     /// Returns `None` not only for `routing_len == 0` (the legacy
@@ -178,7 +178,7 @@ impl BlobHeader {
         let off = self.routing_off;
         let lrs = self.leaf_region_start;
         let routing_end = off.checked_add(self.routing_len)?;
-        // Bounds the cold read relies on (see doc above). All must hold
+        // Bounds the indexed read relies on (see doc above). All must hold
         // for a compactor-written routed blob; any failure ⇒ corrupt ⇒
         // legacy fallback.
         if off < DATA_AREA_START || off >= lrs || lrs > PAGE_SIZE || routing_end > lrs {
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn zeroed_header_is_legacy_layout() {
-        // The cold-read routing fields live in former pad, which
+        // The indexed-read routing fields live in former pad, which
         // `BlobFrameMut::init` zeroes — so every pre-existing blob, and every
         // blob not yet rewritten by the routing-aware compactor, reports the
         // legacy whole-frame layout and is read by pinning the full frame.

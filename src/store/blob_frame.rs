@@ -43,7 +43,7 @@ const MAX_CHILD_BIAS: u32 = (PAGE_SIZE - DATA_AREA_START) / 8 + 1;
 const _: () = assert!(MAX_CHILD_BIAS < u16::MAX as u32);
 
 /// 4 KB OS page granularity — distinct from [`PAGE_SIZE`], which is the
-/// 512 KB blob frame. A cold read fetches leaves a page at a time, so
+/// 512 KB blob frame. A indexed read fetches leaves a page at a time, so
 /// the routing-aware compactor (`compact_blob`) page-aligns the leaf
 /// region to this boundary.
 pub const PAGE_4K: u32 = 0x1000;
@@ -550,13 +550,13 @@ impl<'a> BlobFrame<'a> {
     pub fn alloc_node(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
         let outcome = self.alloc_node_inner(ntype)?;
         // A new internal node allocated into a *routed* frame lands at the
-        // leaf-arena high-water (>= leaf_region_start), where a cold reader
+        // leaf-arena high-water (>= leaf_region_start), where a indexed reader
         // classifies offsets as leaves — silently breaking the routing
         // invariant. Invalidate the routing layout (the next compaction
-        // re-routes); cold reads fall back to the legacy whole-frame path
+        // re-routes); indexed reads fall back to the legacy whole-frame path
         // until then. (In-place leaf allocs de-route too — see
         // `alloc_leaf` — but for a different reason: they rewrite a parent
-        // child pointer in the routing region, so any cached cold-read
+        // child pointer in the routing region, so any cached indexed-read
         // navigation page is stale.) During the routing build itself
         // routing_len is still 0, so this is a no-op.
         if self.header().routing_len != 0 {
@@ -748,10 +748,10 @@ impl<'a> BlobFrame<'a> {
         // — leaves are correctly classified above `leaf_region_start` — but
         // linking it rewrites the parent node's child pointer, which lives
         // in the routing region, and a value-grow also repoints the parent
-        // at the relocated leaf. That makes any cold-read navigation page
+        // at the relocated leaf. That makes any indexed-read navigation page
         // captured from the old routing region stale. De-routing
         // (`routing_len = 0`) takes the blob off the cold routed path until
-        // the next compaction re-routes it; cold reads fall back to the
+        // the next compaction re-routes it; indexed reads fall back to the
         // authoritative full pin meanwhile. The routing build uses
         // `alloc_leaf_at` (not this path) and runs with `routing_len == 0`,
         // so it is unaffected.

@@ -48,14 +48,14 @@
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
 //! | `holt_bm_write_delta_count`             | gauge   | `TreeStats::bm_write_delta_count`      |
-//! | `holt_bm_cold_token_count`              | gauge   | `TreeStats::bm_cold_token_count`       |
-//! | `holt_bm_cold_index_cache_entries`      | gauge   | `TreeStats::bm_cold_index_cache_entries` |
-//! | `holt_bm_cold_index_cache_bytes`        | gauge   | `TreeStats::bm_cold_index_cache_bytes` |
-//! | `holt_bm_cold_index_cache_budget_bytes` | gauge   | `TreeStats::bm_cold_index_cache_budget_bytes` |
-//! | `holt_bm_cold_page_cache_entries`       | gauge   | `TreeStats::bm_cold_page_cache_entries` |
-//! | `holt_bm_cold_page_cache_bytes`         | gauge   | `TreeStats::bm_cold_page_cache_bytes`  |
-//! | `holt_bm_cold_page_cache_ghost_entries` | gauge   | `TreeStats::bm_cold_page_cache_ghost_entries` |
-//! | `holt_bm_cold_page_cache_budget_bytes`  | gauge   | `TreeStats::bm_cold_page_cache_budget_bytes` |
+//! | `holt_bm_read_index_token_count`              | gauge   | `TreeStats::bm_read_index_token_count`       |
+//! | `holt_bm_read_index_cache_entries`      | gauge   | `TreeStats::bm_read_index_cache_entries` |
+//! | `holt_bm_read_index_cache_bytes`        | gauge   | `TreeStats::bm_read_index_cache_bytes` |
+//! | `holt_bm_read_index_cache_budget_bytes` | gauge   | `TreeStats::bm_read_index_cache_budget_bytes` |
+//! | `holt_bm_read_page_cache_entries`       | gauge   | `TreeStats::bm_read_page_cache_entries` |
+//! | `holt_bm_read_page_cache_bytes`         | gauge   | `TreeStats::bm_read_page_cache_bytes`  |
+//! | `holt_bm_read_page_cache_ghost_entries` | gauge   | `TreeStats::bm_read_page_cache_ghost_entries` |
+//! | `holt_bm_read_page_cache_budget_bytes`  | gauge   | `TreeStats::bm_read_page_cache_budget_bytes` |
 //! | `holt_store_live_blobs`                 | gauge   | `TreeStats::store.live_blobs`          |
 //! | `holt_store_live_slots`                 | gauge   | `TreeStats::store.live_slots`          |
 //! | `holt_store_next_slot`                  | gauge   | `TreeStats::store.next_slot`           |
@@ -63,10 +63,10 @@
 //! | `holt_store_pending_free_slots`         | gauge   | `TreeStats::store.pending_free_slots`  |
 //! | `holt_store_data_file_bytes`            | gauge   | `TreeStats::store.data_file_bytes`     |
 //! | `holt_store_data_high_water_bytes`      | gauge   | `TreeStats::store.data_high_water_bytes` |
-//! | `holt_store_cold_index_file_bytes`      | gauge   | `TreeStats::store.cold_index_file_bytes` |
-//! | `holt_store_cold_index_high_water_bytes` | gauge  | `TreeStats::store.cold_index_high_water_bytes` |
-//! | `holt_store_cold_value_file_bytes`      | gauge   | `TreeStats::store.cold_value_file_bytes` |
-//! | `holt_store_cold_value_high_water_bytes` | gauge  | `TreeStats::store.cold_value_high_water_bytes` |
+//! | `holt_store_read_index_file_bytes`      | gauge   | `TreeStats::store.read_index_file_bytes` |
+//! | `holt_store_read_index_high_water_bytes` | gauge  | `TreeStats::store.read_index_high_water_bytes` |
+//! | `holt_store_value_segment_file_bytes`      | gauge   | `TreeStats::store.value_segment_file_bytes` |
+//! | `holt_store_value_segment_high_water_bytes` | gauge  | `TreeStats::store.value_segment_high_water_bytes` |
 //! | `holt_store_manifest_log_bytes`         | gauge   | `TreeStats::store.manifest_log_bytes`  |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
@@ -75,21 +75,21 @@
 //! | `holt_bm_point_full_blob_reads_total`   | counter | `TreeStats::bm_point_full_blob_reads`  |
 //! | `holt_bm_scan_full_blob_reads_total`    | counter | `TreeStats::bm_scan_full_blob_reads`   |
 //! | `holt_bm_silent_full_blob_reads_total`  | counter | `TreeStats::bm_silent_full_blob_reads` |
-//! | `holt_bm_cold_page_hits_total`          | counter | `TreeStats::bm_cold_page_hits`         |
-//! | `holt_bm_cold_page_misses_total`        | counter | `TreeStats::bm_cold_page_misses`       |
-//! | `holt_bm_cold_index_cache_hits_total`   | counter | `TreeStats::bm_cold_index_cache_hits`  |
-//! | `holt_bm_cold_index_cache_misses_total` | counter | `TreeStats::bm_cold_index_cache_misses`|
-//! | `holt_bm_cold_index_loads_total`        | counter | `TreeStats::bm_cold_index_loads`       |
-//! | `holt_bm_cold_index_dir_read_bytes_total` | counter | `TreeStats::bm_cold_index_dir_read_bytes` |
-//! | `holt_bm_cold_index_bucket_reads_total` | counter | `TreeStats::bm_cold_index_bucket_reads` |
-//! | `holt_bm_cold_index_bucket_read_bytes_total` | counter | `TreeStats::bm_cold_index_bucket_read_bytes` |
-//! | `holt_bm_cold_index_inline_hits_total`  | counter | `TreeStats::bm_cold_index_inline_hits` |
-//! | `holt_bm_cold_index_value_hits_total`   | counter | `TreeStats::bm_cold_index_value_hits` |
-//! | `holt_bm_cold_index_value_read_bytes_total` | counter | `TreeStats::bm_cold_index_value_read_bytes` |
-//! | `holt_bm_cold_index_offset_hits_total`  | counter | `TreeStats::bm_cold_index_offset_hits` |
-//! | `holt_bm_cold_index_negative_hits_total`| counter | `TreeStats::bm_cold_index_negative_hits` |
-//! | `holt_bm_cold_index_crossing_hits_total`| counter | `TreeStats::bm_cold_index_crossing_hits` |
-//! | `holt_bm_cold_index_unknowns_total`     | counter | `TreeStats::bm_cold_index_unknowns`    |
+//! | `holt_bm_read_page_hits_total`          | counter | `TreeStats::bm_read_page_hits`         |
+//! | `holt_bm_read_page_misses_total`        | counter | `TreeStats::bm_read_page_misses`       |
+//! | `holt_bm_read_index_cache_hits_total`   | counter | `TreeStats::bm_read_index_cache_hits`  |
+//! | `holt_bm_read_index_cache_misses_total` | counter | `TreeStats::bm_read_index_cache_misses`|
+//! | `holt_bm_read_index_loads_total`        | counter | `TreeStats::bm_read_index_loads`       |
+//! | `holt_bm_read_index_dir_read_bytes_total` | counter | `TreeStats::bm_read_index_dir_read_bytes` |
+//! | `holt_bm_read_index_bucket_reads_total` | counter | `TreeStats::bm_read_index_bucket_reads` |
+//! | `holt_bm_read_index_bucket_read_bytes_total` | counter | `TreeStats::bm_read_index_bucket_read_bytes` |
+//! | `holt_bm_read_index_inline_hits_total`  | counter | `TreeStats::bm_read_index_inline_hits` |
+//! | `holt_bm_read_index_value_hits_total`   | counter | `TreeStats::bm_read_index_value_hits` |
+//! | `holt_bm_read_index_value_read_bytes_total` | counter | `TreeStats::bm_read_index_value_read_bytes` |
+//! | `holt_bm_read_index_offset_hits_total`  | counter | `TreeStats::bm_read_index_offset_hits` |
+//! | `holt_bm_read_index_negative_hits_total`| counter | `TreeStats::bm_read_index_negative_hits` |
+//! | `holt_bm_read_index_crossing_hits_total`| counter | `TreeStats::bm_read_index_crossing_hits` |
+//! | `holt_bm_read_index_unknowns_total`     | counter | `TreeStats::bm_read_index_unknowns`    |
 //! | `holt_bm_optimistic_restarts_total`     | counter | `TreeStats::bm_optimistic_restarts`    |
 //! | `holt_bm_range_restarts_total`          | counter | `TreeStats::bm_range_restarts`         |
 //! | `holt_bm_walker_ops_total`              | counter | `TreeStats::bm_walker_ops`             |
@@ -287,59 +287,59 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
-        "holt_bm_cold_token_count",
-        "Cold-read invalidation tokens retained by the buffer manager.",
+        "holt_bm_read_index_token_count",
+        "Indexed-read invalidation tokens retained by the buffer manager.",
         "gauge",
-        stats.bm_cold_token_count as u64,
+        stats.bm_read_index_token_count as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_cache_entries",
-        "Cold-index directories currently cached in memory.",
+        "holt_bm_read_index_cache_entries",
+        "Read-index directories currently cached in memory.",
         "gauge",
-        stats.bm_cold_index_cache_entries as u64,
+        stats.bm_read_index_cache_entries as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_cache_bytes",
-        "Bytes used by cached cold-index directories.",
+        "holt_bm_read_index_cache_bytes",
+        "Bytes used by cached read-index directories.",
         "gauge",
-        stats.bm_cold_index_cache_bytes as u64,
+        stats.bm_read_index_cache_bytes as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_cache_budget_bytes",
-        "Memory budget for cached cold-index directories.",
+        "holt_bm_read_index_cache_budget_bytes",
+        "Memory budget for cached read-index directories.",
         "gauge",
-        stats.bm_cold_index_cache_budget_bytes as u64,
+        stats.bm_read_index_cache_budget_bytes as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_page_cache_entries",
-        "4 KiB cold-read pages currently cached in memory.",
+        "holt_bm_read_page_cache_entries",
+        "4 KiB indexed-read pages currently cached in memory.",
         "gauge",
-        stats.bm_cold_page_cache_entries as u64,
+        stats.bm_read_page_cache_entries as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_page_cache_bytes",
-        "Bytes used by cached cold-read pages.",
+        "holt_bm_read_page_cache_bytes",
+        "Bytes used by cached indexed-read pages.",
         "gauge",
-        stats.bm_cold_page_cache_bytes as u64,
+        stats.bm_read_page_cache_bytes as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_page_cache_ghost_entries",
-        "Cold leaf-page ghost entries used by second-touch admission.",
+        "holt_bm_read_page_cache_ghost_entries",
+        "Read-page leaf ghost entries used by second-touch admission.",
         "gauge",
-        stats.bm_cold_page_cache_ghost_entries as u64,
+        stats.bm_read_page_cache_ghost_entries as u64,
     );
     metric(
         &mut out,
-        "holt_bm_cold_page_cache_budget_bytes",
-        "Memory budget for cached 4 KiB cold-read pages.",
+        "holt_bm_read_page_cache_budget_bytes",
+        "Memory budget for cached 4 KiB indexed-read pages.",
         "gauge",
-        stats.bm_cold_page_cache_budget_bytes as u64,
+        stats.bm_read_page_cache_budget_bytes as u64,
     );
     metric(
         &mut out,
@@ -392,31 +392,31 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
-        "holt_store_cold_index_file_bytes",
-        "Current size of the cold-index sidecar file.",
+        "holt_store_read_index_file_bytes",
+        "Current size of the read-index file.",
         "gauge",
-        stats.store.cold_index_file_bytes,
+        stats.store.read_index_file_bytes,
     );
     metric(
         &mut out,
-        "holt_store_cold_index_high_water_bytes",
-        "Logical cold-index sidecar high-water bytes implied by next_slot.",
+        "holt_store_read_index_high_water_bytes",
+        "Logical read-index high-water bytes implied by next_slot.",
         "gauge",
-        stats.store.cold_index_high_water_bytes,
+        stats.store.read_index_high_water_bytes,
     );
     metric(
         &mut out,
-        "holt_store_cold_value_file_bytes",
-        "Current size of the cold-value sidecar file.",
+        "holt_store_value_segment_file_bytes",
+        "Current size of the value segment file.",
         "gauge",
-        stats.store.cold_value_file_bytes,
+        stats.store.value_segment_file_bytes,
     );
     metric(
         &mut out,
-        "holt_store_cold_value_high_water_bytes",
-        "Logical cold-value sidecar high-water bytes implied by next_slot.",
+        "holt_store_value_segment_high_water_bytes",
+        "Logical value segment high-water bytes implied by next_slot.",
         "gauge",
-        stats.store.cold_value_high_water_bytes,
+        stats.store.value_segment_high_water_bytes,
     );
     metric(
         &mut out,
@@ -476,108 +476,108 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
-        "holt_bm_cold_page_hits_total",
-        "4 KiB cold-page cache hits.",
+        "holt_bm_read_page_hits_total",
+        "4 KiB read-page cache hits.",
         "counter",
-        stats.bm_cold_page_hits,
+        stats.bm_read_page_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_page_misses_total",
-        "4 KiB cold-page cache misses.",
+        "holt_bm_read_page_misses_total",
+        "4 KiB read-page cache misses.",
         "counter",
-        stats.bm_cold_page_misses,
+        stats.bm_read_page_misses,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_cache_hits_total",
-        "Cold-index directory cache hits.",
+        "holt_bm_read_index_cache_hits_total",
+        "Read-index directory cache hits.",
         "counter",
-        stats.bm_cold_index_cache_hits,
+        stats.bm_read_index_cache_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_cache_misses_total",
-        "Cold-index directory cache misses.",
+        "holt_bm_read_index_cache_misses_total",
+        "Read-index directory cache misses.",
         "counter",
-        stats.bm_cold_index_cache_misses,
+        stats.bm_read_index_cache_misses,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_loads_total",
-        "Cold-index directories loaded from sidecar.",
+        "holt_bm_read_index_loads_total",
+        "Read-index directories loaded from index.",
         "counter",
-        stats.bm_cold_index_loads,
+        stats.bm_read_index_loads,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_dir_read_bytes_total",
-        "Bytes read while loading cold-index directories.",
+        "holt_bm_read_index_dir_read_bytes_total",
+        "Bytes read while loading read-index directories.",
         "counter",
-        stats.bm_cold_index_dir_read_bytes,
+        stats.bm_read_index_dir_read_bytes,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_bucket_reads_total",
-        "Cold-index bucket reads.",
+        "holt_bm_read_index_bucket_reads_total",
+        "Read-index bucket reads.",
         "counter",
-        stats.bm_cold_index_bucket_reads,
+        stats.bm_read_index_bucket_reads,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_bucket_read_bytes_total",
-        "Bytes read by cold-index bucket reads.",
+        "holt_bm_read_index_bucket_read_bytes_total",
+        "Bytes read by read-index bucket reads.",
         "counter",
-        stats.bm_cold_index_bucket_read_bytes,
+        stats.bm_read_index_bucket_read_bytes,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_inline_hits_total",
-        "Positive cold reads served from inline cold-index values.",
+        "holt_bm_read_index_inline_hits_total",
+        "Positive indexed reads served from inline read-index values.",
         "counter",
-        stats.bm_cold_index_inline_hits,
+        stats.bm_read_index_inline_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_value_hits_total",
-        "Positive cold reads served from cold-value sidecar payloads.",
+        "holt_bm_read_index_value_hits_total",
+        "Positive indexed reads served from value segment payloads.",
         "counter",
-        stats.bm_cold_index_value_hits,
+        stats.bm_read_index_value_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_value_read_bytes_total",
-        "Bytes read from cold-value sidecar payloads.",
+        "holt_bm_read_index_value_read_bytes_total",
+        "Bytes read from value segment payloads.",
         "counter",
-        stats.bm_cold_index_value_read_bytes,
+        stats.bm_read_index_value_read_bytes,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_offset_hits_total",
-        "Positive cold reads served by blob-offset fallback plus page reads.",
+        "holt_bm_read_index_offset_hits_total",
+        "Positive indexed reads served by blob-offset fallback plus page reads.",
         "counter",
-        stats.bm_cold_index_offset_hits,
+        stats.bm_read_index_offset_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_negative_hits_total",
-        "Negative cold reads proven by cold-index filters or summaries.",
+        "holt_bm_read_index_negative_hits_total",
+        "Negative indexed reads proven by read-index filters or summaries.",
         "counter",
-        stats.bm_cold_index_negative_hits,
+        stats.bm_read_index_negative_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_crossing_hits_total",
-        "Cold reads routed to child blobs by cold-index crossings.",
+        "holt_bm_read_index_crossing_hits_total",
+        "Indexed reads routed to child blobs by read-index crossings.",
         "counter",
-        stats.bm_cold_index_crossing_hits,
+        stats.bm_read_index_crossing_hits,
     );
     metric(
         &mut out,
-        "holt_bm_cold_index_unknowns_total",
-        "Cold-index probes that fell back to the authoritative blob path.",
+        "holt_bm_read_index_unknowns_total",
+        "Read-index probes that fell back to the authoritative blob path.",
         "counter",
-        stats.bm_cold_index_unknowns,
+        stats.bm_read_index_unknowns,
     );
     metric(
         &mut out,
@@ -933,10 +933,10 @@ mod tests {
             pending_free_slots: 2,
             data_file_bytes: 61,
             data_high_water_bytes: 62,
-            cold_index_file_bytes: 63,
-            cold_index_high_water_bytes: 64,
-            cold_value_file_bytes: 65,
-            cold_value_high_water_bytes: 66,
+            read_index_file_bytes: 63,
+            read_index_high_water_bytes: 64,
+            value_segment_file_bytes: 65,
+            value_segment_high_water_bytes: 66,
             manifest_log_bytes: 67,
         }
     }
@@ -971,14 +971,14 @@ mod tests {
             bm_dirty_count: 2,
             bm_pending_delete_count: 1,
             bm_write_delta_count: 3,
-            bm_cold_token_count: 46,
-            bm_cold_index_cache_entries: 47,
-            bm_cold_index_cache_bytes: 48,
-            bm_cold_index_cache_budget_bytes: 49,
-            bm_cold_page_cache_entries: 50,
-            bm_cold_page_cache_bytes: 51,
-            bm_cold_page_cache_ghost_entries: 52,
-            bm_cold_page_cache_budget_bytes: 53,
+            bm_read_index_token_count: 46,
+            bm_read_index_cache_entries: 47,
+            bm_read_index_cache_bytes: 48,
+            bm_read_index_cache_budget_bytes: 49,
+            bm_read_page_cache_entries: 50,
+            bm_read_page_cache_bytes: 51,
+            bm_read_page_cache_ghost_entries: 52,
+            bm_read_page_cache_budget_bytes: 53,
             bm_cache_hits: 1_000,
             bm_cache_misses: 25,
             bm_full_blob_reads: 20,
@@ -986,21 +986,21 @@ mod tests {
             bm_point_full_blob_reads: 12,
             bm_scan_full_blob_reads: 7,
             bm_silent_full_blob_reads: 1,
-            bm_cold_page_hits: 31,
-            bm_cold_page_misses: 32,
-            bm_cold_index_cache_hits: 33,
-            bm_cold_index_cache_misses: 34,
-            bm_cold_index_loads: 35,
-            bm_cold_index_dir_read_bytes: 36,
-            bm_cold_index_bucket_reads: 37,
-            bm_cold_index_bucket_read_bytes: 38,
-            bm_cold_index_inline_hits: 39,
-            bm_cold_index_value_hits: 40,
-            bm_cold_index_value_read_bytes: 41,
-            bm_cold_index_offset_hits: 42,
-            bm_cold_index_negative_hits: 43,
-            bm_cold_index_crossing_hits: 44,
-            bm_cold_index_unknowns: 45,
+            bm_read_page_hits: 31,
+            bm_read_page_misses: 32,
+            bm_read_index_cache_hits: 33,
+            bm_read_index_cache_misses: 34,
+            bm_read_index_loads: 35,
+            bm_read_index_dir_read_bytes: 36,
+            bm_read_index_bucket_reads: 37,
+            bm_read_index_bucket_read_bytes: 38,
+            bm_read_index_inline_hits: 39,
+            bm_read_index_value_hits: 40,
+            bm_read_index_value_read_bytes: 41,
+            bm_read_index_offset_hits: 42,
+            bm_read_index_negative_hits: 43,
+            bm_read_index_crossing_hits: 44,
+            bm_read_index_unknowns: 45,
             bm_optimistic_restarts: 3,
             bm_range_restarts: 2,
             bm_walker_ops: 4,
@@ -1057,14 +1057,14 @@ mod tests {
         assert!(out.contains("holt_blob_count 3\n"));
         // Monotonic counters keep the `_total` suffix...
         assert!(out.contains("holt_bm_write_delta_count 3\n"));
-        assert!(out.contains("holt_bm_cold_token_count 46\n"));
-        assert!(out.contains("holt_bm_cold_index_cache_entries 47\n"));
-        assert!(out.contains("holt_bm_cold_index_cache_bytes 48\n"));
-        assert!(out.contains("holt_bm_cold_index_cache_budget_bytes 49\n"));
-        assert!(out.contains("holt_bm_cold_page_cache_entries 50\n"));
-        assert!(out.contains("holt_bm_cold_page_cache_bytes 51\n"));
-        assert!(out.contains("holt_bm_cold_page_cache_ghost_entries 52\n"));
-        assert!(out.contains("holt_bm_cold_page_cache_budget_bytes 53\n"));
+        assert!(out.contains("holt_bm_read_index_token_count 46\n"));
+        assert!(out.contains("holt_bm_read_index_cache_entries 47\n"));
+        assert!(out.contains("holt_bm_read_index_cache_bytes 48\n"));
+        assert!(out.contains("holt_bm_read_index_cache_budget_bytes 49\n"));
+        assert!(out.contains("holt_bm_read_page_cache_entries 50\n"));
+        assert!(out.contains("holt_bm_read_page_cache_bytes 51\n"));
+        assert!(out.contains("holt_bm_read_page_cache_ghost_entries 52\n"));
+        assert!(out.contains("holt_bm_read_page_cache_budget_bytes 53\n"));
         assert!(out.contains("holt_store_live_blobs 54\n"));
         assert!(out.contains("holt_store_live_slots 55\n"));
         assert!(out.contains("holt_store_next_slot 60\n"));
@@ -1072,10 +1072,10 @@ mod tests {
         assert!(out.contains("holt_store_pending_free_slots 2\n"));
         assert!(out.contains("holt_store_data_file_bytes 61\n"));
         assert!(out.contains("holt_store_data_high_water_bytes 62\n"));
-        assert!(out.contains("holt_store_cold_index_file_bytes 63\n"));
-        assert!(out.contains("holt_store_cold_index_high_water_bytes 64\n"));
-        assert!(out.contains("holt_store_cold_value_file_bytes 65\n"));
-        assert!(out.contains("holt_store_cold_value_high_water_bytes 66\n"));
+        assert!(out.contains("holt_store_read_index_file_bytes 63\n"));
+        assert!(out.contains("holt_store_read_index_high_water_bytes 64\n"));
+        assert!(out.contains("holt_store_value_segment_file_bytes 65\n"));
+        assert!(out.contains("holt_store_value_segment_high_water_bytes 66\n"));
         assert!(out.contains("holt_store_manifest_log_bytes 67\n"));
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_full_blob_reads_total 20\n"));
@@ -1083,21 +1083,21 @@ mod tests {
         assert!(out.contains("holt_bm_point_full_blob_reads_total 12\n"));
         assert!(out.contains("holt_bm_scan_full_blob_reads_total 7\n"));
         assert!(out.contains("holt_bm_silent_full_blob_reads_total 1\n"));
-        assert!(out.contains("holt_bm_cold_page_hits_total 31\n"));
-        assert!(out.contains("holt_bm_cold_page_misses_total 32\n"));
-        assert!(out.contains("holt_bm_cold_index_cache_hits_total 33\n"));
-        assert!(out.contains("holt_bm_cold_index_cache_misses_total 34\n"));
-        assert!(out.contains("holt_bm_cold_index_loads_total 35\n"));
-        assert!(out.contains("holt_bm_cold_index_dir_read_bytes_total 36\n"));
-        assert!(out.contains("holt_bm_cold_index_bucket_reads_total 37\n"));
-        assert!(out.contains("holt_bm_cold_index_bucket_read_bytes_total 38\n"));
-        assert!(out.contains("holt_bm_cold_index_inline_hits_total 39\n"));
-        assert!(out.contains("holt_bm_cold_index_value_hits_total 40\n"));
-        assert!(out.contains("holt_bm_cold_index_value_read_bytes_total 41\n"));
-        assert!(out.contains("holt_bm_cold_index_offset_hits_total 42\n"));
-        assert!(out.contains("holt_bm_cold_index_negative_hits_total 43\n"));
-        assert!(out.contains("holt_bm_cold_index_crossing_hits_total 44\n"));
-        assert!(out.contains("holt_bm_cold_index_unknowns_total 45\n"));
+        assert!(out.contains("holt_bm_read_page_hits_total 31\n"));
+        assert!(out.contains("holt_bm_read_page_misses_total 32\n"));
+        assert!(out.contains("holt_bm_read_index_cache_hits_total 33\n"));
+        assert!(out.contains("holt_bm_read_index_cache_misses_total 34\n"));
+        assert!(out.contains("holt_bm_read_index_loads_total 35\n"));
+        assert!(out.contains("holt_bm_read_index_dir_read_bytes_total 36\n"));
+        assert!(out.contains("holt_bm_read_index_bucket_reads_total 37\n"));
+        assert!(out.contains("holt_bm_read_index_bucket_read_bytes_total 38\n"));
+        assert!(out.contains("holt_bm_read_index_inline_hits_total 39\n"));
+        assert!(out.contains("holt_bm_read_index_value_hits_total 40\n"));
+        assert!(out.contains("holt_bm_read_index_value_read_bytes_total 41\n"));
+        assert!(out.contains("holt_bm_read_index_offset_hits_total 42\n"));
+        assert!(out.contains("holt_bm_read_index_negative_hits_total 43\n"));
+        assert!(out.contains("holt_bm_read_index_crossing_hits_total 44\n"));
+        assert!(out.contains("holt_bm_read_index_unknowns_total 45\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
         assert!(out.contains("holt_bm_range_restarts_total 2\n"));
         assert!(out.contains("holt_bm_walker_ops_total 4\n"));

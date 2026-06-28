@@ -1,9 +1,9 @@
-//! Bounded cache for cold-read 4 KiB pages.
+//! Bounded cache for indexed-read 4 KiB pages.
 //!
 //! Navigation pages are admitted immediately because they are shared by
 //! many keys in the same blob. Leaf pages use second-touch admission:
 //! one-shot random gets leave only a bounded ghost entry, while repeated
-//! cold hits can reuse the leaf page without pinning the full 512 KiB
+//! indexed hits can reuse the leaf page without pinning the full 512 KiB
 //! blob.
 
 use std::collections::HashMap;
@@ -34,21 +34,21 @@ struct Shard {
     bytes: usize,
 }
 
-pub(crate) struct ColdPageCache {
+pub(crate) struct ReadPageCache {
     shards: Box<[Mutex<Shard>]>,
     shard_budget_bytes: usize,
     clock: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ColdPageCacheStats {
+pub(crate) struct ReadPageCacheStats {
     pub(crate) entries: usize,
     pub(crate) bytes: usize,
     pub(crate) ghost_entries: usize,
     pub(crate) budget_bytes: usize,
 }
 
-impl ColdPageCache {
+impl ReadPageCache {
     pub(crate) fn new(total_budget_bytes: usize) -> Self {
         let shard_budget_bytes = if total_budget_bytes == 0 {
             0
@@ -162,10 +162,10 @@ impl ColdPageCache {
         shard.bytes = shard.bytes.saturating_sub(removed * PAGE_BYTES);
     }
 
-    pub(crate) fn snapshot(&self) -> ColdPageCacheStats {
-        let mut out = ColdPageCacheStats {
+    pub(crate) fn snapshot(&self) -> ReadPageCacheStats {
+        let mut out = ReadPageCacheStats {
             budget_bytes: self.shard_budget_bytes.saturating_mul(SHARDS),
-            ..ColdPageCacheStats::default()
+            ..ReadPageCacheStats::default()
         };
         for shard in &self.shards {
             let shard = shard.lock().unwrap();
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn page_round_trip() {
-        let cache = ColdPageCache::new(1 << 20);
+        let cache = ReadPageCache::new(1 << 20);
         let g = guid(1);
         let src = [7u8; PAGE_BYTES];
         let mut dst = [0u8; PAGE_BYTES];
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn invalidate_drops_all_pages_for_guid() {
-        let cache = ColdPageCache::new(1 << 20);
+        let cache = ReadPageCache::new(1 << 20);
         let g = guid(2);
         let other = guid(3);
         let src = [9u8; PAGE_BYTES];
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn stays_bounded_under_overflow() {
-        let cache = ColdPageCache::new(SHARDS * 64 * 1024);
+        let cache = ReadPageCache::new(SHARDS * 64 * 1024);
         let src = [1u8; PAGE_BYTES];
         for n in 0..2000u16 {
             let mut g = guid((n & 0xff) as u8);
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn zero_budget_disables_admission() {
-        let cache = ColdPageCache::new(0);
+        let cache = ReadPageCache::new(0);
         let g = guid(4);
         let src = [3u8; PAGE_BYTES];
         let mut dst = [0u8; PAGE_BYTES];
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn second_touch_admits_leaf_page() {
-        let cache = ColdPageCache::new(1 << 20);
+        let cache = ReadPageCache::new(1 << 20);
         let g = guid(5);
         let src = [5u8; PAGE_BYTES];
         let mut dst = [0u8; PAGE_BYTES];
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn invalidate_drops_leaf_ghosts() {
-        let cache = ColdPageCache::new(1 << 20);
+        let cache = ReadPageCache::new(1 << 20);
         let g = guid(6);
         let src = [6u8; PAGE_BYTES];
         let mut dst = [0u8; PAGE_BYTES];

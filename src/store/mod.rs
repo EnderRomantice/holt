@@ -13,16 +13,16 @@
 mod blob_frame;
 pub(crate) mod blob_store;
 mod buffer_manager;
-mod cold_read;
+mod read_index;
 
 pub(crate) use blob_frame::{
     decode_child_off, encode_child_off, page_align_up, PAGE_4K, SPILLOVER_RESERVATION,
 };
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
-pub(crate) use blob_store::ColdBlobLookup;
+pub(crate) use blob_store::IndexedBlobLookup;
 pub(crate) use buffer_manager::{
     BlobWriteGuard, BufferStats, DirtySnapshotEntry, WriteDeltaEntry, WriteDeltaKeyState,
     WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,
 };
 pub use buffer_manager::{BufferManager, CachedBlob};
-pub(crate) use cold_read::{ColdIndex, ColdIndexAnswer, ColdIndexHit, ColdIndexStamp};
+pub(crate) use read_index::{ReadIndex, ReadIndexAnswer, ReadIndexHit, ReadIndexStamp};

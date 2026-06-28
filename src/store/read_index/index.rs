@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,8 @@ use crate::layout::{
 use crate::store::{decode_child_off, BlobFrameRef};
 
 const MAGIC: [u8; 8] = *b"HOLTCI01";
-const VERSION: u16 = 10;
-const HEADER_LEN: usize = 8 + 2 + 2 + 4 + ColdIndexStamp::ENCODED_LEN + 4 + 4 + 4 + 4;
+const VERSION: u16 = 11;
+const HEADER_LEN: usize = 8 + 2 + 2 + 4 + ReadIndexStamp::ENCODED_LEN + 4 + 4 + 4 + 4 + 4 + 4;
 const BLOOM_BYTES: usize = 2048;
 const BLOOM_BITS: usize = BLOOM_BYTES * 8;
 const BLOOM_PROBES: usize = 4;
@@ -21,15 +21,16 @@ const BUCKET_CRC_LEN: usize = 4;
 const INLINE_VALUE_MAX: usize = 256;
 const MAX_INDEX_BYTES: usize = PAGE_SIZE as usize;
 const MAX_VALUE_BYTES: usize = PAGE_SIZE as usize;
+const MAX_COMPONENT_BYTES: usize = 64 * 1024;
 const MIN_BUCKETS: usize = 64;
 const MAX_BUCKETS: usize = 4096;
 const SHARDS: usize = 16;
 const VALUE_INLINE: u32 = 0;
-const VALUE_COLD: u32 = 1;
+const VALUE_SEGMENT: u32 = 1;
 const VALUE_BLOB: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ColdIndexStamp {
+pub(crate) struct ReadIndexStamp {
     pub(crate) root_slot: u16,
     pub(crate) num_slots: u16,
     pub(crate) space_used: u32,
@@ -45,7 +46,7 @@ pub(crate) struct ColdIndexStamp {
     pub(crate) routing_unfit: u32,
 }
 
-impl ColdIndexStamp {
+impl ReadIndexStamp {
     const ENCODED_LEN: usize = 2 + 2 + (9 * 4) + 8 + 16;
 
     pub(crate) fn new(header: &BlobHeader) -> Self {
@@ -115,7 +116,7 @@ impl ColdIndexStamp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColdIndexAnswer {
+pub(crate) enum ReadIndexAnswer {
     NotFound,
     Crossing {
         child_guid: BlobGuid,
@@ -146,37 +147,40 @@ struct BuildLeaf {
     seq: u64,
 }
 
-pub(crate) struct ColdIndexBuild {
+pub(crate) struct ReadIndexBuild {
     pub(crate) index: Vec<u8>,
     pub(crate) values: Vec<u8>,
 }
 
 struct DecodedHeader {
-    stamp: ColdIndexStamp,
+    stamp: ReadIndexStamp,
     bucket_count: usize,
     crossing_count: usize,
     crossing_bytes: usize,
     base_prefix_len: usize,
+    component_count: usize,
+    component_bytes: usize,
     directory_len: usize,
     total_len: usize,
 }
 
 #[derive(Debug)]
-pub(crate) struct ColdIndex {
-    stamp: ColdIndexStamp,
+pub(crate) struct ReadIndex {
+    stamp: ReadIndexStamp,
     bloom: Box<[u8; BLOOM_BYTES]>,
     buckets: Box<[BucketEntry]>,
     base_prefix: Box<[u8]>,
     crossings: Box<[CrossingEntry]>,
+    components: Box<[Box<[u8]>]>,
     bytes: usize,
 }
 
-pub(crate) enum ColdIndexHit {
+pub(crate) enum ReadIndexHit {
     Inline {
         value: Vec<u8>,
         seq: u64,
     },
-    ColdValue {
+    ValueSegment {
         value_off: u32,
         value_len: u32,
         value_crc32: u32,
@@ -189,14 +193,14 @@ pub(crate) enum ColdIndexHit {
     },
 }
 
-impl ColdIndex {
+impl ReadIndex {
     pub(crate) const HEADER_LEN: usize = HEADER_LEN;
 
-    pub(crate) fn build(frame: BlobFrameRef<'_>) -> Result<ColdIndexBuild> {
+    pub(crate) fn build(frame: BlobFrameRef<'_>) -> Result<ReadIndexBuild> {
         let mut builder = IndexBuilder::default();
         let root = decode_child(frame.header().root_slot)?;
         walk(frame, root, &mut Vec::new(), &mut builder)?;
-        let values = pack_cold_values(&mut builder.leaves)?;
+        let values = pack_value_segments(&mut builder.leaves)?;
         let bucket_count = choose_bucket_count(builder.leaves.len());
         builder
             .leaves
@@ -208,42 +212,58 @@ impl ColdIndex {
         let bloom = encode_bloom(&builder.leaves);
         let base_prefix = common_leaf_prefix(&builder.leaves);
         let crossing_bytes = encode_crossings(&builder.crossings)?;
+        let component_bytes = encode_components(&builder.leaves)?;
         let bucket_blocks = encode_bucket_blocks(&builder.leaves, bucket_count, &base_prefix)?;
         let directory_len = HEADER_LEN
             + BLOOM_BYTES
             + bucket_count * BUCKET_ENTRY_LEN
             + base_prefix.len()
-            + crossing_bytes.len();
+            + crossing_bytes.len()
+            + component_bytes.len();
         let total_len = directory_len + bucket_blocks.iter().map(Vec::len).sum::<usize>();
+        if total_len > MAX_INDEX_BYTES {
+            return Err(Error::node_corrupt("read index total length"));
+        }
         let mut out = Vec::with_capacity(total_len);
         out.extend_from_slice(&MAGIC);
         put_u16(&mut out, VERSION);
         put_u16(&mut out, 0);
-        put_u32_checked(&mut out, total_len, "cold index total length")?;
-        ColdIndexStamp::new(frame.header()).encode(&mut out);
-        put_u32_checked(&mut out, bucket_count, "cold index buckets")?;
-        put_u32_checked(&mut out, builder.crossings.len(), "cold index crossings")?;
-        put_u32_checked(&mut out, crossing_bytes.len(), "cold index crossings bytes")?;
-        put_u32_checked(&mut out, base_prefix.len(), "cold index base prefix")?;
+        put_u32_checked(&mut out, total_len, "read index total length")?;
+        ReadIndexStamp::new(frame.header()).encode(&mut out);
+        put_u32_checked(&mut out, bucket_count, "read index buckets")?;
+        put_u32_checked(&mut out, builder.crossings.len(), "read index crossings")?;
+        put_u32_checked(&mut out, crossing_bytes.len(), "read index crossings bytes")?;
+        put_u32_checked(&mut out, base_prefix.len(), "read index base prefix")?;
+        put_u32_checked(
+            &mut out,
+            component_count(&component_bytes)?,
+            "read index components",
+        )?;
+        put_u32_checked(
+            &mut out,
+            component_bytes.len(),
+            "read index components bytes",
+        )?;
         out.extend_from_slice(&bloom[..]);
         let mut cursor = u32::try_from(directory_len)
-            .map_err(|_| Error::node_corrupt("cold index directory"))?;
+            .map_err(|_| Error::node_corrupt("read index directory"))?;
         for block in &bucket_blocks {
             put_u32(&mut out, cursor);
-            put_u32_checked(&mut out, block.len(), "cold index bucket block")?;
+            put_u32_checked(&mut out, block.len(), "read index bucket block")?;
             cursor = cursor
                 .checked_add(
                     u32::try_from(block.len())
-                        .map_err(|_| Error::node_corrupt("cold index bucket block"))?,
+                        .map_err(|_| Error::node_corrupt("read index bucket block"))?,
                 )
-                .ok_or(Error::node_corrupt("cold index bucket offset"))?;
+                .ok_or(Error::node_corrupt("read index bucket offset"))?;
         }
         out.extend_from_slice(&base_prefix);
         out.extend_from_slice(&crossing_bytes);
+        out.extend_from_slice(&component_bytes);
         for block in bucket_blocks {
             out.extend_from_slice(&block);
         }
-        Ok(ColdIndexBuild { index: out, values })
+        Ok(ReadIndexBuild { index: out, values })
     }
 
     pub(crate) fn directory_len(header: &[u8]) -> Result<usize> {
@@ -256,7 +276,7 @@ impl ColdIndex {
         let mut input = bytes.as_slice();
         let decoded = decode_header(&mut input)?;
         if encoded_len != decoded.directory_len {
-            return Err(Error::node_corrupt("cold index: directory length"));
+            return Err(Error::node_corrupt("read index: directory length"));
         }
 
         let mut bloom = Box::new([0u8; BLOOM_BYTES]);
@@ -272,7 +292,7 @@ impl ColdIndex {
                 .is_none_or(|end| end > decoded.total_len)
                 || (len as usize) < BUCKET_CRC_LEN
             {
-                return Err(Error::node_corrupt("cold index: bucket range"));
+                return Err(Error::node_corrupt("read index: bucket range"));
             }
             buckets.push(BucketEntry { off, len });
         }
@@ -291,8 +311,19 @@ impl ColdIndex {
                 .into_boxed_slice();
             crossings.push(CrossingEntry { prefix, child_guid });
         }
-        if !crossing_input.is_empty() || !input.is_empty() {
-            return Err(Error::node_corrupt("cold index: directory trailing bytes"));
+        if !crossing_input.is_empty() {
+            return Err(Error::node_corrupt("read index: crossing bytes"));
+        }
+        let component_bytes = take(&mut input, decoded.component_bytes)?;
+        let mut component_input = component_bytes;
+        let mut components = Vec::with_capacity(decoded.component_count);
+        for _ in 0..decoded.component_count {
+            let len = take_u32(&mut component_input)? as usize;
+            let component = take(&mut component_input, len)?.to_vec().into_boxed_slice();
+            components.push(component);
+        }
+        if !component_input.is_empty() || !input.is_empty() {
+            return Err(Error::node_corrupt("read index: directory trailing bytes"));
         }
 
         let bytes = size_of::<Self>()
@@ -302,6 +333,10 @@ impl ColdIndex {
             + crossings
                 .iter()
                 .map(|entry| size_of::<CrossingEntry>() + entry.prefix.len())
+                .sum::<usize>()
+            + components
+                .iter()
+                .map(|entry| size_of::<Box<[u8]>>() + entry.len())
                 .sum::<usize>();
         Ok(Self {
             stamp: decoded.stamp,
@@ -309,19 +344,20 @@ impl ColdIndex {
             buckets: buckets.into_boxed_slice(),
             base_prefix,
             crossings: crossings.into_boxed_slice(),
+            components: components.into_boxed_slice(),
             bytes,
         })
     }
 
-    pub(crate) fn route_or_absent(&self, user_key: &[u8], depth: usize) -> ColdIndexAnswer {
+    pub(crate) fn route_or_absent(&self, user_key: &[u8], depth: usize) -> ReadIndexAnswer {
         if let Some((child_guid, child_depth)) = self.crossing(user_key, depth) {
-            return ColdIndexAnswer::Crossing {
+            return ReadIndexAnswer::Crossing {
                 child_guid,
                 child_depth,
             };
         }
 
-        ColdIndexAnswer::NotFound
+        ReadIndexAnswer::NotFound
     }
 
     pub(crate) fn crossing(&self, user_key: &[u8], depth: usize) -> Option<(BlobGuid, usize)> {
@@ -345,7 +381,35 @@ impl ColdIndex {
         &self.base_prefix
     }
 
-    pub(crate) fn stamp(&self) -> ColdIndexStamp {
+    pub(crate) fn next_component_rollup(
+        &self,
+        prefix: &[u8],
+        delimiter: u8,
+        lower_bound: Option<(&[u8], bool)>,
+    ) -> Option<&[u8]> {
+        if delimiter != b'/' {
+            return None;
+        }
+        self.components.iter().find_map(|component| {
+            let component = component.as_ref();
+            if component.len() <= prefix.len() || !component.starts_with(prefix) {
+                return None;
+            }
+            if let Some((bound, inclusive)) = lower_bound {
+                let allowed = if inclusive {
+                    component >= bound
+                } else {
+                    component > bound
+                };
+                if !allowed {
+                    return None;
+                }
+            }
+            Some(component)
+        })
+    }
+
+    pub(crate) fn stamp(&self) -> ReadIndexStamp {
         self.stamp
     }
 
@@ -359,15 +423,15 @@ impl ColdIndex {
         &self,
         user_key: &[u8],
         block: &[u8],
-    ) -> Result<Option<ColdIndexHit>> {
+    ) -> Result<Option<ReadIndexHit>> {
         if block.len() < BUCKET_CRC_LEN {
-            return Err(Error::node_corrupt("cold index: bucket block"));
+            return Err(Error::node_corrupt("read index: bucket block"));
         }
         let body_len = block.len() - BUCKET_CRC_LEN;
         let expected_crc32 = u32::from_le_bytes(block[body_len..].try_into().unwrap());
         let body = &block[..body_len];
         if crc32fast::hash(body) != expected_crc32 {
-            return Err(Error::node_corrupt("cold index: bucket crc"));
+            return Err(Error::node_corrupt("read index: bucket crc"));
         }
         let key_hash = hash_user_key(user_key);
         let mut input = body;
@@ -391,16 +455,16 @@ impl ColdIndex {
                 continue;
             }
             return Ok(Some(match value {
-                Some(value) => ColdIndexHit::Inline {
+                Some(value) => ReadIndexHit::Inline {
                     value: value.to_vec(),
                     seq,
                 },
                 None => match value_source {
-                    VALUE_COLD => {
-                        if !valid_cold_value_range(value_source_off, full_value_len) {
-                            return Err(Error::node_corrupt("cold index: cold value range"));
+                    VALUE_SEGMENT => {
+                        if !valid_value_segment_range(value_source_off, full_value_len) {
+                            return Err(Error::node_corrupt("read index: value segment range"));
                         }
-                        ColdIndexHit::ColdValue {
+                        ReadIndexHit::ValueSegment {
                             value_off: value_source_off,
                             value_len: full_value_len,
                             value_crc32,
@@ -409,15 +473,15 @@ impl ColdIndex {
                     }
                     VALUE_BLOB => {
                         if !valid_blob_value_range(value_source_off, full_value_len) {
-                            return Err(Error::node_corrupt("cold index: blob value range"));
+                            return Err(Error::node_corrupt("read index: blob value range"));
                         }
-                        ColdIndexHit::BlobOffset {
+                        ReadIndexHit::BlobOffset {
                             value_off: value_source_off,
                             value_len: full_value_len,
                             seq,
                         }
                     }
-                    _ => return Err(Error::node_corrupt("cold index: value source")),
+                    _ => return Err(Error::node_corrupt("read index: value source")),
                 },
             }));
         }
@@ -435,13 +499,13 @@ struct IndexBuilder {
     crossings: Vec<CrossingEntry>,
 }
 
-pub(crate) struct ColdIndexCache {
+pub(crate) struct ReadIndexCache {
     shards: Box<[Mutex<IndexShard>]>,
     shard_budget_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ColdIndexCacheStats {
+pub(crate) struct ReadIndexCacheStats {
     pub(crate) entries: usize,
     pub(crate) bytes: usize,
     pub(crate) budget_bytes: usize,
@@ -455,12 +519,12 @@ struct IndexShard {
 }
 
 struct CacheEntry {
-    index: Arc<ColdIndex>,
+    index: Arc<ReadIndex>,
     bytes: usize,
     tick: u64,
 }
 
-impl ColdIndexCache {
+impl ReadIndexCache {
     pub(crate) fn new(budget_bytes: usize) -> Self {
         Self {
             shards: (0..SHARDS)
@@ -471,7 +535,7 @@ impl ColdIndexCache {
         }
     }
 
-    pub(crate) fn get(&self, guid: BlobGuid) -> Option<Arc<ColdIndex>> {
+    pub(crate) fn get(&self, guid: BlobGuid) -> Option<Arc<ReadIndex>> {
         if self.shard_budget_bytes == 0 {
             return None;
         }
@@ -483,7 +547,7 @@ impl ColdIndexCache {
         Some(Arc::clone(&entry.index))
     }
 
-    pub(crate) fn insert(&self, guid: BlobGuid, index: ColdIndex) -> Arc<ColdIndex> {
+    pub(crate) fn insert(&self, guid: BlobGuid, index: ReadIndex) -> Arc<ReadIndex> {
         let bytes = index.memory_bytes();
         let index = Arc::new(index);
         if self.shard_budget_bytes == 0 {
@@ -519,10 +583,10 @@ impl ColdIndexCache {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> ColdIndexCacheStats {
-        let mut out = ColdIndexCacheStats {
+    pub(crate) fn snapshot(&self) -> ReadIndexCacheStats {
+        let mut out = ReadIndexCacheStats {
             budget_bytes: self.shard_budget_bytes.saturating_mul(SHARDS),
-            ..ColdIndexCacheStats::default()
+            ..ReadIndexCacheStats::default()
         };
         for shard in &self.shards {
             let shard = shard.lock().unwrap();
@@ -558,10 +622,10 @@ fn walk(
 ) -> Result<()> {
     let body = frame
         .body_at_offset(off)
-        .ok_or(Error::node_corrupt("cold index: body"))?;
+        .ok_or(Error::node_corrupt("read index: body"))?;
     let ntype = frame
         .ntype_at(off)
-        .ok_or(Error::node_corrupt("cold index: ntype"))?;
+        .ok_or(Error::node_corrupt("read index: ntype"))?;
     match ntype {
         NodeType::Leaf => {
             let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
@@ -573,7 +637,7 @@ fn walk(
             let prefix = *cast::<Prefix>(body);
             let len = usize::from(prefix.prefix_len);
             if len > PREFIX_MAX_INLINE {
-                return Err(Error::node_corrupt("cold index: prefix len"));
+                return Err(Error::node_corrupt("read index: prefix len"));
             }
             append_path(path, &prefix.bytes[..len], |path| {
                 walk(frame, decode_prefix_child(prefix.child)?, path, builder)
@@ -583,7 +647,7 @@ fn walk(
             let blob = *cast::<BlobNode>(body);
             let len = usize::from(blob.prefix_len);
             if len > BLOB_MAX_INLINE {
-                return Err(Error::node_corrupt("cold index: blob prefix len"));
+                return Err(Error::node_corrupt("read index: blob prefix len"));
             }
             append_path(path, &blob.bytes[..len], |path| {
                 builder.crossings.push(CrossingEntry {
@@ -616,7 +680,7 @@ fn walk(
                 if child_idx != 0 {
                     let idx = usize::from(child_idx - 1);
                     if idx >= 48 {
-                        return Err(Error::node_corrupt("cold index: node48 child index"));
+                        return Err(Error::node_corrupt("read index: node48 child index"));
                     }
                     append_path(path, &[byte], |path| {
                         walk(frame, decode_child(node.children[idx])?, path, builder)
@@ -636,7 +700,7 @@ fn walk(
             }
         }
         NodeType::EmptyRoot => {}
-        NodeType::Invalid => return Err(Error::node_corrupt("cold index: invalid node")),
+        NodeType::Invalid => return Err(Error::node_corrupt("read index: invalid node")),
     }
     Ok(())
 }
@@ -655,33 +719,36 @@ fn append_path(
 
 fn decode_header(input: &mut &[u8]) -> Result<DecodedHeader> {
     if take(input, MAGIC.len())? != MAGIC {
-        return Err(Error::node_corrupt("cold index: magic"));
+        return Err(Error::node_corrupt("read index: magic"));
     }
     let version = take_u16(input)?;
     if version != VERSION {
-        return Err(Error::node_corrupt("cold index: version"));
+        return Err(Error::node_corrupt("read index: version"));
     }
     let _flags = take_u16(input)?;
     let total_len = take_u32(input)? as usize;
-    let stamp = ColdIndexStamp::decode(input)?;
+    let stamp = ReadIndexStamp::decode(input)?;
     let bucket_count = take_u32(input)? as usize;
     let crossing_count = take_u32(input)? as usize;
     let crossing_bytes = take_u32(input)? as usize;
     let base_prefix_len = take_u32(input)? as usize;
+    let component_count = take_u32(input)? as usize;
+    let component_bytes = take_u32(input)? as usize;
     if total_len > MAX_INDEX_BYTES {
-        return Err(Error::node_corrupt("cold index: total length"));
+        return Err(Error::node_corrupt("read index: total length"));
     }
     if !(MIN_BUCKETS..=MAX_BUCKETS).contains(&bucket_count) || !bucket_count.is_power_of_two() {
-        return Err(Error::node_corrupt("cold index: bucket count"));
+        return Err(Error::node_corrupt("read index: bucket count"));
     }
     let directory_len = HEADER_LEN
         .checked_add(BLOOM_BYTES)
         .and_then(|len| len.checked_add(bucket_count.saturating_mul(BUCKET_ENTRY_LEN)))
         .and_then(|len| len.checked_add(base_prefix_len))
         .and_then(|len| len.checked_add(crossing_bytes))
-        .ok_or(Error::node_corrupt("cold index: directory length"))?;
+        .and_then(|len| len.checked_add(component_bytes))
+        .ok_or(Error::node_corrupt("read index: directory length"))?;
     if total_len < directory_len {
-        return Err(Error::node_corrupt("cold index: total length"));
+        return Err(Error::node_corrupt("read index: total length"));
     }
     Ok(DecodedHeader {
         stamp,
@@ -689,6 +756,8 @@ fn decode_header(input: &mut &[u8]) -> Result<DecodedHeader> {
         crossing_count,
         crossing_bytes,
         base_prefix_len,
+        component_count,
+        component_bytes,
         directory_len,
         total_len,
     })
@@ -728,11 +797,53 @@ fn bucket_idx(hash: u64, bucket_count: usize) -> usize {
 fn encode_crossings(crossings: &[CrossingEntry]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for entry in crossings {
-        put_u32_checked(&mut out, entry.prefix.len(), "cold index prefix")?;
+        put_u32_checked(&mut out, entry.prefix.len(), "read index prefix")?;
         out.extend_from_slice(&entry.child_guid);
         out.extend_from_slice(&entry.prefix);
     }
     Ok(out)
+}
+
+fn encode_components(leaves: &[BuildLeaf]) -> Result<Vec<u8>> {
+    let mut components = BTreeSet::<Vec<u8>>::new();
+    for leaf in leaves {
+        let key = leaf.key.strip_suffix(&[0]).unwrap_or(&leaf.key);
+        let mut start = 0usize;
+        while let Some(pos) = key[start..].iter().position(|&b| b == b'/') {
+            let end = start + pos + 1;
+            if end < key.len() {
+                components.insert(key[..end].to_vec());
+            }
+            start = end;
+        }
+    }
+
+    let bytes = components
+        .iter()
+        .try_fold(0usize, |acc, component| {
+            acc.checked_add(4)?.checked_add(component.len())
+        })
+        .unwrap_or(MAX_COMPONENT_BYTES + 1);
+    if bytes > MAX_COMPONENT_BYTES {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(bytes);
+    for component in components {
+        put_u32_checked(&mut out, component.len(), "read index component")?;
+        out.extend_from_slice(&component);
+    }
+    Ok(out)
+}
+
+fn component_count(bytes: &[u8]) -> Result<usize> {
+    let mut input = bytes;
+    let mut count = 0usize;
+    while !input.is_empty() {
+        let len = take_u32(&mut input)? as usize;
+        let _ = take(&mut input, len)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn encode_bloom(leaves: &[BuildLeaf]) -> Box<[u8; BLOOM_BYTES]> {
@@ -774,7 +885,7 @@ fn encode_bucket_blocks(
     for leaf in leaves {
         let block = &mut blocks[bucket_idx(leaf.hash, bucket_count)];
         if !leaf.key.starts_with(base_prefix) {
-            return Err(Error::node_corrupt("cold index base prefix"));
+            return Err(Error::node_corrupt("read index base prefix"));
         }
         let suffix = &leaf.key[base_prefix.len()..];
         put_u64(block, leaf.hash);
@@ -782,9 +893,9 @@ fn encode_bucket_blocks(
         put_u32(block, leaf.value_source_off);
         put_u32(block, leaf.value_len);
         put_u32(block, leaf.value_crc32);
-        put_u32_checked(block, suffix.len(), "cold index key suffix")?;
+        put_u32_checked(block, suffix.len(), "read index key suffix")?;
         match &leaf.value {
-            Some(value) => put_u32_checked(block, value.len(), "cold index value")?,
+            Some(value) => put_u32_checked(block, value.len(), "read index value")?,
             None => put_u32(block, 0),
         }
         put_u64(block, leaf.seq);
@@ -800,7 +911,7 @@ fn encode_bucket_blocks(
     Ok(blocks)
 }
 
-fn pack_cold_values(leaves: &mut [BuildLeaf]) -> Result<Vec<u8>> {
+fn pack_value_segments(leaves: &mut [BuildLeaf]) -> Result<Vec<u8>> {
     let mut values = Vec::new();
     for leaf in leaves {
         let Some(value) = leaf.value.as_ref() else {
@@ -820,9 +931,9 @@ fn pack_cold_values(leaves: &mut [BuildLeaf]) -> Result<Vec<u8>> {
             leaf.value = None;
             continue;
         }
-        leaf.value_source = VALUE_COLD;
+        leaf.value_source = VALUE_SEGMENT;
         leaf.value_source_off =
-            u32::try_from(values.len()).map_err(|_| Error::node_corrupt("cold value offset"))?;
+            u32::try_from(values.len()).map_err(|_| Error::node_corrupt("value segment offset"))?;
         values.extend_from_slice(value);
         leaf.value = None;
     }
@@ -834,16 +945,16 @@ fn index_leaf(body: &[u8], off: u32, leaf: Leaf, builder: &mut IndexBuilder) -> 
     let key_end = key_start + usize::from(leaf.key_len);
     let value_end = key_end + usize::from(leaf.value_len);
     if key_end > body.len() {
-        return Err(Error::node_corrupt("cold index: leaf key range"));
+        return Err(Error::node_corrupt("read index: leaf key range"));
     }
     if value_end > body.len() {
-        return Err(Error::node_corrupt("cold index: leaf value range"));
+        return Err(Error::node_corrupt("read index: leaf value range"));
     }
     let key = &body[key_start..key_end];
     let value = &body[key_end..value_end];
     let value_off = off
-        .checked_add(u32::try_from(key_end).map_err(|_| Error::node_corrupt("cold index value"))?)
-        .ok_or(Error::node_corrupt("cold index value offset"))?;
+        .checked_add(u32::try_from(key_end).map_err(|_| Error::node_corrupt("read index value"))?)
+        .ok_or(Error::node_corrupt("read index value offset"))?;
     let value_len = u32::from(leaf.value_len);
     let value_crc32 = crc32fast::hash(value);
     let value = Some(value.to_vec().into_boxed_slice());
@@ -886,13 +997,13 @@ fn exact_key_range_matches(user_key: &[u8], start: usize, want: &[u8]) -> bool {
 
 fn decode_child(encoded: u16) -> Result<u32> {
     if encoded == 0 {
-        return Err(Error::node_corrupt("cold index: null child"));
+        return Err(Error::node_corrupt("read index: null child"));
     }
     Ok(decode_child_off(encoded))
 }
 
 fn decode_prefix_child(encoded: u32) -> Result<u32> {
-    let encoded = u16::try_from(encoded).map_err(|_| Error::node_corrupt("cold index: child"))?;
+    let encoded = u16::try_from(encoded).map_err(|_| Error::node_corrupt("read index: child"))?;
     decode_child(encoded)
 }
 
@@ -941,7 +1052,7 @@ fn valid_blob_value_range(value_off: u32, value_len: u32) -> bool {
             .is_some_and(|end| end <= PAGE_SIZE)
 }
 
-fn valid_cold_value_range(value_off: u32, value_len: u32) -> bool {
+fn valid_value_segment_range(value_off: u32, value_len: u32) -> bool {
     value_off
         .checked_add(value_len)
         .is_some_and(|end| end <= PAGE_SIZE)
@@ -979,7 +1090,7 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
     if input.len() < len {
-        return Err(Error::node_corrupt("cold index: truncated"));
+        return Err(Error::node_corrupt("read index: truncated"));
     }
     let (head, tail) = input.split_at(len);
     *input = tail;
@@ -1048,12 +1159,12 @@ mod tests {
         }
     }
 
-    fn decode_dir(bytes: &[u8]) -> ColdIndex {
-        let dir_len = ColdIndex::directory_len(&bytes[..ColdIndex::HEADER_LEN]).unwrap();
-        ColdIndex::decode_directory(bytes[..dir_len].to_vec()).unwrap()
+    fn decode_dir(bytes: &[u8]) -> ReadIndex {
+        let dir_len = ReadIndex::directory_len(&bytes[..ReadIndex::HEADER_LEN]).unwrap();
+        ReadIndex::decode_directory(bytes[..dir_len].to_vec()).unwrap()
     }
 
-    fn bucket<'a>(bytes: &'a [u8], index: &ColdIndex, key: &[u8]) -> &'a [u8] {
+    fn bucket<'a>(bytes: &'a [u8], index: &ReadIndex, key: &[u8]) -> &'a [u8] {
         let (off, len) = index.bucket_range(key).unwrap();
         &bytes[off as usize..off as usize + len as usize]
     }
@@ -1070,14 +1181,14 @@ mod tests {
         let guid = [0x11; 16];
         let mut buf = crate::store::blob_store::AlignedBlobBuf::zeroed();
         BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
-        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+        let bytes = ReadIndex::build(BlobFrameRef::wrap(buf.as_slice()))
             .unwrap()
             .index;
         let index = decode_dir(&bytes);
         assert_eq!(index.stamp.blob_guid, guid);
         assert!(matches!(
             index.route_or_absent(b"missing", 0),
-            ColdIndexAnswer::NotFound
+            ReadIndexAnswer::NotFound
         ));
     }
 
@@ -1086,12 +1197,12 @@ mod tests {
         let guid = [0x15; 16];
         let mut buf = crate::store::blob_store::AlignedBlobBuf::zeroed();
         BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
-        let mut bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+        let mut bytes = ReadIndex::build(BlobFrameRef::wrap(buf.as_slice()))
             .unwrap()
             .index;
         bytes[12..16].copy_from_slice(&(PAGE_SIZE + 1).to_le_bytes());
 
-        assert!(ColdIndex::directory_len(&bytes[..ColdIndex::HEADER_LEN]).is_err());
+        assert!(ReadIndex::directory_len(&bytes[..ReadIndex::HEADER_LEN]).is_err());
     }
 
     #[test]
@@ -1102,7 +1213,7 @@ mod tests {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
             install_leaf(&mut frame, b"alpha\0", b"one", 1, false);
         }
-        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+        let bytes = ReadIndex::build(BlobFrameRef::wrap(buf.as_slice()))
             .unwrap()
             .index;
         let index = decode_dir(&bytes);
@@ -1110,7 +1221,7 @@ mod tests {
         assert!(!index.may_have_key(b"alpha~"));
         assert_eq!(index.base_prefix.as_ref(), b"alpha\0");
         match index.lookup_leaf_in_bucket(b"alpha", bucket(&bytes, &index, b"alpha")) {
-            Ok(Some(ColdIndexHit::Inline { value, seq })) => {
+            Ok(Some(ReadIndexHit::Inline { value, seq })) => {
                 assert_eq!(value, b"one");
                 assert_eq!(seq, 1);
             }
@@ -1122,18 +1233,18 @@ mod tests {
             let mut frame = BlobFrame::init(tomb.as_mut_slice(), guid).unwrap();
             install_leaf(&mut frame, b"beta\0", b"two", 2, true);
         }
-        let bytes = ColdIndex::build(BlobFrameRef::wrap(tomb.as_slice()))
+        let bytes = ReadIndex::build(BlobFrameRef::wrap(tomb.as_slice()))
             .unwrap()
             .index;
         let index = decode_dir(&bytes);
         assert!(matches!(
             index.route_or_absent(b"beta", 0),
-            ColdIndexAnswer::NotFound
+            ReadIndexAnswer::NotFound
         ));
     }
 
     #[test]
-    fn large_value_bucket_stores_cold_value_offset() {
+    fn large_value_bucket_stores_value_segment_offset() {
         let guid = [0x1b; 16];
         let mut buf = crate::store::blob_store::AlignedBlobBuf::zeroed();
         let key = b"large-object\0";
@@ -1143,13 +1254,13 @@ mod tests {
             install_leaf(&mut frame, key, &value, 42, false);
         }
 
-        let build = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice())).unwrap();
+        let build = ReadIndex::build(BlobFrameRef::wrap(buf.as_slice())).unwrap();
         assert_eq!(build.values, value);
         let bytes = build.index;
         let index = decode_dir(&bytes);
         match index.lookup_leaf_in_bucket(b"large-object", bucket(&bytes, &index, b"large-object"))
         {
-            Ok(Some(ColdIndexHit::ColdValue {
+            Ok(Some(ReadIndexHit::ValueSegment {
                 value_off,
                 value_len,
                 value_crc32,
@@ -1160,7 +1271,7 @@ mod tests {
                 assert_eq!(value_crc32, crc32fast::hash(&value));
                 assert_eq!(seq, 42);
             }
-            _ => panic!("large value should be indexed by cold value offset"),
+            _ => panic!("large value should be indexed by value segment offset"),
         }
     }
 
@@ -1172,7 +1283,7 @@ mod tests {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
             install_leaf(&mut frame, b"alpha\0", b"one", 1, false);
         }
-        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+        let bytes = ReadIndex::build(BlobFrameRef::wrap(buf.as_slice()))
             .unwrap()
             .index;
         let index = decode_dir(&bytes);
@@ -1220,8 +1331,8 @@ mod tests {
             };
             encoded.extend_from_slice(block);
         }
-        let index = ColdIndex {
-            stamp: ColdIndexStamp {
+        let index = ReadIndex {
+            stamp: ReadIndexStamp {
                 root_slot: 0,
                 num_slots: 0,
                 space_used: 0,
@@ -1240,13 +1351,14 @@ mod tests {
             buckets: buckets.into_boxed_slice(),
             base_prefix: base,
             crossings: Box::new([]),
+            components: Box::new([]),
             bytes: 0,
         };
 
         let (off, len) = index.bucket_range(b"bucket/a/file-0001").unwrap();
         let block = &encoded[off as usize..off as usize + len as usize];
         match index.lookup_leaf_in_bucket(b"bucket/a/file-0001", block) {
-            Ok(Some(ColdIndexHit::Inline { value, seq })) => {
+            Ok(Some(ReadIndexHit::Inline { value, seq })) => {
                 assert_eq!(value, b"one");
                 assert_eq!(seq, 7);
             }
@@ -1265,6 +1377,82 @@ mod tests {
     }
 
     #[test]
+    fn component_summary_returns_next_path_rollup() {
+        let leaves = vec![
+            BuildLeaf {
+                hash: hash_exact_key(b"bucket/a/file-0001\0"),
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 3,
+                value_crc32: crc32fast::hash(b"one"),
+                key: b"bucket/a/file-0001\0".to_vec().into_boxed_slice(),
+                value: Some(b"one".to_vec().into_boxed_slice()),
+                seq: 7,
+            },
+            BuildLeaf {
+                hash: hash_exact_key(b"bucket/b/file-0001\0"),
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 3,
+                value_crc32: crc32fast::hash(b"two"),
+                key: b"bucket/b/file-0001\0".to_vec().into_boxed_slice(),
+                value: Some(b"two".to_vec().into_boxed_slice()),
+                seq: 8,
+            },
+            BuildLeaf {
+                hash: hash_exact_key(b"bucket/file-0001\0"),
+                value_source: VALUE_INLINE,
+                value_source_off: 0,
+                value_len: 5,
+                value_crc32: crc32fast::hash(b"plain"),
+                key: b"bucket/file-0001\0".to_vec().into_boxed_slice(),
+                value: Some(b"plain".to_vec().into_boxed_slice()),
+                seq: 9,
+            },
+        ];
+        let components = encode_components(&leaves).unwrap();
+        assert_eq!(component_count(&components).unwrap(), 3);
+
+        let index = ReadIndex {
+            stamp: ReadIndexStamp {
+                root_slot: 0,
+                num_slots: 0,
+                space_used: 0,
+                compact_times: 0,
+                dead_bytes: 0,
+                gap_space: 0,
+                tombstone_leaf_cnt: 0,
+                created_epoch: 0,
+                blob_guid: [0; 16],
+                routing_off: 0,
+                routing_len: 0,
+                leaf_region_start: 0,
+                routing_unfit: 0,
+            },
+            bloom: Box::new([0; BLOOM_BYTES]),
+            buckets: Box::new([]),
+            base_prefix: Box::new([]),
+            crossings: Box::new([]),
+            components: vec![
+                b"bucket/a/".to_vec().into_boxed_slice(),
+                b"bucket/b/".to_vec().into_boxed_slice(),
+            ]
+            .into_boxed_slice(),
+            bytes: 0,
+        };
+
+        assert_eq!(
+            index.next_component_rollup(b"bucket/", b'/', None),
+            Some(b"bucket/a/".as_slice())
+        );
+        assert_eq!(
+            index.next_component_rollup(b"bucket/", b'/', Some((b"bucket/a/", false))),
+            Some(b"bucket/b/".as_slice())
+        );
+        assert_eq!(index.next_component_rollup(b"bucket/", b':', None), None);
+    }
+
+    #[test]
     fn indexes_blob_crossing_prefixes() {
         let guid = [0x13; 16];
         let child = [0x44; 16];
@@ -1273,14 +1461,14 @@ mod tests {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
             install_blob_node(&mut frame, b"bucket/a/", child);
         }
-        let bytes = ColdIndex::build(BlobFrameRef::wrap(buf.as_slice()))
+        let bytes = ReadIndex::build(BlobFrameRef::wrap(buf.as_slice()))
             .unwrap()
             .index;
         let index = decode_dir(&bytes);
         assert!(!index.may_have_key(b"bucket/a/object"));
         assert!(matches!(
             index.route_or_absent(b"bucket/a/object", 0),
-            ColdIndexAnswer::Crossing {
+            ReadIndexAnswer::Crossing {
                 child_guid,
                 child_depth: 9,
                 ..

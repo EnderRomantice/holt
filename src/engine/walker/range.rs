@@ -822,7 +822,7 @@ pub struct RangeIter {
     initialized: bool,
     terminated: bool,
     stats: ScanStats,
-    /// Cold-scan I/O read-ahead window: child blobs pinned ahead of the
+    /// Indexed-scan I/O read-ahead window: child blobs pinned ahead of the
     /// descent reaching them, so a run of cross-blob children reads at
     /// device queue depth instead of one serial round-trip each. Filled
     /// from the (cached) parent when entering a run of `Blob` crossings
@@ -1457,12 +1457,12 @@ impl RangeIter {
             .is_none_or(|bound| bound.allows(&self.emit_buf))
     }
 
-    fn prepare_cold_blob_rollup(
+    fn prepare_indexed_blob_rollup(
         &mut self,
         child_guid: BlobGuid,
         blob_prefix: &[u8],
     ) -> Option<u64> {
-        let (index, epoch) = self.bm.cold_index_for_liveness(child_guid)?;
+        let (index, epoch) = self.bm.read_index_for_liveness(child_guid)?;
         if !index.has_indexed_leaf() {
             return None;
         }
@@ -1477,13 +1477,14 @@ impl RangeIter {
         self.prepare_segment_rollup(&segment).then_some(epoch)
     }
 
-    fn cold_blob_rollup_candidate_key(
+    fn indexed_blob_rollup_candidate_key(
         &self,
         child_guid: BlobGuid,
         blob_prefix: &[u8],
     ) -> Option<Vec<u8>> {
-        let (index, epoch) = self.bm.cold_index_for_liveness(child_guid)?;
-        if !index.has_indexed_leaf() || !self.bm.cold_liveness_token_valid(child_guid, epoch) {
+        let (index, epoch) = self.bm.read_index_for_liveness(child_guid)?;
+        if !index.has_indexed_leaf() || !self.bm.read_index_liveness_token_valid(child_guid, epoch)
+        {
             return None;
         }
         if let Some(candidate) = self.rollup_key_from_segment(blob_prefix) {
@@ -1495,6 +1496,16 @@ impl RangeIter {
         }
         let segment = self.cold_rollup_segment(blob_prefix, base_prefix);
         self.rollup_key_from_segment(&segment)
+    }
+
+    fn prepare_cold_component_rollup(&mut self, child_guid: BlobGuid) -> Option<u64> {
+        let delimiter = self.delimiter?;
+        let (index, epoch) = self.bm.read_index_for_liveness(child_guid)?;
+        let candidate =
+            index.next_component_rollup(&self.prefix, delimiter, self.lower_bound_tuple())?;
+        self.emit_buf.clear();
+        self.emit_buf.extend_from_slice(candidate);
+        Some(epoch)
     }
 
     fn cold_rollup_segment(&self, blob_prefix: &[u8], base_prefix: &[u8]) -> Vec<u8> {
@@ -1509,6 +1520,12 @@ impl RangeIter {
 
     fn prepare_branch_rollup(&mut self, byte: u8) -> bool {
         self.prepare_segment_rollup(std::slice::from_ref(&byte))
+    }
+
+    fn lower_bound_tuple(&self) -> Option<(&[u8], bool)> {
+        self.lower_bound
+            .as_ref()
+            .map(|bound| (bound.key(), bound.inclusive))
     }
 
     fn segment_rollup_len(&self, segment: &[u8]) -> Option<usize> {
@@ -1659,8 +1676,8 @@ impl RangeIter {
                             if self.segment_has_allowed_rollup_candidate(p_bytes.as_slice()) {
                                 return Ok(InitResult::Ready);
                             }
-                            if let Some(candidate) =
-                                self.cold_blob_rollup_candidate_key(child_guid, p_bytes.as_slice())
+                            if let Some(candidate) = self
+                                .indexed_blob_rollup_candidate_key(child_guid, p_bytes.as_slice())
                             {
                                 if self
                                     .lower_bound
@@ -2018,9 +2035,9 @@ impl RangeIter {
                         self.stack[idx].next = 1;
                         let can_rollup = self.prepare_segment_rollup(p_bytes.as_slice());
                         let cold_rollup_epoch =
-                            self.prepare_cold_blob_rollup(child_guid, p_bytes.as_slice());
+                            self.prepare_indexed_blob_rollup(child_guid, p_bytes.as_slice());
                         if let Some(epoch) = cold_rollup_epoch {
-                            if self.bm.cold_liveness_token_valid(child_guid, epoch) {
+                            if self.bm.read_index_liveness_token_valid(child_guid, epoch) {
                                 if !self.path_is_still_valid() {
                                     return Ok(RangeAdvance::Restart);
                                 }
@@ -2029,6 +2046,21 @@ impl RangeIter {
                                     self.terminated = true;
                                 }
                                 if needs_reseek && !self.terminated {
+                                    self.reseek_after_emit();
+                                }
+                                return Ok(self.common_prefix_advance_from_emit());
+                            }
+                        }
+                        let cold_component_epoch = self.prepare_cold_component_rollup(child_guid);
+                        if let Some(epoch) = cold_component_epoch {
+                            if self.bm.read_index_liveness_token_valid(child_guid, epoch) {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                if !self.set_lower_bound_to_emit_successor() {
+                                    self.terminated = true;
+                                }
+                                if !self.terminated {
                                     self.reseek_after_emit();
                                 }
                                 return Ok(self.common_prefix_advance_from_emit());
@@ -2111,14 +2143,14 @@ impl RangeIter {
                                         let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
                                         self.segment_has_rollup_candidate(&b.bytes[..plen])
                                     });
-                                // Cold-scan I/O read-ahead: when entering a run
+                                // Indexed-scan I/O read-ahead: when entering a run
                                 // of cross-blob children and the window has
                                 // drained, collect the upcoming child-blob guids
                                 // from this (cached) parent so they can be pinned
                                 // concurrently (device queue depth) below. Do not
                                 // prefetch a child whose BlobNode already proves a
                                 // delimiter rollup; the iterator can emit the
-                                // CommonPrefix from the parent plus cold-index
+                                // CommonPrefix from the parent plus read-index
                                 // liveness and avoid the child blob read entirely.
                                 let prefetch_guids = if !self.snapshot_cursor
                                     && child_ntype == NodeType::Blob
@@ -2464,11 +2496,11 @@ fn blob_child_guid(frame: BlobFrameRef<'_>, off: u32) -> Option<BlobGuid> {
 }
 
 /// Collect up to a bounded window of consecutive child-blob guids for a
-/// cold-scan read-ahead: the current `Blob` child at `first_off` plus
+/// indexed-scan read-ahead: the current `Blob` child at `first_off` plus
 /// following siblings of the parent inner node, stopping at the first
 /// non-`Blob` sibling (the run of cross-blob children has ended). Pure
 /// reads from the cached `frame`; the caller pins the returned guids
-/// concurrently so their cold reads pipeline.
+/// concurrently so their indexed reads pipeline.
 fn collect_blob_child_window(
     frame: BlobFrameRef<'_>,
     parent_off: u32,
