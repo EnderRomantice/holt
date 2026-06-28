@@ -32,7 +32,7 @@ compaction stalls, or a single global writer lock.
 - **Concurrent hot path**: optimistic reads and per-blob latching for
   disjoint subtrees.
 - **Page-granular indexed reads**: an in-blob routing region clusters a blob's
-  internal nodes so a cold point lookup reads only the pages its descent
+  internal nodes so an indexed point lookup reads only the pages its descent
   touches (~18 KB mean, ~27× less I/O) instead of pinning the whole 512 KB
   frame. Reusable header/routing pages are cached separately from one-shot
   leaf pages.
@@ -66,7 +66,7 @@ system built for that shape.
 
 ```toml
 [dependencies]
-holt = "0.7"
+holt = "0.8"
 ```
 
 File-backed trees are Unix-oriented. Linux uses the `io-uring` feature
@@ -190,7 +190,7 @@ a minor release, but minor releases may still break source compatibility
 before 1.0. Pin exact versions for production evaluation:
 
 ```toml
-holt = "=0.7.3"
+holt = "=0.8.0"
 ```
 
 The engine is covered by unit, integration, property, fuzz, soak, and

@@ -7,6 +7,39 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.8.0] — 2026-06-29
+
+### Added
+
+- Added checkpoint-built read indexes and value segments as the named
+  acceleration layer for page-granular indexed reads. `read.idx` stores the
+  routable directory, filters, component summaries, crossings, and inline small
+  values; `value.seg` stores larger value payloads referenced by the index.
+  Both files are rebuildable accelerators and never the source of truth.
+- Added read-index component summaries for delimiter/prefix rollups, allowing
+  some `list(..., delimiter="/")` paths to emit `CommonPrefix` entries without
+  pinning every child blob.
+
+### Changed
+
+- **Breaking observability/API cleanup.** Public stats, metrics, and benchmark
+  output now use `read_index_*`, `read_page_*`, and `value_segment_*` names
+  instead of the older `cold_*` / sidecar terminology.
+- **Breaking accelerator file rename.** File-backed stores now use `read.idx`
+  and `value.seg` instead of `cold.idx` and `cold.val`. These files are
+  advisory and can be regenerated from `blobs.dat`; committed data, WAL, and
+  manifest recovery remain authoritative.
+- Renamed the internal `cold_read` module to `read_index` and aligned walker,
+  buffer-manager, blob-store, tests, README, and metrics terminology around the
+  indexed-read model.
+
+### Validation
+
+- `cargo check --workspace --all-features --locked`
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`
+- `cargo test --workspace --all-features --locked`
+- `cargo test --test wal_tree_integration --all-features --locked`
+
 ## [0.7.3] — 2026-06-19
 
 ### Fixed
