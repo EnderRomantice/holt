@@ -7,6 +7,47 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.8.1] — 2026-07-01
+
+### Fixed
+
+- Hardened corrupted on-disk root pointers on read-side entry paths. Lookup,
+  routed indexed reads, and blob-topology scans now return `NodeCorrupt`
+  instead of tripping a debug assertion when a persisted root child pointer is
+  the null sentinel.
+- Added system fault regressions for manifest corruption, authoritative blob
+  root corruption, read-index corruption fallback, value-segment corruption
+  fallback, store-directory removal, permission denial, and injected ENOSPC
+  checkpoint write failure.
+
+### Changed
+
+- Expanded fuzz coverage for metadata-shaped delimiters (`/`, `:`, `|`, `#`,
+  `@`, `\`) and public `Tree::is_prefix_empty`.
+- Added a dedicated `read_index_model` fuzz target that exercises multi-blob
+  spillover, checkpoint, reopen, constrained buffer pools, indexed positive and
+  negative reads, prefix liveness, delimiter scans, stale read-index fallback,
+  and repeated checkpoint/reopen cycles.
+- Extended the soak harness to mix public prefix-empty checks and metadata
+  delimiter scans in both single-tree and DB modes.
+- Extended the Verus model with delimiter-tagged component-summary invariants
+  and prefix-liveness tri-state safety.
+
+### Validation
+
+- `cargo fmt --all --check`
+- `cargo fmt --manifest-path tools/soak/Cargo.toml --check`
+- `git diff --check`
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`
+- `cargo clippy --manifest-path tools/soak/Cargo.toml --locked -- -D warnings`
+- `cargo test --workspace --locked`
+- `cargo +nightly fuzz run atomic_model -- -runs=64`
+- `cargo +nightly fuzz run db_model -- -runs=48`
+- `cargo +nightly fuzz run read_index_model -- -runs=8`
+- `VERUS=/Users/guochengsong/.local/bin/verus ./verified/verify.sh`
+- `cargo run --manifest-path tools/soak/Cargo.toml --locked -- --mode normal --dir target/holt-soak-local-normal --reset --duration-secs 2 --keys 1000 --ops 4000 --threads 2 --buffer-pool 16 --wal-sync false`
+- `cargo run --manifest-path tools/soak/Cargo.toml --locked -- --mode db-normal --dir target/holt-soak-local-db --reset --duration-secs 2 --keys 1000 --ops 4000 --threads 2 --buffer-pool 16 --wal-sync false`
+
 ## [0.8.0] — 2026-06-29
 
 ### Added
