@@ -158,6 +158,9 @@ jobs:
       - name: cargo fuzz run db_model
         run: cargo +nightly fuzz run db_model -- -runs=256
 
+      - name: cargo fuzz run read_index_model
+        run: cargo +nightly fuzz run read_index_model -- -runs=4
+
   # --------------------------------------------------------------
   # Coverage — source-based LLVM coverage over lib + integration
   # tests + examples on Ubuntu. The line threshold is deliberately

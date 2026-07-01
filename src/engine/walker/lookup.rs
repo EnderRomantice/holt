@@ -22,11 +22,10 @@ use crate::store::{
 };
 
 use super::cast;
-use super::readers::{child_offset, resolve_typed};
+use super::readers::{child_offset, resolve_typed, root_child_offset};
 use super::route::{pin_route_parent, validate_route_edge};
 use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
 use super::SearchKey;
-use crate::store::decode_child_off;
 
 /// Look up `key` in the tree whose root is the encoded offset
 /// `start_root` (depth 0).
@@ -45,7 +44,7 @@ pub(super) fn lookup<'a>(
 ) -> Result<LookupResult<'a>> {
     descend(
         frame,
-        decode_child_off(start_root),
+        root_child_offset(start_root, "lookup: root child")?,
         SearchKey::exact(key),
         0,
     )
@@ -60,7 +59,12 @@ pub(super) fn lookup_at<'a>(
     key: SearchKey<'_>,
     depth: usize,
 ) -> Result<LookupResult<'a>> {
-    descend(frame, decode_child_off(start_root), key, depth)
+    descend(
+        frame,
+        root_child_offset(start_root, "lookup_at: root child")?,
+        key,
+        depth,
+    )
 }
 
 /// Multi-blob lookup — wait-free in the common case.
@@ -717,7 +721,11 @@ fn routed_read_cached(
             let frame = pages.frame();
             let h = frame.header();
             match h.routing_region() {
-                Some(rr) => (decode_child_off(h.root_slot), rr, ReadIndexStamp::new(h)),
+                Some(rr) => (
+                    root_child_offset(h.root_slot, "routed_read_cached: root child")?,
+                    rr,
+                    ReadIndexStamp::new(h),
+                ),
                 None => return Ok(IndexedBlobLookup::Unknown), // legacy -> full pin
             }
         };
@@ -975,7 +983,10 @@ pub(super) fn indexed_read_into(
         let frame = BlobFrameRef::wrap(&scratch[..]);
         let h = frame.header();
         match h.routing_region() {
-            Some(rr) => (decode_child_off(h.root_slot), rr),
+            Some(rr) => (
+                root_child_offset(h.root_slot, "indexed_read_into: root child")?,
+                rr,
+            ),
             None => return Ok(IndexedBlobLookup::Unknown), // legacy → full pin
         }
     };

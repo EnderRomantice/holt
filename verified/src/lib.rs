@@ -511,6 +511,93 @@ pub proof fn lemma_delimiter_rollup_bounds(prefix_len: nat, rest: Seq<u8>, delim
     lemma_find_delimiter_in_bounds(rest, delimiter);
 }
 
+pub open spec fn supported_component_delimiter(delimiter: u8) -> bool {
+    delimiter == 47u8  // '/'
+        || delimiter == 58u8  // ':'
+        || delimiter == 124u8 // '|'
+        || delimiter == 35u8  // '#'
+        || delimiter == 64u8  // '@'
+        || delimiter == 92u8  // '\'
+}
+
+pub proof fn lemma_metadata_delimiters_are_supported()
+    ensures
+        supported_component_delimiter(47u8),
+        supported_component_delimiter(58u8),
+        supported_component_delimiter(124u8),
+        supported_component_delimiter(35u8),
+        supported_component_delimiter(64u8),
+        supported_component_delimiter(92u8),
+{
+}
+
+pub ghost struct ComponentSummaryEntry {
+    pub delimiter: u8,
+    pub prefix: Seq<u8>,
+}
+
+impl ComponentSummaryEntry {
+    pub open spec fn wf(self) -> bool {
+        supported_component_delimiter(self.delimiter)
+            && self.prefix.len() > 0
+            && self.prefix[(self.prefix.len() - 1) as int] == self.delimiter
+    }
+}
+
+pub proof fn lemma_component_summary_entry_ends_at_its_delimiter(entry: ComponentSummaryEntry)
+    requires
+        entry.wf(),
+    ensures
+        entry.prefix.len() > 0,
+        entry.prefix[(entry.prefix.len() - 1) as int] == entry.delimiter,
+        supported_component_delimiter(entry.delimiter),
+{
+}
+
+pub enum PrefixLiveness {
+    Present,
+    Absent,
+    Unknown,
+}
+
+pub open spec fn liveness_may_short_circuit(liveness: PrefixLiveness) -> bool {
+    match liveness {
+        PrefixLiveness::Present => true,
+        PrefixLiveness::Absent => true,
+        PrefixLiveness::Unknown => false,
+    }
+}
+
+pub open spec fn liveness_join(a: PrefixLiveness, b: PrefixLiveness) -> PrefixLiveness {
+    match a {
+        PrefixLiveness::Present => PrefixLiveness::Present,
+        PrefixLiveness::Unknown => match b {
+            PrefixLiveness::Present => PrefixLiveness::Present,
+            _ => PrefixLiveness::Unknown,
+        },
+        PrefixLiveness::Absent => b,
+    }
+}
+
+pub proof fn lemma_unknown_liveness_cannot_short_circuit()
+    ensures
+        !liveness_may_short_circuit(PrefixLiveness::Unknown),
+{
+}
+
+pub proof fn lemma_present_liveness_dominates(other: PrefixLiveness)
+    ensures
+        match liveness_join(PrefixLiveness::Present, other) {
+            PrefixLiveness::Present => true,
+            _ => false,
+        },
+        match liveness_join(other, PrefixLiveness::Present) {
+            PrefixLiveness::Present => true,
+            _ => false,
+        },
+{
+}
+
 pub open spec fn align8(raw: nat) -> nat {
     ((raw + 7) / 8) * 8
 }

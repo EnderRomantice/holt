@@ -10,6 +10,8 @@ const MAX_OPS: usize = 96;
 const MAX_BATCH_OPS: usize = 12;
 const KEYSPACE: u8 = 32;
 const DIRS: u8 = 8;
+const PREFIXES: u8 = DIRS + 2;
+const DELIMITERS: [u8; 6] = [b'/', b':', b'|', b'#', b'@', b'\\'];
 
 #[derive(Debug)]
 struct Ops(Vec<Op>);
@@ -20,9 +22,10 @@ enum Op {
     Delete { key: u8 },
     Get { key: u8 },
     RangePrefix { dir: u8 },
-    RangeDelimiter { dir: u8 },
+    RangeDelimiter { dir: u8, delimiter: u8 },
     KeyScanPrefix { dir: u8 },
-    KeyScanDelimiter { dir: u8 },
+    KeyScanDelimiter { dir: u8, delimiter: u8 },
+    PrefixEmpty { dir: u8 },
     ViewPrefix { dir: u8 },
     Checkpoint,
     Reopen,
@@ -62,7 +65,7 @@ impl<'a> Arbitrary<'a> for Ops {
 
 impl<'a> Arbitrary<'a> for Op {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        Ok(match u.int_in_range(0..=9u8)? {
+        Ok(match u.int_in_range(0..=10u8)? {
             0 => Self::Put {
                 key: key_id(u)?,
                 value: value_id(u)?,
@@ -70,11 +73,18 @@ impl<'a> Arbitrary<'a> for Op {
             1 => Self::Delete { key: key_id(u)? },
             2 => Self::Get { key: key_id(u)? },
             3 => Self::RangePrefix { dir: dir_id(u)? },
-            4 => Self::RangeDelimiter { dir: dir_id(u)? },
+            4 => Self::RangeDelimiter {
+                dir: dir_id(u)?,
+                delimiter: delimiter_id(u)?,
+            },
             5 => Self::KeyScanPrefix { dir: dir_id(u)? },
-            6 => Self::KeyScanDelimiter { dir: dir_id(u)? },
-            7 => Self::ViewPrefix { dir: dir_id(u)? },
-            8 => {
+            6 => Self::KeyScanDelimiter {
+                dir: dir_id(u)?,
+                delimiter: delimiter_id(u)?,
+            },
+            7 => Self::PrefixEmpty { dir: dir_id(u)? },
+            8 => Self::ViewPrefix { dir: dir_id(u)? },
+            9 => {
                 if bool::arbitrary(u)? {
                     Self::Checkpoint
                 } else {
@@ -131,15 +141,34 @@ fn value_id(u: &mut Unstructured<'_>) -> ArbitraryResult<u8> {
 }
 
 fn dir_id(u: &mut Unstructured<'_>) -> ArbitraryResult<u8> {
-    u.int_in_range(0..=DIRS - 1)
+    u.int_in_range(0..=PREFIXES - 1)
+}
+
+fn delimiter_id(u: &mut Unstructured<'_>) -> ArbitraryResult<u8> {
+    u.int_in_range(0..=DELIMITERS.len() as u8 - 1)
+}
+
+fn delimiter(id: u8) -> u8 {
+    DELIMITERS[id as usize % DELIMITERS.len()]
 }
 
 fn key(id: u8) -> Vec<u8> {
-    format!("dir/{:02}/file/{:02}", id % DIRS, id % KEYSPACE).into_bytes()
+    format!(
+        "dir/{:02}/tenant:{:02}|bucket#{:02}@shard\\file/{:02}",
+        id % DIRS,
+        id % 4,
+        id % 8,
+        id % KEYSPACE
+    )
+    .into_bytes()
 }
 
 fn prefix(dir: u8) -> Vec<u8> {
-    format!("dir/{:02}/", dir % DIRS).into_bytes()
+    if dir < DIRS {
+        format!("dir/{:02}/", dir).into_bytes()
+    } else {
+        format!("missing/{:02}/", dir - DIRS).into_bytes()
+    }
 }
 
 fn value(id: u8) -> Vec<u8> {
@@ -348,12 +377,17 @@ fn expected_key_entries(
     expected
 }
 
-fn assert_range_delimiter_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, dir: u8) {
+fn assert_range_delimiter_matches_model_with(
+    tree: &Tree,
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    dir: u8,
+    delimiter: u8,
+) {
     let prefix = prefix(dir);
-    let expected = expected_key_entries(model, dir, Some(b'/'));
+    let expected = expected_key_entries(model, dir, Some(delimiter));
     let got: Vec<_> = tree
         .scan(&prefix)
-        .delimiter(b'/')
+        .delimiter(delimiter)
         .into_iter()
         .map(|entry| match entry.unwrap() {
             RangeEntry::Key { key, version, .. } => {
@@ -365,6 +399,12 @@ fn assert_range_delimiter_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, V
         })
         .collect();
     assert_eq!(got, expected);
+}
+
+fn assert_prefix_empty_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, dir: u8) {
+    let prefix = prefix(dir);
+    let expected = !model.keys().any(|key| key.starts_with(&prefix));
+    assert_eq!(tree.is_prefix_empty(&prefix).unwrap(), expected);
 }
 
 fn assert_key_scan_matches_model(
@@ -489,11 +529,19 @@ fuzz_target!(|ops: Ops| {
                 assert_eq!(tree.get(&key(id)).unwrap(), model.get(&key(id)).cloned());
             }
             Op::RangePrefix { dir } => assert_prefix_matches_model(&tree, &model, dir),
-            Op::RangeDelimiter { dir } => assert_range_delimiter_matches_model(&tree, &model, dir),
-            Op::KeyScanPrefix { dir } => assert_key_scan_matches_model(&tree, &model, dir, None),
-            Op::KeyScanDelimiter { dir } => {
-                assert_key_scan_matches_model(&tree, &model, dir, Some(b'/'));
+            Op::RangeDelimiter { dir, delimiter } => {
+                assert_range_delimiter_matches_model_with(
+                    &tree,
+                    &model,
+                    dir,
+                    self::delimiter(delimiter),
+                );
             }
+            Op::KeyScanPrefix { dir } => assert_key_scan_matches_model(&tree, &model, dir, None),
+            Op::KeyScanDelimiter { dir, delimiter } => {
+                assert_key_scan_matches_model(&tree, &model, dir, Some(self::delimiter(delimiter)));
+            }
+            Op::PrefixEmpty { dir } => assert_prefix_empty_matches_model(&tree, &model, dir),
             Op::ViewPrefix { dir } => assert_view_matches_model(&tree, &model, dir),
             Op::Checkpoint => tree.checkpoint().unwrap(),
             Op::Reopen => {

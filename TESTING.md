@@ -13,7 +13,7 @@ Run on every push and pull request:
 | Unit/integration | `cargo test --workspace --all-features --lib --tests --examples --locked` | API semantics, walker behavior, WAL replay, checkpoint recovery, view/range behavior, atomic batches |
 | Doctests/examples | `cargo test --workspace --all-features --doc --locked`; example binaries | Public API examples stay buildable |
 | Lint | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Formatting and warning-free code |
-| Fuzz smoke | `cargo +nightly fuzz run atomic_model -- -runs=512`; `cargo +nightly fuzz run db_model -- -runs=256` | Keeps the fuzz targets building and exercises random API traces |
+| Fuzz smoke | `cargo +nightly fuzz run atomic_model -- -runs=512`; `cargo +nightly fuzz run db_model -- -runs=256`; `cargo +nightly fuzz run read_index_model -- -runs=4` | Keeps the fuzz targets building and exercises random API traces |
 | Soak smoke | `tools/soak --mode normal`; `tools/soak --mode db-normal` with short runs | Keeps the lifecycle harness buildable and catches obvious reopen regressions |
 | Coverage | `cargo llvm-cov ...` | Prevents accidental coverage drops |
 | Regression bench | `benches/ regression` | Catches large local performance regressions without comparator dependencies |
@@ -46,6 +46,9 @@ Run on every push and pull request:
 - delimiter rollup / `CommonPrefix` behavior;
 - key-only scans through both owned iteration and borrowed visitor paths;
 - scoped `View` snapshots and view-local key scans.
+- public `Tree::is_prefix_empty`;
+- delimiter rollup for the metadata delimiter set (`/`, `:`, `|`,
+  `#`, `@`, `\`).
 
 Long campaigns should preserve the minimized corpus under
 `fuzz/corpus/atomic_model` only when the corpus entry represents a
@@ -59,7 +62,19 @@ per-tree `BTreeMap` oracle. The model covers:
 - cross-tree `DB::atomic` batches;
 - per-tree point operations through DB-opened tree handles;
 - DB-level scoped `View` snapshots;
-- record scans, delimiter key scans, checkpoint, and WAL replay.
+- public per-tree `Tree::is_prefix_empty`;
+- record scans, delimiter key scans over the metadata delimiter set,
+  checkpoint, and WAL replay.
+
+`fuzz/fuzz_targets/read_index_model.rs` is the cold-read/read-index
+model. It preloads a multi-blob file-backed tree, checkpoints it, reopens
+with a constrained buffer pool, then fuzzes:
+
+- positive and negative point reads through the indexed cold path;
+- public `is_prefix_empty` over live and absent prefixes;
+- delimiter scans across `/`, `:`, `|`, `#`, `@`, and `\`;
+- stale read-index fallback after post-checkpoint put/delete;
+- checkpoint/reopen cycles with the same model oracle.
 
 ## Soak Harness
 
@@ -107,6 +122,8 @@ cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
 - insert/remove arity preservation;
 - prefix split branch shape;
 - delimiter rollup bounds;
+- component-summary delimiter tagging;
+- prefix-liveness tri-state safety;
 - virtual user-key terminator;
 - leaf extent alignment.
 - DB catalog state transitions for create/drop/finalize visibility;
@@ -124,11 +141,11 @@ layout and walker code depend on.
 
 ## Known Gaps
 
-These are not fully automated yet:
+These still require special host support or long-running jobs:
 
-- disk-full / `ENOSPC`;
-- permission changes and directory removal during operation;
-- systematic manifest/blob bit-flip corruption injection;
-- multi-process open contention;
+- host-level disk-full / `ENOSPC` runs beyond the injected checkpoint
+  failpoint;
+- broad offline corruption fuzzing beyond the targeted manifest,
+  blob-root, read-index, and value-segment bit-flip tests;
 - ThreadSanitizer or Loom-style concurrency model checking;
 - long io_uring crash/soak on a real Linux NVMe host.

@@ -16,7 +16,7 @@ use crate::store::{decode_child_off, BlobFrameRef, BufferManager};
 
 use super::super::simd;
 use super::cast;
-use super::readers::resolve_typed;
+use super::readers::{resolve_typed, root_child_offset};
 
 /// One reachable blob plus its cross-blob depth from the root.
 ///
@@ -53,7 +53,7 @@ pub(crate) fn collect_blob_children_from_frame(frame: BlobFrameRef<'_>) -> Resul
     let mut found = Vec::new();
     scan_subtree(
         frame,
-        decode_child_off(frame.header().root_slot),
+        root_child_offset(frame.header().root_slot, "scan: root child")?,
         &mut found,
     )?;
     Ok(found)
@@ -101,7 +101,8 @@ fn collect_blob_topology_inner(
         {
             let guard = pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let root_off = decode_child_off(frame.header().root_slot);
+            let root_off =
+                root_child_offset(frame.header().root_slot, "scan topology: root child")?;
             scan_subtree(frame, root_off, &mut found)?;
         }
         for child_guid in found {

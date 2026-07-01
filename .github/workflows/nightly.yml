@@ -213,6 +213,9 @@ jobs:
       - name: cargo fuzz run db_model
         run: cargo +nightly fuzz run db_model -- -max_total_time="$FUZZ_SECONDS"
 
+      - name: cargo fuzz run read_index_model
+        run: cargo +nightly fuzz run read_index_model -- -max_total_time="$FUZZ_SECONDS"
+
   verified-model:
     name: Verus model
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_verus }}

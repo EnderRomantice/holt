@@ -7,10 +7,12 @@ the parent workspace.
 ## Modes
 
 - `normal`: multi-threaded point read/write/delete, key-only prefix
-  scan, atomic batch, checkpoint, reopen, and oracle verification.
+  scan over metadata delimiters, public prefix-empty checks, atomic
+  batch, checkpoint, reopen, and oracle verification.
 - `db-normal`: multi-threaded named-tree DB run with cross-tree atomic
-  batches, per-tree point reads, key-only scans, DB views, checkpoint,
-  reopen, and oracle verification.
+  batches, per-tree point reads, key-only scans over metadata
+  delimiters, public prefix-empty checks, DB views, checkpoint, reopen,
+  and oracle verification.
 - `crash`: parent process repeatedly starts a child writer, kills it
   with `SIGKILL`, reopens the tree, and verifies every operation the
   child acknowledged in `soak-ack.log`.

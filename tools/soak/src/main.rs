@@ -14,6 +14,7 @@ type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, DynError>;
 
 const DB_SOAK_TREES: [&str; 4] = ["objects", "inodes", "locks", "sessions"];
+const SOAK_DELIMITERS: [u8; 6] = [b'/', b':', b'|', b'#', b'@', b'\\'];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -152,13 +153,15 @@ fn run_normal(cfg: &Config) -> Result<()> {
                     let rev = make_revision(tid, done);
                     tree.put(&key(idx), &value(idx, rev))?;
                     oracle[idx].store(rev, Ordering::Release);
-                } else if roll < 75 {
+                } else if roll < 72 {
                     verify_one(&tree, &oracle, idx)?;
-                } else if roll < 85 {
+                } else if roll < 82 {
                     tree.delete(&key(idx))?;
                     oracle[idx].store(0, Ordering::Release);
-                } else if roll < 95 {
+                } else if roll < 92 {
                     scan_small_prefix(&tree, idx)?;
+                } else if roll < 97 {
+                    verify_prefix_empty(&tree, &oracle, idx)?;
                 } else {
                     let rev = make_revision(tid, done);
                     let k = key(idx);
@@ -226,14 +229,14 @@ fn run_db_normal(cfg: &Config) -> Result<()> {
                             )
                         })?;
                     oracle[tree_slot][idx].store(rev, Ordering::Release);
-                } else if roll < 65 {
+                } else if roll < 62 {
                     verify_db_one(&db, &oracle, tree_slot, idx).map_err(|e| {
                         format!(
                             "db-normal get tree={} idx={idx} done={done}: {e}",
                             DB_SOAK_TREES[tree_slot]
                         )
                     })?;
-                } else if roll < 75 {
+                } else if roll < 72 {
                     let key = key(idx);
                     db.atomic(|batch| batch.delete(DB_SOAK_TREES[tree_slot], &key))
                         .map_err(|e| {
@@ -243,14 +246,21 @@ fn run_db_normal(cfg: &Config) -> Result<()> {
                             )
                         })?;
                     oracle[tree_slot][idx].store(0, Ordering::Release);
-                } else if roll < 88 {
+                } else if roll < 84 {
                     scan_db_small_prefix(&db, tree_slot, idx).map_err(|e| {
                         format!(
                             "db-normal scan tree={} idx={idx} done={done}: {e}",
                             DB_SOAK_TREES[tree_slot]
                         )
                     })?;
-                } else if roll < 96 {
+                } else if roll < 91 {
+                    verify_db_prefix_empty(&db, &oracle, tree_slot, idx).map_err(|e| {
+                        format!(
+                            "db-normal prefix-empty tree={} idx={idx} done={done}: {e}",
+                            DB_SOAK_TREES[tree_slot]
+                        )
+                    })?;
+                } else if roll < 97 {
                     let other =
                         (tree_slot + 1 + (rng.next_u64() as usize % (DB_SOAK_TREES.len() - 1)))
                             % DB_SOAK_TREES.len();
@@ -566,10 +576,11 @@ fn verify_db_ack_entries(db: &DB, expected: &[(Vec<u8>, u64, u64)]) -> Result<()
 }
 
 fn scan_small_prefix(tree: &Tree, idx: usize) -> Result<()> {
-    let prefix = format!("bucket-{:03}/", idx % 256);
+    let prefix = bucket_prefix(idx);
+    let delimiter = delimiter_for_index(idx);
     let mut seen = 0usize;
     tree.scan_keys(prefix.as_bytes())
-        .delimiter(b'/')
+        .delimiter(delimiter)
         .visit(16, |entry| {
             match entry {
                 KeyRangeEntryRef::Key { .. } | KeyRangeEntryRef::CommonPrefix(_) => {
@@ -588,8 +599,33 @@ fn scan_db_small_prefix(db: &DB, tree_slot: usize, idx: usize) -> Result<()> {
     scan_small_prefix(&tree, idx)
 }
 
+fn verify_prefix_empty(tree: &Tree, oracle: &[AtomicU64], idx: usize) -> Result<()> {
+    let missing = format!("missing-bucket-{:03}/", idx % 256);
+    if !tree.is_prefix_empty(missing.as_bytes())? {
+        return Err(format!("missing prefix `{missing}` unexpectedly reported non-empty").into());
+    }
+    if oracle[idx].load(Ordering::Acquire) != 0 {
+        let prefix = bucket_prefix(idx);
+        if tree.is_prefix_empty(prefix.as_bytes())? {
+            return Err(format!("live key prefix `{prefix}` unexpectedly reported empty").into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_db_prefix_empty(
+    db: &DB,
+    oracle: &[Vec<AtomicU64>],
+    tree_slot: usize,
+    idx: usize,
+) -> Result<()> {
+    let tree = db.open_tree(DB_SOAK_TREES[tree_slot])?;
+    verify_prefix_empty(&tree, &oracle[tree_slot], idx)
+}
+
 fn view_db_prefix(db: &DB, tree_slot: usize, idx: usize) -> Result<()> {
-    let prefix = format!("bucket-{:03}/", idx % 256);
+    let prefix = bucket_prefix(idx);
+    let delimiter = delimiter_for_index(idx);
     let scopes = [(DB_SOAK_TREES[tree_slot], prefix.as_bytes())];
     db.view(&scopes, |view| {
         let Some(tree) = view.tree(DB_SOAK_TREES[tree_slot]) else {
@@ -597,7 +633,7 @@ fn view_db_prefix(db: &DB, tree_slot: usize, idx: usize) -> Result<()> {
         };
         let mut seen = 0usize;
         tree.scan_keys(prefix.as_bytes())?
-            .delimiter(b'/')
+            .delimiter(delimiter)
             .visit(16, |entry| {
                 match entry {
                     KeyRangeEntryRef::Key { .. } | KeyRangeEntryRef::CommonPrefix(_) => {
@@ -737,11 +773,20 @@ fn partitioned_index(rng: &mut Rng, keys: usize, threads: usize, tid: usize) -> 
 
 fn key(idx: usize) -> Vec<u8> {
     format!(
-        "bucket-{bucket:03}/tenant-{tenant:02}/path/object-{idx:010}.bin",
+        "bucket-{bucket:03}/tenant:{tenant:02}|path#{path:02}@shard\\object/{idx:010}.bin",
         bucket = idx % 256,
         tenant = idx % 32,
+        path = idx % 64,
     )
     .into_bytes()
+}
+
+fn bucket_prefix(idx: usize) -> String {
+    format!("bucket-{:03}/", idx % 256)
+}
+
+fn delimiter_for_index(idx: usize) -> u8 {
+    SOAK_DELIMITERS[idx % SOAK_DELIMITERS.len()]
 }
 
 fn value(idx: usize, rev: u64) -> Vec<u8> {

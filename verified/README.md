@@ -29,6 +29,9 @@ The current model covers:
 - compact/filter survivor packing into Empty, unary Prefix, or the smallest fitting inner node;
 - leaf split structure: optional Prefix plus a valid two-child Node4 branch;
 - delimiter rollup bounds for S3-style `CommonPrefix` emission;
+- metadata delimiter support for component summaries (`/`, `:`, `|`, `#`, `@`, `\`);
+- delimiter-tagged component-summary entries ending at their own delimiter;
+- prefix-liveness tri-state safety (`Unknown` cannot short-circuit);
 - Holt's virtual `0x00` user-key terminator;
 - the 8-byte leaf extent alignment rule;
 - DB catalog create/drop/finalize visibility transitions;

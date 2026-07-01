@@ -38,6 +38,7 @@ struct FailpointBlobStore {
     fail_delete_at: AtomicUsize, // 1-based ordinal; usize::MAX = disarmed
     fail_flush_at: AtomicUsize,
     fail_write_at: AtomicUsize,
+    fail_write_storage_full_at: AtomicUsize,
     flush_retry_pending: AtomicBool,
 }
 
@@ -51,6 +52,7 @@ impl FailpointBlobStore {
             fail_delete_at: AtomicUsize::new(usize::MAX),
             fail_flush_at: AtomicUsize::new(usize::MAX),
             fail_write_at: AtomicUsize::new(usize::MAX),
+            fail_write_storage_full_at: AtomicUsize::new(usize::MAX),
             flush_retry_pending: AtomicBool::new(false),
         }
     }
@@ -62,6 +64,9 @@ impl FailpointBlobStore {
     }
     fn arm_write(&self, nth: usize) {
         self.fail_write_at.store(nth, Ordering::SeqCst);
+    }
+    fn arm_write_storage_full(&self, nth: usize) {
+        self.fail_write_storage_full_at.store(nth, Ordering::SeqCst);
     }
     fn delete_count(&self) -> usize {
         self.delete_calls.load(Ordering::SeqCst)
@@ -75,6 +80,11 @@ fn failpoint_err(msg: &'static str) -> holt::Error {
     holt::Error::BlobStoreIo(io::Error::other(msg))
 }
 
+fn storage_full_err(_msg: &'static str) -> holt::Error {
+    const ENOSPC: i32 = 28;
+    holt::Error::BlobStoreIo(io::Error::from_raw_os_error(ENOSPC))
+}
+
 impl BlobStore for FailpointBlobStore {
     fn read_blob(&self, guid: holt::BlobGuid, dst: &mut AlignedBlobBuf) -> holt::Result<()> {
         self.inner.read_blob(guid, dst)
@@ -85,6 +95,12 @@ impl BlobStore for FailpointBlobStore {
         if n == armed {
             self.fail_write_at.store(usize::MAX, Ordering::SeqCst);
             return Err(failpoint_err("failpoint: write_blob"));
+        }
+        let storage_full_armed = self.fail_write_storage_full_at.load(Ordering::SeqCst);
+        if n == storage_full_armed {
+            self.fail_write_storage_full_at
+                .store(usize::MAX, Ordering::SeqCst);
+            return Err(storage_full_err("failpoint: write_blob storage full"));
         }
         self.inner.write_blob(guid, src)
     }
@@ -254,6 +270,39 @@ fn dirty_write_failure_is_retried_next_round() {
 
     // Verify the value is durable.
     assert_eq!(tree.get(b"k1").unwrap().as_deref(), Some(&b"v1"[..]),);
+}
+
+#[test]
+fn storage_full_write_failure_is_retried_next_round() {
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
+    let fp_clone: Arc<dyn BlobStore> = fp.clone();
+    let mut cfg = TreeConfig::memory();
+    cfg.memory_flush_on_write = false;
+    let tree = Tree::open_with_blob_store(cfg, fp_clone).unwrap();
+
+    tree.put(b"k-storage-full", b"v").unwrap();
+    let writes_pre = fp.write_calls.load(Ordering::SeqCst);
+    fp.arm_write_storage_full(writes_pre + 1);
+
+    let err = tree.checkpoint().unwrap_err();
+    match err {
+        holt::Error::BlobStoreIo(e) => {
+            assert_eq!(e.kind(), io::ErrorKind::StorageFull);
+        }
+        other => panic!("expected storage-full BlobStoreIo, got {other:?}"),
+    }
+    assert!(
+        tree.stats().unwrap().bm_dirty_count >= 1,
+        "storage-full write must leave dirty entry for retry",
+    );
+
+    tree.checkpoint().unwrap();
+    assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
+    assert_eq!(
+        tree.get(b"k-storage-full").unwrap().as_deref(),
+        Some(&b"v"[..]),
+    );
 }
 
 #[test]

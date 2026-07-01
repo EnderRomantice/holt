@@ -153,3 +153,12 @@ pub(super) fn read_node256_child(frame: BlobFrameRef<'_>, off: u32, byte: u8) ->
 pub(super) fn child_offset(encoded: u16) -> u32 {
     decode_child_off(encoded)
 }
+
+/// Checked root-child decode for bytes read from disk.
+#[inline]
+pub(super) fn root_child_offset(encoded: u16, context: &'static str) -> Result<u32> {
+    if encoded == 0 {
+        return Err(Error::node_corrupt(context));
+    }
+    Ok(decode_child_off(encoded))
+}

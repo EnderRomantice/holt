@@ -11,6 +11,8 @@ const MAX_OPS: usize = 80;
 const MAX_BATCH_OPS: usize = 12;
 const KEYSPACE: u8 = 32;
 const DIRS: u8 = 8;
+const PREFIXES: u8 = DIRS + 2;
+const DELIMITERS: [u8; 6] = [b'/', b':', b'|', b'#', b'@', b'\\'];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TreeModel {
@@ -30,7 +32,8 @@ enum Op {
     Delete { tree: u8, key: u8 },
     Get { tree: u8, key: u8 },
     RangePrefix { tree: u8, dir: u8 },
-    KeyScanDelimiter { tree: u8, dir: u8 },
+    KeyScanDelimiter { tree: u8, dir: u8, delimiter: u8 },
+    PrefixEmpty { tree: u8, dir: u8 },
     ViewPrefix { tree: u8, dir: u8 },
     Checkpoint,
     Reopen,
@@ -98,7 +101,7 @@ impl<'a> Arbitrary<'a> for Ops {
 
 impl<'a> Arbitrary<'a> for Op {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        Ok(match u.int_in_range(0..=10u8)? {
+        Ok(match u.int_in_range(0..=11u8)? {
             0 => Self::Create { tree: tree_id(u)? },
             1 => Self::Drop { tree: tree_id(u)? },
             2 => Self::Put {
@@ -121,13 +124,18 @@ impl<'a> Arbitrary<'a> for Op {
             6 => Self::KeyScanDelimiter {
                 tree: tree_id(u)?,
                 dir: dir_id(u)?,
+                delimiter: delimiter_id(u)?,
             },
-            7 => Self::ViewPrefix {
+            7 => Self::PrefixEmpty {
                 tree: tree_id(u)?,
                 dir: dir_id(u)?,
             },
-            8 => Self::Checkpoint,
-            9 => Self::Reopen,
+            8 => Self::ViewPrefix {
+                tree: tree_id(u)?,
+                dir: dir_id(u)?,
+            },
+            9 => Self::Checkpoint,
+            10 => Self::Reopen,
             _ => {
                 let len = u.int_in_range(0..=MAX_BATCH_OPS)?;
                 let mut batch = Vec::with_capacity(len);
@@ -184,7 +192,15 @@ fn value_id(u: &mut Unstructured<'_>) -> ArbitraryResult<u8> {
 }
 
 fn dir_id(u: &mut Unstructured<'_>) -> ArbitraryResult<u8> {
-    u.int_in_range(0..=DIRS - 1)
+    u.int_in_range(0..=PREFIXES - 1)
+}
+
+fn delimiter_id(u: &mut Unstructured<'_>) -> ArbitraryResult<u8> {
+    u.int_in_range(0..=DELIMITERS.len() as u8 - 1)
+}
+
+fn delimiter(id: u8) -> u8 {
+    DELIMITERS[id as usize % DELIMITERS.len()]
 }
 
 fn tree_name(id: u8) -> &'static str {
@@ -192,11 +208,22 @@ fn tree_name(id: u8) -> &'static str {
 }
 
 fn key(id: u8) -> Vec<u8> {
-    format!("dir/{:02}/file/{:02}", id % DIRS, id % KEYSPACE).into_bytes()
+    format!(
+        "dir/{:02}/tenant:{:02}|bucket#{:02}@shard\\file/{:02}",
+        id % DIRS,
+        id % 4,
+        id % 8,
+        id % KEYSPACE
+    )
+    .into_bytes()
 }
 
 fn prefix(dir: u8) -> Vec<u8> {
-    format!("dir/{:02}/", dir % DIRS).into_bytes()
+    if dir < DIRS {
+        format!("dir/{:02}/", dir).into_bytes()
+    } else {
+        format!("missing/{:02}/", dir - DIRS).into_bytes()
+    }
 }
 
 fn value(id: u8) -> Vec<u8> {
@@ -468,16 +495,22 @@ fn expected_key_entries(
     expected
 }
 
-fn assert_key_scan_matches_model(db: &DB, model: &[TreeModel], tree: u8, dir: u8) {
+fn assert_key_scan_matches_model(
+    db: &DB,
+    model: &[TreeModel],
+    tree: u8,
+    dir: u8,
+    delimiter: u8,
+) {
     let name = tree_name(tree);
     match live_tree(model, tree) {
         Ok(model_tree) => {
             let handle = db.open_tree(name).unwrap();
             let prefix = prefix(dir);
-            let expected = expected_key_entries(model_tree, dir, Some(b'/'));
+            let expected = expected_key_entries(model_tree, dir, Some(delimiter));
             let got: Vec<_> = handle
                 .scan_keys(&prefix)
-                .delimiter(b'/')
+                .delimiter(delimiter)
                 .into_iter()
                 .map(|entry| match entry.unwrap() {
                     KeyRangeEntry::Key { key, version } => {
@@ -493,7 +526,7 @@ fn assert_key_scan_matches_model(db: &DB, model: &[TreeModel], tree: u8, dir: u8
             let mut visited = Vec::new();
             handle
                 .scan_keys(&prefix)
-                .delimiter(b'/')
+                .delimiter(delimiter)
                 .visit(usize::MAX, |entry| {
                     visited.push(match entry {
                         KeyRangeEntryRef::Key { key, version } => {
@@ -509,6 +542,25 @@ fn assert_key_scan_matches_model(db: &DB, model: &[TreeModel], tree: u8, dir: u8
                 })
                 .unwrap();
             assert_eq!(visited, expected);
+        }
+        Err(ModelErr::TreeNotFound) => {
+            assert!(matches!(
+                db.open_tree(name),
+                Err(holt::Error::TreeNotFound { .. })
+            ));
+        }
+        Err(e) => panic!("unexpected model error: {e:?}"),
+    }
+}
+
+fn assert_prefix_empty_matches_model(db: &DB, model: &[TreeModel], tree: u8, dir: u8) {
+    let name = tree_name(tree);
+    match live_tree(model, tree) {
+        Ok(model_tree) => {
+            let handle = db.open_tree(name).unwrap();
+            let prefix = prefix(dir);
+            let expected = !model_tree.keys().any(|key| key.starts_with(&prefix));
+            assert_eq!(handle.is_prefix_empty(&prefix).unwrap(), expected);
         }
         Err(ModelErr::TreeNotFound) => {
             assert!(matches!(
@@ -673,8 +725,15 @@ fuzz_target!(|ops: Ops| {
                 Err(e) => panic!("unexpected model error: {e:?}"),
             },
             Op::RangePrefix { tree, dir } => assert_prefix_matches_model(&db, &model, tree, dir),
-            Op::KeyScanDelimiter { tree, dir } => {
-                assert_key_scan_matches_model(&db, &model, tree, dir);
+            Op::KeyScanDelimiter {
+                tree,
+                dir,
+                delimiter,
+            } => {
+                assert_key_scan_matches_model(&db, &model, tree, dir, self::delimiter(delimiter));
+            }
+            Op::PrefixEmpty { tree, dir } => {
+                assert_prefix_empty_matches_model(&db, &model, tree, dir);
             }
             Op::ViewPrefix { tree, dir } => assert_db_view_matches_model(&db, &model, tree, dir),
             Op::Checkpoint => {
