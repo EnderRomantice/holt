@@ -55,7 +55,9 @@
 //!   Rewriting or deleting a blob clears the read-index header before
 //!   the authoritative frame changes; checkpoint publication writes
 //!   value bytes first and the index header last. Slot reuse is the
-//!   reclamation mechanism, avoiding an append-only value-segment GC.
+//!   normal reclamation mechanism, avoiding an append-only value-segment
+//!   GC. Explicit `vacuum` trims trailing free slots from all three
+//!   packed files after the manifest high-water mark is durable.
 //!
 //! ## I/O store
 //!
@@ -91,7 +93,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::api::errors::{Error, Result};
-use crate::api::stats::StoreStats;
+use crate::api::stats::{StoreStats, VacuumStats};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -823,6 +825,38 @@ impl FileBlobStore {
         self.preallocated_slots.fetch_max(target, Ordering::AcqRel);
         Ok(())
     }
+
+    fn flush_locked(&self) -> Result<()> {
+        // Order matters: data must be on disk before the manifest
+        // promotes any new slot. Otherwise a crash could leave the
+        // manifest pointing at a slot whose data is still in NVMe's
+        // write cache.
+        if let Some(epoch) = self.data_needs_sync() {
+            self.sync_data_file()?;
+            self.mark_data_synced(epoch);
+        }
+
+        if self.manifest_dirty.swap(false, Ordering::AcqRel) {
+            let mut m = self.manifest.write().unwrap();
+            if let Err(e) = m.persist_pending_deltas(&self.data_dir) {
+                self.manifest_dirty.store(true, Ordering::Release);
+                return Err(e);
+            }
+            m.pending_log.clear();
+            m.publish_pending_free_slots();
+        }
+        Ok(())
+    }
+
+    fn shrink_packed_files(&self, slots: u64) -> Result<u64> {
+        let len = slots.saturating_mul(u64::from(PAGE_SIZE));
+        let mut bytes = 0;
+        bytes += shrink_file_to_len(&self.data_file, len)?;
+        bytes += shrink_file_to_len(&self.read_index_file, len)?;
+        bytes += shrink_file_to_len(&self.value_segment_file, len)?;
+        self.preallocated_slots.store(slots, Ordering::Release);
+        Ok(bytes)
+    }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -840,6 +874,16 @@ fn slots_for_len(len: u64) -> u64 {
 
 fn file_len(file: &File) -> u64 {
     file.metadata().map_or(0, |m| m.len())
+}
+
+fn shrink_file_to_len(file: &File, len: u64) -> Result<u64> {
+    let current = file_len(file);
+    if current <= len {
+        return Ok(0);
+    }
+    file.set_len(len)?;
+    file.sync_all()?;
+    Ok(current - len)
 }
 
 fn round_up_slots(required_slots: u64) -> u64 {
@@ -1300,29 +1344,36 @@ impl BlobStore for FileBlobStore {
 
     fn flush(&self) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
-        // Order matters: data must be on disk before the manifest
-        // promotes any new slot. Otherwise a crash could leave the
-        // manifest pointing at a slot whose data is still in NVMe's
-        // write cache.
-        if let Some(epoch) = self.data_needs_sync() {
-            self.sync_data_file()?;
-            self.mark_data_synced(epoch);
-        }
-
-        if self.manifest_dirty.swap(false, Ordering::AcqRel) {
-            let mut m = self.manifest.write().unwrap();
-            if let Err(e) = m.persist_pending_deltas(&self.data_dir) {
-                self.manifest_dirty.store(true, Ordering::Release);
-                return Err(e);
-            }
-            m.pending_log.clear();
-            m.publish_pending_free_slots();
-        }
-        Ok(())
+        self.flush_locked()
     }
 
     fn needs_flush(&self) -> bool {
         self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire)
+    }
+
+    fn vacuum(&self) -> Result<VacuumStats> {
+        let _io = self.data_io_lock.lock().unwrap();
+        self.flush_locked()?;
+
+        let (slots_trimmed, next_slot) = {
+            let mut m = self.manifest.write().unwrap();
+            let slots_trimmed = m.trim_trailing_free_slots();
+            if slots_trimmed == 0 {
+                return Ok(VacuumStats::default());
+            }
+            m.persist_snapshot(&self.data_dir)?;
+            m.truncate_log()?;
+            m.pending_log.clear();
+            self.manifest_dirty.store(false, Ordering::Release);
+            (slots_trimmed, m.next_slot)
+        };
+
+        let bytes_truncated = self.shrink_packed_files(next_slot)?;
+        Ok(VacuumStats {
+            unreachable_blobs: 0,
+            slots_trimmed,
+            bytes_truncated,
+        })
     }
 }
 
@@ -1422,6 +1473,11 @@ impl Manifest {
         }
         self.reusable_slots
             .append_slots(&mut self.pending_free_slots);
+    }
+
+    fn trim_trailing_free_slots(&mut self) -> u64 {
+        self.publish_pending_free_slots();
+        self.reusable_slots.trim_trailing(&mut self.next_slot)
     }
 
     fn persist_pending_deltas(&mut self, data_dir: &Path) -> Result<()> {
@@ -1670,6 +1726,33 @@ impl ReusableSlots {
 
     fn append_slots(&mut self, slots: &mut Vec<u64>) {
         self.singles.append(slots);
+    }
+
+    fn trim_trailing(&mut self, next_slot: &mut u64) -> u64 {
+        let original = *next_slot;
+        self.singles.sort_unstable();
+
+        while let Some(tail) = next_slot.checked_sub(1) {
+            if self.singles.last().copied() == Some(tail) {
+                self.singles.pop();
+                *next_slot = tail;
+                continue;
+            }
+
+            let Some(range_idx) = self
+                .ranges
+                .iter()
+                .position(|range| range.next <= tail && tail <= range.end)
+            else {
+                break;
+            };
+
+            let lower = self.ranges[range_idx].next;
+            self.ranges.swap_remove(range_idx);
+            *next_slot = lower;
+        }
+
+        original.saturating_sub(*next_slot)
     }
 
     fn len(&self) -> u64 {
@@ -2008,6 +2091,87 @@ mod tests {
     }
 
     #[test]
+    fn vacuum_trims_trailing_free_slots_and_accelerators() {
+        let dir = tempfile::tempdir().unwrap();
+        let g1: BlobGuid = [0x51; 16];
+        let g2: BlobGuid = [0x52; 16];
+        let g3: BlobGuid = [0x53; 16];
+
+        {
+            let Some(b) = try_open(dir.path()) else {
+                return;
+            };
+            b.write_blob(g1, &buf_with(1)).unwrap();
+            b.write_blob(g2, &buf_with(2)).unwrap();
+            b.write_blob(g3, &buf_with(3)).unwrap();
+            b.flush().unwrap();
+            b.publish_read_index(g3, &[0xAB; 512], &[0xCD; 512])
+                .unwrap();
+
+            let before = b.store_stats();
+            assert_eq!(before.next_slot, 3);
+            assert!(before.data_file_bytes >= 3 * u64::from(PAGE_SIZE));
+            assert!(before.read_index_file_bytes > u64::from(PAGE_SIZE));
+            assert!(before.value_segment_file_bytes > u64::from(PAGE_SIZE));
+
+            b.delete_blob(g3).unwrap();
+            b.delete_blob(g2).unwrap();
+            b.flush().unwrap();
+            let vacuum = b.vacuum().unwrap();
+            assert_eq!(vacuum.slots_trimmed, 2);
+            assert!(vacuum.bytes_truncated >= 2 * u64::from(PAGE_SIZE));
+
+            let after = b.store_stats();
+            assert_eq!(after.next_slot, 1);
+            assert_eq!(after.reusable_slots, 0);
+            assert_eq!(after.data_file_bytes, u64::from(PAGE_SIZE));
+            assert!(after.read_index_file_bytes <= u64::from(PAGE_SIZE));
+            assert!(after.value_segment_file_bytes <= u64::from(PAGE_SIZE));
+        }
+
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let mut dst = AlignedBlobBuf::zeroed();
+        b.read_blob(g1, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 1);
+        assert!(!b.has_blob(g2).unwrap());
+        assert!(!b.has_blob(g3).unwrap());
+    }
+
+    #[test]
+    fn vacuum_keeps_middle_free_slots_reusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        let g1: BlobGuid = [0x61; 16];
+        let g2: BlobGuid = [0x62; 16];
+        let g3: BlobGuid = [0x63; 16];
+        let g4: BlobGuid = [0x64; 16];
+
+        b.write_blob(g1, &buf_with(1)).unwrap();
+        b.write_blob(g2, &buf_with(2)).unwrap();
+        b.write_blob(g3, &buf_with(3)).unwrap();
+        b.flush().unwrap();
+        b.delete_blob(g2).unwrap();
+        b.flush().unwrap();
+
+        let vacuum = b.vacuum().unwrap();
+        assert_eq!(vacuum.slots_trimmed, 0);
+        let stats = b.store_stats();
+        assert_eq!(stats.next_slot, 3);
+        assert_eq!(stats.reusable_slots, 1);
+
+        b.write_blob(g4, &buf_with(4)).unwrap();
+        assert_eq!(
+            b.offset_of(g4).unwrap(),
+            u64::from(PAGE_SIZE),
+            "middle free slot must remain available for reuse",
+        );
+    }
+
+    #[test]
     fn deleted_slot_is_reused_only_after_manifest_flush() {
         let dir = tempfile::tempdir().unwrap();
         let Some(b) = try_open(dir.path()) else {
@@ -2092,6 +2256,21 @@ mod tests {
         assert_eq!(slots.range_count(), 1);
         assert_eq!(slots.pop(), Some(1));
         assert_eq!(slots.pop(), Some(2));
+    }
+
+    #[test]
+    fn reusable_slots_trim_only_contiguous_tail() {
+        let mut slots = ReusableSlots::reconstruct(10, &[0, 2, 5]).unwrap();
+        let mut next_slot = 10;
+
+        assert_eq!(slots.trim_trailing(&mut next_slot), 4);
+        assert_eq!(next_slot, 6);
+        assert_eq!(slots.len(), 3, "holes below the new tail remain reusable");
+
+        slots.append_slots(&mut vec![5]);
+        assert_eq!(slots.trim_trailing(&mut next_slot), 3);
+        assert_eq!(next_slot, 3);
+        assert_eq!(slots.pop(), Some(1));
     }
 
     #[test]

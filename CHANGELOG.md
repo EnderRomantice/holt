@@ -7,6 +7,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [Unreleased]
+
+### Added
+
+- Added explicit `Tree::vacuum` and `DB::vacuum` maintenance APIs. `gc`
+  still performs logical reachability reclamation; `vacuum` follows it with a
+  checkpoint and physically trims trailing reusable slots from `blobs.dat`,
+  `read.idx`, and `value.seg`.
+
+### Fixed
+
+- File-backed stores now persist a reduced manifest high-water mark and
+  truncate packed accelerator/data files after tail-slot reclamation. This
+  prevents long-running delete/compact workloads from staying pinned to their
+  historical slot high-water mark after the tail is durably free.
+
 ## [0.8.1] — 2026-07-01
 
 ### Fixed

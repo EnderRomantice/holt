@@ -16,7 +16,7 @@ use super::checkpoint::{self, CheckpointImage};
 use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::snapshot::Snapshot;
-use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
+use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats, VacuumStats};
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
@@ -402,6 +402,21 @@ impl DB {
             reachable.extend(crate::engine::collect_blob_guids(&self.store, snap_root)?);
         }
         self.store.gc_sweep_unreachable(&reachable)
+    }
+
+    /// Reclaim logical garbage and physically trim trailing free store slots.
+    ///
+    /// This is the DB-wide analog of [`Tree::vacuum`](crate::Tree::vacuum):
+    /// it collects reachability across the catalog, every live named tree,
+    /// and live snapshots, checkpoints the shared store, then asks the
+    /// file backend to truncate packed-file tails that are already durably
+    /// free. Live blobs are never moved.
+    pub fn vacuum(&self) -> Result<VacuumStats> {
+        let unreachable = self.gc()?;
+        self.checkpoint()?;
+        let mut stats = self.store.vacuum_storage()?;
+        stats.unreachable_blobs = unreachable;
+        Ok(stats)
     }
 
     /// Export a consistent point-in-time image of every live family.

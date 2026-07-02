@@ -100,6 +100,26 @@ pub struct StoreStats {
     pub manifest_log_bytes: u64,
 }
 
+/// Physical space reclaimed by an explicit vacuum pass.
+///
+/// `gc` only makes unreachable slots reusable. `vacuum` first runs
+/// that logical reclamation path, then asks the file store to drop
+/// trailing reusable slots from its packed files. Middle holes are
+/// intentionally left for normal slot reuse because moving live blob
+/// slots would require rewriting every cross-blob pointer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VacuumStats {
+    /// Unreachable blob frames logically removed before the physical
+    /// trim. For custom stores this may be zero even when a backend
+    /// reclaims bytes internally.
+    pub unreachable_blobs: usize,
+    /// Manifest slots trimmed from the packed-file tail.
+    pub slots_trimmed: u64,
+    /// Bytes removed from store files. Counts `blobs.dat`,
+    /// `read.idx`, and `value.seg` truncation.
+    pub bytes_truncated: u64,
+}
+
 /// Tree-wide aggregate counters from [`Tree::stats`](crate::Tree::stats).
 ///
 /// `blobs` carries the per-blob breakdown in BFS order from the
