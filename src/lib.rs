@@ -173,7 +173,7 @@ pub use engine::{
 // Stats snapshots returned by `Tree::stats` and `DB::stats`.
 pub use api::stats::{
     BlobStats, CheckpointerStats, DBStats, JournalStats, OpenStats, RouteCacheStats, StoreStats,
-    TreeStats,
+    TreeStats, VacuumStats,
 };
 
 // Single-record atomic batches.

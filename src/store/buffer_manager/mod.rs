@@ -138,7 +138,7 @@ use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 
-use crate::api::stats::StoreStats;
+use crate::api::stats::{StoreStats, VacuumStats};
 use guid_hash::GuidBuildHasher;
 
 use crate::api::errors::{Error, Result};
@@ -607,6 +607,10 @@ impl BufferManager {
             }
         }
         Ok(freed)
+    }
+
+    pub(crate) fn vacuum_storage(&self) -> Result<VacuumStats> {
+        self.store.vacuum()
     }
 }
 
@@ -2514,6 +2518,10 @@ impl BlobStore for BufferManager {
 
     fn store_stats(&self) -> StoreStats {
         self.store.store_stats()
+    }
+
+    fn vacuum(&self) -> Result<VacuumStats> {
+        self.store.vacuum()
     }
 }
 

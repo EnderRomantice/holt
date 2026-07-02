@@ -142,6 +142,20 @@ pub struct CheckpointConfig {
     ///
     /// Default 16.
     pub io_queue_capacity: usize,
+    /// Run store-level vacuum opportunistically after successful
+    /// checkpoint epochs once tail-reclaimable space crosses
+    /// [`Self::auto_vacuum_min_free_bytes`].
+    ///
+    /// Vacuum is a physical-space maintenance action only: it relocates
+    /// live high-water slots into lower reusable holes, trims packed-file
+    /// tails, and, on Linux, punches remaining reusable middle-slot holes.
+    /// A failed auto-vacuum logs a warning but does not make the completed
+    /// checkpoint fail.
+    pub auto_vacuum: bool,
+    /// Tail-reclaimable store space required before automatic
+    /// vacuum is attempted. Default 256 MiB. Auto-vacuum keys off tail
+    /// bytes so it does not repeatedly revisit already-sparse middle holes.
+    pub auto_vacuum_min_free_bytes: u64,
 }
 
 impl Default for CheckpointConfig {
@@ -154,6 +168,8 @@ impl Default for CheckpointConfig {
             eviction_interval: Duration::from_secs(1),
             eviction_idle_ticks: 1024,
             io_queue_capacity: 16,
+            auto_vacuum: true,
+            auto_vacuum_min_free_bytes: 256 * 1024 * 1024,
         }
     }
 }

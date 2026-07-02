@@ -19,7 +19,9 @@ use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use super::snapshot::Snapshot;
 use super::stats::OpenStats;
-use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
+use super::stats::{
+    BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats, VacuumStats,
+};
 use super::view::View;
 use crate::concurrency::{CommitGate, EndpointLocks, Gate};
 use crate::engine;
@@ -1901,6 +1903,27 @@ impl Tree {
             reachable.extend(engine::collect_blob_guids(&self.store, snap_root)?);
         }
         self.store.gc_sweep_unreachable(&reachable)
+    }
+
+    /// Reclaim logical garbage and physical space from free store slots.
+    ///
+    /// [`Self::gc`] only makes unreachable blob frames reusable. `vacuum`
+    /// follows that with a checkpoint and store-level physical cleanup:
+    /// live high-water slots may be relocated into lower reusable holes,
+    /// packed-file tails that are durably free are truncated, and on
+    /// Linux any remaining reusable middle slots are hole-punched. This
+    /// can change physical slot addresses inside the file backend, but
+    /// GUID/key visibility is unchanged.
+    ///
+    /// Only supported on standalone trees. Named trees inside a
+    /// [`DB`](crate::DB) share one store; use [`DB::vacuum`](crate::DB::vacuum)
+    /// there so every live tree participates in the reachable set.
+    pub fn vacuum(&self) -> Result<VacuumStats> {
+        let unreachable = self.gc()?;
+        self.checkpoint()?;
+        let mut stats = self.store.vacuum_storage()?;
+        stats.unreachable_blobs = unreachable;
+        Ok(stats)
     }
 
     /// [`Self::snapshot`] without taking this tree's maintenance/mutation

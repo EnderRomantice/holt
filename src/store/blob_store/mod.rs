@@ -35,7 +35,7 @@ pub use file::FileBlobStore;
 pub use memory::MemoryBlobStore;
 
 use crate::api::errors::Result;
-use crate::api::stats::StoreStats;
+use crate::api::stats::{StoreStats, VacuumStats};
 use crate::layout::BlobGuid;
 
 #[doc(hidden)]
@@ -229,5 +229,16 @@ pub trait BlobStore: Send + Sync {
     /// packed-file or read-index state may return zeros.
     fn store_stats(&self) -> StoreStats {
         StoreStats::default()
+    }
+
+    /// Reclaim physical store space that is already logically free.
+    ///
+    /// The default is a no-op for memory/custom stores. File-backed
+    /// stores may relocate live high-water slots into lower reusable
+    /// holes before trimming packed-file tails and, where supported,
+    /// release physical blocks for reusable middle slots. GUID
+    /// mappings remain authoritative and stable.
+    fn vacuum(&self) -> Result<VacuumStats> {
+        Ok(VacuumStats::default())
     }
 }
