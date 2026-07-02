@@ -1905,12 +1905,14 @@ impl Tree {
         self.store.gc_sweep_unreachable(&reachable)
     }
 
-    /// Reclaim logical garbage and physically trim trailing free store slots.
+    /// Reclaim logical garbage and physical space from free store slots.
     ///
     /// [`Self::gc`] only makes unreachable blob frames reusable. `vacuum`
-    /// follows that with a checkpoint and a store-level trim of packed
-    /// file tails that are already durably free. It never moves live
-    /// blobs, so middle holes remain reserved for future slot reuse.
+    /// follows that with a checkpoint and store-level physical cleanup:
+    /// packed-file tails that are durably free are truncated, and on
+    /// Linux reusable middle slots are hole-punched while keeping their
+    /// logical slot numbers available for future reuse. It never moves
+    /// live blobs.
     ///
     /// Only supported on standalone trees. Named trees inside a
     /// [`DB`](crate::DB) share one store; use [`DB::vacuum`](crate::DB::vacuum)

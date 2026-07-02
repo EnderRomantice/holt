@@ -62,11 +62,17 @@
 //! | `holt_store_reusable_slots`             | gauge   | `TreeStats::store.reusable_slots`      |
 //! | `holt_store_pending_free_slots`         | gauge   | `TreeStats::store.pending_free_slots`  |
 //! | `holt_store_data_file_bytes`            | gauge   | `TreeStats::store.data_file_bytes`     |
+//! | `holt_store_data_allocated_bytes`       | gauge   | `TreeStats::store.data_allocated_bytes` |
 //! | `holt_store_data_high_water_bytes`      | gauge   | `TreeStats::store.data_high_water_bytes` |
 //! | `holt_store_read_index_file_bytes`      | gauge   | `TreeStats::store.read_index_file_bytes` |
+//! | `holt_store_read_index_allocated_bytes` | gauge   | `TreeStats::store.read_index_allocated_bytes` |
 //! | `holt_store_read_index_high_water_bytes` | gauge  | `TreeStats::store.read_index_high_water_bytes` |
 //! | `holt_store_value_segment_file_bytes`      | gauge   | `TreeStats::store.value_segment_file_bytes` |
+//! | `holt_store_value_segment_allocated_bytes` | gauge | `TreeStats::store.value_segment_allocated_bytes` |
 //! | `holt_store_value_segment_high_water_bytes` | gauge  | `TreeStats::store.value_segment_high_water_bytes` |
+//! | `holt_store_tail_reclaimable_slots`     | gauge   | `TreeStats::store.tail_reclaimable_slots` |
+//! | `holt_store_tail_reclaimable_bytes`     | gauge   | `TreeStats::store.tail_reclaimable_bytes` |
+//! | `holt_store_middle_reusable_slots`      | gauge   | `TreeStats::store.middle_reusable_slots` |
 //! | `holt_store_manifest_log_bytes`         | gauge   | `TreeStats::store.manifest_log_bytes`  |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
 //! | `holt_bm_cache_misses_total`            | counter | `TreeStats::bm_cache_misses`           |
@@ -385,6 +391,13 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
+        "holt_store_data_allocated_bytes",
+        "Filesystem blocks allocated for blobs.dat.",
+        "gauge",
+        stats.store.data_allocated_bytes,
+    );
+    metric(
+        &mut out,
         "holt_store_data_high_water_bytes",
         "Logical blobs.dat high-water bytes implied by next_slot.",
         "gauge",
@@ -396,6 +409,13 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Current size of the read-index file.",
         "gauge",
         stats.store.read_index_file_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_read_index_allocated_bytes",
+        "Filesystem blocks allocated for the read-index file.",
+        "gauge",
+        stats.store.read_index_allocated_bytes,
     );
     metric(
         &mut out,
@@ -413,10 +433,38 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
+        "holt_store_value_segment_allocated_bytes",
+        "Filesystem blocks allocated for the value segment file.",
+        "gauge",
+        stats.store.value_segment_allocated_bytes,
+    );
+    metric(
+        &mut out,
         "holt_store_value_segment_high_water_bytes",
         "Logical value segment high-water bytes implied by next_slot.",
         "gauge",
         stats.store.value_segment_high_water_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_tail_reclaimable_slots",
+        "Durably free packed-file tail slots that vacuum can trim.",
+        "gauge",
+        stats.store.tail_reclaimable_slots,
+    );
+    metric(
+        &mut out,
+        "holt_store_tail_reclaimable_bytes",
+        "Packed-file bytes that vacuum can remove by tail truncation.",
+        "gauge",
+        stats.store.tail_reclaimable_bytes,
+    );
+    metric(
+        &mut out,
+        "holt_store_middle_reusable_slots",
+        "Durably free middle slots that remain reusable and can be sparse-punched.",
+        "gauge",
+        stats.store.middle_reusable_slots,
     );
     metric(
         &mut out,
@@ -932,12 +980,18 @@ mod tests {
             reusable_slots: 5,
             pending_free_slots: 2,
             data_file_bytes: 61,
-            data_high_water_bytes: 62,
-            read_index_file_bytes: 63,
-            read_index_high_water_bytes: 64,
-            value_segment_file_bytes: 65,
-            value_segment_high_water_bytes: 66,
-            manifest_log_bytes: 67,
+            data_allocated_bytes: 62,
+            data_high_water_bytes: 63,
+            read_index_file_bytes: 64,
+            read_index_allocated_bytes: 65,
+            read_index_high_water_bytes: 66,
+            value_segment_file_bytes: 67,
+            value_segment_allocated_bytes: 68,
+            value_segment_high_water_bytes: 69,
+            tail_reclaimable_slots: 3,
+            tail_reclaimable_bytes: 70,
+            middle_reusable_slots: 2,
+            manifest_log_bytes: 71,
         }
     }
 
@@ -1071,12 +1125,18 @@ mod tests {
         assert!(out.contains("holt_store_reusable_slots 5\n"));
         assert!(out.contains("holt_store_pending_free_slots 2\n"));
         assert!(out.contains("holt_store_data_file_bytes 61\n"));
-        assert!(out.contains("holt_store_data_high_water_bytes 62\n"));
-        assert!(out.contains("holt_store_read_index_file_bytes 63\n"));
-        assert!(out.contains("holt_store_read_index_high_water_bytes 64\n"));
-        assert!(out.contains("holt_store_value_segment_file_bytes 65\n"));
-        assert!(out.contains("holt_store_value_segment_high_water_bytes 66\n"));
-        assert!(out.contains("holt_store_manifest_log_bytes 67\n"));
+        assert!(out.contains("holt_store_data_allocated_bytes 62\n"));
+        assert!(out.contains("holt_store_data_high_water_bytes 63\n"));
+        assert!(out.contains("holt_store_read_index_file_bytes 64\n"));
+        assert!(out.contains("holt_store_read_index_allocated_bytes 65\n"));
+        assert!(out.contains("holt_store_read_index_high_water_bytes 66\n"));
+        assert!(out.contains("holt_store_value_segment_file_bytes 67\n"));
+        assert!(out.contains("holt_store_value_segment_allocated_bytes 68\n"));
+        assert!(out.contains("holt_store_value_segment_high_water_bytes 69\n"));
+        assert!(out.contains("holt_store_tail_reclaimable_slots 3\n"));
+        assert!(out.contains("holt_store_tail_reclaimable_bytes 70\n"));
+        assert!(out.contains("holt_store_middle_reusable_slots 2\n"));
+        assert!(out.contains("holt_store_manifest_log_bytes 71\n"));
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_full_blob_reads_total 20\n"));
         assert!(out.contains("holt_bm_full_blob_read_bytes_total 10485760\n"));

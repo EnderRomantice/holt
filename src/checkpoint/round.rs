@@ -533,7 +533,23 @@ fn finish_epoch(shared: &Arc<Shared>, report: CheckpointEpochReport) -> Result<(
         return Err(e);
     }
     shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
+    maybe_auto_vacuum(shared);
     Ok(())
+}
+
+fn maybe_auto_vacuum(shared: &Arc<Shared>) {
+    if !shared.cfg.auto_vacuum {
+        return;
+    }
+
+    let stats = shared.bm.stats().store;
+    if stats.tail_reclaimable_bytes < shared.cfg.auto_vacuum_min_free_bytes {
+        return;
+    }
+
+    if let Err(e) = shared.bm.vacuum_storage() {
+        eprintln!("holt: auto-vacuum failed: {e}");
+    }
 }
 
 fn restore_unreported_epoch(shared: &Arc<Shared>, pending: PendingEpoch) {

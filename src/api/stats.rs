@@ -86,16 +86,34 @@ pub struct StoreStats {
     pub pending_free_slots: u64,
     /// Current size of `blobs.dat` on disk, including preallocation.
     pub data_file_bytes: u64,
+    /// Physical filesystem blocks allocated for `blobs.dat`.
+    ///
+    /// This can be lower than [`Self::data_file_bytes`] after a
+    /// vacuum pass punches holes in reusable middle slots.
+    pub data_allocated_bytes: u64,
     /// Logical high-water bytes implied by `next_slot`.
     pub data_high_water_bytes: u64,
     /// Current size of the read-index file.
     pub read_index_file_bytes: u64,
+    /// Physical filesystem blocks allocated for the read-index file.
+    pub read_index_allocated_bytes: u64,
     /// Logical high-water bytes for the read-index.
     pub read_index_high_water_bytes: u64,
     /// Current size of the value segment file.
     pub value_segment_file_bytes: u64,
+    /// Physical filesystem blocks allocated for the value segment file.
+    pub value_segment_allocated_bytes: u64,
     /// Logical high-water bytes for the value segment.
     pub value_segment_high_water_bytes: u64,
+    /// Durably free slots at the packed-file tail that a vacuum can
+    /// remove by truncating all packed files.
+    pub tail_reclaimable_slots: u64,
+    /// Bytes that would be removed by truncating the current tail.
+    pub tail_reclaimable_bytes: u64,
+    /// Durably free slots below the tail. These stay addressable for
+    /// reuse, but Linux vacuum can release their physical blocks with
+    /// hole punching.
+    pub middle_reusable_slots: u64,
     /// Current durable manifest delta log size.
     pub manifest_log_bytes: u64,
 }
@@ -104,9 +122,10 @@ pub struct StoreStats {
 ///
 /// `gc` only makes unreachable slots reusable. `vacuum` first runs
 /// that logical reclamation path, then asks the file store to drop
-/// trailing reusable slots from its packed files. Middle holes are
-/// intentionally left for normal slot reuse because moving live blob
-/// slots would require rewriting every cross-blob pointer.
+/// trailing reusable slots from its packed files and, on Linux,
+/// releases physical blocks for reusable middle slots with hole
+/// punching. Middle slots remain logically addressable for future
+/// reuse.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VacuumStats {
     /// Unreachable blob frames logically removed before the physical
@@ -118,6 +137,15 @@ pub struct VacuumStats {
     /// Bytes removed from store files. Counts `blobs.dat`,
     /// `read.idx`, and `value.seg` truncation.
     pub bytes_truncated: u64,
+    /// Reusable middle slots submitted to filesystem hole punching.
+    ///
+    /// Repeated vacuum calls may submit the same sparse slots again;
+    /// this is an operation count, not proof that new blocks were
+    /// released.
+    pub slots_punched: u64,
+    /// Bytes submitted to filesystem hole punching. The actual `du`
+    /// reduction depends on filesystem support and block accounting.
+    pub bytes_punched: u64,
 }
 
 /// Tree-wide aggregate counters from [`Tree::stats`](crate::Tree::stats).
