@@ -14,7 +14,7 @@ type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, DynError>;
 
 const DB_SOAK_TREES: [&str; 4] = ["objects", "inodes", "locks", "sessions"];
-const SOAK_DELIMITERS: [u8; 6] = [b'/', b':', b'|', b'#', b'@', b'\\'];
+const SOAK_DELIMITERS: [u8; 6] = *b"/:|#@\\";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
