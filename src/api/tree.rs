@@ -40,7 +40,7 @@ use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::{
     BlobFrame, BlobFrameRef, BufferManager, BufferStats, CachedBlob, DirtySnapshotEntry,
-    WriteDeltaEntry, WriteThroughEntry,
+    WriteDeltaEntry, WriteThroughEntry, WriteThroughStatus,
 };
 
 use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
@@ -95,7 +95,7 @@ impl TreeRuntime {
 
 struct DirtyWriteOutcome {
     wrote_any: bool,
-    failed: CheckpointMap,
+    retry: CheckpointMap,
     first_err: Option<Error>,
 }
 
@@ -2187,13 +2187,17 @@ impl Tree {
                 }
             };
 
-            return Self::finish_checkpoint_snapshot_shared(
+            Self::finish_checkpoint_snapshot_shared(
                 store,
                 journal,
                 commit_gate,
                 snap_pending,
                 snap_bytes,
-            );
+            )?;
+            if Self::checkpoint_is_clean_shared(store, journal, commit_gate) {
+                return Ok(());
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -2224,12 +2228,9 @@ impl Tree {
         Option<u64>,
     )> {
         if let Some(journal) = journal {
-            let wal_up_to = {
-                let _commit = commit_gate.enter_checkpoint();
-                journal.queued_work()
-            };
             store.flush_write_deltas()?;
             let _commit = commit_gate.enter_checkpoint();
+            let wal_up_to = journal.queued_work();
             let snap_dirty = store.snapshot_dirty();
             let snap_pending = store.snapshot_pending_deletes();
             match store.snapshot_dirty_versions(&snap_dirty) {
@@ -2266,12 +2267,12 @@ impl Tree {
     ) -> Result<()> {
         let DirtyWriteOutcome {
             wrote_any,
-            failed: dirty_failed,
+            retry: dirty_retry,
             first_err: first_dirty_err,
         } = Self::write_checkpoint_bytes_shared(store, snap_bytes);
-        let had_dirty_failure = !dirty_failed.is_empty();
-        if had_dirty_failure {
-            store.restore_dirty(dirty_failed);
+        let has_dirty_retry = !dirty_retry.is_empty();
+        if has_dirty_retry {
+            store.restore_dirty(dirty_retry);
         }
 
         if !wrote_any && snap_pending.is_empty() && !store.needs_flush() {
@@ -2286,9 +2287,13 @@ impl Tree {
             return Err(e);
         }
 
-        if had_dirty_failure {
+        if let Some(e) = first_dirty_err {
             store.restore_pending_deletes(snap_pending);
-            return Err(first_dirty_err.expect("had_dirty_failure ⇒ first_dirty_err set"));
+            return Err(e);
+        }
+        if has_dirty_retry {
+            store.restore_pending_deletes(snap_pending);
+            return Ok(());
         }
 
         let PendingDeleteOutcome {
@@ -2322,25 +2327,34 @@ impl Tree {
                 },
             )
             .collect();
-        let mut failed = CheckpointMap::new();
+        let mut retry = CheckpointMap::new();
         let mut first_err = None;
         if !entries.is_empty() {
             let expected: Vec<_> = entries
                 .iter()
                 .map(|entry| (entry.guid, entry.expected_seq))
                 .collect();
-            if let Err(e) = store.write_through_batch(&entries) {
-                // BlobStore batch failure may have landed any prefix;
-                // retry the whole snapshot next round.
-                for (guid, expected_seq) in expected {
-                    failed.insert(guid, expected_seq);
+            match store.write_through_batch(&entries) {
+                Ok(report) => {
+                    for (entry, status) in entries.iter().zip(report.statuses) {
+                        if matches!(status, WriteThroughStatus::Stale) {
+                            retry.insert(entry.guid, entry.expected_seq);
+                        }
+                    }
                 }
-                first_err = Some(e);
+                Err(e) => {
+                    // BlobStore batch failure may have landed any prefix;
+                    // retry the whole snapshot next round.
+                    for (guid, expected_seq) in expected {
+                        retry.insert(guid, expected_seq);
+                    }
+                    first_err = Some(e);
+                }
             }
         }
         DirtyWriteOutcome {
             wrote_any: !entries.is_empty(),
-            failed,
+            retry,
             first_err,
         }
     }
@@ -2410,6 +2424,20 @@ impl Tree {
             }
         }
         Ok(())
+    }
+
+    fn checkpoint_is_clean_shared(
+        store: &Arc<BufferManager>,
+        journal: Option<&Arc<Journal>>,
+        commit_gate: &Arc<CommitGate>,
+    ) -> bool {
+        let _commit = commit_gate.enter_checkpoint();
+        store.dirty_count() == 0
+            && store.flushing_count() == 0
+            && store.pending_delete_count() == 0
+            && store.write_delta_count() == 0
+            && !store.needs_flush()
+            && journal.is_none_or(|journal| !journal.needs_checkpoint())
     }
 
     /// Snapshot per-blob and aggregate counters for every blob
@@ -3006,6 +3034,58 @@ mod tests {
         fn needs_flush(&self) -> bool {
             self.pending.load(Ordering::Acquire)
         }
+    }
+
+    #[test]
+    fn synchronous_checkpoint_retries_stale_snapshot_bytes() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x71; 16];
+        let mut initial = AlignedBlobBuf::zeroed();
+        initial.as_mut_slice()[123] = 0x01;
+        inner.write_blob(guid, &initial).unwrap();
+
+        let bm = Arc::new(BufferManager::new(Arc::clone(&inner), 4));
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x02;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let versioned = bm.snapshot_dirty_versions(&snap).unwrap();
+        let entry = &versioned[0];
+        let stale_bytes = bm
+            .snapshot_bytes_if_version(entry.guid, entry.content_version)
+            .unwrap()
+            .expect("snapshot version still current before racing write");
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x03;
+        }
+        bm.mark_dirty_cached(guid, 20, pin.as_ref());
+
+        let outcome = super::Tree::write_checkpoint_bytes_shared(
+            &bm,
+            vec![(guid, entry.expected_seq, entry.content_version, stale_bytes)],
+        );
+        assert!(outcome.first_err.is_none());
+        assert_eq!(outcome.retry.get(&guid), Some(&entry.expected_seq));
+        bm.restore_dirty(outcome.retry);
+
+        let mut stored = AlignedBlobBuf::zeroed();
+        inner.read_blob(guid, &mut stored).unwrap();
+        assert_eq!(
+            stored.as_slice()[123],
+            0x01,
+            "stale checkpoint bytes must not be treated as durable"
+        );
+        assert_eq!(
+            bm.snapshot_dirty()[&guid],
+            10,
+            "manual checkpoint must keep the earliest unflushed seq for retry"
+        );
     }
 
     #[test]
