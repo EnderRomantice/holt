@@ -203,7 +203,9 @@ pub fn blob_would_route(frame: BlobFrameRef<'_>) -> bool {
 /// - `tombstone_leaf_cnt = 0` (every survivor is by definition live).
 /// - `compact_times` bumped by one.
 /// - `gap_space` reset to whatever fresh allocations report.
-/// - Original `blob_guid` preserved.
+/// - Original `blob_guid`, `created_epoch`, and `epoch_high_water`
+///   preserved. Compaction changes the frame layout, not its snapshot
+///   generation.
 /// - If every leaf in the source was tombstoned, the root becomes
 ///   the freshly-allocated `EmptyRoot` sentinel.
 ///
@@ -217,10 +219,16 @@ pub fn blob_would_route(frame: BlobFrameRef<'_>) -> bool {
 /// the heap, lives for the duration of the call) plus one full
 /// blob memcpy at the end. Roughly tens of µs on a modern machine.
 pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
-    let (blob_guid, old_root_off, old_compact_times) = {
+    let (blob_guid, old_root_off, old_compact_times, old_created_epoch, old_epoch_high_water) = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let h = old_frame.header();
-        (h.blob_guid, decode_child_off(h.root_slot), h.compact_times)
+        (
+            h.blob_guid,
+            decode_child_off(h.root_slot),
+            h.compact_times,
+            h.created_epoch,
+            h.epoch_high_water,
+        )
     };
 
     // Pass 0: measure the live subtree so the page-aligned leaf region
@@ -240,6 +248,15 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
     loop {
         let overran = {
             let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
+            // `init` deliberately starts a brand-new frame at epoch zero.
+            // This scratch image is instead a physical rewrite of the same
+            // logical version, so retain both generation fields before either
+            // the routed build or its legacy fallback becomes visible.
+            {
+                let h = new_frame.header_mut();
+                h.created_epoch = old_created_epoch;
+                h.epoch_high_water = old_epoch_high_water;
+            }
             let old_frame = BlobFrame::wrap(buf.as_mut_slice());
             let mut leaf_cursor = lrs_opt.unwrap_or(0);
             let cloned = clone_subtree(
@@ -379,16 +396,29 @@ pub fn is_mergeable(
     Ok(space_ok && slots_ok && no_grandchild && no_tombstones)
 }
 
-/// Inline a child blob's subtree back into its parent, replacing
-/// the cross-blob `BlobNode` crossing with the child's contents.
+/// Prepared result of cloning a mergeable child into its parent frame.
+///
+/// The old `BlobNode` and child remain live until the direct owner of that
+/// edge has successfully rewired its pointer to `inlined_root`. This keeps a
+/// failed ancestor rewrite from handing a still-reachable child to GC.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PreparedBlobMerge {
+    pub(super) inlined_root: u32,
+    pub(super) parent_bn_off: u32,
+    pub(super) child_guid: BlobGuid,
+}
+
+/// Clone a child blob's subtree into its parent in preparation for replacing
+/// the cross-blob `BlobNode` crossing with the cloned contents.
 ///
 /// Reads the child via an exclusive guard, deep-clones the child's
 /// entry-point subtree into `parent_frame` (preserve-mode — caller
 /// should compact the child first if dropping tombstones matters),
-/// optionally wraps the cloned root in the `BlobNode`'s inline
-/// prefix, frees the parent's `BlobNode` slot, and drops the child
-/// blob from the BM. Returns the slot in `parent_frame` where the
-/// inlined subtree's root now lives.
+/// optionally wraps the cloned root in the `BlobNode`'s inline prefix, and
+/// returns the prepared replacement. It deliberately does not abandon the
+/// old `BlobNode`, update external-blob accounting, or queue the child for
+/// reclamation. The direct edge owner performs those actions only after its
+/// pointer rewrite succeeds.
 ///
 /// **The caller's responsibility**: rewire the grandparent's
 /// pointer to the returned slot. Typical pattern: a recursive
@@ -401,23 +431,21 @@ pub fn is_mergeable(
 /// `true` before this is called. Calling without that check risks
 /// `OutOfSpace` mid-clone on a too-big merge or wasted work on a
 /// merge that violates the no-nested-crossings precondition.
-/// `seq` is stamped on the deferred-delete entry the merged
-/// child generates. Callers from a user op path should pass the
-/// op's WAL seq so the W2D protocol can pair the manifest delete
-/// with a real WAL record. Internal callers (compact, the
-/// checkpoint round's merge pass) pass
-/// [`crate::store::STRUCTURAL_SEQ`] — the merge
-/// has no WAL record and shouldn't pin the trim watermark.
-pub fn merge_blob(
+pub(super) fn merge_blob(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
     parent_bn_off: u32,
-    seq: u64,
-) -> Result<u32> {
+) -> Result<PreparedBlobMerge> {
     let bn = read_blob_node(parent_frame, parent_bn_off)?;
     let child_guid = bn.child_blob_guid;
     let plen = (bn.prefix_len as usize).min(BLOB_MAX_INLINE);
     let prefix_bytes: Vec<u8> = bn.bytes[..plen].to_vec();
+
+    // Any appended clone uses the legacy allocation cursor. De-route before
+    // the first fallible child read/allocation so an error path that publishes
+    // the partial frame can never persist a routed header over appended legacy
+    // nodes. Failure leaves only a safe full-pin layout plus space debt.
+    parent_frame.header_mut().routing_len = 0;
 
     let new_subtree_root = {
         let child_pin = bm.pin(child_guid)?;
@@ -444,40 +472,11 @@ pub fn merge_blob(
         write_prefix_chain(parent_frame, &prefix_bytes, new_subtree_root)?
     };
 
-    // Abandon-on-free: the parent's BlobNode is unreachable now that
-    // the grandparent will be repointed at `inlined_root`.
-    parent_frame.note_abandoned(parent_bn_off);
-    // Keep external-blob accounting correct — the BlobNode is gone.
-    {
-        let h = parent_frame.header_mut();
-        h.num_ext_blobs = h.num_ext_blobs.saturating_sub(1);
-        // A merge appends the cloned subtree's internals + leaves via the
-        // single `space_used` cursor, so any prior routing layout on the
-        // parent is now stale (internals would sit above a stale
-        // `leaf_region_start`). Demote to legacy/full-pin; the next
-        // compaction re-routes the parent.
-        h.routing_len = 0;
-    }
-    // Hand the now-orphaned child blob to the deferred-delete
-    // protocol. An inline `bm.delete_blob` here would push the
-    // manifest mutation to in-memory before the caller's WAL
-    // flush (or, for internal callers like compact / merge_pass,
-    // before the next checkpoint round's Sync); on crash that
-    // would leave the parent in cache pointing at no child
-    // while manifest persistence raced ahead through any
-    // unrelated `store.flush`.
-    bm.mark_for_delete(child_guid, seq);
-
-    #[cfg(feature = "tracing")]
-    tracing::debug!(
-        target: "holt::engine::merge",
-        child_guid = ?&child_guid[..4],
-        parent_bn_off = parent_bn_off,
-        inlined_root = inlined_root,
-        "merge_blob: folded child into parent + queued delete",
-    );
-
-    Ok(inlined_root)
+    Ok(PreparedBlobMerge {
+        inlined_root,
+        parent_bn_off,
+        child_guid,
+    })
 }
 
 fn read_blob_node(frame: &BlobFrame<'_>, off: u32) -> Result<BlobNode> {

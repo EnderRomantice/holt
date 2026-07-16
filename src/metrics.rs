@@ -47,6 +47,9 @@
 //! | `holt_blob_overfull_children`            | gauge   | `TreeStats::overfull_child_blobs`       |
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
+//! | `holt_bm_gc_orphan_backlog_count`       | gauge   | `TreeStats::bm_gc_orphan_backlog_count` |
+//! | `holt_bm_gc_reclaimed_total`            | counter | `TreeStats::bm_gc_reclaimed_count`    |
+//! | `holt_bm_gc_last_full_sweep_deferred_count` | gauge | `TreeStats::bm_gc_last_full_sweep_deferred_count` |
 //! | `holt_bm_write_delta_count`             | gauge   | `TreeStats::bm_write_delta_count`      |
 //! | `holt_bm_read_index_token_count`              | gauge   | `TreeStats::bm_read_index_token_count`       |
 //! | `holt_bm_read_index_cache_entries`      | gauge   | `TreeStats::bm_read_index_cache_entries` |
@@ -120,6 +123,7 @@
 //! | `holt_open_wal_replay_records_total`    | counter | `OpenStats::wal_replay_records`        |
 //! | `holt_open_wal_replay_bytes`            | gauge   | `OpenStats::wal_replay_bytes`          |
 //! | `holt_open_wal_replay_duration_seconds` | gauge   | `OpenStats::wal_replay_micros`         |
+//! | `holt_open_epoch_recovery_duration_seconds` | gauge | `OpenStats::epoch_recovery_micros` |
 //! | `holt_open_wal_torn_tail`               | gauge   | `OpenStats::wal_torn_tail`             |
 //! | `holt_journal_appends_total`             | counter | `JournalStats::appends`                |
 //! | `holt_journal_batches_total`             | counter | `JournalStats::batches`                |
@@ -283,6 +287,27 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "Number of blobs queued for deferred store deletion.",
         "gauge",
         stats.bm_pending_delete_count as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_gc_orphan_backlog_count",
+        "COW/structural orphan debt, including staged and snapshot-held blobs.",
+        "gauge",
+        stats.bm_gc_orphan_backlog_count as u64,
+    );
+    metric(
+        &mut out,
+        "holt_bm_gc_reclaimed_total",
+        "Cumulative blobs physically reclaimed by full sweeps or clean-frontier exact reclaim.",
+        "counter",
+        stats.bm_gc_reclaimed_count,
+    );
+    metric(
+        &mut out,
+        "holt_bm_gc_last_full_sweep_deferred_count",
+        "Unreachable candidates deferred by pins or the bounded limit in the latest successful full reachability sweep.",
+        "gauge",
+        stats.bm_gc_last_full_sweep_deferred_count as u64,
     );
     metric(
         &mut out,
@@ -796,6 +821,13 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "gauge",
         micros_to_seconds(stats.open.wal_replay_micros),
     );
+    metric_f64(
+        &mut out,
+        "holt_open_epoch_recovery_duration_seconds",
+        "Wall-clock time spent restoring DB-wide snapshot epoch state.",
+        "gauge",
+        micros_to_seconds(stats.open.epoch_recovery_micros),
+    );
     metric(
         &mut out,
         "holt_open_wal_torn_tail",
@@ -1024,6 +1056,9 @@ mod tests {
             blobs: Vec::new(),
             bm_dirty_count: 2,
             bm_pending_delete_count: 1,
+            bm_gc_orphan_backlog_count: 4,
+            bm_gc_reclaimed_count: 5,
+            bm_gc_last_full_sweep_deferred_count: 6,
             bm_write_delta_count: 3,
             bm_read_index_token_count: 46,
             bm_read_index_cache_entries: 47,
@@ -1075,6 +1110,7 @@ mod tests {
                 wal_replay_records: 21,
                 wal_replay_bytes: 4096,
                 wal_replay_micros: 12_500,
+                epoch_recovery_micros: 2_500,
                 wal_torn_tail: true,
             },
             journal: with_journal.then_some(JournalStats {
@@ -1110,6 +1146,15 @@ mod tests {
         assert!(out.contains("# TYPE holt_blob_count gauge\n"));
         assert!(out.contains("holt_blob_count 3\n"));
         // Monotonic counters keep the `_total` suffix...
+        assert!(out.contains("holt_bm_gc_orphan_backlog_count 4\n"));
+        assert!(out.contains(
+            "# HELP holt_bm_gc_reclaimed_total Cumulative blobs physically reclaimed by full sweeps or clean-frontier exact reclaim.\n"
+        ));
+        assert!(out.contains("# TYPE holt_bm_gc_reclaimed_total counter\n"));
+        assert!(out.contains("holt_bm_gc_reclaimed_total 5\n"));
+        assert!(!out.contains("holt_bm_gc_reclaimed_count"));
+        assert!(out.contains("# TYPE holt_bm_gc_last_full_sweep_deferred_count gauge\n"));
+        assert!(out.contains("holt_bm_gc_last_full_sweep_deferred_count 6\n"));
         assert!(out.contains("holt_bm_write_delta_count 3\n"));
         assert!(out.contains("holt_bm_read_index_token_count 46\n"));
         assert!(out.contains("holt_bm_read_index_cache_entries 47\n"));
@@ -1176,6 +1221,7 @@ mod tests {
         assert!(out.contains("holt_open_wal_replay_records_total 21\n"));
         assert!(out.contains("holt_open_wal_replay_bytes 4096\n"));
         assert!(out.contains("holt_open_wal_replay_duration_seconds 0.012500\n"));
+        assert!(out.contains("holt_open_epoch_recovery_duration_seconds 0.002500\n"));
         assert!(out.contains("holt_open_wal_torn_tail 1\n"));
         // ...non-monotonic gauges (sum-over-reachable-blobs) drop it.
         assert!(out.contains("# TYPE holt_slots gauge\n"));

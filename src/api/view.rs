@@ -12,18 +12,20 @@ use super::tree::{count_scan_limit, prefix_count_from_seen};
 use crate::concurrency::Gate;
 use crate::engine::{self, KeyRangeBuilder, KeyRangeEntryRef, RangeBuilder};
 use crate::layout::BlobGuid;
-use crate::store::{BufferManager, CachedBlob};
+use crate::store::{BufferManager, CachedBlob, SnapshotLease};
 
 /// Immutable read transaction over one captured prefix.
 ///
 /// Created by [`crate::Tree::view`]. Subsequent live-tree writes do
-/// not affect it.
+/// not affect it. Clones and owned range cursors retain the underlying
+/// snapshot epoch until the final derived handle is dropped.
 #[derive(Clone)]
 pub struct View {
     scope: Vec<u8>,
     store: Arc<BufferManager>,
     root_guid: BlobGuid,
     root_pin: Arc<CachedBlob>,
+    snapshot_lease: Arc<SnapshotLease>,
     range_gate: Arc<Gate>,
     scan_fence: Option<(Arc<Gate>, Arc<Gate>)>,
 }
@@ -34,6 +36,7 @@ impl View {
         store: Arc<BufferManager>,
         root_guid: BlobGuid,
         root_pin: Arc<CachedBlob>,
+        snapshot_lease: Arc<SnapshotLease>,
         scan_fence: Option<(Arc<Gate>, Arc<Gate>)>,
     ) -> Self {
         Self {
@@ -41,6 +44,7 @@ impl View {
             store,
             root_guid,
             root_pin,
+            snapshot_lease,
             range_gate: Arc::new(Gate::new()),
             scan_fence,
         }
@@ -70,7 +74,7 @@ impl View {
     pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
         self.ensure_in_scope(key)?;
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| {
+        engine::lookup_multi_with_snapshot(&self.store, &self.root_pin, None, search, |hit| {
             RecordVersion::new(hit.seq)
         })
     }
@@ -131,9 +135,11 @@ impl View {
 
     fn lookup_record(&self, key: &[u8]) -> Result<Option<Record>> {
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| Record {
-            value: hit.value.to_vec(),
-            version: RecordVersion::new(hit.seq),
+        engine::lookup_multi_with_snapshot(&self.store, &self.root_pin, None, search, |hit| {
+            Record {
+                value: hit.value.to_vec(),
+                version: RecordVersion::new(hit.seq),
+            }
         })
     }
 
@@ -146,11 +152,12 @@ impl View {
                 || Arc::clone(&self.range_gate),
                 |(gate, _)| Arc::clone(gate),
             ),
-        );
+        )
+        .with_snapshot_lease(Arc::clone(&self.snapshot_lease));
         let builder = if let Some((_, mutation_gate)) = &self.scan_fence {
             builder.with_mutation_gate(Arc::clone(mutation_gate))
         } else {
-            builder.snapshot_cursor()
+            builder
         };
         builder.prefix(prefix)
     }

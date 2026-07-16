@@ -158,6 +158,7 @@ pub struct VacuumStats {
 /// root; the totals are pre-summed for the common "how big is the
 /// tree?" question. All bytes / counts are sums over `blobs`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TreeStats {
     /// Number of distinct blobs reachable from the tree root.
     pub blob_count: u32,
@@ -203,6 +204,19 @@ pub struct TreeStats {
     /// queued deletes and deletes already claimed by a checkpoint
     /// epoch but not yet completed.
     pub bm_pending_delete_count: usize,
+    /// COW/structural orphan debt: parent-publication staging,
+    /// snapshot-held candidates, and clean-frontier reclaim backlog.
+    pub bm_gc_orphan_backlog_count: usize,
+    /// Cumulative blobs physically reclaimed by full reachability sweeps or
+    /// clean-frontier exact reclaim.
+    pub bm_gc_reclaimed_count: u64,
+    /// Unreachable candidates deferred by the most recent successful full
+    /// reachability sweep because of its batch limit or a pin.
+    ///
+    /// Bounded exact-reclaim passes do not change this value; use
+    /// [`Self::bm_gc_orphan_backlog_count`] for current COW/structural FIFO
+    /// debt.
+    pub bm_gc_last_full_sweep_deferred_count: usize,
     /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
@@ -403,6 +417,7 @@ impl TreeStats {
 /// `DB`, not any one ART root. Per-tree shape counters still live in
 /// [`TreeStats`] because shape is root-specific.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DBStats {
     /// Number of named trees opened by this process.
     pub open_tree_count: usize,
@@ -411,6 +426,18 @@ pub struct DBStats {
     pub bm_dirty_count: usize,
     /// Number of deferred deletes across every tree.
     pub bm_pending_delete_count: usize,
+    /// COW/structural orphan debt, including staged and snapshot-held blobs.
+    pub bm_gc_orphan_backlog_count: usize,
+    /// Cumulative blobs physically reclaimed by full reachability sweeps or
+    /// clean-frontier exact reclaim.
+    pub bm_gc_reclaimed_count: u64,
+    /// Unreachable candidates deferred by the most recent successful full
+    /// reachability sweep because of its batch limit or a pin.
+    ///
+    /// Bounded exact-reclaim passes do not change this value; use
+    /// [`Self::bm_gc_orphan_backlog_count`] for current COW/structural FIFO
+    /// debt.
+    pub bm_gc_last_full_sweep_deferred_count: usize,
     /// Deferred WAL-backed writes waiting to be merged into ART blob
     /// frames. WAL truncation waits for this to reach zero.
     pub bm_write_delta_count: usize,
@@ -556,6 +583,7 @@ pub struct JournalStats {
 
 /// Reopen-time recovery telemetry captured while opening a tree.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct OpenStats {
     /// WAL records scanned during reopen.
     pub wal_replay_records: u64,
@@ -563,6 +591,10 @@ pub struct OpenStats {
     pub wal_replay_bytes: u64,
     /// Wall-clock time spent replaying the WAL, in microseconds.
     pub wal_replay_micros: u64,
+    /// Wall-clock time spent restoring the DB-wide snapshot epoch from every
+    /// frame reachable through the live catalog closure. Standalone
+    /// trees report zero because their root carries a direct high-water.
+    pub epoch_recovery_micros: u64,
     /// Non-zero iff reopen stopped at a torn WAL tail.
     pub wal_torn_tail: bool,
 }

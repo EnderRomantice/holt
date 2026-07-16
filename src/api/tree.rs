@@ -27,6 +27,7 @@ use crate::concurrency::{CommitGate, EndpointLocks, Gate};
 use crate::engine;
 use crate::engine::{
     KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyScanOutcome, PrefixCount, RangeBuilder,
+    RangeIter,
 };
 use crate::journal::codec::{
     encode_erase_record, encode_insert_record, encode_rename_object_record,
@@ -40,8 +41,10 @@ use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::{
     BlobFrame, BlobFrameRef, BufferManager, BufferStats, CachedBlob, DirtySnapshotEntry,
-    WriteDeltaEntry, WriteThroughEntry, WriteThroughStatus,
+    WriteDeltaEntry, WriteThroughEntry,
 };
+
+const AUTO_GC_BATCH_SIZE: usize = 256;
 
 use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
 
@@ -50,6 +53,44 @@ const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
 const SHAPE_UNDERFILLED_CHILD_FILL_PER_MILLE: u32 = 350;
 const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 const WRITE_DELTA_FLUSH_THRESHOLD: usize = 262_144;
+
+#[cfg(test)]
+struct FullGcSnapshotCaptureBarrier {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl FullGcSnapshotCaptureBarrier {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_GC_SNAPSHOT_CAPTURE_BARRIER: std::cell::RefCell<Option<Arc<FullGcSnapshotCaptureBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_full_gc_snapshot_capture_barrier_for_current_thread(
+    barrier: Arc<FullGcSnapshotCaptureBarrier>,
+) {
+    FULL_GC_SNAPSHOT_CAPTURE_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_full_gc_after_snapshot_capture() {
+    let barrier = FULL_GC_SNAPSHOT_CAPTURE_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
 
 type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 type CheckpointMap = HashMap<BlobGuid, u64>;
@@ -179,7 +220,9 @@ pub(crate) fn prefix_count_from_seen(
 ///   records the blob content version it was built from; if an
 ///   interleaved writer changes a frame, the iterator discards its
 ///   stack and performs a marker-aware seek from the last emitted
-///   key / delimiter lower bound.
+///   key / delimiter lower bound. Each `next()` holds the shared
+///   maintenance and mutation gates for that cursor step only; a
+///   caller-paused iterator does not block structural maintenance.
 /// - **Writes** (`put`, `delete`) enter the shared side of
 ///   `maintenance_gate`, lock the key's endpoint shard, then hold the
 ///   per-blob `HybridLatch` exclusively for the blobs they touch.
@@ -191,9 +234,9 @@ pub(crate) fn prefix_count_from_seen(
 ///   exclusive windows on `maintenance_gate` while folding/deleting
 ///   cross-blob edges. Blob-local compaction runs on the shared
 ///   side under per-blob latches. Point reads rely on parent/child
-///   blob latches instead of this tree-wide gate; range scans and
-///   foreground writers enter the shared side, while `atomic` and
-///   scoped `view` capture enter the exclusive side.
+///   blob latches instead of this tree-wide gate; each range-cursor
+///   advance and foreground write enters the shared side, while
+///   snapshot/view capture enters the exclusive mutation side.
 /// - **`rename`** locks the two endpoint shards for `src` and
 ///   `dst` in canonical order after entering the shared maintenance
 ///   side. `put` / `delete` lock their single endpoint shard, so a
@@ -525,7 +568,7 @@ impl Tree {
 
     fn open_inner(cfg: TreeConfig, bm: Arc<BufferManager>, attach_journal: bool) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
-        ensure_root_blob(&bm, root_guid)?;
+        ensure_durable_root_blob(&bm, root_guid)?;
 
         let mut open_stats = OpenStats::default();
         // Restore the CoW epoch above every persisted frame's
@@ -534,6 +577,9 @@ impl Tree {
         {
             let root = bm.pin(root_guid)?;
             let high_water = crate::layout::frame_epoch_high_water(root.read().as_slice());
+            if high_water == u64::MAX {
+                return Err(Error::node_corrupt("snapshot epoch exhausted"));
+            }
             bm.set_current_epoch(high_water);
         }
         // File-backed WAL trees replay every durable record onto the
@@ -908,10 +954,12 @@ impl Tree {
                     (outcome, None)
                 }
             } else {
-                // No WAL — no journal/checkpoint publish boundary to
-                // race with. `memory_flush_on_write` (if set)
-                // flushes dirty + pending-delete sets inline before
-                // returning.
+                // A no-WAL mutation only needs the publish gate while a
+                // snapshot can force COW. Keep the guard around edge
+                // repoint + parent dirty/orphan promotion, then release it
+                // before any inline flush (CommitGate is non-reentrant).
+                let commit =
+                    (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
                 let outcome = engine::insert_multi_conditional(
                     &self.store,
                     &self.root_pin,
@@ -925,9 +973,9 @@ impl Tree {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
+                drop(commit);
                 if outcome.mutated && self.cfg.memory_flush_on_write {
-                    self.flush_dirty_inline()?;
-                    self.flush_pending_deletes_inline()?;
+                    self.flush_inline()?;
                 }
                 (outcome, None)
             }
@@ -1057,6 +1105,8 @@ impl Tree {
                 }
                 // No-op delete (key wasn't there) is not logged.
             } else {
+                let commit =
+                    (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
                 let outcome = engine::erase_multi_conditional(
                     &self.store,
                     &self.root_pin,
@@ -1069,15 +1119,13 @@ impl Tree {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
+                drop(commit);
                 if outcome.mutated && self.cfg.memory_flush_on_write {
                     // Flush every blob the walker touched (root + any
                     // children) — no WAL means this is the sole
                     // durability path. snapshot_dirty drains all
                     // entries; we commit each through the store.
-                    self.flush_dirty_inline()?;
-                    // Plus drain any deferred deletes queued by a
-                    // conservative parent-unlink path.
-                    self.flush_pending_deletes_inline()?;
+                    self.flush_inline()?;
                 }
                 (outcome, None)
             }
@@ -1173,6 +1221,8 @@ impl Tree {
                 encode_rename_object_record(&mut record, seq, self.tree_id, src, dst, force);
                 journal.submit(record, self.cfg.durability.wal_sync())?
             } else {
+                let commit =
+                    (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
                 let erase_out = engine::erase_multi(
                     &self.store,
                     &self.root_pin,
@@ -1192,12 +1242,12 @@ impl Tree {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
+                drop(commit);
                 if self.cfg.memory_flush_on_write {
                     // Walker may have dirtied child blobs across the
                     // erase + insert sequence — drain the full set.
                     // The erase half can also queue SubtreeGone deletes.
-                    self.flush_dirty_inline()?;
-                    self.flush_pending_deletes_inline()?;
+                    self.flush_inline()?;
                 }
                 None
             }
@@ -1302,10 +1352,11 @@ impl Tree {
                 ack.wait()?;
             }
         } else {
+            let commit = (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
             self.apply_batch_walker_inline(pending, base_seq, None)?;
+            drop(commit);
             if self.cfg.memory_flush_on_write {
-                self.flush_dirty_inline()?;
-                self.flush_pending_deletes_inline()?;
+                self.flush_inline()?;
             }
         }
         Ok(())
@@ -1759,7 +1810,9 @@ impl Tree {
     /// This is not an MVCC snapshot: a long scan can observe keys
     /// committed after iterator creation if they sort after the
     /// current cursor. It is, however, monotonic with respect to
-    /// already-emitted keys and rollups.
+    /// already-emitted keys and rollups. Each `next()` holds the shared
+    /// maintenance/mutation gates only for one cursor step; the iterator does
+    /// not retain those gates while user code is between calls.
     pub fn range(&self) -> RangeBuilder {
         let builder = self.range_builder_base();
         match self.flush_write_delta_for_tree() {
@@ -1778,6 +1831,13 @@ impl Tree {
         .with_mutation_gate(Arc::clone(&self.mutation_gate))
         .with_write_delta_flush(self.tree_id, Arc::clone(&self.commit_gate))
         .with_liveness(Arc::clone(&self.dropped))
+    }
+
+    /// Build a record cursor for a caller that already owns the DB maintenance
+    /// fence on either its shared or exclusive side. The cursor advances with
+    /// [`RangeIter::next_unlocked`].
+    pub(crate) fn range_unlocked(&self) -> RangeIter {
+        self.range_builder_base().into_iter()
     }
 
     /// Shorthand for `tree.range().prefix(p)` — the
@@ -1834,11 +1894,13 @@ impl Tree {
 
     /// Run a read-only transaction over a prefix snapshot.
     ///
-    /// Internally a [`Self::snapshot`] held for the duration of `read`: a
-    /// copy-on-write capture (O(1) — only the root frame is copied; later
-    /// live writes fork the frames this view references). Writes committed
-    /// after the capture are invisible to all reads made through the view,
-    /// and point lookup / range / list keep using the ART walker.
+    /// Internally this captures a [`Self::snapshot`] and passes its view to
+    /// `read`: a copy-on-write capture (O(1) — only the root frame is copied;
+    /// later live writes fork the frames this view references). Writes
+    /// committed after the capture are invisible to all reads made through
+    /// the view, and point lookup / range / list keep using the ART walker.
+    /// A cloned [`View`] or owned cursor returned through `R` may outlive the
+    /// callback and keeps the snapshot epoch leased until it is dropped.
     ///
     /// A view is scoped: reads outside `prefix` return
     /// [`Error::OutsideViewScope`]. Use `prefix = b""` only when a
@@ -1862,25 +1924,32 @@ impl Tree {
     /// mechanism exposed as a scoped closure; this returns an owned handle.
     ///
     /// Reads outside `prefix` return [`Error::OutsideViewScope`]; use
-    /// `prefix = b""` for a whole-tree snapshot. The snapshot stays valid
-    /// until its handle is dropped (or [`Snapshot::retire`] is called).
+    /// `prefix = b""` for a whole-tree snapshot. Dropping the main handle (or
+    /// calling [`Snapshot::retire`]) releases that handle; cloned views and
+    /// owned cursors remain valid and keep the epoch leased until they too are
+    /// dropped.
     pub fn snapshot(&self, prefix: &[u8]) -> Result<Snapshot> {
-        self.flush_write_delta_for_tree()?;
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
-        // Freeze live writers so the root frame is byte-stable for the
-        // copy, and so no writer is mid-overwriting a soon-to-be-shared
-        // frame at the instant the fork barrier rises.
+        // Freeze this tree before publishing deferred writes. Holding the
+        // same commit-writer admission from delta flush through root copy and
+        // barrier registration linearizes snapshot creation against both
+        // acknowledged puts and the all-tree background delta flush.
         let _freeze = self.mutation_gate.enter_exclusive();
-        Ok(self.snapshot_unlocked(prefix))
+        let _commit = self.commit_gate.enter_writer();
+        self.store.flush_write_deltas_for_tree(self.tree_id)?;
+        self.snapshot_unlocked(prefix)
     }
 
-    /// Reclaim copy-on-write frames left unreachable by a crash that
-    /// happened while a snapshot was live: the in-memory orphan list is
-    /// lost on restart, so those forked-away frames would otherwise leak
-    /// in the store forever. Sweeps every persisted frame not reachable
-    /// from the live root or a live snapshot root, returning the count
-    /// freed. Idempotent.
+    /// Reclaim persisted frames not reachable from the live root or a live
+    /// snapshot root, returning the count freed. This includes copy-on-write
+    /// frames left behind when a process crashed with a snapshot live.
+    ///
+    /// GC first checkpoints the writer-frozen live root, then computes
+    /// reachability from that same image, and only then deletes unreachable
+    /// blobs. This ordering prevents a durable old parent from losing a
+    /// child that only the newer in-memory parent stopped referencing.
+    /// Idempotent.
     ///
     /// Only supported on standalone trees — trees opened through a `DB`
     /// share one buffer manager, so a safe sweep needs a DB-wide pass and
@@ -1890,25 +1959,40 @@ impl Tree {
             return Err(Error::GcRequiresStandaloneTree);
         }
         self.flush_write_delta_for_tree()?;
-        let _maintenance = self.maintenance_gate.enter_shared();
+        let _maintenance = self.maintenance_gate.enter_exclusive();
         self.ensure_live()?;
         // Freeze writers so the reachable set is stable across the walk.
         let _freeze = self.mutation_gate.enter_exclusive();
 
-        let mut reachable: HashSet<BlobGuid> = HashSet::new();
-        reachable.insert(self.root_guid);
-        reachable.extend(engine::collect_blob_guids(&self.store, self.root_guid)?);
-        for snap_root in self.store.snapshot_roots() {
+        // The reachable set below is based on the current in-memory parent
+        // images. Make those exact images durable before deleting anything
+        // they no longer reference.
+        Self::checkpoint_shared_store_with_maintenance_held(
+            &self.store,
+            self.journal.as_ref(),
+            &self.commit_gate,
+        )?;
+
+        let mut canonical_reachable: HashSet<BlobGuid> = HashSet::new();
+        canonical_reachable.insert(self.root_guid);
+        canonical_reachable.extend(engine::collect_blob_guids(&self.store, self.root_guid)?);
+        let snapshot_roots = self.store.snapshot_roots_pinned()?;
+        #[cfg(test)]
+        pause_full_gc_after_snapshot_capture();
+        let mut reachable = canonical_reachable.clone();
+        for snapshot_root in snapshot_roots {
+            let snap_root = snapshot_root.guid();
             reachable.insert(snap_root);
             reachable.extend(engine::collect_blob_guids(&self.store, snap_root)?);
         }
-        self.store.gc_sweep_unreachable(&reachable)
+        self.store
+            .gc_sweep_unreachable_with_canonical(&reachable, &canonical_reachable)
     }
 
     /// Reclaim logical garbage and physical space from free store slots.
     ///
-    /// [`Self::gc`] only makes unreachable blob frames reusable. `vacuum`
-    /// follows that with a checkpoint and store-level physical cleanup:
+    /// [`Self::gc`] checkpoints first and then makes unreachable blob frames
+    /// reusable. `vacuum` follows with store-level physical cleanup:
     /// live high-water slots may be relocated into lower reusable holes,
     /// packed-file tails that are durably free are truncated, and on
     /// Linux any remaining reusable middle slots are hole-punched. This
@@ -1920,7 +2004,6 @@ impl Tree {
     /// there so every live tree participates in the reachable set.
     pub fn vacuum(&self) -> Result<VacuumStats> {
         let unreachable = self.gc()?;
-        self.checkpoint()?;
         let mut stats = self.store.vacuum_storage()?;
         stats.unreachable_blobs = unreachable;
         Ok(stats)
@@ -1930,11 +2013,11 @@ impl Tree {
     /// gates — the caller must already hold the mutation gate exclusively.
     /// Used by [`crate::DB::view`] to capture several trees atomically
     /// under a single coordinated freeze.
-    pub(crate) fn snapshot_unlocked(&self, prefix: &[u8]) -> Snapshot {
+    pub(crate) fn snapshot_unlocked(&self, prefix: &[u8]) -> Result<Snapshot> {
         self.snapshot_unlocked_with_scan_fence(prefix, true)
     }
 
-    pub(crate) fn snapshot_unlocked_unfenced(&self, prefix: &[u8]) -> Snapshot {
+    pub(crate) fn snapshot_unlocked_unfenced(&self, prefix: &[u8]) -> Result<Snapshot> {
         self.snapshot_unlocked_with_scan_fence(prefix, false)
     }
 
@@ -1942,12 +2025,19 @@ impl Tree {
         &self,
         prefix: &[u8],
         fence_live_writers: bool,
-    ) -> Snapshot {
+    ) -> Result<Snapshot> {
         use crate::store::STRUCTURAL_SEQ;
 
         let snap_root = engine::fresh_blob_guid();
         let root_pin = self.store.install_snapshot_root(snap_root, &self.root_pin);
-        let epoch = self.store.register_snapshot(snap_root);
+        let epoch = match self.store.register_snapshot(snap_root, &root_pin) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                drop(root_pin);
+                self.store.discard_snapshot_root(snap_root);
+                return Err(error);
+            }
+        };
 
         // Persist the bumped epoch on the live root so a reopened tree
         // restores `current_epoch` above every frame's `created_epoch`.
@@ -1961,11 +2051,18 @@ impl Tree {
         self.store
             .mark_dirty_cached(self.root_guid, STRUCTURAL_SEQ, self.root_pin.as_ref());
 
+        let snapshot_lease = crate::store::SnapshotLease::new(
+            Arc::clone(&self.store),
+            epoch,
+            snap_root,
+            Arc::clone(&root_pin),
+        );
         let view = View::new(
             prefix.to_vec(),
             Arc::clone(&self.store),
             snap_root,
             root_pin,
+            snapshot_lease,
             fence_live_writers.then(|| {
                 (
                     Arc::clone(&self.maintenance_gate),
@@ -1973,7 +2070,7 @@ impl Tree {
                 )
             }),
         );
-        Snapshot::new(view, Arc::clone(&self.store), epoch)
+        Ok(Snapshot::new(view, epoch))
     }
 
     /// Return `true` if no live key starts with `prefix`.
@@ -2002,75 +2099,111 @@ impl Tree {
     /// tracked for the next round. Write-through with `expected_seq`
     /// matches checkpoint: retire only the entry captured by this
     /// snapshot, leaving any racing newer seq for a later flush.
-    pub(crate) fn flush_dirty_inline(&self) -> Result<()> {
-        let snap = self.store.snapshot_dirty();
-        let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
-        let mut first_err: Option<Error> = None;
-        let mut entries = Vec::with_capacity(snap.len());
-        for (guid, expected_seq) in snap {
-            // `snapshot_bytes` clones the cached image under a
-            // brief shared read guard so we hand owned bytes to
-            // write-through. `None` means the blob was evicted
-            // between snapshot_dirty and snapshot_bytes — invariant
-            // I1 regressed, so restore the entry and fail loudly.
-            if let Some(bytes) = self.store.snapshot_bytes(guid) {
-                entries.push(WriteThroughEntry {
-                    guid,
-                    bytes,
-                    expected_seq,
-                    content_version: None,
-                });
-            } else {
-                failed.insert(guid, expected_seq);
-                first_err.get_or_insert(Error::Internal(
-                    "flush_dirty_inline: dirty entry lost cache image — invariant I1 violated",
-                ));
+    /// Commit the no-WAL dirty and pending-delete phases under one global
+    /// checkpoint-I/O guard. Keeping this guard across both phases prevents a
+    /// stale concurrent epoch from republishing an old parent between the
+    /// current parent sync and its child delete.
+    pub(crate) fn flush_inline(&self) -> Result<()> {
+        let _checkpoint_io = self.store.enter_checkpoint_io();
+        self.flush_dirty_inline_locked()?;
+        self.flush_pending_deletes_inline_locked()
+    }
+
+    fn flush_dirty_inline_locked(&self) -> Result<()> {
+        loop {
+            let snap = self.store.snapshot_dirty();
+            if snap.is_empty() {
+                return Ok(());
             }
-        }
-        if !entries.is_empty() {
-            let expected: Vec<_> = entries
-                .iter()
-                .map(|entry| (entry.guid, entry.expected_seq))
-                .collect();
-            if let Err(e) = self.store.write_through_batch(&entries) {
-                for (guid, expected_seq) in expected {
-                    failed.insert(guid, expected_seq);
+            let versioned_snap = match self.store.snapshot_dirty_versions(&snap) {
+                Ok(versioned) => versioned,
+                Err(e) => {
+                    self.store.restore_dirty(snap);
+                    return Err(e);
                 }
-                if first_err.is_none() {
-                    first_err = Some(e);
+            };
+            let mut failed = CheckpointMap::new();
+            let mut first_err = None;
+            let mut entries = Vec::with_capacity(versioned_snap.len());
+            for snapshot in versioned_snap {
+                // Clone only the exact cache image captured for this round.
+                // A writer may change the frame after the dirty snapshot; in
+                // that case restore the claimed seq and retry instead of
+                // retiring the newer bytes against an older store image.
+                match self
+                    .store
+                    .snapshot_bytes_if_version(snapshot.guid, snapshot.content_version)
+                {
+                    Ok(Some(bytes)) => entries.push(WriteThroughEntry {
+                        guid: snapshot.guid,
+                        bytes,
+                        expected_seq: snapshot.expected_seq,
+                        content_version: Some(snapshot.content_version),
+                    }),
+                    Ok(None) => {
+                        failed.insert(snapshot.guid, snapshot.expected_seq);
+                    }
+                    Err(e) => {
+                        failed.insert(snapshot.guid, snapshot.expected_seq);
+                        first_err.get_or_insert(e);
+                    }
                 }
             }
+            if !entries.is_empty() {
+                let expected: Vec<_> = entries
+                    .iter()
+                    .map(|entry| (entry.guid, entry.expected_seq))
+                    .collect();
+                match crate::checkpoint::write_entries_child_first(&self.store, entries) {
+                    Ok(deferred) => failed.extend(deferred),
+                    Err(e) => {
+                        failed.extend(expected);
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+            let should_retry = !failed.is_empty() && first_err.is_none();
+            if !failed.is_empty() {
+                self.store.restore_dirty(failed);
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            if !should_retry {
+                return Ok(());
+            }
+            std::thread::yield_now();
         }
-        if !failed.is_empty() {
-            self.store.restore_dirty(failed);
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// Drain the BM pending-delete queue and apply each
     /// `store.delete_blob` synchronously.
     ///
-    /// Companion to [`Self::flush_dirty_inline`] for the deferred
+    /// Companion to [`Self::flush_dirty_inline_locked`] for the deferred
     /// delete protocol — `erase` ops that emptied a child blob
     /// stage the delete here so the manifest mutation can't reach
     /// disk before the WAL record covering the erase is durable
     /// (invariant W2D).
     ///
-    /// Must run **after** `flush_dirty_inline` (any new bytes in
+    /// Must run **after** `flush_dirty_inline_locked` (any new bytes in
     /// dirty land first) and **before** the trailing
     /// `store.flush` (which persists the manifest deletion).
     /// Restoration is automatic on individual failures — the
     /// remaining entries stay queued for the next attempt.
-    pub(crate) fn flush_pending_deletes_inline(&self) -> Result<()> {
+    fn flush_pending_deletes_inline_locked(&self) -> Result<()> {
+        // Publish every rewritten parent before applying a logical user
+        // delete's manifest mutation.
+        self.store.flush_inner()?;
         let pending = self.store.snapshot_pending_deletes();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
+        let mut applied: std::collections::HashMap<BlobGuid, u64> =
+            std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         for (guid, seq) in pending {
             match self.store.execute_pending_delete(guid, seq) {
-                Ok(true) => {}
+                Ok(true) => {
+                    applied.insert(guid, seq);
+                }
                 Ok(false) => {
                     failed.insert(guid, seq);
                 }
@@ -2084,6 +2217,16 @@ impl Tree {
         }
         if !failed.is_empty() {
             self.store.restore_pending_deletes(failed);
+        }
+        // A successful delete only changed the store's in-memory manifest.
+        // Cross its durability frontier before the no-WAL mutation returns;
+        // on failure, restore the exact applied set so a later inline flush
+        // retries the sync/delete idempotently.
+        if !applied.is_empty() {
+            if let Err(e) = self.store.flush_inner() {
+                self.store.restore_pending_deletes(applied);
+                return Err(e);
+            }
         }
         if let Some(e) = first_err {
             return Err(e);
@@ -2108,9 +2251,11 @@ impl Tree {
     /// 2. **Clone bytes outside `commit_gate`**: if any blob changed
     ///    after intent capture, restore the whole snapshot and retry
     ///    so manual checkpoint remains a durability barrier.
-    /// 3. **Per-blob write-through** with CAS-on-seq. The CAS
-    ///    retires the dirty entry only if no racing writer bumped
-    ///    it; failures stay in `dirty` for the next round.
+    /// 3. **Dependency-ordered write-through**. Dirty frames are arranged in
+    ///    child-before-parent waves; each write uses CAS-on-seq/content
+    ///    version and retires the dirty entry only if no racing writer bumped
+    ///    it. A missing/external dirty child defers its parent, and failures
+    ///    stay in `dirty` for the next round.
     ///    If the snapshot had neither dirty blobs nor pending
     ///    deletes and the store reports no outstanding flush
     ///    work, skip the store Sync path entirely.
@@ -2126,34 +2271,51 @@ impl Tree {
     ///    deleted slot. Restore pending and return the dirty
     ///    error. The next round will retry the parent write and
     ///    only then process its child's deletion.
-    /// 6. **Apply pending deletes**. User WAL deletes mutate the
-    ///    manifest in memory; structural deletes only retire their
-    ///    fence and leave orphan cleanup to a future reachability
-    ///    GC. Each `execute_pending_delete` is idempotent against a
-    ///    missing entry; failures are restored.
+    /// 6. **Apply pending deletes**. These are logical user WAL deletes;
+    ///    structural children never enter this queue and instead use
+    ///    parent-scoped orphan staging. Each `execute_pending_delete` is
+    ///    idempotent against a missing entry; failures are restored.
     /// 7. **Post-delete sync** — re-`store.flush` iff any manifest
     ///    delete actually applied. Failure → restore the
     ///    already-applied entries so the truncate gate stays
     ///    closed and the next round retries the sync.
-    /// 8. **Conditional WAL truncate** — only if
-    ///    `dirty_count == 0`, `flushing_count == 0`,
-    ///    `pending_delete_count == 0`, and the store reports no
-    ///    deferred flush work *now*. A racing writer, restored
-    ///    failure, or deferred data/manifest sync must keep the WAL
-    ///    alive until a future flush.
+    /// 8. **Conditional WAL truncate** — only if dirty, flushing,
+    ///    pending-delete, orphan-staging, and write-delta debt are all zero
+    ///    and the store reports no deferred flush work *now*. A racing writer,
+    ///    restored failure, or deferred data/manifest sync keeps the WAL alive.
+    /// 9. **Standalone exact reclaim** — with the maintenance fence still
+    ///    exclusive, drain one bounded retired COW/structural FIFO batch. DB
+    ///    tree handles leave shared-store cleanup to [`crate::DB::checkpoint`].
     ///
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
-        Self::checkpoint_shared_parts(
+        if self.tree_id != 0 {
+            return Self::checkpoint_shared_store(
+                &self.store,
+                self.journal.as_ref(),
+                &self.maintenance_gate,
+                &self.commit_gate,
+            );
+        }
+
+        // Standalone checkpoints also make bounded progress on retired COW
+        // and structural storage. The same exclusive maintenance fence covers
+        // the durable parent frontier, exact FIFO capture, and physical
+        // deletion; this fast path does not run a reachability walk.
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        let _freeze = self.mutation_gate.enter_exclusive();
+        Self::checkpoint_shared_store_with_maintenance_held(
             &self.store,
             self.journal.as_ref(),
-            &self.maintenance_gate,
             &self.commit_gate,
-        )
+        )?;
+        self.store
+            .reclaim_retired_orphans_bounded(AUTO_GC_BATCH_SIZE)?;
+        Ok(())
     }
 
-    pub(crate) fn checkpoint_shared_parts(
+    pub(crate) fn checkpoint_shared_store(
         store: &Arc<BufferManager>,
         journal: Option<&Arc<Journal>>,
         maintenance_gate: &Arc<Gate>,
@@ -2161,6 +2323,18 @@ impl Tree {
     ) -> Result<()> {
         let _maintenance = maintenance_gate.enter_shared();
 
+        Self::checkpoint_shared_store_with_maintenance_held(store, journal, commit_gate)
+    }
+
+    /// Complete a checkpoint while the caller already holds the maintenance
+    /// gate, on either its shared or exclusive side. This lets GC keep writers
+    /// frozen across both the durability barrier and the reachability walk
+    /// without re-entering the non-reentrant gate.
+    pub(crate) fn checkpoint_shared_store_with_maintenance_held(
+        store: &Arc<BufferManager>,
+        journal: Option<&Arc<Journal>>,
+        commit_gate: &Arc<CommitGate>,
+    ) -> Result<()> {
         loop {
             let (snap_dirty, snap_pending, versioned_snap, wal_up_to) =
                 Self::capture_checkpoint_intent_shared(store, journal, commit_gate)?;
@@ -2228,8 +2402,8 @@ impl Tree {
         Option<u64>,
     )> {
         if let Some(journal) = journal {
-            store.flush_write_deltas()?;
             let _commit = commit_gate.enter_checkpoint();
+            store.flush_write_deltas()?;
             let wal_up_to = journal.queued_work();
             let snap_dirty = store.snapshot_dirty();
             let snap_pending = store.snapshot_pending_deletes();
@@ -2244,6 +2418,7 @@ impl Tree {
                 }
             }
         } else {
+            let _commit = commit_gate.enter_checkpoint();
             store.flush_write_deltas()?;
             let snap_dirty = store.snapshot_dirty();
             let snap_pending = store.snapshot_pending_deletes();
@@ -2265,6 +2440,10 @@ impl Tree {
         snap_pending: CheckpointMap,
         snap_bytes: CheckpointBytes,
     ) -> Result<()> {
+        // Capture/CommitGate has already been released. Serialize the complete
+        // manual write/sync/delete/sync transaction with the background I/O
+        // worker so an older stale epoch cannot land after a newer delete.
+        let _checkpoint_io = store.enter_checkpoint_io();
         let DirtyWriteOutcome {
             wrote_any,
             retry: dirty_retry,
@@ -2282,7 +2461,7 @@ impl Tree {
 
         // Successful write-throughs already retired their dirty
         // entries; sync them before any manifest delete can land.
-        if let Err(e) = store.flush() {
+        if let Err(e) = store.flush_inner() {
             store.restore_pending_deletes(snap_pending);
             return Err(e);
         }
@@ -2327,6 +2506,7 @@ impl Tree {
                 },
             )
             .collect();
+        let wrote_any = !entries.is_empty();
         let mut retry = CheckpointMap::new();
         let mut first_err = None;
         if !entries.is_empty() {
@@ -2334,13 +2514,9 @@ impl Tree {
                 .iter()
                 .map(|entry| (entry.guid, entry.expected_seq))
                 .collect();
-            match store.write_through_batch(&entries) {
-                Ok(report) => {
-                    for (entry, status) in entries.iter().zip(report.statuses) {
-                        if matches!(status, WriteThroughStatus::Stale) {
-                            retry.insert(entry.guid, entry.expected_seq);
-                        }
-                    }
+            match crate::checkpoint::write_entries_child_first(store, entries) {
+                Ok(deferred) => {
+                    retry.extend(deferred);
                 }
                 Err(e) => {
                     // BlobStore batch failure may have landed any prefix;
@@ -2353,7 +2529,7 @@ impl Tree {
             }
         }
         DirtyWriteOutcome {
-            wrote_any: !entries.is_empty(),
+            wrote_any,
             retry,
             first_err,
         }
@@ -2392,7 +2568,7 @@ impl Tree {
             .filter(|(guid, seq)| **seq != STRUCTURAL_SEQ && !pending_failed.contains_key(*guid))
             .count();
         if applied_manifest_deletes > 0 {
-            if let Err(e) = store.flush() {
+            if let Err(e) = store.flush_inner() {
                 let restore_applied: CheckpointMap = snap_pending
                     .iter()
                     .filter(|(g, seq)| **seq != STRUCTURAL_SEQ && !pending_failed.contains_key(*g))
@@ -2416,6 +2592,7 @@ impl Tree {
                 if store.dirty_count() == 0
                     && store.flushing_count() == 0
                     && store.pending_delete_count() == 0
+                    && store.orphan_staging_count() == 0
                     && store.write_delta_count() == 0
                     && !store.needs_flush()
                 {
@@ -2435,6 +2612,7 @@ impl Tree {
         store.dirty_count() == 0
             && store.flushing_count() == 0
             && store.pending_delete_count() == 0
+            && store.orphan_staging_count() == 0
             && store.write_delta_count() == 0
             && !store.needs_flush()
             && journal.is_none_or(|journal| !journal.needs_checkpoint())
@@ -2484,6 +2662,9 @@ impl Tree {
             blobs: aggregate.blobs,
             bm_dirty_count: bm.dirty_count,
             bm_pending_delete_count: bm.pending_delete_count,
+            bm_gc_orphan_backlog_count: bm.gc_orphan_backlog_count,
+            bm_gc_reclaimed_count: bm.gc_reclaimed_count,
+            bm_gc_last_full_sweep_deferred_count: bm.gc_last_full_sweep_deferred_count,
             bm_write_delta_count: bm.write_delta_count,
             bm_read_index_token_count: bm.read_index_token_count,
             bm_read_index_cache_entries: bm.read_index_cache_entries,
@@ -2666,8 +2847,9 @@ impl Tree {
     /// through their versioned cursor frames and restart from the
     /// last emitted lower bound.
     ///
-    /// Both phases stage their changes via `mark_dirty` /
-    /// `mark_for_delete` on the internal `BufferManager`
+    /// Both phases stage rewritten parents via `mark_dirty`; structural
+    /// children use parent-scoped orphan staging, while logical user deletes
+    /// continue through `mark_for_delete` on the internal `BufferManager`
     /// rather than writing through to store inline. This keeps
     /// compact compatible with invariant **W2D**: a naive
     /// `bm.commit(*guid)` per touched blob would push the cache
@@ -2805,16 +2987,28 @@ impl Tree {
         if !self.store.has_blob(guid)? {
             return Ok(());
         }
-        let _commit = self
-            .journal
-            .as_ref()
-            .map(|_| self.commit_gate.enter_writer());
+        // Parent edge mutation, orphan staging, dirty publication, and
+        // staging promotion form one clean-frontier transaction even for a
+        // custom/no-WAL store with background checkpointing enabled.
+        let _commit = self.commit_gate.enter_writer();
         let pin = self.store.pin(guid)?;
-        let (merged, has_children) = {
+        let merge_result = {
             let mut guard = pin.write();
             let mut frame = guard.frame();
-            let merged = engine::try_merge_children(&self.store, &mut frame, STRUCTURAL_SEQ)?;
-            (merged, frame.header().num_ext_blobs != 0)
+            engine::try_merge_children(&self.store, &mut frame, STRUCTURAL_SEQ)
+                .map(|merged| (merged, frame.header().num_ext_blobs != 0))
+        };
+        let (merged, has_children) = match merge_result {
+            Ok(result) => result,
+            Err(error) => {
+                // The pass may already have folded earlier children before a
+                // later child failed. Those rewrites are logically neutral;
+                // publish the exact partial parent so staged child GUIDs can
+                // leave parent-scoped limbo and checkpoint can make progress.
+                self.store.mark_dirty(guid, STRUCTURAL_SEQ);
+                drop(pin);
+                return Err(error);
+            }
         };
         if merged.merged > 0 {
             self.store.mark_dirty(guid, STRUCTURAL_SEQ);
@@ -2832,6 +3026,25 @@ impl Tree {
     pub fn config(&self) -> &TreeConfig {
         &self.cfg
     }
+}
+
+/// Ensure a deterministic empty root exists beyond the store's durability
+/// frontier before any catalog or replay path publishes a reference to it.
+pub(crate) fn ensure_durable_root_blob(bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<()> {
+    if !bm.has_blob(root_guid)? {
+        let mut scratch = bm.alloc_blob_buf_zeroed();
+        BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
+        bm.write_blob(root_guid, &scratch)?;
+    }
+    // A prior create attempt may have submitted the root write and then
+    // failed its flush. In that case `has_blob` is already true, but callers
+    // still must cross the root durability frontier before publishing any
+    // catalog/reference that makes it reachable.
+    // Always retry the durability barrier. Custom stores may have submitted
+    // a prior root write before returning a flush error, and `has_blob` alone
+    // does not imply that mapping survived a crash.
+    bm.flush()?;
+    Ok(())
 }
 
 /// Replay `path` onto the BM-cached blobs and return the
@@ -2859,16 +3072,6 @@ impl Tree {
 /// a `Tree::open` → `Tree::checkpoint` immediately after replay
 /// could find an empty dirty set, write nothing to store, then
 /// truncate the WAL — silently losing every replayed record.
-pub(crate) fn ensure_root_blob(bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<()> {
-    if !bm.has_blob(root_guid)? {
-        let mut scratch = bm.alloc_blob_buf_zeroed();
-        BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
-        bm.write_blob(root_guid, &scratch)?;
-        bm.flush()?;
-    }
-    Ok(())
-}
-
 pub(crate) fn replay_wal<F>(
     path: &std::path::Path,
     bm: &Arc<BufferManager>,
@@ -2887,7 +3090,7 @@ where
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let guid = root_for_tree_id(tree_id)?;
-                ensure_root_blob(bm, guid)?;
+                ensure_durable_root_blob(bm, guid)?;
                 let pin = bm.pin(guid)?;
                 let (guid, pin) = entry.insert((guid, pin));
                 (*guid, Arc::clone(pin))
@@ -2981,20 +3184,306 @@ where
 #[cfg(test)]
 mod tests {
     use crate::concurrency::CommitGate;
+    use crate::engine::{RouteHit, SearchKey};
     use crate::journal::Journal;
     use crate::layout::BlobGuid;
     use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
-    use crate::store::BufferManager;
-    use crate::TreeBuilder;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::store::{BlobFrame, BufferManager};
+    use crate::{Durability, Error, Tree, TreeBuilder, TreeConfig};
+    use std::collections::{HashMap, HashSet};
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::sync_channel;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn standalone_reopens_exhausted_epoch_without_leaking_failed_snapshot_root() {
+        let store = Arc::new(MemoryBlobStore::new());
+        let mut cfg = TreeConfig::memory();
+        cfg.checkpoint.enabled = false;
+        cfg.memory_flush_on_write = false;
+
+        {
+            let store_dyn: Arc<dyn BlobStore> = store.clone();
+            let tree = Tree::open_with_blob_store(cfg.clone(), store_dyn).unwrap();
+            tree.put(b"key", b"before").unwrap();
+            tree.store.set_current_epoch(u64::MAX - 2);
+            let snapshot = tree.snapshot(b"").unwrap();
+            assert_eq!(snapshot.epoch(), u64::MAX - 2);
+            assert_eq!(tree.store.current_epoch(), u64::MAX - 1);
+            drop(snapshot);
+            tree.checkpoint().unwrap();
+        }
+
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let reopened = Tree::open_with_blob_store(cfg.clone(), store_dyn).unwrap();
+        assert_eq!(reopened.store.current_epoch(), u64::MAX - 1);
+        assert_eq!(
+            reopened.get(b"key").unwrap().as_deref(),
+            Some(&b"before"[..])
+        );
+        let cached_before = reopened.store.cached_count();
+        let dirty_before = reopened.store.dirty_count();
+        let barrier_before = reopened.store.fork_barrier();
+        let live_before = reopened.store.snapshot_roots_pinned().unwrap().len();
+
+        let error = reopened.snapshot(b"").unwrap_err();
+        assert!(matches!(error, Error::SnapshotEpochExhausted));
+        assert_eq!(reopened.store.cached_count(), cached_before);
+        assert_eq!(reopened.store.dirty_count(), dirty_before);
+        assert_eq!(reopened.store.fork_barrier(), barrier_before);
+        assert_eq!(
+            reopened.store.snapshot_roots_pinned().unwrap().len(),
+            live_before,
+        );
+        assert_eq!(reopened.store.current_epoch(), u64::MAX - 1);
+
+        reopened.put(b"key", b"after").unwrap();
+        assert_eq!(
+            reopened.get(b"key").unwrap().as_deref(),
+            Some(&b"after"[..])
+        );
+
+        let corrupt_store = Arc::new(MemoryBlobStore::new());
+        let mut root = AlignedBlobBuf::zeroed();
+        BlobFrame::init(root.as_mut_slice(), [0; 16]).unwrap();
+        crate::layout::set_frame_epoch_high_water(root.as_mut_slice(), u64::MAX);
+        corrupt_store.write_blob([0; 16], &root).unwrap();
+        let corrupt_dyn: Arc<dyn BlobStore> = corrupt_store;
+        let error = Tree::open_with_blob_store(cfg, corrupt_dyn).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::NodeCorrupt {
+                context: "snapshot epoch exhausted",
+                ..
+            }
+        ));
+    }
+
+    fn spilled_tree_with_same_child_keys() -> (Tree, Vec<u8>, Vec<u8>, RouteHit) {
+        let tree = TreeBuilder::new("ignored")
+            .memory()
+            .buffer_pool_size(32)
+            .open()
+            .unwrap();
+        let old = vec![0x6A; 1024];
+        for i in 0..1200u32 {
+            tree.put(format!("route/{i:08}").as_bytes(), &old).unwrap();
+        }
+        assert!(tree.stats().unwrap().blob_count > 1);
+
+        let mut first_by_child = HashMap::<BlobGuid, Vec<u8>>::new();
+        for i in 0..1200u32 {
+            let key = format!("route/{i:08}").into_bytes();
+            assert_eq!(tree.get(&key).unwrap().as_deref(), Some(&old[..]));
+            let Some(route) = tree.route_cache.lookup(SearchKey::user(&key)) else {
+                continue;
+            };
+            if let Some(first) = first_by_child.get(&route.child_guid) {
+                if first != &key {
+                    return (tree, first.clone(), key, route);
+                }
+            } else {
+                first_by_child.insert(route.child_guid, key);
+            }
+        }
+        panic!("test precondition: no two keys routed to the same child");
+    }
 
     struct FlushPendingStore {
         inner: MemoryBlobStore,
         pending: AtomicBool,
+    }
+
+    struct FailReadStore {
+        inner: Arc<MemoryBlobStore>,
+        fail_guids: Mutex<HashSet<BlobGuid>>,
+        last_failed: Mutex<Option<BlobGuid>>,
+    }
+
+    struct InlineBlockingStore {
+        inner: MemoryBlobStore,
+        block_next_batch: AtomicBool,
+        entered: Barrier,
+        release: Barrier,
+    }
+
+    struct FailTrailingDeleteFlushStore {
+        inner: MemoryBlobStore,
+        flush_calls: AtomicUsize,
+        fail_flush_at: AtomicUsize,
+    }
+
+    impl FailTrailingDeleteFlushStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                flush_calls: AtomicUsize::new(0),
+                fail_flush_at: AtomicUsize::new(usize::MAX),
+            }
+        }
+
+        fn fail_after_one_successful_flush(&self) {
+            self.fail_flush_at.store(
+                self.flush_calls.load(Ordering::Acquire) + 2,
+                Ordering::Release,
+            );
+        }
+    }
+
+    impl BlobStore for FailTrailingDeleteFlushStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> crate::Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> crate::Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> crate::Result<()> {
+            let ordinal = self.flush_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if ordinal == self.fail_flush_at.load(Ordering::Acquire) {
+                self.fail_flush_at.store(usize::MAX, Ordering::Release);
+                return Err(crate::Error::BlobStoreIo(io::Error::other(
+                    "failpoint: trailing delete flush",
+                )));
+            }
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> crate::Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    impl InlineBlockingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                block_next_batch: AtomicBool::new(false),
+                entered: Barrier::new(2),
+                release: Barrier::new(2),
+            }
+        }
+
+        fn arm(&self) {
+            self.block_next_batch.store(true, Ordering::Release);
+        }
+    }
+
+    impl BlobStore for InlineBlockingStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs_with_data_sync(
+            &self,
+            writes: &[(BlobGuid, &AlignedBlobBuf)],
+        ) -> crate::Result<()> {
+            self.inner.write_blobs_with_data_sync(writes)?;
+            if self.block_next_batch.swap(false, Ordering::AcqRel) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(())
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> crate::Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> crate::Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> crate::Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> crate::Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    impl FailReadStore {
+        fn new(inner: Arc<MemoryBlobStore>) -> Self {
+            Self {
+                inner,
+                fail_guids: Mutex::new(HashSet::new()),
+                last_failed: Mutex::new(None),
+            }
+        }
+
+        fn arm(&self, guids: impl IntoIterator<Item = BlobGuid>) {
+            self.fail_guids.lock().unwrap().extend(guids);
+            *self.last_failed.lock().unwrap() = None;
+        }
+
+        fn clear(&self) {
+            self.fail_guids.lock().unwrap().clear();
+        }
+
+        fn take_last_failed(&self) -> Option<BlobGuid> {
+            self.last_failed.lock().unwrap().take()
+        }
+    }
+
+    impl BlobStore for FailReadStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> crate::Result<()> {
+            if self.fail_guids.lock().unwrap().contains(&guid) {
+                *self.last_failed.lock().unwrap() = Some(guid);
+                return Err(crate::Error::BlobStoreIo(io::Error::other(
+                    "failpoint: deep child read",
+                )));
+            }
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> crate::Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> crate::Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> crate::Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> crate::Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> crate::Result<bool> {
+            self.inner.has_blob(guid)
+        }
     }
 
     impl FlushPendingStore {
@@ -3041,7 +3530,9 @@ mod tests {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0x71; 16];
         let mut initial = AlignedBlobBuf::zeroed();
-        initial.as_mut_slice()[123] = 0x01;
+        BlobFrame::init(initial.as_mut_slice(), guid).unwrap();
+        let value_offset = crate::layout::DATA_AREA_START as usize + 123;
+        initial.as_mut_slice()[value_offset] = 0x01;
         inner.write_blob(guid, &initial).unwrap();
 
         let bm = Arc::new(BufferManager::new(Arc::clone(&inner), 4));
@@ -3049,7 +3540,7 @@ mod tests {
 
         {
             let mut guard = pin.write();
-            guard.as_mut_slice()[123] = 0x02;
+            guard.as_mut_slice()[value_offset] = 0x02;
         }
         bm.mark_dirty_cached(guid, 10, pin.as_ref());
         let snap = bm.snapshot_dirty();
@@ -3062,7 +3553,7 @@ mod tests {
 
         {
             let mut guard = pin.write();
-            guard.as_mut_slice()[123] = 0x03;
+            guard.as_mut_slice()[value_offset] = 0x03;
         }
         bm.mark_dirty_cached(guid, 20, pin.as_ref());
 
@@ -3077,7 +3568,7 @@ mod tests {
         let mut stored = AlignedBlobBuf::zeroed();
         inner.read_blob(guid, &mut stored).unwrap();
         assert_eq!(
-            stored.as_slice()[123],
+            stored.as_slice()[value_offset],
             0x01,
             "stale checkpoint bytes must not be treated as durable"
         );
@@ -3086,6 +3577,93 @@ mod tests {
             10,
             "manual checkpoint must keep the earliest unflushed seq for retry"
         );
+    }
+
+    #[test]
+    fn inline_flush_retries_racing_content_version_and_reopens_latest_value() {
+        let store = Arc::new(InlineBlockingStore::new());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let mut cfg = TreeConfig::memory();
+        cfg.memory_flush_on_write = false;
+        let tree = Tree::open_with_blob_store(cfg.clone(), store_dyn).unwrap();
+        tree.put(b"inline-race", b"old").unwrap();
+
+        store.arm();
+        let flushing = tree.clone();
+        let flush_thread = thread::spawn(move || flushing.flush_inline());
+        store.entered.wait();
+        tree.put(b"inline-race", b"new").unwrap();
+        store.release.wait();
+        flush_thread.join().unwrap().unwrap();
+
+        assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
+        drop(tree);
+        let store_dyn: Arc<dyn BlobStore> = store;
+        let reopened = Tree::open_with_blob_store(cfg, store_dyn).unwrap();
+        assert_eq!(
+            reopened.get(b"inline-race").unwrap().as_deref(),
+            Some(&b"new"[..]),
+            "inline flush must retry the raced frame and persist its latest cache image",
+        );
+    }
+
+    #[test]
+    fn manual_checkpoint_waits_for_global_io_epoch() {
+        let mut cfg = TreeConfig::memory();
+        cfg.memory_flush_on_write = false;
+        cfg.checkpoint.enabled = false;
+        let tree = Tree::open(cfg).unwrap();
+        tree.put(b"manual-io-lock", b"value").unwrap();
+
+        let checkpoint_io = tree.store.enter_checkpoint_io();
+        let worker_tree = tree.clone();
+        let (done_tx, done_rx) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = worker_tree.checkpoint();
+            done_tx.send(result).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "manual checkpoint must not bypass an active checkpoint I/O epoch",
+        );
+        drop(checkpoint_io);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            tree.get(b"manual-io-lock").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+    }
+
+    #[test]
+    fn inline_delete_sync_failure_restores_pending_fence_for_retry() {
+        let store = Arc::new(FailTrailingDeleteFlushStore::new());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let mut cfg = TreeConfig::memory();
+        cfg.memory_flush_on_write = false;
+        cfg.checkpoint.enabled = false;
+        let tree = Tree::open_with_blob_store(cfg, store_dyn).unwrap();
+        let child = [0x74; 16];
+        store
+            .inner
+            .write_blob(child, &AlignedBlobBuf::zeroed())
+            .unwrap();
+        tree.store.mark_for_delete(child, 7);
+
+        store.fail_after_one_successful_flush();
+        assert!(tree.flush_inline().is_err());
+        assert_eq!(
+            tree.store.pending_delete_count(),
+            1,
+            "an unsynced applied manifest delete must remain retryable",
+        );
+
+        tree.flush_inline().unwrap();
+        assert_eq!(tree.store.pending_delete_count(), 0);
+        assert!(!store.inner.has_blob(child).unwrap());
     }
 
     #[test]
@@ -3218,6 +3796,130 @@ mod tests {
     }
 
     #[test]
+    fn no_wal_snapshot_mutation_waits_for_clean_frontier_capture() {
+        let tree = TreeBuilder::new("ignored").memory().open().unwrap();
+        tree.put(b"key", b"old").unwrap();
+        let snapshot = tree.snapshot(b"").unwrap();
+
+        let clean_capture = tree.commit_gate.enter_checkpoint();
+        let worker_tree = tree.clone();
+        let (done_tx, done_rx) = sync_channel(0);
+        let worker = thread::spawn(move || {
+            worker_tree.put(b"key", b"new").unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "no-WAL mutation under a live snapshot bypassed clean-frontier capture"
+        );
+        drop(clean_capture);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(snapshot.get(b"key").unwrap().as_deref(), Some(&b"old"[..]));
+        assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn compact_keeps_snapshot_child_visible_until_first_lazy_read() {
+        let tree = TreeBuilder::new("ignored")
+            .memory()
+            .buffer_pool_size(16)
+            .open()
+            .unwrap();
+        let big = vec![0xCDu8; 4 * 1024];
+        for i in 0..256u32 {
+            tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+        }
+        for i in 0..248u32 {
+            tree.delete(format!("k{i:08}").as_bytes()).unwrap();
+        }
+        assert!(tree.stats().unwrap().blob_count > 1);
+
+        let snapshot = tree.snapshot(b"").unwrap();
+        tree.compact().unwrap();
+        assert!(
+            tree.stats().unwrap().blob_count > 1,
+            "merge must retain a child that a live snapshot can lazily reach"
+        );
+        assert_eq!(
+            snapshot.get(b"k00000248").unwrap().as_deref(),
+            Some(&big[..]),
+            "snapshot's first post-compact lazy child pin failed"
+        );
+        tree.checkpoint().unwrap();
+        assert_eq!(
+            snapshot.get(b"k00000255").unwrap().as_deref(),
+            Some(&big[..]),
+            "checkpoint reclaimed a child held by the snapshot lease"
+        );
+
+        drop(snapshot);
+        tree.compact().unwrap();
+        tree.checkpoint().unwrap();
+        assert_eq!(tree.stats().unwrap().blob_count, 1);
+    }
+
+    #[test]
+    fn full_gc_retains_snapshot_only_orphans_for_post_capture_exact_reclaim() {
+        let tree = Tree::open(TreeConfig::memory()).unwrap();
+        let old = vec![0x41; 1024];
+        let new = vec![0x42; 1024];
+        for i in 0..1200u32 {
+            tree.put(format!("gc/{i:08}").as_bytes(), &old).unwrap();
+        }
+        assert!(
+            tree.stats().unwrap().blob_count > 1,
+            "test requires snapshot-shared child blobs",
+        );
+        tree.checkpoint().unwrap();
+
+        let snapshot = tree.snapshot(b"").unwrap();
+        for i in 0..1200u32 {
+            tree.put(format!("gc/{i:08}").as_bytes(), &new).unwrap();
+        }
+        assert!(
+            tree.stats().unwrap().bm_gc_orphan_backlog_count > 0,
+            "COW mutations must create snapshot-protected orphan debt",
+        );
+
+        let barrier = Arc::new(super::FullGcSnapshotCaptureBarrier::new());
+        let worker_barrier = Arc::clone(&barrier);
+        let worker_tree = tree.clone();
+        let worker = thread::spawn(move || {
+            super::set_full_gc_snapshot_capture_barrier_for_current_thread(worker_barrier);
+            worker_tree.gc().unwrap()
+        });
+
+        // GC now owns strong pins for the snapshot closure but has not yet
+        // built/swept the union. Retiring the last user lease moves the old
+        // COW frames into the exact-reclaim FIFO during that window.
+        barrier.entered.wait();
+        drop(snapshot);
+        barrier.release.wait();
+        let _ = worker.join().unwrap();
+
+        assert!(
+            tree.stats().unwrap().bm_gc_orphan_backlog_count > 0,
+            "snapshot-only reachability must not erase retired FIFO entries",
+        );
+        tree.checkpoint().unwrap();
+        assert_eq!(
+            tree.stats().unwrap().bm_gc_orphan_backlog_count,
+            0,
+            "ordinary checkpoint must reclaim the FIFO once GC pins retire",
+        );
+        for i in [0, 599, 1199] {
+            assert_eq!(
+                tree.get(format!("gc/{i:08}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(&new[..]),
+            );
+        }
+    }
+
+    #[test]
     fn synchronous_checkpoint_truncate_waits_for_store_flush() {
         let store = Arc::new(FlushPendingStore::new());
         let bm = Arc::new(BufferManager::new(store.clone(), 8));
@@ -3239,6 +3941,302 @@ mod tests {
         assert!(
             !journal.needs_checkpoint(),
             "WAL should truncate once BM state is clean and store is durable"
+        );
+    }
+
+    #[test]
+    fn repeated_snapshot_and_escaped_reader_drops_release_root_cache_entries() {
+        let tree = TreeBuilder::new("ignored").memory().open().unwrap();
+        tree.put(b"key", b"value").unwrap();
+        let baseline = tree.store.cached_count();
+
+        for _ in 0..64 {
+            drop(tree.snapshot(b"").unwrap());
+
+            let snapshot = tree.snapshot(b"").unwrap();
+            let escaped_view = snapshot.view().clone();
+            drop(snapshot);
+            drop(escaped_view);
+
+            let snapshot = tree.snapshot(b"").unwrap();
+            let record_builder = snapshot.range();
+            drop(snapshot);
+            drop(record_builder);
+
+            let snapshot = tree.snapshot(b"").unwrap();
+            let record_cursor = snapshot.range().into_iter();
+            drop(snapshot);
+            drop(record_cursor);
+
+            let snapshot = tree.snapshot(b"").unwrap();
+            let key_cursor = snapshot.range_keys().into_iter();
+            drop(snapshot);
+            drop(key_cursor);
+
+            let snapshot = tree.snapshot(b"").unwrap();
+            let mut partial_cursor = snapshot.range().into_iter();
+            drop(snapshot);
+            assert!(partial_cursor.next().is_some());
+            drop(partial_cursor);
+        }
+
+        assert_eq!(
+            tree.store.cached_count(),
+            baseline,
+            "ephemeral snapshot roots must leave the cache after the final derived reader drops",
+        );
+    }
+
+    #[test]
+    fn route_cached_atomic_batch_cows_snapshot_shared_child() {
+        let (tree, first, second, _) = spilled_tree_with_same_child_keys();
+        let old = vec![0x6A; 1024];
+        let snapshot = tree.snapshot(b"").unwrap();
+        let hits_before = tree.route_cache.stats().hits;
+
+        assert!(tree
+            .atomic(|batch| {
+                batch.put(&first, b"new-first");
+                batch.put(&second, b"new-second");
+            })
+            .unwrap());
+        assert!(
+            tree.route_cache.stats().hits > hits_before,
+            "atomic insert run must probe the pre-warmed route fast path",
+        );
+        assert_eq!(snapshot.get(&first).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(snapshot.get(&second).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(
+            tree.get(&first).unwrap().as_deref(),
+            Some(&b"new-first"[..])
+        );
+        assert_eq!(
+            tree.get(&second).unwrap().as_deref(),
+            Some(&b"new-second"[..])
+        );
+        assert!(tree.store.gc_orphan_backlog_count() > 0);
+    }
+
+    #[test]
+    fn cold_deferred_batch_cows_snapshot_shared_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.checkpoint.enabled = false;
+        cfg.durability = Durability::Wal { sync: true };
+        cfg.buffer_pool_size = 32;
+        let tree = Tree::open(cfg).unwrap();
+        let old = vec![0x4B; 1024];
+        for i in 0..1200u32 {
+            tree.put(format!("cold/{i:08}").as_bytes(), &old).unwrap();
+        }
+        tree.checkpoint().unwrap();
+        assert!(tree.stats().unwrap().blob_count > 1);
+
+        let mut first_by_child = HashMap::<BlobGuid, Vec<u8>>::new();
+        let (first, second) = (0..1200u32)
+            .find_map(|i| {
+                let key = format!("cold/{i:08}").into_bytes();
+                // The baseline was materialized by the deferred-write
+                // batch, which deliberately has no Tree-owned route cache
+                // to populate. An existing-key conditional insert is a
+                // side-effect-free way to make the normal writer learn the
+                // root crossing before we select two keys from one child.
+                assert!(!tree.put_if_absent(&key, &old).unwrap());
+                let route = tree.route_cache.lookup(SearchKey::user(&key))?;
+                first_by_child
+                    .insert(route.child_guid, key.clone())
+                    .map(|first| (first, key))
+            })
+            .expect("two keys routed through one child");
+        tree.route_cache.clear();
+        assert_eq!(tree.route_cache.stats().entries, 0);
+
+        let snapshot = tree.snapshot(b"").unwrap();
+        tree.put(&first, b"new-first").unwrap();
+        tree.put(&second, b"new-second").unwrap();
+        assert_eq!(tree.store.write_delta_count_for_tree(tree.tree_id), 2);
+        assert_eq!(tree.route_cache.stats().entries, 0);
+        tree.checkpoint().unwrap();
+
+        assert_eq!(snapshot.get(&first).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(snapshot.get(&second).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(
+            tree.get(&first).unwrap().as_deref(),
+            Some(&b"new-first"[..])
+        );
+        assert_eq!(
+            tree.get(&second).unwrap().as_deref(),
+            Some(&b"new-second"[..])
+        );
+        assert!(tree.store.gc_orphan_backlog_count() > 0);
+    }
+
+    #[test]
+    fn deep_read_failure_after_cow_publishes_structural_parent() {
+        let inner = Arc::new(MemoryBlobStore::new());
+        let failing = Arc::new(FailReadStore::new(Arc::clone(&inner)));
+        let store: Arc<dyn BlobStore> = failing.clone();
+        let mut cfg = TreeConfig::memory();
+        cfg.buffer_pool_size = 96;
+        cfg.memory_flush_on_write = false;
+        let tree = Tree::open_with_blob_store(cfg.clone(), store).unwrap();
+
+        // Force a two-crossing shape. Values are large enough to make this
+        // bounded setup converge quickly while still exercising ordinary
+        // BlobNode spillover rather than the large-value rejection path.
+        let old = vec![0x35; 8 * 1024];
+        let mut keys = Vec::new();
+        for i in 0..4096u32 {
+            let key = format!("deep/read/fail/{i:08}").into_bytes();
+            tree.put(&key, &old).unwrap();
+            keys.push(key);
+            if i >= 511 && i % 256 == 255 && tree.stats().unwrap().max_blob_depth >= 2 {
+                break;
+            }
+        }
+        tree.checkpoint().unwrap();
+        assert!(
+            tree.stats().unwrap().max_blob_depth >= 2,
+            "test precondition: setup did not produce a grandchild blob",
+        );
+
+        // Find a key that descends through a grandchild, then leave that
+        // exact grandchild cold and armed. The failpoint stays armed until
+        // explicitly cleared so best-effort read-ahead cannot consume it.
+        let deep_guids = crate::engine::collect_blob_topology_silent(&tree.store, tree.root_guid)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| (entry.depth >= 2).then_some(entry.guid))
+            .collect::<Vec<_>>();
+        assert!(!deep_guids.is_empty());
+        for guid in &deep_guids {
+            assert!(
+                tree.store.evict_from_cache_for_test(*guid),
+                "test precondition: deep child remained pinned",
+            );
+        }
+        failing.arm(deep_guids);
+        let mut target = None;
+        for key in &keys {
+            let read = tree.get(key);
+            if matches!(read, Err(crate::Error::BlobStoreIo(_))) {
+                target = failing.take_last_failed().map(|guid| (key.clone(), guid));
+                break;
+            }
+        }
+        failing.clear();
+        let (target, failed_guid) = target.expect("no key descended through a cold grandchild");
+
+        // Learn the root crossing while the target is readable, then make
+        // only its grandchild cold. The failed put must therefore get past
+        // the root-child fork before the injected read error fires.
+        assert!(!tree.put_if_absent(&target, &old).unwrap());
+        assert!(tree.route_cache.lookup(SearchKey::user(&target)).is_some());
+        assert!(tree.store.evict_from_cache_for_test(failed_guid));
+        let snapshot = tree.snapshot(b"").unwrap();
+        failing.arm([failed_guid]);
+        let error = tree.put(&target, b"new-after-retry").unwrap_err();
+        assert!(matches!(error, crate::Error::BlobStoreIo(_)));
+        assert_eq!(failing.take_last_failed(), Some(failed_guid));
+        failing.clear();
+
+        assert_eq!(snapshot.get(&target).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(tree.get(&target).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(
+            tree.store.orphan_staging_count(),
+            0,
+            "the root parent must publish the successful shape-only fork even when descent fails",
+        );
+        assert!(
+            tree.store.gc_orphan_backlog_count() > 0,
+            "the snapshot-retained pre-fork child must be tracked as an orphan",
+        );
+        tree.checkpoint().unwrap();
+
+        tree.put(&target, b"new-after-retry").unwrap();
+        assert_eq!(snapshot.get(&target).unwrap().as_deref(), Some(&old[..]));
+        assert_eq!(
+            tree.get(&target).unwrap().as_deref(),
+            Some(&b"new-after-retry"[..]),
+        );
+        tree.checkpoint().unwrap();
+        drop(snapshot);
+        tree.checkpoint().unwrap();
+        drop(tree);
+
+        let store: Arc<dyn BlobStore> = failing;
+        let reopened = Tree::open_with_blob_store(cfg, store).unwrap();
+        assert_eq!(
+            reopened.get(&target).unwrap().as_deref(),
+            Some(&b"new-after-retry"[..]),
+            "retry must survive checkpoint and reopen after structural-error recovery",
+        );
+    }
+
+    #[test]
+    fn checkpoint_delta_flush_linearizes_before_snapshot_barrier() {
+        let (tree, target, _, route) = spilled_tree_with_same_child_keys();
+        let seq = tree.next_seq.fetch_add(1, Ordering::Relaxed);
+        tree.store.stage_write_delta_put(
+            tree.tree_id,
+            tree.root_guid,
+            &target,
+            b"checkpoint-value",
+            seq,
+            false,
+        );
+
+        // Block the checkpoint delta flush exactly at its target child. The
+        // checkpoint must already own commit-exclusive before it can reach
+        // this latch; snapshot may own tree-mutation-exclusive meanwhile but
+        // must not copy/register its root until the flush releases commit.
+        let child_pin = tree.store.pin(route.child_guid).unwrap();
+        let child_guard = child_pin.write();
+        let checkpoint_store = Arc::clone(&tree.store);
+        let checkpoint_commit = Arc::clone(&tree.commit_gate);
+        let (checkpoint_tx, checkpoint_rx) = sync_channel(0);
+        let checkpoint = thread::spawn(move || {
+            let result =
+                Tree::capture_checkpoint_intent_shared(&checkpoint_store, None, &checkpoint_commit)
+                    .map(|_| ());
+            checkpoint_tx.send(result).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !tree.commit_gate.checkpoint_pending_for_test() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "checkpoint never acquired commit-exclusive"
+            );
+            thread::yield_now();
+        }
+
+        let snapshot_tree = tree.clone();
+        let (snapshot_tx, snapshot_rx) = sync_channel(0);
+        let snapshot_worker = thread::spawn(move || {
+            snapshot_tx.send(snapshot_tree.snapshot(b"")).unwrap();
+        });
+        assert!(
+            snapshot_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot barrier must wait behind the active delta flush",
+        );
+
+        drop(child_guard);
+        drop(child_pin);
+        checkpoint_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        checkpoint.join().unwrap();
+        let snapshot = snapshot_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        snapshot_worker.join().unwrap();
+        assert_eq!(
+            snapshot.get(&target).unwrap().as_deref(),
+            Some(&b"checkpoint-value"[..]),
+            "snapshot must linearize after the acknowledged delta it waited behind",
         );
     }
 }

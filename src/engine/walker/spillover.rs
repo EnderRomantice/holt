@@ -14,7 +14,7 @@ use crate::layout::{
     leaf_body_size, size_of_node, BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType,
     Prefix, DATA_AREA_START, PAGE_SIZE,
 };
-use crate::store::{decode_child_off, encode_child_off, BlobFrame, BufferManager};
+use crate::store::{decode_child_off, encode_child_off, BlobFrame, BlobFrameRef, BufferManager};
 
 use super::super::simd;
 use super::cast;
@@ -32,6 +32,11 @@ pub(super) use super::migrate::compact_blob;
 
 const SPILLOVER_TARGET_CHILD_FILL_PCT: u32 = 70;
 const SPILLOVER_MIN_CHILD_FILL_PCT: u32 = 35;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_PREPARED_PARENT_COMPACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Copy)]
 struct SubtreeFootprint {
@@ -78,11 +83,9 @@ fn spillover_min_child_bytes() -> u32 {
 /// key scale instead of repeatedly peeling off the largest branch
 /// into near-full child blobs.
 ///
-/// Returns the BlobNode slot installed in `frame` so callers /
-/// tests can verify. The new blob lives in the BM cache + dirty
-/// map; its store write happens during the next checkpoint round
-/// (after the WAL record for the spillover-triggering op is
-/// durable — invariant W2D).
+/// The new blob lives in the BM cache + dirty map; its store write happens
+/// during the next checkpoint round (after the WAL record for the
+/// spillover-triggering op is durable — invariant W2D).
 ///
 /// `seq` is the WAL seq the caller pre-allocated for the op that
 /// triggered spillover (insert / rename / batched put). The new
@@ -93,54 +96,82 @@ pub(super) fn spillover_blob(
     bm: &BufferManager,
     frame: &mut BlobFrame<'_>,
     seq: u64,
-) -> Result<u32> {
-    let root_off = decode_child_off(frame.header().root_slot);
-    let victim = pick_victim_subtree(frame, root_off)?;
+) -> Result<()> {
+    // Prepare the complete parent rewrite in scratch. Once the child enters
+    // the BM dirty set there must be no fallible operation left that could
+    // strand it unreachable or leave a half-abandoned parent in cache.
+    let mut prepared_buf = bm.alloc_blob_buf_zeroed();
+    frame.copy_bytes_to(prepared_buf.as_mut_slice());
+    let mut prepared = BlobFrame::wrap(prepared_buf.as_mut_slice());
+    let root_off = decode_child_off(prepared.header().root_slot);
+    let victim = pick_victim_subtree(&prepared, root_off)?;
 
     let new_guid = fresh_blob_guid();
-    let outcome = make_blob_from_node_in(bm, frame, victim.victim_off, new_guid)?;
-
-    // Stage the new blob via the unified `mark_dirty → checkpoint
-    // round` protocol — the bytes stay in cache until the round
-    // flushes WAL **first** and then writes them through. An
-    // inline `bm.write_blob(new_guid, ...) + bm.flush()` here
-    // would violate invariant W2D: a crash between the inline
-    // write and the user's WAL flush would leave an orphan in
-    // store AND the parent's BlobNode staged only in cache —
-    // and a racing checkpointer could flush the parent's
-    // BlobNode before the user's WAL record was durable,
-    // leaving the on-disk parent pointing at the pre-spillover
-    // orphan position.
-    bm.install_new_blob(new_guid, outcome.buf, seq);
+    let outcome = make_blob_from_node_in(bm, &prepared, victim.victim_off, new_guid)?;
+    if BlobFrameRef::wrap(outcome.buf.as_slice())
+        .header()
+        .blob_guid
+        != new_guid
+    {
+        return Err(Error::node_corrupt(
+            "spillover: prepared child self-GUID mismatch",
+        ));
+    }
 
     // Abandon the migrated subtree's nodes in the source blob (they've
     // been copied to the child); reclaimed at next compaction. Bump
     // dead-bytes so the source still triggers compaction.
-    abandon_subtree(frame, victim.victim_off)?;
+    abandon_subtree(&mut prepared, victim.victim_off)?;
 
     // Allocate a BlobNode pointing at the child blob. The child
     // blob's own header.root_slot is the only entry slot.
-    let bn_alloc = frame.alloc_node(NodeType::Blob)?;
-    let bn_off = frame
+    let bn_alloc = prepared.alloc_node(NodeType::Blob)?;
+    let bn_off = prepared
         .offset_of_slot(bn_alloc.slot)
         .ok_or(Error::node_corrupt("spillover: BlobNode offset"))?;
     let bn = BlobNode::new(&[], new_guid);
-    write_struct_at(frame, bn_off, &bn)?;
+    write_struct_at(&mut prepared, bn_off, &bn)?;
 
     // Wire the parent of the migrated subtree to point at the new
     // BlobNode instead of the now-abandoned victim subtree.
     if victim.parent_off == root_off && victim.via_header_root {
-        frame.header_mut().root_slot = encode_child_off(bn_off);
+        prepared.header_mut().root_slot = encode_child_off(bn_off);
     } else {
         match victim.kind {
             VictimEdgeKind::Prefix => {
-                set_prefix_child(frame, victim.parent_off, bn_off)?;
+                set_prefix_child(&mut prepared, victim.parent_off, bn_off)?;
             }
             VictimEdgeKind::Inner(parent_ntype) => {
-                inner_update_child(frame, victim.parent_off, parent_ntype, victim.byte, bn_off)?;
+                inner_update_child(
+                    &mut prepared,
+                    victim.parent_off,
+                    parent_ntype,
+                    victim.byte,
+                    bn_off,
+                )?;
             }
         }
     }
+
+    // Repack the prepared parent before either image becomes visible. This
+    // is the last fallible structural step and reclaims the abandoned bytes
+    // needed by the insert retry. A compaction error therefore leaves both
+    // the live parent and the BM dirty set unchanged.
+    #[cfg(test)]
+    if FAIL_PREPARED_PARENT_COMPACT.with(|armed| armed.replace(false)) {
+        return Err(Error::Internal(
+            "failpoint: prepared spillover parent compaction",
+        ));
+    }
+    compact_blob(&mut prepared_buf)?;
+
+    // Stage the new blob via the unified `mark_dirty → checkpoint
+    // round` protocol — the bytes stay in cache until the round
+    // flushes WAL **first** and then writes them through. Every fallible
+    // parent transformation above has succeeded, so the only remaining
+    // parent publication is a fixed-size memcpy.
+    bm.install_new_blob(new_guid, outcome.buf, seq);
+    frame.replace_bytes_from(prepared_buf.as_slice());
 
     #[cfg(feature = "tracing")]
     tracing::debug!(
@@ -151,7 +182,7 @@ pub(super) fn spillover_blob(
         "spillover: migrated subtree to fresh child blob",
     );
 
-    Ok(bn_off)
+    Ok(())
 }
 
 /// Memo for per-`pick_victim` subtree footprints, keyed by a node's
@@ -708,7 +739,9 @@ mod tests {
     use super::super::insert::insert;
     use super::*;
     use crate::layout::PAGE_SIZE;
-    use crate::store::BlobFrame;
+    use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
+    use crate::store::{BlobFrame, BufferManager};
+    use std::sync::Arc;
 
     fn candidate(bytes: u32, nodes: u32) -> VictimCandidate {
         candidate_with_boundary(bytes, nodes, BoundaryQuality::Arbitrary, 16)
@@ -832,5 +865,62 @@ mod tests {
             "victim should be a nested in-band branch, not the overfull direct branch: {footprint:?}",
         );
         assert_eq!(victim.byte, b'x');
+    }
+
+    fn spillable_frame() -> AlignedBlobBuf {
+        let mut buf = AlignedBlobBuf::zeroed();
+        BlobFrame::init(buf.as_mut_slice(), [0x41; 16]).unwrap();
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        let value = vec![0x6B; 1024];
+        for i in 0..360u32 {
+            put(
+                &mut frame,
+                format!("spill/two-phase/{i:06}").as_bytes(),
+                &value,
+                u64::from(i) + 1,
+            );
+        }
+        buf
+    }
+
+    #[test]
+    fn prepared_spillover_failure_does_not_install_or_rewrite() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner.clone(), 8);
+        let mut buf = spillable_frame();
+        let before = buf.as_slice().to_vec();
+        FAIL_PREPARED_PARENT_COMPACT.with(|armed| armed.set(true));
+
+        let error = {
+            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            spillover_blob(&bm, &mut frame, crate::store::STRUCTURAL_SEQ).unwrap_err()
+        };
+        assert!(matches!(error, Error::Internal(_)));
+        assert_eq!(buf.as_slice(), before);
+        assert_eq!(bm.dirty_count(), 0);
+        assert!(inner.list_blobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prepared_spillover_installs_self_identifying_reachable_child() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 8);
+        let mut buf = spillable_frame();
+        {
+            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            spillover_blob(&bm, &mut frame, crate::store::STRUCTURAL_SEQ).unwrap();
+        }
+        let children = super::super::scan::collect_blob_children_from_frame(BlobFrameRef::wrap(
+            buf.as_slice(),
+        ))
+        .unwrap();
+        assert_eq!(children.len(), 1);
+        let child = bm.pin(children[0]).unwrap();
+        assert_eq!(
+            BlobFrameRef::wrap(child.read().as_slice())
+                .header()
+                .blob_guid,
+            children[0],
+        );
     }
 }

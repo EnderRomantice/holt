@@ -1,16 +1,14 @@
 //! Fault-injection tests for the checkpoint round's
-//! deferred-delete + Sync paths.
+//! deferred-delete, structural-orphan, and Sync paths.
 //!
 //! Wraps a real store (`MemoryBlobStore` or `FileBlobStore`)
 //! in a [`FailpointBlobStore`] that can be told to fail the N-th
 //! `delete_blob` / `flush` / `write_blob` call. The tests verify
-//! that structural pending deletes:
+//! that structural orphans:
 //!
-//! - retire their in-memory fence without calling
-//!   `store.delete_blob`;
-//! - do not issue a post-delete Sync when no manifest delete
-//!   happened;
-//! - stay queued when dirty write or pre-delete Sync fails.
+//! - never enter the user-delete visibility-fence queue;
+//! - remain queued when the rewritten parent cannot be made durable;
+//! - are deleted only after a clean parent-publication frontier.
 //!
 //! The write tests also verify that a failed `write_blob` keeps
 //! the entry in `dirty` so a subsequent round retries the byte
@@ -164,13 +162,7 @@ fn clean_checkpoint_skips_flush_inner() {
     );
 }
 
-/// Build a tree on a failpoint-wrapped memory store and stage at
-/// least one structural deferred delete in the BM's `pending_deletes`
-/// set. This models the background merge path that caused the
-/// nightly crash-soak manifest corruption: the old child blob must
-/// remain in the store manifest because no logical WAL record proves
-/// that every durable parent has stopped referencing it.
-fn setup_with_pending_delete() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, Tree) {
+fn setup_after_mass_delete() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, Tree) {
     let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
     let fp_dyn: Arc<dyn BlobStore> = fp.clone();
@@ -185,53 +177,62 @@ fn setup_with_pending_delete() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, 
         tree.put(k.as_bytes(), &payload).unwrap();
     }
 
-    // Make enough children empty, then compact so the maintenance
-    // merge path stages STRUCTURAL_SEQ pending deletes.
+    // Make enough children empty to produce logical user-delete fences and
+    // leave underfilled children for structural compaction tests.
     for i in 0..950u32 {
         let k = format!("k{i:05}");
         let _ = tree.delete(k.as_bytes()).unwrap();
     }
+    (inner, fp, tree)
+}
+
+/// Build a tree with at least one parent-scoped structural orphan. The
+/// rewritten parent must become durable before the exact old child GUID may
+/// leave the store manifest.
+fn setup_with_structural_orphan() -> (Arc<dyn BlobStore>, Arc<FailpointBlobStore>, Tree) {
+    let (inner, fp, tree) = setup_after_mass_delete();
+    tree.checkpoint().unwrap();
     tree.compact().unwrap();
     (inner, fp, tree)
 }
 
 #[test]
-fn structural_pending_delete_skips_manifest_delete_and_post_sync() {
-    let (inner, fp, tree) = setup_with_pending_delete();
+fn structural_orphan_waits_for_parent_durability_before_delete() {
+    let (inner, fp, tree) = setup_with_structural_orphan();
 
     let stats_before = tree.stats().unwrap();
-    assert!(
-        stats_before.bm_pending_delete_count > 0,
-        "setup must produce at least one pending delete (got {})",
-        stats_before.bm_pending_delete_count,
-    );
+    assert_eq!(stats_before.bm_pending_delete_count, 0);
+    assert!(stats_before.bm_gc_orphan_backlog_count > 0);
+    assert_eq!(fp.delete_count(), 0);
 
     let flushes_before = fp.flush_count();
-    // If structural cleanup incorrectly runs a post-delete Sync,
-    // this second flush will trip.
-    fp.arm_flush(flushes_before + 2);
-    // If structural cleanup incorrectly mutates the manifest,
-    // this delete failpoint will trip.
-    fp.arm_delete(fp.delete_count() + 1);
-
-    tree.checkpoint().unwrap();
-    assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
-
-    let store_blobs = inner.list_blobs().unwrap();
-    let stats = tree.stats().unwrap();
-    assert!(
-        store_blobs.len() as u32 >= stats.blob_count,
-        "structural cleanup may leave orphan blobs, but must not \
-         delete a durable blob that a parent can still reference",
-    );
+    fp.arm_flush(flushes_before + 1);
+    assert!(tree.checkpoint().is_err());
     assert_eq!(
         fp.delete_count(),
         0,
-        "structural pending delete must not call store.delete_blob",
+        "a failed parent checkpoint must not delete structural children",
     );
+    assert!(tree.stats().unwrap().bm_gc_orphan_backlog_count > 0);
+
+    fp.arm_delete(fp.delete_count() + 1);
+    assert!(tree.checkpoint().is_err());
     assert!(
-        fp.flush_count() < flushes_before + 2,
-        "structural pending delete must not trigger a post-delete Sync",
+        tree.stats().unwrap().bm_gc_orphan_backlog_count > 0,
+        "a failed exact-child delete must restore the orphan FIFO",
+    );
+
+    tree.checkpoint().unwrap();
+    let stats = tree.stats().unwrap();
+    assert_eq!(stats.bm_pending_delete_count, 0);
+    assert_eq!(stats.bm_gc_orphan_backlog_count, 0);
+    assert!(fp.delete_count() > 0);
+
+    let store_blobs = inner.list_blobs().unwrap();
+    assert_eq!(
+        store_blobs.len() as u32,
+        stats.blob_count,
+        "clean-frontier reclaim must leave exactly the reachable tree",
     );
 }
 
@@ -306,28 +307,18 @@ fn storage_full_write_failure_is_retried_next_round() {
 }
 
 #[test]
-fn dirty_write_failure_does_not_propagate_to_pending_delete() {
-    // Regression for the bug where a failed parent write_through
-    // didn't stop the round from applying a dependent child's
-    // manifest delete — leaving "old parent on-disk still
-    // references a now-deleted child" on a crash before the next
-    // round caught up. The fix: on any write failure, the
-    // pre-delete sync still runs (to fsync the writes that DID
-    // succeed), but no manifest delete fires; the whole pending
-    // snapshot is restored for the next round.
-    let (_inner, fp, tree) = setup_with_pending_delete();
+fn dirty_write_failure_does_not_release_structural_orphan() {
+    // A failed parent write-through must not release its exact detached child:
+    // the durable old parent may still reference that GUID.
+    let (_inner, fp, tree) = setup_with_structural_orphan();
     let stats_before = tree.stats().unwrap();
     assert!(
         stats_before.bm_dirty_count > 0,
         "setup precondition: dirty entry queued (got {})",
         stats_before.bm_dirty_count,
     );
-    assert!(
-        stats_before.bm_pending_delete_count > 0,
-        "setup precondition: pending delete queued (got {})",
-        stats_before.bm_pending_delete_count,
-    );
-    let pending_before = stats_before.bm_pending_delete_count;
+    assert!(stats_before.bm_gc_orphan_backlog_count > 0);
+    let orphan_before = stats_before.bm_gc_orphan_backlog_count;
     let deletes_before = fp.delete_count();
 
     // Arm the NEXT write_blob to fail — that's the first
@@ -348,10 +339,8 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
         stats_after.bm_dirty_count,
     );
     assert_eq!(
-        stats_after.bm_pending_delete_count, pending_before,
-        "dirty failure must NOT apply any pending delete — whole \
-         snapshot restored (got {} vs {})",
-        stats_after.bm_pending_delete_count, pending_before,
+        stats_after.bm_gc_orphan_backlog_count, orphan_before,
+        "dirty failure must preserve the exact structural-orphan backlog",
     );
 
     assert_eq!(
@@ -364,19 +353,15 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
     tree.checkpoint().unwrap();
     let stats_done = tree.stats().unwrap();
     assert_eq!(stats_done.bm_dirty_count, 0);
-    assert_eq!(stats_done.bm_pending_delete_count, 0);
+    assert_eq!(stats_done.bm_gc_orphan_backlog_count, 0);
 }
 
 #[test]
-fn pre_delete_sync_failure_restores_pending() {
-    // Regression for the bug where the pre-delete `store.flush`
-    // failure path drained `pending` (the checkpoint snapshot) but
-    // never restored it — losing every queued unlink intent. The
-    // fix restores `pending` on every Sync-failure return path
-    // before phase 6.
-    let (inner, fp, tree) = setup_with_pending_delete();
-    let pending_before = tree.stats().unwrap().bm_pending_delete_count;
-    assert!(pending_before > 0, "setup precondition");
+fn parent_sync_failure_preserves_structural_orphan() {
+    let (_inner, fp, tree) = setup_with_structural_orphan();
+    let orphan_before = tree.stats().unwrap().bm_gc_orphan_backlog_count;
+    let deletes_before = fp.delete_count();
+    assert!(orphan_before > 0, "setup precondition");
 
     // First `store.flush` call inside `tree.checkpoint` is the
     // pre-delete data Sync at phase 3 — arm to fail it.
@@ -391,24 +376,19 @@ fn pre_delete_sync_failure_restores_pending() {
 
     let stats_after = tree.stats().unwrap();
     assert_eq!(
-        stats_after.bm_pending_delete_count, pending_before,
-        "pre-delete Sync failure must restore the entire pending \
-         snapshot (got {} vs {})",
-        stats_after.bm_pending_delete_count, pending_before,
+        stats_after.bm_gc_orphan_backlog_count, orphan_before,
+        "parent Sync failure must preserve the exact orphan backlog",
     );
 
-    // Phase 6 didn't run, so no manifest delete applied.
-    let store_blobs = inner.list_blobs().unwrap();
-    let stats = tree.stats().unwrap();
     assert_eq!(
-        store_blobs.len() as u32,
-        stats.blob_count,
+        fp.delete_count(),
+        deletes_before,
         "no manifest delete must have applied while pre-delete Sync failed",
     );
 
     // Recovery: next checkpoint drains the restored snapshot.
     tree.checkpoint().unwrap();
-    assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
+    assert_eq!(tree.stats().unwrap().bm_gc_orphan_backlog_count, 0);
 }
 
 #[test]

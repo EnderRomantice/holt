@@ -347,6 +347,22 @@ impl<'a> BlobFrame<'a> {
         BlobFrameRef { buf: self.buf }
     }
 
+    /// Copy the complete frame image into another frame-sized buffer.
+    ///
+    /// Structural walkers use this to prepare a fallible rewrite off to
+    /// the side, then publish it with one infallible replacement only after
+    /// every allocation and edge update has succeeded.
+    pub(crate) fn copy_bytes_to(&self, dst: &mut [u8]) {
+        assert_eq!(dst.len(), PAGE_SIZE as usize);
+        dst.copy_from_slice(self.buf);
+    }
+
+    /// Replace this complete frame with a previously prepared frame image.
+    pub(crate) fn replace_bytes_from(&mut self, src: &[u8]) {
+        assert_eq!(src.len(), PAGE_SIZE as usize);
+        self.buf.copy_from_slice(src);
+    }
+
     /// Initialize a fresh blob from a zeroed buffer.
     ///
     /// Writes the header, sets `space_used` to `DATA_AREA_START`,

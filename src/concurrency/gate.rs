@@ -96,7 +96,7 @@ impl Gate {
     }
 
     #[cfg(test)]
-    fn writer_pending_for_test(&self) -> bool {
+    pub(crate) fn writer_pending_for_test(&self) -> bool {
         self.state.load(Ordering::Acquire) & WRITE_BIT != 0
     }
 }

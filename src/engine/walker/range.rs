@@ -30,7 +30,8 @@ use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::concurrency::{CommitGate, Gate};
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
 use crate::store::{
-    decode_child_off, BlobFrameRef, BufferManager, CachedBlob, PrefixLiveness, WriteDeltaKeyState,
+    decode_child_off, BlobFrameRef, BufferManager, CachedBlob, PrefixLiveness, SnapshotLease,
+    WriteDeltaKeyState,
 };
 
 use smallvec::SmallVec;
@@ -358,6 +359,7 @@ impl ProjectedRangeEntry {
 pub struct RangeBuilder {
     bm: Arc<BufferManager>,
     root_pin: Arc<CachedBlob>,
+    snapshot_lease: Option<Arc<SnapshotLease>>,
     root_guid: BlobGuid,
     tree_id: Option<u64>,
     maintenance_gate: Arc<Gate>,
@@ -365,7 +367,6 @@ pub struct RangeBuilder {
     commit_gate: Option<Arc<CommitGate>>,
     dropped: Option<Arc<AtomicBool>>,
     preflight_error: Option<Error>,
-    snapshot_cursor: bool,
     prefix: KeyBuf,
     start_after: Option<KeyBuf>,
     delimiter: Option<u8>,
@@ -385,6 +386,7 @@ impl RangeBuilder {
         Self {
             bm,
             root_pin,
+            snapshot_lease: None,
             root_guid,
             tree_id: None,
             maintenance_gate,
@@ -392,7 +394,6 @@ impl RangeBuilder {
             commit_gate: None,
             dropped: None,
             preflight_error: None,
-            snapshot_cursor: false,
             prefix: KeyBuf::new(),
             start_after: None,
             delimiter: None,
@@ -401,6 +402,11 @@ impl RangeBuilder {
 
     pub(crate) fn with_liveness(mut self, dropped: Arc<AtomicBool>) -> Self {
         self.dropped = Some(dropped);
+        self
+    }
+
+    pub(crate) fn with_snapshot_lease(mut self, lease: Arc<SnapshotLease>) -> Self {
+        self.snapshot_lease = Some(lease);
         self
     }
 
@@ -421,11 +427,6 @@ impl RangeBuilder {
 
     pub(crate) fn with_preflight_error(mut self, error: Error) -> Self {
         self.preflight_error = Some(error);
-        self
-    }
-
-    pub(crate) fn snapshot_cursor(mut self) -> Self {
-        self.snapshot_cursor = true;
         self
     }
 
@@ -500,15 +501,19 @@ impl IntoIterator for RangeBuilder {
 
 impl RangeBuilder {
     fn into_iter_with_projection(self, projection: RangeProjection) -> RangeIter {
+        let gc_epoch = self.bm.gc_stable_read_epoch();
+        let missing_child_is_corruption = self.snapshot_lease.is_some();
         RangeIter {
             bm: self.bm,
             root_pin: self.root_pin,
+            _snapshot_lease: self.snapshot_lease,
             root_guid: self.root_guid,
             maintenance_gate: self.maintenance_gate,
             mutation_gate: self.mutation_gate,
             dropped: self.dropped,
             preflight_error: self.preflight_error,
-            snapshot_cursor: self.snapshot_cursor,
+            missing_child_is_corruption,
+            gc_epoch,
             stack: Vec::with_capacity(8),
             curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
             emit_buf: Vec::with_capacity(self.prefix.len().saturating_add(64)),
@@ -840,7 +845,12 @@ pub struct RangeIter {
     mutation_gate: Option<Arc<Gate>>,
     dropped: Option<Arc<AtomicBool>>,
     preflight_error: Option<Error>,
-    snapshot_cursor: bool,
+    /// Snapshot leases make a missing descendant stable corruption. Live
+    /// cursors may instead restart across a concurrent physical-GC epoch.
+    missing_child_is_corruption: bool,
+    /// Physical-GC sequence captured for this live cursor attempt.
+    /// Snapshot cursors keep strict missing-child semantics instead.
+    gc_epoch: u64,
     /// Descent stack. Empty = no init done (if `!initialized`) or
     /// exhausted (if `terminated`).
     stack: Vec<Frame>,
@@ -874,6 +884,9 @@ pub struct RangeIter {
     /// until consumed. Correctness-neutral — a pre-pinned blob is the
     /// same blob, re-validated by the per-frame `version` check on use.
     prefetch: HashMap<BlobGuid, Arc<CachedBlob>>,
+    // Declared after every pin-bearing field so stack/prefetch/root drop
+    // first. The final lease drop can then evict the ephemeral snapshot root.
+    _snapshot_lease: Option<Arc<SnapshotLease>>,
 }
 
 struct Frame {
@@ -1158,6 +1171,16 @@ enum InitResult {
     Restart,
 }
 
+enum ChildPin {
+    Pinned(Arc<CachedBlob>),
+    Restart,
+}
+
+enum ChildPush {
+    Pushed,
+    Restart,
+}
+
 enum RangeAdvance {
     Entry(ProjectedRangeEntry),
     KeyRef(KeyRefKind),
@@ -1229,6 +1252,13 @@ impl RangeIter {
         self.stats
     }
 
+    /// Advance without entering `maintenance_gate`.
+    /// Caller must already hold the tree's maintenance guard.
+    pub(crate) fn next_unlocked(&mut self) -> Option<Result<RangeEntry>> {
+        self.next_projected_maybe_guarded(false)
+            .map(|entry| entry.map(ProjectedRangeEntry::into_record))
+    }
+
     fn next_projected_maybe_guarded(
         &mut self,
         enter_gate: bool,
@@ -1270,16 +1300,39 @@ impl RangeIter {
         if let Some(error) = self.preflight_error.take() {
             return Err(error);
         }
+        if !self.missing_child_is_corruption {
+            let current = self.bm.gc_stable_read_epoch();
+            if current != self.gc_epoch {
+                self.gc_epoch = current;
+                return Ok(RangeAdvance::Restart);
+            }
+        }
         if !self.initialized {
             match self.init_descent()? {
                 InitResult::Ready => {
                     self.initialized = true;
                 }
-                InitResult::Empty => return Ok(RangeAdvance::Done),
+                InitResult::Empty => {
+                    return if !self.missing_child_is_corruption
+                        && self.bm.gc_raced_since(self.gc_epoch)
+                    {
+                        Ok(RangeAdvance::Restart)
+                    } else {
+                        Ok(RangeAdvance::Done)
+                    };
+                }
                 InitResult::Restart => return Ok(RangeAdvance::Restart),
             }
         }
-        self.advance_to_next_entry()
+        let advance = self.advance_to_next_entry()?;
+        if matches!(advance, RangeAdvance::Done)
+            && !self.missing_child_is_corruption
+            && self.bm.gc_raced_since(self.gc_epoch)
+        {
+            Ok(RangeAdvance::Restart)
+        } else {
+            Ok(advance)
+        }
     }
 
     fn ensure_live(&self) -> Result<()> {
@@ -1664,7 +1717,7 @@ impl RangeIter {
                         let is_candidate = {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
-                            if !self.frame_content_still_valid(top) {
+                            if !Self::frame_content_still_valid(top) {
                                 return Ok(InitResult::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1697,7 +1750,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
-                        if !self.frame_version_still_valid(top, version) {
+                        if !Self::frame_version_still_valid(top, version) {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1746,7 +1799,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top.pin.read();
                         let version = top.pin.content_version();
-                        if !self.frame_version_still_valid(top, version) {
+                        if !Self::frame_version_still_valid(top, version) {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1803,8 +1856,11 @@ impl RangeIter {
                                 continue;
                             }
                             self.stack[idx].next = 1;
-                            if !self.push_in_other_blob(child_guid, p_bytes.as_slice())? {
-                                self.pop_frame();
+                            if matches!(
+                                self.push_in_other_blob(child_guid, p_bytes.as_slice())?,
+                                ChildPush::Restart
+                            ) {
+                                return Ok(InitResult::Restart);
                             }
                         }
                     }
@@ -1830,7 +1886,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
-                        if !self.frame_version_still_valid(top, version) {
+                        if !Self::frame_version_still_valid(top, version) {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1893,7 +1949,7 @@ impl RangeIter {
                     let top = &self.stack[idx];
                     let guard = top.pin.read();
                     let version = top.pin.content_version();
-                    if !self.frame_version_still_valid(top, version) {
+                    if !Self::frame_version_still_valid(top, version) {
                         return Ok(RangeAdvance::Restart);
                     }
                     subtree_has_live_leaf(BlobFrameRef::wrap(guard.as_slice()), top.off)?
@@ -1925,7 +1981,7 @@ impl RangeIter {
                         let kv = {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
-                            if !self.frame_content_still_valid(top) {
+                            if !Self::frame_content_still_valid(top) {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -2070,7 +2126,7 @@ impl RangeIter {
                             let top = &self.stack[idx];
                             let guard = top_pin.read();
                             let version = top_pin.content_version();
-                            if !self.frame_version_still_valid(top, version) {
+                            if !Self::frame_version_still_valid(top, version) {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -2130,7 +2186,7 @@ impl RangeIter {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
                             let version = top.pin.content_version();
-                            if !self.frame_version_still_valid(top, version) {
+                            if !Self::frame_version_still_valid(top, version) {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -2196,9 +2252,9 @@ impl RangeIter {
                                 }
                             }
                         }
-                        let Some(child_pin) = self.pin_scan_child(child_guid)? else {
-                            self.pop_frame();
-                            continue;
+                        let child_pin = match self.pin_scan_child(child_guid)? {
+                            ChildPin::Pinned(pin) => pin,
+                            ChildPin::Restart => return Ok(RangeAdvance::Restart),
                         };
                         child_pin.prefetch_header();
                         if can_rollup {
@@ -2237,7 +2293,7 @@ impl RangeIter {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
-                        if !self.frame_version_still_valid(top, version) {
+                        if !Self::frame_version_still_valid(top, version) {
                             return Ok(RangeAdvance::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -2282,7 +2338,7 @@ impl RangeIter {
                                 // delimiter rollup; the iterator can emit the
                                 // CommonPrefix from the parent plus read-index
                                 // liveness and avoid the child blob read entirely.
-                                let prefetch_guids = if !self.snapshot_cursor
+                                let prefetch_guids = if !self.missing_child_is_corruption
                                     && child_ntype == NodeType::Blob
                                     && !child_blob_rollup
                                     && self.prefetch.is_empty()
@@ -2387,23 +2443,38 @@ impl RangeIter {
         });
     }
 
-    fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<bool> {
-        let Some(child_pin) = self.pin_scan_child(child_guid)? else {
-            return Ok(false);
+    fn push_in_other_blob(
+        &mut self,
+        child_guid: BlobGuid,
+        prefix_bytes: &[u8],
+    ) -> Result<ChildPush> {
+        let child_pin = match self.pin_scan_child(child_guid)? {
+            ChildPin::Pinned(pin) => pin,
+            ChildPin::Restart => return Ok(ChildPush::Restart),
         };
         child_pin.prefetch_header();
         self.push_pinned_other_blob(child_pin, child_guid, prefix_bytes)?;
-        Ok(true)
+        Ok(ChildPush::Pushed)
     }
 
-    fn pin_scan_child(&mut self, child_guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
+    fn pin_scan_child(&mut self, child_guid: BlobGuid) -> Result<ChildPin> {
         // Consume a read-ahead pin if one was warmed for this child.
         if let Some(pin) = self.prefetch.remove(&child_guid) {
-            return Ok(Some(pin));
+            return Ok(ChildPin::Pinned(pin));
         }
         match self.bm.pin_scan(child_guid) {
-            Ok(pin) => Ok(Some(pin)),
-            Err(e) if is_blob_store_not_found(&e) => Ok(None),
+            Ok(pin) => Ok(ChildPin::Pinned(pin)),
+            Err(e)
+                if is_blob_store_not_found(&e)
+                    && missing_scan_child_is_retryable(
+                        &self.bm,
+                        self.missing_child_is_corruption,
+                        self.gc_epoch,
+                        child_guid,
+                    ) =>
+            {
+                Ok(ChildPin::Restart)
+            }
             Err(e) => Err(e),
         }
     }
@@ -2435,24 +2506,22 @@ impl RangeIter {
     }
 
     fn path_is_still_valid(&self) -> bool {
-        if self.snapshot_cursor {
-            return true;
-        }
         self.stack
             .iter()
             .all(|frame| frame.pin.validate_content_version(frame.version))
     }
 
-    fn frame_content_still_valid(&self, frame: &Frame) -> bool {
-        self.snapshot_cursor || frame.pin.content_version() == frame.version
+    fn frame_content_still_valid(frame: &Frame) -> bool {
+        frame.pin.content_version() == frame.version
     }
 
-    fn frame_version_still_valid(&self, frame: &Frame, current_version: u64) -> bool {
-        self.snapshot_cursor || current_version == frame.version
+    fn frame_version_still_valid(frame: &Frame, current_version: u64) -> bool {
+        current_version == frame.version
     }
 
     fn restart_cursor(&mut self) {
         self.bm.note_range_restart();
+        self.gc_epoch = self.bm.gc_stable_read_epoch();
         self.stats.restarts += 1;
         self.stack.clear();
         self.curr_key.clear();
@@ -2476,6 +2545,15 @@ impl RangeIter {
         let new_len = self.curr_key.len().saturating_sub(f.pushed_bytes as usize);
         self.curr_key.truncate(new_len);
     }
+}
+
+fn missing_scan_child_is_retryable(
+    bm: &BufferManager,
+    missing_child_is_corruption: bool,
+    gc_epoch: u64,
+    child_guid: BlobGuid,
+) -> bool {
+    !missing_child_is_corruption && (bm.has_delete_fence(child_guid) || bm.gc_raced_since(gc_epoch))
 }
 
 fn path_seek_relation(path: &[u8], target: &[u8]) -> SeekRelation {
@@ -2731,5 +2809,29 @@ fn next_inner_child_from(
         _ => Err(Error::node_corrupt(
             "range::next_inner_child: not an inner node",
         )),
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
+
+    #[test]
+    fn live_cursor_restarts_on_delete_fence_without_gc_epoch_change() {
+        let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(store, 4);
+        let child_guid = [0xD1; 16];
+        let gc_epoch = bm.gc_read_epoch();
+        bm.mark_for_delete(child_guid, 7);
+
+        assert_eq!(bm.gc_read_epoch(), gc_epoch);
+        assert!(missing_scan_child_is_retryable(
+            &bm, false, gc_epoch, child_guid
+        ));
+        assert!(
+            !missing_scan_child_is_retryable(&bm, true, gc_epoch, child_guid),
+            "stable snapshot cursors must not hide a genuinely missing descendant"
+        );
     }
 }

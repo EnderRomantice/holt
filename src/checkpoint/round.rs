@@ -7,9 +7,9 @@
 //! 0. **Merge pass** (optional, controlled by
 //!    `CheckpointConfig::auto_merge`) — drains queued parent-merge
 //!    candidates and folds mergeable children back into parents.
-//!    Merge mutations are staged through the same dirty /
-//!    pending-delete sets as foreground writes, then flushed by
-//!    this round after the WAL sync.
+//!    Rewritten parents enter the dirty set; their exact detached children
+//!    enter parent-scoped orphan staging and become reclaimable only after
+//!    parent dirty publication and a clean durable frontier.
 //! 1. **Snapshot dirty + pending deletes + content versions** under
 //!    the exclusive side of the tree's commit-publish gate.
 //! 2. **Flush WAL** through the journal worker so every record that
@@ -22,9 +22,12 @@
 //!    order. This is the truncate watermark: a later epoch may not
 //!    advance WAL trimming before every older epoch is known to
 //!    have landed or restored.
-//! 6. **Truncate WAL** only when the pipeline is empty and
-//!    `bm.dirty_count() == 0 && bm.pending_delete_count() == 0`
-//!    under the commit-publish gate.
+//! 6. **Truncate WAL** only when the pipeline is empty and dirty, flushing,
+//!    pending-delete, orphan-staging, and write-delta debt are all zero and
+//!    the store has no deferred flush work, under the commit-publish gate.
+//! 7. **Bounded exact reclaim** — while the maintenance fence still excludes
+//!    topology changes, drain one retired COW/structural FIFO batch. Pinned
+//!    candidates return to the queue; no all-store reachability walk occurs.
 //!
 //! This function is called from two places:
 //!
@@ -146,36 +149,49 @@ impl Pipeline {
         if !self.in_flight.is_empty() {
             return Ok(());
         }
-        let Some(journal) = &shared.journal else {
-            return Ok(());
+        // Lock order is maintenance -> commit everywhere topology may
+        // change. Keep the exclusive maintenance fence through exact
+        // reclaim: no writer, merge, compact, or DB drop can publish a new
+        // edge or topology while a clean frontier's FIFO batch is deleted.
+        let _maintenance = shared.maintenance_gate.enter_exclusive();
+        let candidates = {
+            let _commit = shared.commit_gate.enter_checkpoint();
+            // The dirty/flushing/pending counters are BufferManager state and do
+            // NOT capture the store's own deferred durability: the I/O worker
+            // retires a dirty entry right after the data `pwrite` but BEFORE the
+            // data fsync + manifest-delta persist (`flush_inner`). So all three
+            // counters can read 0 while `store.needs_flush()` is still true —
+            // i.e. a just-written blob's new slot mapping is only in the in-memory
+            // manifest, not yet in `manifest.log`. Truncating the WAL there leaves
+            // a crashed reopen with the acked write in NEITHER the (truncated) WAL
+            // nor the (un-persisted) manifest — a lost acknowledged write. The
+            // SIGKILL crash soak hits exactly this (lazy routing keeps the root
+            // blob a perpetual compaction target, so it is re-written every round).
+            // `run_round`'s early-skip gates on the same `needs_flush()` for this
+            // recovery edge; mirror it here so truncate waits for store durability.
+            let clean = shared.bm.dirty_count() == 0
+                && shared.bm.flushing_count() == 0
+                && shared.bm.pending_delete_count() == 0
+                && shared.bm.orphan_staging_count() == 0
+                && shared.bm.write_delta_count() == 0
+                && !shared.bm.needs_flush();
+            if !clean {
+                return Ok(());
+            }
+            if let Some(journal) = &shared.journal {
+                if journal.needs_checkpoint() {
+                    journal.truncate()?;
+                    use std::sync::atomic::Ordering;
+                    shared.truncates.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            shared.bm.take_retired_orphans_bounded(256)
         };
-        if !journal.needs_checkpoint() {
-            return Ok(());
-        }
-        let _commit = shared.commit_gate.enter_checkpoint();
-        // The dirty/flushing/pending counters are BufferManager state and do
-        // NOT capture the store's own deferred durability: the I/O worker
-        // retires a dirty entry right after the data `pwrite` but BEFORE the
-        // data fsync + manifest-delta persist (`flush_inner`). So all three
-        // counters can read 0 while `store.needs_flush()` is still true —
-        // i.e. a just-written blob's new slot mapping is only in the in-memory
-        // manifest, not yet in `manifest.log`. Truncating the WAL there leaves
-        // a crashed reopen with the acked write in NEITHER the (truncated) WAL
-        // nor the (un-persisted) manifest — a lost acknowledged write. The
-        // SIGKILL crash soak hits exactly this (lazy routing keeps the root
-        // blob a perpetual compaction target, so it is re-written every round).
-        // `run_round`'s early-skip gates on the same `needs_flush()` for this
-        // recovery edge; mirror it here so truncate waits for store durability.
-        if shared.bm.dirty_count() == 0
-            && shared.bm.flushing_count() == 0
-            && shared.bm.pending_delete_count() == 0
-            && shared.bm.write_delta_count() == 0
-            && !shared.bm.needs_flush()
-        {
-            journal.truncate()?;
-            use std::sync::atomic::Ordering;
-            shared.truncates.fetch_add(1, Ordering::Relaxed);
-        }
+        // A clean frontier durably publishes every current parent image.
+        // Retired COW GUIDs can now be reclaimed directly from their FIFO;
+        // this keeps the default background path bounded without rescanning
+        // the complete blob manifest on every idle checkpoint.
+        shared.bm.reclaim_retired_orphan_batch(candidates)?;
         Ok(())
     }
 }
@@ -248,6 +264,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     let (mut snap, mut pending, versioned_snap, wal_up_to) = if let Some(journal) = &shared.journal
     {
         let _maintenance = shared.maintenance_gate.enter_shared();
+        let _commit = shared.commit_gate.enter_checkpoint();
         if let Err(e) = shared.bm.flush_write_deltas() {
             shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
             shared
@@ -255,7 +272,6 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
                 .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             return Err(e);
         }
-        let _commit = shared.commit_gate.enter_checkpoint();
         let wal_up_to = journal.queued_work();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
@@ -274,6 +290,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         (snap, pending, versioned_snap, Some(wal_up_to))
     } else {
         let _maintenance = shared.maintenance_gate.enter_shared();
+        let _commit = shared.commit_gate.enter_checkpoint();
         if let Err(e) = shared.bm.flush_write_deltas() {
             shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
             shared
@@ -449,9 +466,9 @@ fn clone_versioned_dirty(
 
 /// Candidate-driven merge pass — fold mergeable `BlobNode`
 /// children back into their parents. Stages the mutations via the
-/// unified `mark_dirty` + `mark_for_delete` protocol so the round's
-/// later checkpoint epoch (WAL flush → data writes → store sync →
-/// pending deletes → re-Sync → truncate) handles persistence under W2D.
+/// unified parent-scoped staging + `mark_dirty` protocol so the round's
+/// later checkpoint epoch durably publishes the parent before the exact child
+/// GUID can enter bounded orphan reclamation.
 /// Takes the exclusive maintenance gate around one parent at a
 /// time so no foreground writer is lock-coupling through the child
 /// edge being folded and queued for delete. Foreground spillovers
@@ -465,12 +482,11 @@ fn clone_versioned_dirty(
 /// be wrong here — both happen pre-Sync, pre-WAL. `bm.commit`
 /// would push cache bytes (potentially including user mutations
 /// whose WAL records aren't yet durable) directly to store, and
-/// `bm.delete_blob` would mutate the manifest in-memory which a
-/// later `store.flush` could persist while the corresponding
-/// user WAL records still hadn't reached disk. Staging through
-/// dirty / pending-delete avoids both: the only flush path is the
-/// round's checkpoint epoch, which runs strictly after step 2's
-/// WAL flush.
+/// `bm.delete_blob` would mutate the manifest in-memory which a later
+/// `store.flush` could persist while the corresponding user WAL records still
+/// hadn't reached disk. Parent-scoped staging avoids both: dirty publication
+/// promotes the child into snapshot-protected or clean-frontier state, and the
+/// checkpoint epoch runs strictly after step 2's WAL flush.
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::STRUCTURAL_SEQ;
 
@@ -481,20 +497,30 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
         if !shared.bm.has_blob(guid)? {
             continue;
         }
-        let _commit = shared
-            .journal
-            .as_ref()
-            .map(|_| shared.commit_gate.enter_writer());
+        // Also required for custom/no-WAL stores: clean-frontier capture
+        // must not interleave parent edge mutation with its dirty publish.
+        let _commit = shared.commit_gate.enter_writer();
         let pin = match shared.bm.pin(guid) {
             Ok(pin) => pin,
             Err(e) if is_blob_store_not_found(&e) => continue,
             Err(e) => return Err(e),
         };
-        let (stats, has_children) = {
+        let merge_result = {
             let mut guard = pin.write();
             let mut frame = guard.frame();
-            let stats = engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)?;
-            (stats, frame.header().num_ext_blobs != 0)
+            engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)
+                .map(|stats| (stats, frame.header().num_ext_blobs != 0))
+        };
+        let (stats, has_children) = match merge_result {
+            Ok(result) => result,
+            Err(error) => {
+                // Earlier children in this same parent may already have been
+                // folded. Publishing the semantically-equivalent partial
+                // parent drains their parent-scoped staging before retry.
+                shared.bm.mark_dirty(guid, STRUCTURAL_SEQ);
+                drop(pin);
+                return Err(error);
+            }
         };
         if stats.merged > 0 {
             // Keep the parent pin alive until after dirty

@@ -11,7 +11,8 @@
 //! │     ├─ snapshot_dirty + journal.flush                    │
 //! │     ├─ submit one CheckpointEpoch                        │
 //! │     ├─ reap completed epochs in FIFO order               │
-//! │     └─ journal.truncate iff pipeline empty + clean BM     │
+//! │     ├─ journal.truncate iff pipeline empty + clean BM     │
+//! │     └─ bounded clean-frontier exact orphan reclaim        │
 //! └────────┬─────────────────────────────────────────────────┘
 //!          │ IoTask (bounded crossbeam channel)
 //!          ▼
@@ -86,6 +87,7 @@ use crate::concurrency::{CommitGate, Gate};
 use crate::journal::Journal;
 use crate::store::BufferManager;
 
+pub(crate) use self::io::write_entries_child_first;
 use self::io::IoTask;
 
 // ---------- public config ----------
@@ -116,11 +118,12 @@ pub struct CheckpointConfig {
     /// Default 512. This bounds dirty growth without forcing an
     /// early checkpoint for a handful of hot blobs.
     pub dirty_blob_threshold: usize,
-    /// Drain queued parent-merge candidates at the start of each
-    /// round. Parent merge rewrites structural BlobNode edges and
-    /// queues old child blobs for deferred manifest deletion, so it
-    /// remains opt-in until reachability-safe delete GC is available
-    /// for fully asynchronous checkpoint pipelines.
+    /// Drain queued parent-merge candidates at the start of each round.
+    /// Parent merge rewrites structural BlobNode edges and stages detached
+    /// children under their exact parent publication; a clean durable
+    /// checkpoint frontier later hands them to bounded physical reclamation.
+    /// The work remains opt-in because it trades foreground tree shape for
+    /// additional background rewrite and checkpoint I/O.
     ///
     /// Default `false`; foreground split/shape control remains
     /// enabled, and callers can still run explicit maintenance.
@@ -414,6 +417,7 @@ impl Drop for Checkpointer {
 // ---------- checkpoint_thread main loop ----------
 
 fn checkpoint_main(shared: &Arc<Shared>) {
+    shared.bm.register_checkpoint_waker(thread::current());
     let mut pipeline = round::Pipeline::new(shared.cfg.io_queue_capacity);
     loop {
         if shared.checkpoint_stop.load(Ordering::Acquire) {
@@ -422,13 +426,17 @@ fn checkpoint_main(shared: &Arc<Shared>) {
         if let Err(e) = pipeline.reap_ready(shared) {
             eprintln!("holt: checkpoint epoch failed: {e}");
         }
-        let has_pressure = shared.bm.dirty_count() >= shared.cfg.dirty_blob_threshold.max(1)
+        let write_pressure = shared.bm.dirty_count() >= shared.cfg.dirty_blob_threshold.max(1)
             || shared.bm.pending_delete_count() != 0;
-        if !has_pressure {
+        if !write_pressure {
             if !pipeline.is_empty() {
                 thread::park_timeout(shared.cfg.idle_interval.min(Duration::from_millis(1)));
                 continue;
             }
+            // A newly retired orphan unparks this thread once. If every
+            // candidate is pinned and the round makes no progress, the next
+            // outer iteration waits a full idle interval instead of spinning
+            // solely because the backlog gauge remains non-zero.
             thread::park_timeout(shared.cfg.idle_interval);
         }
         if shared.checkpoint_stop.load(Ordering::Acquire) {
@@ -452,6 +460,7 @@ fn checkpoint_main(shared: &Arc<Shared>) {
     if let Err(e) = pipeline.drain(shared) {
         eprintln!("holt: checkpoint pipeline drain during shutdown failed: {e}");
     }
+    shared.bm.clear_checkpoint_waker();
 }
 
 #[cfg(test)]
@@ -550,6 +559,58 @@ mod tests {
     struct FlushGateStore {
         inner: MemoryBlobStore,
         flush_pending: AtomicBool,
+    }
+
+    struct BlockingExactDeleteStore {
+        inner: MemoryBlobStore,
+        target: BlobGuid,
+        delete_entered: std::sync::Barrier,
+        delete_release: std::sync::Barrier,
+    }
+
+    impl BlockingExactDeleteStore {
+        fn new(target: BlobGuid) -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                target,
+                delete_entered: std::sync::Barrier::new(2),
+                delete_release: std::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    impl BlobStore for BlockingExactDeleteStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            self.inner.write_blobs_with_data_sync(writes)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            if guid == self.target {
+                self.delete_entered.wait();
+                self.delete_release.wait();
+            }
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
     }
 
     impl FlushGateStore {
@@ -757,6 +818,152 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn pinned_orphan_backlog_parks_and_does_not_starve_later_work() {
+        let inner = Arc::new(MemoryBlobStore::new());
+        let pinned_guid = [0x31; 16];
+        let free_guid = [0x32; 16];
+        let snapshot_root = [0x33; 16];
+        inner
+            .write_blob(pinned_guid, &test_blob(pinned_guid))
+            .unwrap();
+        inner.write_blob(free_guid, &test_blob(free_guid)).unwrap();
+        inner
+            .write_blob(snapshot_root, &test_blob(snapshot_root))
+            .unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 8));
+        let pinned = bm.pin(pinned_guid).unwrap();
+        let root_pin = bm.pin(snapshot_root).unwrap();
+
+        let mut cfg = no_merge_cfg();
+        cfg.idle_interval = Duration::from_millis(20);
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            maintenance_gate(),
+            commit_gate(),
+            cfg,
+        )
+        .expect("spawn");
+
+        let retire = |guid| {
+            let epoch = bm.register_snapshot(snapshot_root, &root_pin).unwrap();
+            bm.stage_cow_reclaim(snapshot_root, guid, epoch);
+            bm.mark_dirty_cached(snapshot_root, epoch, root_pin.as_ref());
+            bm.retire_snapshot(epoch);
+        };
+        retire(pinned_guid);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ck.rounds_attempted() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "checkpointer never attempted pinned orphan cleanup"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let rounds_before_wait = ck.rounds_attempted();
+        thread::sleep(Duration::from_millis(120));
+        let rounds_after_wait = ck.rounds_attempted();
+        assert!(
+            rounds_after_wait - rounds_before_wait <= 10,
+            "all-pinned orphan backlog busy-spun: {rounds_before_wait} -> {rounds_after_wait}"
+        );
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+
+        retire(free_guid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while inner.has_blob(free_guid).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "later reclaimable orphan was starved by the pinned FIFO head"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(inner.has_blob(pinned_guid).unwrap());
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+
+        drop(pinned);
+        ck.wake();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while inner.has_blob(pinned_guid).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "released pinned orphan was not eventually reclaimed"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(bm.gc_orphan_backlog_count(), 0);
+        drop(ck);
+    }
+
+    #[test]
+    fn background_exact_reclaim_fences_writer_merge_and_drop_admission() {
+        let orphan = [0x34; 16];
+        let snapshot_root = [0x35; 16];
+        let store = Arc::new(BlockingExactDeleteStore::new(orphan));
+        store.inner.write_blob(orphan, &test_blob(orphan)).unwrap();
+        store
+            .inner
+            .write_blob(snapshot_root, &test_blob(snapshot_root))
+            .unwrap();
+        let bm = Arc::new(BufferManager::new(store.clone(), 8));
+        let root_pin = bm.pin(snapshot_root).unwrap();
+        let epoch = bm.register_snapshot(snapshot_root, &root_pin).unwrap();
+        bm.stage_cow_reclaim(snapshot_root, orphan, epoch);
+        bm.mark_dirty_cached(snapshot_root, epoch, root_pin.as_ref());
+        bm.retire_snapshot(epoch);
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+
+        let maintenance = maintenance_gate();
+        let commit = commit_gate();
+        let mut cfg = no_merge_cfg();
+        cfg.idle_interval = Duration::from_secs(10);
+        let ck = Checkpointer::spawn(Arc::clone(&bm), None, Arc::clone(&maintenance), commit, cfg)
+            .expect("spawn");
+        ck.wake();
+        store.delete_entered.wait();
+
+        // Foreground writers enter maintenance shared; merge and DB drop
+        // enter maintenance exclusive. Neither admission class may overlap
+        // the physical exact delete selected from a clean frontier.
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_gate = Arc::clone(&maintenance);
+        let writer = thread::spawn(move || {
+            let _guard = writer_gate.enter_shared();
+            writer_tx.send(()).unwrap();
+        });
+        let (topology_tx, topology_rx) = std::sync::mpsc::sync_channel(1);
+        let topology_gate = Arc::clone(&maintenance);
+        let topology = thread::spawn(move || {
+            let _guard = topology_gate.enter_exclusive();
+            topology_tx.send(()).unwrap();
+        });
+        assert!(writer_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(
+            topology_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "merge/drop admission bypassed exact-reclaim maintenance fence",
+        );
+
+        store.delete_release.wait();
+        writer_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        topology_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        writer.join().unwrap();
+        topology.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.inner.has_blob(orphan).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "exact reclaim did not finish after releasing the store",
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(bm.gc_orphan_backlog_count(), 0);
+        drop(root_pin);
+        drop(ck);
     }
 
     #[test]

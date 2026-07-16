@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use holt::{BlobStore, Durability, Error, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, DB};
+use holt::{
+    BlobStore, Durability, Error, FileBlobStore, MemoryBlobStore, Tree, TreeBuilder, TreeConfig, DB,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -52,9 +54,7 @@ fn snapshot_reads_across_blob_boundaries() {
     // the snapshot's copied root crosses `BlobNode`s into shared child
     // frames on read.
     let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
-    let tree = TreeBuilder::new("ignored")
-        .open_with_blob_store(store.clone())
-        .unwrap();
+    let tree = Tree::open_with_blob_store(TreeConfig::memory(), store.clone()).unwrap();
 
     const N: u32 = 5000;
     let value = vec![0xAB_u8; 200];
@@ -124,9 +124,7 @@ fn snapshot_isolates_cross_blob_writes() {
     // overwrite them. Uses a multi-blob tree so the writes cross into
     // shared child frames.
     let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
-    let tree = TreeBuilder::new("ignored")
-        .open_with_blob_store(store.clone())
-        .unwrap();
+    let tree = Tree::open_with_blob_store(TreeConfig::memory(), store.clone()).unwrap();
 
     const N: u32 = 5000;
     let orig = vec![0xAB_u8; 200];
@@ -315,14 +313,13 @@ fn snapshot_stable_under_randomized_churn() {
 }
 
 #[test]
-fn retire_reclaims_forked_frames() {
-    // Retiring a snapshot must free the frames it kept alive (the
-    // forked-away originals + the snapshot root), returning the blob
-    // count to the live working set — no leak.
+fn retire_defers_forked_frame_reclamation_to_gc() {
+    // Retiring a snapshot releases process-local ownership but must keep
+    // persisted frames until a durability-barrier-protected GC proves them
+    // unreachable. That fail-closed interval prevents a durable old parent
+    // from losing a child.
     let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
-    let tree = TreeBuilder::new("ignored")
-        .open_with_blob_store(store.clone())
-        .unwrap();
+    let tree = Tree::open_with_blob_store(TreeConfig::memory(), store.clone()).unwrap();
 
     const N: u32 = 5000;
     let orig = vec![0xAB_u8; 200];
@@ -333,6 +330,7 @@ fn retire_reclaims_forked_frames() {
     let baseline = store.list_blobs().unwrap().len();
     assert!(baseline >= 2, "need a multi-blob tree");
 
+    let during;
     {
         let snap = tree.snapshot(b"").unwrap();
         // Overwrite a spread of keys → forks the shared child frames
@@ -342,19 +340,26 @@ fn retire_reclaims_forked_frames() {
             tree.put(format!("k{i:08}").as_bytes(), b"x").unwrap();
         }
         tree.checkpoint().unwrap();
-        let during = store.list_blobs().unwrap().len();
+        during = store.list_blobs().unwrap().len();
         assert!(
             during > baseline,
             "snapshot + forks should add blobs: {during} vs {baseline}",
         );
         assert_eq!(snap.get(b"k00000000").unwrap().as_deref(), Some(&orig[..]));
-    } // snapshot dropped → retire → reclaim
+    } // snapshot dropped → process-local retire only
 
-    tree.checkpoint().unwrap();
-    let after = store.list_blobs().unwrap().len();
+    let after_retire = store.list_blobs().unwrap().len();
     assert_eq!(
-        after, baseline,
-        "retire must reclaim every snapshot frame: {after} vs {baseline}",
+        after_retire, during,
+        "retire must preserve persisted COW frames until GC",
+    );
+
+    let freed = tree.gc().unwrap();
+    assert_eq!(freed, during - baseline);
+    let after_gc = store.list_blobs().unwrap().len();
+    assert_eq!(
+        after_gc, baseline,
+        "GC must reclaim every retired snapshot frame: {after_gc} vs {baseline}",
     );
 
     // Live tree intact.
@@ -369,13 +374,11 @@ fn retire_reclaims_forked_frames() {
 }
 
 #[test]
-fn overlapping_snapshots_reclaim_after_last_retires() {
-    // Two overlapping snapshots accumulate forked-away frames; the full
-    // working set is reclaimed once the last one retires.
+fn overlapping_snapshots_reclaim_on_gc_after_last_retires() {
+    // Two overlapping snapshots accumulate forked-away frames. Retirement
+    // releases their process-local holds; durable space is reclaimed by GC.
     let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
-    let tree = TreeBuilder::new("ignored")
-        .open_with_blob_store(store.clone())
-        .unwrap();
+    let tree = Tree::open_with_blob_store(TreeConfig::memory(), store.clone()).unwrap();
 
     const N: u32 = 5000;
     let v = vec![0xAB_u8; 200];
@@ -403,6 +406,7 @@ fn overlapping_snapshots_reclaim_after_last_retires() {
     drop(s2);
     tree.checkpoint().unwrap();
 
+    tree.gc().unwrap();
     let after = store.list_blobs().unwrap().len();
     assert_eq!(
         after, baseline,
@@ -418,7 +422,7 @@ fn overlapping_snapshots_reclaim_after_last_retires() {
 }
 
 #[test]
-fn snapshot_correct_after_reopen() {
+fn snapshot_correct_after_multi_blob_compact_checkpoint_reopen() {
     let dir = tempdir().unwrap();
     let cfg = || {
         let mut c = TreeConfig::new(dir.path());
@@ -441,6 +445,10 @@ fn snapshot_correct_after_reopen() {
         for i in 0..N {
             tree.put(format!("k{i:06}").as_bytes(), &v1).unwrap();
         }
+        assert!(
+            tree.stats().unwrap().blob_count > 1,
+            "test must exercise compacted child frames",
+        );
         {
             let snap = tree.snapshot(b"").unwrap();
             for i in 0..N {
@@ -448,6 +456,21 @@ fn snapshot_correct_after_reopen() {
             }
             assert_eq!(snap.get(b"k000000").unwrap().as_deref(), Some(&v1[..]));
         } // retire
+        tree.checkpoint().unwrap();
+
+        // Rebuild the high-epoch COW frames before persisting them. If
+        // compact_blob resets either generation field, reopen can allocate a
+        // snapshot epoch older than a surviving child and a later live write
+        // will mutate that child underneath the snapshot.
+        let compactions_before = tree.stats().unwrap().total_compactions;
+        for _ in 0..4 {
+            tree.compact().unwrap();
+        }
+        let compactions_after = tree.stats().unwrap().total_compactions;
+        assert!(
+            compactions_after > compactions_before,
+            "test must compact at least one high-epoch frame",
+        );
         tree.checkpoint().unwrap();
     }
 
@@ -558,7 +581,7 @@ fn run_crash_session(child_test: &str, dir: &std::path::Path) {
 /// Child body for [`crash_leaked_tree_snapshot_does_not_leave_persistent_garbage`]:
 /// snapshot + writes + checkpoint, then "crash" — forget the snapshot
 /// so it never retires. Snapshot roots are in-memory only, so reopen
-/// should see live data without requiring GC cleanup.
+/// should see live data; the storage owner explicitly runs recovery GC.
 #[test]
 #[ignore = "child-process body for crash_leaked_tree_snapshot_does_not_leave_persistent_garbage"]
 fn crash_leak_tree_session() {
@@ -589,8 +612,9 @@ fn crash_leaked_tree_snapshot_does_not_leave_persistent_garbage() {
 
     run_crash_session("crash_leak_tree_session", dir.path());
 
-    // Reopen: the forgotten snapshot was not a durable root. Only the
-    // live tree should remain reachable.
+    // Reopen itself preserves generic Holt startup semantics and does not run
+    // a full store sweep. The forgotten snapshot was not a durable root, so
+    // the storage owner's explicit recovery GC can reclaim its old frames.
     let tree = Tree::open(cfg()).unwrap();
     for i in 0..N {
         assert_eq!(
@@ -601,10 +625,7 @@ fn crash_leaked_tree_snapshot_does_not_leave_persistent_garbage() {
     }
 
     let freed = tree.gc().unwrap();
-    assert_eq!(
-        freed, 0,
-        "ephemeral read snapshots must not leave persistent garbage",
-    );
+    assert!(freed > 0, "explicit recovery gc must reclaim crash orphans");
     // Idempotent: GC remains a no-op.
     assert_eq!(tree.gc().unwrap(), 0, "second gc must be a no-op");
     // gc must not have touched live data.
@@ -640,6 +661,17 @@ fn crash_leak_db_session() {
         t1.put(format!("k{i:06}").as_bytes(), b"new").unwrap();
     }
     db.checkpoint().unwrap();
+    for i in [0, CRASH_LEAK_N / 2, CRASH_LEAK_N - 1] {
+        assert_eq!(
+            snap.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&v[..]),
+            "deferred batch flush overwrote snapshot child {i}",
+        );
+    }
+    assert!(
+        db.stats().bm_gc_orphan_backlog_count > 0,
+        "snapshot-shared batch updates must create COW orphan debt",
+    );
     std::mem::forget(snap); // crash: read snapshot state is process-local
 }
 
@@ -655,9 +687,9 @@ fn db_crash_leaked_snapshot_does_not_leave_persistent_garbage() {
 
     let db = DB::open(cfg()).unwrap();
     let freed = db.gc().unwrap();
-    assert_eq!(
-        freed, 0,
-        "ephemeral read snapshots must not leave DB-wide persistent garbage",
+    assert!(
+        freed > 0,
+        "explicit DB recovery gc must reclaim crash orphans",
     );
     assert_eq!(db.gc().unwrap(), 0, "second db gc must be a no-op");
 
@@ -679,6 +711,91 @@ fn db_crash_leaked_snapshot_does_not_leave_persistent_garbage() {
 }
 
 #[test]
+fn db_reopen_recovers_epoch_from_surviving_other_family_frames() {
+    let dir = tempdir().unwrap();
+    let cfg = || crash_leak_cfg(dir.path());
+    let keys = (400..528u32)
+        .map(|i| format!("epoch/{i:08}").into_bytes())
+        .collect::<Vec<_>>();
+
+    {
+        let db = DB::open(cfg()).unwrap();
+        let data = db.create_tree("data").unwrap();
+        let epoch_owner = db.create_tree("epoch-owner").unwrap();
+        epoch_owner.put(b"anchor", b"owner").unwrap();
+        let old = vec![0x31; 1024];
+        for i in 0..1200u32 {
+            data.put(format!("epoch/{i:08}").as_bytes(), &old).unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert!(data.stats().unwrap().blob_count > 1);
+
+        // This snapshot advances the DB-global epoch on another family. Data
+        // then forks high-epoch children while its own root high-water can
+        // remain older.
+        let owner_snapshot = epoch_owner.snapshot(b"").unwrap();
+        for key in &keys {
+            data.put(key, b"session-one").unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert!(db.stats().bm_gc_orphan_backlog_count > 0);
+        drop(owner_snapshot);
+        db.checkpoint().unwrap();
+
+        // Remove the root that originally carried the maximum high-water.
+        // Reopen must recover from the created_epoch on data's surviving
+        // reachable frames rather than assuming that root still exists.
+        db.drop_tree("epoch-owner").unwrap();
+        drop(epoch_owner);
+        db.gc().unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.list_trees().unwrap(), vec!["data"]);
+    }
+
+    let db = DB::open(cfg()).unwrap();
+    let data = db.open_tree("data").unwrap();
+    db.view(&[("data", b"")], |view| {
+        for key in &keys {
+            data.put(key, b"session-two")?;
+        }
+        db.checkpoint()?;
+
+        let stable = view.tree("data").expect("captured data family");
+        for key in &keys {
+            assert_eq!(stable.get(key)?.as_deref(), Some(&b"session-one"[..]));
+            assert_eq!(data.get(key)?.as_deref(), Some(&b"session-two"[..]));
+        }
+        assert!(
+            db.stats().bm_gc_orphan_backlog_count > 0,
+            "session-two writes must COW the reopened snapshot-shared child",
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn db_epoch_recovery_accepts_wal_replayed_cache_only_roots() {
+    let dir = tempdir().unwrap();
+    let cfg = || crash_leak_cfg(dir.path());
+
+    {
+        let db = DB::open(cfg()).unwrap();
+        let tree = db.create_tree("wal-only").unwrap();
+        tree.put(b"key", b"acked-before-checkpoint").unwrap();
+        // Deliberately no checkpoint: catalog/root/data exist only through
+        // the durable WAL plus replayed BM cache in the next session.
+    }
+
+    let db = DB::open(cfg()).unwrap();
+    let tree = db.open_tree("wal-only").unwrap();
+    assert_eq!(
+        tree.get(b"key").unwrap().as_deref(),
+        Some(&b"acked-before-checkpoint"[..])
+    );
+}
+
+#[test]
 fn gc_rejects_db_trees() {
     let dir = tempdir().unwrap();
     let db = DB::open(TreeConfig::new(dir.path())).unwrap();
@@ -687,4 +804,450 @@ fn gc_rejects_db_trees() {
         matches!(tree.gc(), Err(Error::GcRequiresStandaloneTree)),
         "gc on a DB tree must be rejected",
     );
+}
+
+#[test]
+fn db_gc_finishes_dropping_tree_protocol_before_global_sweep() {
+    let dir = tempdir().unwrap();
+    let cfg = || crash_leak_cfg(dir.path());
+
+    {
+        let db = DB::open(cfg()).unwrap();
+        let live = db.create_tree("live").unwrap();
+        let doomed = db.create_tree("doomed").unwrap();
+        for i in 0..512u32 {
+            live.put(format!("live/{i:04}").as_bytes(), b"kept")
+                .unwrap();
+            doomed
+                .put(format!("doomed/{i:04}").as_bytes(), &[0xDD; 256])
+                .unwrap();
+        }
+        db.checkpoint().unwrap();
+        db.drop_tree("doomed").unwrap();
+        drop(doomed);
+        drop(live);
+
+        db.gc().unwrap();
+        assert_eq!(db.list_trees().unwrap(), vec!["live"]);
+        assert!(matches!(
+            db.open_tree("doomed"),
+            Err(Error::TreeNotFound { .. })
+        ));
+    }
+
+    let db = DB::open(cfg()).unwrap();
+    assert_eq!(db.list_trees().unwrap(), vec!["live"]);
+    assert!(matches!(
+        db.open_tree("doomed"),
+        Err(Error::TreeNotFound { .. })
+    ));
+    let live = db.open_tree("live").unwrap();
+    for i in 0..512u32 {
+        assert_eq!(
+            live.get(format!("live/{i:04}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(&b"kept"[..]),
+        );
+    }
+}
+
+#[test]
+fn retained_dropped_tree_handle_does_not_block_checkpoint_or_gc() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let db = DB::open(crash_leak_cfg(dir.path())).unwrap();
+    let doomed = db.create_tree("doomed").unwrap();
+    for i in 0..2600u32 {
+        doomed
+            .put(format!("doomed/{i:08}").as_bytes(), &[0xD1; 240])
+            .unwrap();
+    }
+    db.checkpoint().unwrap();
+    db.drop_tree("doomed").unwrap();
+    assert!(matches!(
+        db.create_tree("doomed"),
+        Err(Error::TreeExists { .. })
+    ));
+    assert!(matches!(
+        doomed.get(b"doomed/00000000"),
+        Err(Error::TreeDropped)
+    ));
+
+    let run_with_timeout = |label: &'static str, op: fn(&DB) -> holt::Result<usize>| {
+        let worker_db = db.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(op(&worker_db)).unwrap());
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("{label} did not return with a retained dropped handle"))
+            .unwrap();
+        worker.join().unwrap();
+        result
+    };
+
+    let checkpoint = |db: &DB| db.checkpoint().map(|()| 0);
+    assert_eq!(run_with_timeout("checkpoint", checkpoint), 0);
+    assert_eq!(run_with_timeout("gc", DB::gc), 0);
+    assert!(matches!(
+        db.open_tree("doomed"),
+        Err(Error::TreeNotFound { .. })
+    ));
+
+    drop(doomed);
+    assert!(db.gc().unwrap() > 0);
+    let replacement = db.create_tree("doomed").unwrap();
+    assert_eq!(replacement.get(b"doomed/00000000").unwrap(), None);
+    assert!(db.stats().bm_pending_delete_count == 0);
+}
+
+#[test]
+fn dropped_tree_escaped_view_and_cursor_keep_descendants_live() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(crash_leak_cfg(dir.path())).unwrap();
+    let doomed = db.create_tree("doomed").unwrap();
+    let original = vec![0x6D; 240];
+    for i in 0..ESCAPED_READER_N {
+        doomed
+            .put(format!("k{i:08}").as_bytes(), &original)
+            .unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    let snapshot = doomed.snapshot(b"").unwrap();
+    let escaped_view = snapshot.view().clone();
+    let mut escaped_cursor = snapshot.range().into_iter();
+    drop(snapshot);
+    db.drop_tree("doomed").unwrap();
+    drop(doomed);
+
+    db.checkpoint().unwrap();
+    assert_eq!(db.gc().unwrap(), 0);
+    assert_eq!(
+        escaped_view.get(b"k00000000").unwrap().as_deref(),
+        Some(&original[..])
+    );
+    let mut seen = 0u32;
+    for entry in &mut escaped_cursor {
+        match entry.unwrap() {
+            holt::RangeEntry::Key { key, value, .. } => {
+                assert_eq!(key, format!("k{seen:08}").into_bytes());
+                assert_eq!(value, original);
+                seen += 1;
+            }
+            other => panic!("unexpected escaped range entry: {other:?}"),
+        }
+    }
+    assert_eq!(seen, ESCAPED_READER_N);
+
+    drop(escaped_cursor);
+    drop(escaped_view);
+    assert!(db.gc().unwrap() > 0);
+    assert!(matches!(
+        db.open_tree("doomed"),
+        Err(Error::TreeNotFound { .. })
+    ));
+}
+
+#[test]
+fn live_range_has_no_gap_or_duplicate_across_gc_epochs() {
+    use std::sync::mpsc;
+
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..ESCAPED_READER_N {
+        tree.put(format!("k{i:08}").as_bytes(), &[0x7A; 240])
+            .unwrap();
+    }
+    tree.checkpoint().unwrap();
+
+    let scan_tree = tree.clone();
+    let (first_tx, first_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    let scanner = std::thread::spawn(move || {
+        let mut cursor = scan_tree.range().into_iter();
+        let mut keys = Vec::new();
+        match cursor.next().expect("first range entry").unwrap() {
+            holt::RangeEntry::Key { key, .. } => keys.push(key),
+            other => panic!("unexpected first live range entry: {other:?}"),
+        }
+        first_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+        for entry in &mut cursor {
+            match entry.unwrap() {
+                holt::RangeEntry::Key { key, .. } => keys.push(key),
+                other => panic!("unexpected live range entry: {other:?}"),
+            }
+        }
+        (keys, cursor.stats())
+    });
+
+    first_rx.recv().unwrap();
+    tree.gc().unwrap();
+    resume_tx.send(()).unwrap();
+    let (keys, stats) = scanner.join().unwrap();
+    let expected = (0..ESCAPED_READER_N)
+        .map(|i| format!("k{i:08}").into_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys, expected,
+        "GC restart skipped or duplicated a range key"
+    );
+    assert!(stats.restarts > 0, "test did not cross a physical GC epoch");
+}
+
+const ESCAPED_READER_N: u32 = 2600;
+
+fn escaped_reader_tree() -> (Arc<dyn BlobStore>, Tree, Vec<u8>) {
+    let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let tree = Tree::open_with_blob_store(TreeConfig::memory(), store.clone()).unwrap();
+    let original = vec![0x5A_u8; 240];
+    for i in 0..ESCAPED_READER_N {
+        tree.put(format!("k{i:08}").as_bytes(), &original).unwrap();
+    }
+    tree.checkpoint().unwrap();
+    assert!(
+        store.list_blobs().unwrap().len() >= 2,
+        "escaped-reader tests require child blobs",
+    );
+    (store, tree, original)
+}
+
+fn mutate_escaped_reader_tree(tree: &Tree) {
+    for i in (0..ESCAPED_READER_N).step_by(3) {
+        tree.put(format!("k{i:08}").as_bytes(), b"live-generation")
+            .unwrap();
+    }
+    tree.checkpoint().unwrap();
+}
+
+#[test]
+fn escaped_view_keeps_epoch_and_descendants_live_through_gc() {
+    let (_store, tree, original) = escaped_reader_tree();
+    let snapshot = tree.snapshot(b"").unwrap();
+    let escaped = snapshot.view().clone();
+    drop(snapshot);
+
+    mutate_escaped_reader_tree(&tree);
+    tree.gc().unwrap();
+
+    for i in 0..ESCAPED_READER_N {
+        assert_eq!(
+            escaped
+                .get(format!("k{i:08}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(&original[..]),
+            "escaped view lost snapshot key {i}",
+        );
+    }
+
+    drop(escaped);
+    assert!(
+        tree.gc().unwrap() > 0,
+        "last escaped view drop must make retired COW frames reclaimable",
+    );
+}
+
+#[test]
+fn escaped_record_cursor_keeps_epoch_and_descendants_live_through_gc() {
+    let (_store, tree, original) = escaped_reader_tree();
+    let snapshot = tree.snapshot(b"").unwrap();
+    let mut cursor = snapshot.range().into_iter();
+    drop(snapshot);
+
+    mutate_escaped_reader_tree(&tree);
+    tree.gc().unwrap();
+
+    let mut seen = 0u32;
+    for entry in &mut cursor {
+        match entry.unwrap() {
+            holt::RangeEntry::Key { value, .. } => {
+                assert_eq!(value, original);
+                seen += 1;
+            }
+            holt::RangeEntry::CommonPrefix(_) => panic!("unexpected delimiter rollup"),
+            _ => panic!("unexpected range entry variant"),
+        }
+    }
+    assert_eq!(seen, ESCAPED_READER_N);
+
+    drop(cursor);
+    assert!(tree.gc().unwrap() > 0);
+}
+
+#[test]
+fn escaped_key_cursor_keeps_epoch_and_descendants_live_through_gc() {
+    let (_store, tree, _original) = escaped_reader_tree();
+    let snapshot = tree.snapshot(b"").unwrap();
+    let mut cursor = snapshot.range_keys().into_iter();
+    drop(snapshot);
+
+    mutate_escaped_reader_tree(&tree);
+    tree.gc().unwrap();
+
+    let mut seen = 0u32;
+    for entry in &mut cursor {
+        match entry.unwrap() {
+            holt::KeyRangeEntry::Key { key, .. } => {
+                assert_eq!(key, format!("k{seen:08}").into_bytes());
+                seen += 1;
+            }
+            holt::KeyRangeEntry::CommonPrefix(_) => panic!("unexpected delimiter rollup"),
+            _ => panic!("unexpected key-range entry variant"),
+        }
+    }
+    assert_eq!(seen, ESCAPED_READER_N);
+
+    drop(cursor);
+    assert!(tree.gc().unwrap() > 0);
+}
+
+/// Store directory used by the crash-session child below.
+const COW_RETIRE_CRASH_DIR_ENV: &str = "HOLT_COW_RETIRE_CRASH_DIR";
+
+fn cow_retire_crash_cfg(dir: &std::path::Path) -> TreeConfig {
+    let mut cfg = TreeConfig::new(dir);
+    cfg.checkpoint.enabled = false;
+    cfg.memory_flush_on_write = false;
+    cfg
+}
+
+/// Create a durable multi-blob tree, fork its child frames under a snapshot,
+/// retire that snapshot, then durably flush only the underlying store
+/// manifest. The live parent and its replacement children deliberately stay
+/// in the BufferManager's dirty cache. `process::exit` models a crash by
+/// skipping every Rust destructor and therefore every orderly Tree shutdown.
+#[test]
+#[ignore = "child-process body for cow_retire_keeps_durable_parent_children_reopenable"]
+fn cow_retire_before_parent_checkpoint_crash_session() {
+    let Some(dir) = std::env::var_os(COW_RETIRE_CRASH_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let store = Arc::new(FileBlobStore::open(&dir).unwrap());
+    let tree = Tree::open_with_blob_store(cow_retire_crash_cfg(&dir), store.clone()).unwrap();
+
+    const N: u32 = 5000;
+    let original = [0xAB_u8; 200];
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), &original).unwrap();
+    }
+    tree.checkpoint().unwrap();
+    assert!(
+        store.list_blobs().unwrap().len() >= 2,
+        "test requires a durable parent with child blobs",
+    );
+
+    let snapshot = tree.snapshot(b"").unwrap();
+    for i in (0..N).step_by(3) {
+        tree.put(format!("k{i:08}").as_bytes(), b"new").unwrap();
+    }
+    drop(snapshot);
+
+    // Persist any manifest mutation issued by snapshot retirement without
+    // checkpointing the dirty live parent or its replacement children.
+    store.flush().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn cow_retire_keeps_durable_parent_children_reopenable() {
+    let dir = tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new(exe)
+        .args([
+            "cow_retire_before_parent_checkpoint_crash_session",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(COW_RETIRE_CRASH_DIR_ENV, dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "crash-session child failed: {status}");
+
+    // The uncheckpointed live mutation is allowed to disappear. The last
+    // durable parent must still be able to load every original child.
+    let store = Arc::new(FileBlobStore::open(dir.path()).unwrap());
+    let tree = Tree::open_with_blob_store(cow_retire_crash_cfg(dir.path()), store).unwrap();
+    let original = [0xAB_u8; 200];
+    for i in 0..5000u32 {
+        assert_eq!(
+            tree.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
+            Some(&original[..]),
+            "durable key {i} was lost after snapshot retirement crash",
+        );
+    }
+}
+
+/// Store directory used by the GC crash-session child below.
+const COW_GC_CRASH_DIR_ENV: &str = "HOLT_COW_GC_CRASH_DIR";
+
+/// Leave the stable store at generation 1, advance the in-memory parent to
+/// generation 2 through copy-on-write, and invoke public GC. GC must first
+/// make generation 2 durable before it physically deletes generation 1's
+/// children.
+#[test]
+#[ignore = "child-process body for gc_checkpoints_parent_before_physical_sweep"]
+fn gc_before_parent_checkpoint_crash_session() {
+    let Some(dir) = std::env::var_os(COW_GC_CRASH_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let store = Arc::new(FileBlobStore::open(&dir).unwrap());
+    let tree = Tree::open_with_blob_store(cow_retire_crash_cfg(&dir), store.clone()).unwrap();
+
+    const N: u32 = 5000;
+    let original = [0x11_u8; 200];
+    for i in 0..N {
+        tree.put(format!("k{i:08}").as_bytes(), &original).unwrap();
+    }
+    tree.checkpoint().unwrap();
+    assert!(store.list_blobs().unwrap().len() >= 2);
+
+    let snapshot = tree.snapshot(b"").unwrap();
+    for i in (0..N).step_by(3) {
+        tree.put(format!("k{i:08}").as_bytes(), b"generation-2")
+            .unwrap();
+    }
+    drop(snapshot);
+
+    tree.gc().unwrap();
+    store.flush().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn gc_checkpoints_parent_before_physical_sweep() {
+    let dir = tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let status = std::process::Command::new(exe)
+        .args([
+            "gc_before_parent_checkpoint_crash_session",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(COW_GC_CRASH_DIR_ENV, dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "GC crash-session child failed: {status}");
+
+    let store = Arc::new(FileBlobStore::open(dir.path()).unwrap());
+    let tree = Tree::open_with_blob_store(cow_retire_crash_cfg(dir.path()), store).unwrap();
+    let original = [0x11_u8; 200];
+    for i in 0..5000u32 {
+        let want: &[u8] = if i % 3 == 0 {
+            b"generation-2"
+        } else {
+            &original
+        };
+        assert_eq!(
+            tree.get(format!("k{i:08}").as_bytes()).unwrap().as_deref(),
+            Some(want),
+            "durable key {i} did not match the GC checkpoint generation",
+        );
+    }
 }

@@ -46,6 +46,11 @@ impl CommitGate {
             _inner: self.gate.enter_exclusive(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_pending_for_test(&self) -> bool {
+        self.gate.writer_pending_for_test()
+    }
 }
 
 #[derive(Debug)]

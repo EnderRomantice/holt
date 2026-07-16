@@ -392,8 +392,11 @@ fn lock_coupled_erase_in_blob(
                 crossing.child_guid,
                 child_guard.as_slice(),
                 crossing.parent_off,
-                seq,
             )? {
+                // Fork + edge repoint is a logically neutral structural
+                // transaction. Publish the parent before releasing its latch
+                // so a later deep read/pin error cannot strand cow_pending.
+                bm.mark_dirty_cached(current_guid, crate::store::STRUCTURAL_SEQ, current_entry);
                 drop(child_guard);
                 drop(child_pin);
                 let fork_guard = fork_pin.write();

@@ -21,11 +21,11 @@
 //!
 //! The `write_blob` trait method is still write-through (cache +
 //! store in one call). Internal call sites that produce a new
-//! blob (spillover) or unlink one (erase's `SubtreeGone` /
-//! merge) go through [`BufferManager::install_new_blob`] /
-//! [`BufferManager::mark_for_delete`] instead, so the store
-//! write or manifest mutation is deferred until the next flush —
-//! invariant **W2D** below.
+//! blob (spillover) or unlink one (erase's `SubtreeGone`) goes through
+//! [`BufferManager::install_new_blob`] / [`BufferManager::mark_for_delete`].
+//! Structural merge instead stages the detached child against its exact
+//! rewritten parent until a clean durable frontier can reclaim it. Store
+//! writes and manifest mutations therefore stay behind invariant **W2D**.
 //!
 //! ## Dirty tracking + deferred deletes
 //!
@@ -132,9 +132,9 @@ mod residency;
 mod telemetry;
 mod write_delta;
 
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use dashmap::DashMap;
 
@@ -180,13 +180,103 @@ pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 /// registration, retirement, and orphan recording stay consistent.
 #[derive(Default)]
 struct SnapshotState {
-    /// Epoch → snapshot root GUID for every live snapshot.
-    live: BTreeMap<u64, BlobGuid>,
+    /// Epoch → snapshot root for every live snapshot. The weak pin can
+    /// be upgraded under the registry lock so GC holds a stable root while
+    /// a last derived view/cursor concurrently releases its epoch lease.
+    live: BTreeMap<u64, SnapshotRoot>,
+    /// COW detachments grouped by the parent whose edge was repointed.
+    /// A child stays non-reclaimable here until that exact parent publishes
+    /// dirty/flushing debt; this closes the last-lease-drop window between
+    /// edge mutation and `mark_dirty(parent)`.
+    cow_pending: HashMap<BlobGuid, Vec<(BlobGuid, u64)>>,
     /// Frames forked away from the live tree, tagged with the
-    /// `created_epoch` of the forked-away version. Safe to free once the
-    /// fork barrier drops below the tag (no live snapshot can reference
-    /// it). One entry per fork.
+    /// `created_epoch` of the forked-away version. Once the fork barrier
+    /// drops below the tag no live snapshot can reference it. Retirement only
+    /// moves the exact GUID into the reclaim FIFO; physical deletion waits for
+    /// a clean durable checkpoint frontier or a full reachability sweep.
     orphans: Vec<(BlobGuid, u64)>,
+    /// Structural detachments grouped by their rewritten parent. These do
+    /// not install a visibility fence because a stable snapshot may still
+    /// lazily pin the old child. Parent dirty publication promotes them to
+    /// `structural_orphans` or the reclaim FIFO.
+    structural_pending: HashMap<BlobGuid, HashSet<BlobGuid>>,
+    /// Children detached by structural merge while at least one snapshot
+    /// lease is live. Unlike a COW fork, a merge has no per-snapshot epoch
+    /// tag: any copied root may still point at the detached child. Hold the
+    /// exact GUID until the last lease retires, then move it to the same
+    /// post-checkpoint FIFO as ordinary retired COW frames.
+    structural_orphans: HashSet<BlobGuid>,
+    /// Copy-on-write and structural frames eligible for exact reclaim after
+    /// their final snapshot epoch has retired. A clean checkpoint drains this
+    /// FIFO in bounded batches without an all-store reachability walk; pinned
+    /// candidates are restored for a later pass.
+    retired_orphans: VecDeque<BlobGuid>,
+    retired_orphan_set: HashSet<BlobGuid>,
+}
+
+struct SnapshotRoot {
+    guid: BlobGuid,
+    pin: Weak<CachedBlob>,
+}
+
+/// Shared lifetime token for one copy-on-write snapshot epoch.
+///
+/// Every `View`, range builder, and owned cursor derived from a snapshot
+/// carries this token. The epoch retires only after the final derived read
+/// handle drops, preventing GC from collecting descendants that an escaped
+/// handle can still reach.
+pub(crate) struct SnapshotLease {
+    store: Arc<BufferManager>,
+    epoch: u64,
+    root_guid: BlobGuid,
+    // Keeps the ephemeral root resident for the full lease lifetime. GC
+    // upgrades the registry's weak pin while holding the registry lock.
+    root_pin: Option<Arc<CachedBlob>>,
+}
+
+impl SnapshotLease {
+    pub(crate) fn new(
+        store: Arc<BufferManager>,
+        epoch: u64,
+        root_guid: BlobGuid,
+        root_pin: Arc<CachedBlob>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            epoch,
+            root_guid,
+            root_pin: Some(root_pin),
+        })
+    }
+}
+
+impl Drop for SnapshotLease {
+    fn drop(&mut self) {
+        self.store.retire_snapshot(self.epoch);
+        drop(self.root_pin.take());
+        self.store.discard_snapshot_root(self.root_guid);
+    }
+}
+
+/// Strong snapshot-root pin owned by one GC reachability pass.
+pub(crate) struct PinnedSnapshotRoot {
+    store: Arc<BufferManager>,
+    guid: BlobGuid,
+    pin: Option<Arc<CachedBlob>>,
+}
+
+impl PinnedSnapshotRoot {
+    #[must_use]
+    pub(crate) fn guid(&self) -> BlobGuid {
+        self.guid
+    }
+}
+
+impl Drop for PinnedSnapshotRoot {
+    fn drop(&mut self) {
+        drop(self.pin.take());
+        self.store.discard_snapshot_root(self.guid);
+    }
 }
 
 /// One pre-snapshotted blob image ready for checkpoint write-through.
@@ -285,6 +375,9 @@ impl CacheBudget {
 pub(crate) struct BufferStats {
     pub(crate) dirty_count: usize,
     pub(crate) pending_delete_count: usize,
+    pub(crate) gc_orphan_backlog_count: usize,
+    pub(crate) gc_reclaimed_count: u64,
+    pub(crate) gc_last_full_sweep_deferred_count: usize,
     pub(crate) read_index_token_count: usize,
     pub(crate) read_index_cache_entries: usize,
     pub(crate) read_index_cache_bytes: usize,
@@ -331,6 +424,11 @@ pub(crate) struct BufferStats {
     pub(crate) admission_protects: u64,
     pub(crate) write_delta_count: usize,
     pub(crate) store: StoreStats,
+}
+
+pub(crate) struct GcSweepOutcome {
+    pub(crate) freed: usize,
+    pub(crate) complete: bool,
 }
 
 /// Frequency-aware blob cache; see the module docs.
@@ -386,6 +484,11 @@ pub struct BufferManager {
     /// the foreground writer gate.
     write_delta: WriteDelta,
     write_delta_flush: Mutex<()>,
+    /// Serializes one complete checkpoint I/O phase: dependency-ordered
+    /// dirty waves, their durability syncs, and the following pending-delete
+    /// phase. Callers acquire this only after releasing CommitGate/capture
+    /// locks; low-level write/flush helpers never acquire it recursively.
+    checkpoint_io: Mutex<()>,
     delete_fence_total: AtomicUsize,
     /// Rotating shard cursors for advisory maintenance queues.
     /// Without this, a fixed shard-0-first drain can starve later
@@ -419,9 +522,72 @@ pub struct BufferManager {
     /// may be visible to a snapshot and so must be forked before an
     /// in-place overwrite; `0` (no live snapshot) disables forking.
     fork_barrier: AtomicU64,
-    /// Live CoW snapshot registry + forked-away orphan list. Drives
-    /// fork-barrier recomputation and orphan reclaim on retire.
+    /// Live CoW snapshot registry plus detached-frame staging/FIFO state.
+    /// Retirement lowers the fork barrier and moves eligible COW/structural
+    /// GUIDs into the exact-reclaim FIFO; it never deletes persisted data
+    /// inline. Physical deletion requires a clean durable checkpoint frontier
+    /// or a full reachability sweep.
     snapshots: Mutex<SnapshotState>,
+    /// Even while idle and odd while physical GC deletion is active.
+    /// Optimistic readers use this sequence to distinguish a concurrent
+    /// reachability sweep from a stable missing-child corruption.
+    gc_epoch: AtomicU64,
+    physical_gc: Mutex<()>,
+    gc_reclaimed_count: AtomicU64,
+    /// Unreachable candidates deferred by the most recently completed full
+    /// reachability sweep. Exact FIFO reclaim deliberately does not overwrite
+    /// this value: an empty exact batch cannot prove that full-sweep debt is
+    /// gone.
+    gc_last_full_sweep_deferred_count: AtomicUsize,
+    checkpoint_waker: Mutex<Option<std::thread::Thread>>,
+}
+
+struct GcEpochGuard<'a> {
+    _serial: MutexGuard<'a, ()>,
+    epoch: &'a AtomicU64,
+}
+
+#[cfg(test)]
+struct ResidentPinBarrier {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ResidentPinBarrier {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESIDENT_PIN_BARRIER: std::cell::RefCell<Option<Arc<ResidentPinBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_resident_pin_barrier_for_current_thread(barrier: Arc<ResidentPinBarrier>) {
+    RESIDENT_PIN_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_resident_pin_after_fence_check() {
+    let barrier = RESIDENT_PIN_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
+
+impl Drop for GcEpochGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.epoch.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 1, "GC epoch must be active on guard drop");
+    }
 }
 
 impl BufferManager {
@@ -449,6 +615,60 @@ impl BufferManager {
     #[must_use]
     pub(crate) fn fork_barrier(&self) -> u64 {
         self.fork_barrier.load(Ordering::Acquire)
+    }
+
+    /// Capture the physical-GC sequence for one optimistic reader attempt.
+    #[must_use]
+    pub(crate) fn gc_read_epoch(&self) -> u64 {
+        self.gc_epoch.load(Ordering::Acquire)
+    }
+
+    /// Wait for a physical sweep to leave its odd epoch and return the next
+    /// stable even sequence. Used only when a range cursor crosses a GC
+    /// barrier; the uncontended path is one atomic load.
+    #[must_use]
+    pub(crate) fn gc_stable_read_epoch(&self) -> u64 {
+        loop {
+            let epoch = self.gc_read_epoch();
+            if epoch & 1 == 0 {
+                return epoch;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Return `true` when physical deletion was active at capture time or
+    /// crossed the reader attempt. A stable even value means a missing blob
+    /// is not explained by GC and must remain a hard error.
+    #[must_use]
+    pub(crate) fn gc_raced_since(&self, captured: u64) -> bool {
+        captured & 1 != 0 || self.gc_epoch.load(Ordering::Acquire) != captured
+    }
+
+    /// Run a short publication closure while physical GC is excluded, but
+    /// only if the caller's optimistic generation is still current.
+    pub(crate) fn with_stable_gc_epoch<R>(
+        &self,
+        captured: u64,
+        publish: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
+        (!self.gc_raced_since(captured)).then(publish)
+    }
+
+    #[must_use]
+    pub(crate) fn gc_epoch_still_stable(&self, captured: u64) -> bool {
+        self.with_stable_gc_epoch(captured, || ()).is_some()
+    }
+
+    fn begin_gc_epoch(&self) -> GcEpochGuard<'_> {
+        let serial = self.physical_gc.lock().expect("physical GC lock poisoned");
+        let previous = self.gc_epoch.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0, "physical GC passes must be serialized");
+        GcEpochGuard {
+            _serial: serial,
+            epoch: &self.gc_epoch,
+        }
     }
 
     /// Fork a frame for copy-on-write: copy `src_bytes` to a fresh GUID
@@ -498,67 +718,173 @@ impl BufferManager {
     /// epoch (so frames created afterwards are private to the live
     /// tree), raises the fork barrier to the snapshot's epoch, and
     /// returns that epoch.
-    pub(crate) fn register_snapshot(&self, root_guid: BlobGuid) -> u64 {
+    pub(crate) fn register_snapshot(
+        &self,
+        root_guid: BlobGuid,
+        root_pin: &Arc<CachedBlob>,
+    ) -> Result<u64> {
         let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
-        // `fetch_add` returns the pre-bump value: that is this snapshot's
-        // epoch and, because `current_epoch` only ever increases, the
-        // largest key in the registry — hence the new barrier.
-        let epoch = self.current_epoch.fetch_add(1, Ordering::AcqRel);
-        snaps.live.insert(epoch, root_guid);
+        // The returned pre-bump value is this snapshot's barrier; the
+        // post-bump value is persisted as the root high-water and stamps new
+        // frames. MAX-1 is a valid but exhausted durable high-water, while
+        // MAX can never be emitted by a successful registration. A checked
+        // atomic update prevents MAX from wrapping to zero and clearing the
+        // fork barrier while an exhausted snapshot remains live.
+        let epoch = self
+            .current_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < u64::MAX - 1).then_some(current + 1)
+            })
+            .map_err(|_| Error::SnapshotEpochExhausted)?;
+        snaps.live.insert(
+            epoch,
+            SnapshotRoot {
+                guid: root_guid,
+                pin: Arc::downgrade(root_pin),
+            },
+        );
         self.fork_barrier.store(epoch, Ordering::Release);
-        epoch
+        Ok(epoch)
     }
 
-    /// Record a frame forked away from the live tree so it can be freed
-    /// once no live snapshot can reference it. `created_epoch` is the
-    /// epoch of the forked-away version (≤ the barrier at fork time).
-    pub(crate) fn record_orphan(&self, guid: BlobGuid, created_epoch: u64) {
-        self.snapshots
-            .lock()
-            .expect("snapshot registry poisoned")
-            .orphans
-            .push((guid, created_epoch));
+    /// Stage a frame forked away from the live tree until its rewritten parent
+    /// publishes dirty/flushing debt. `created_epoch` is the epoch of the
+    /// forked-away version (≤ the barrier at fork time). Lease retirement only
+    /// makes it eligible; a clean exact frontier or full GC deletes it.
+    pub(crate) fn stage_cow_reclaim(
+        &self,
+        parent_guid: BlobGuid,
+        guid: BlobGuid,
+        created_epoch: u64,
+    ) {
+        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        let pending = snapshots.cow_pending.entry(parent_guid).or_default();
+        if !pending.iter().any(|(candidate, _)| *candidate == guid) {
+            pending.push((guid, created_epoch));
+        }
+    }
+
+    /// Stage a child detached by structural merge under the parent whose
+    /// cached edge was rewritten. Staging is deliberately not reclaimable;
+    /// `mark_dirty(parent)` promotes it only after the new parent image is
+    /// protected by dirty/flushing checkpoint debt.
+    pub(crate) fn stage_structural_reclaim(&self, parent_guid: BlobGuid, child_guid: BlobGuid) {
+        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        snapshots
+            .structural_pending
+            .entry(parent_guid)
+            .or_default()
+            .insert(child_guid);
+    }
+
+    /// Promote every COW/structural detachment owned by `parent_guid` after
+    /// that parent's dirty image has been published. A concurrent final
+    /// snapshot retirement can only make a staged child eligible here,
+    /// after dirty/flushing state already closes the clean frontier.
+    fn publish_parent_orphans(&self, parent_guid: BlobGuid) {
+        let wake = {
+            let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+            let cow = snapshots
+                .cow_pending
+                .remove(&parent_guid)
+                .unwrap_or_default();
+            let structural = snapshots
+                .structural_pending
+                .remove(&parent_guid)
+                .unwrap_or_default();
+            let barrier = snapshots.live.keys().next_back().copied().unwrap_or(0);
+            let mut wake = false;
+            for (guid, created_epoch) in cow {
+                if barrier != 0 && created_epoch <= barrier {
+                    snapshots.orphans.push((guid, created_epoch));
+                } else if snapshots.retired_orphan_set.insert(guid) {
+                    snapshots.retired_orphans.push_back(guid);
+                    wake = true;
+                }
+            }
+            for guid in structural {
+                if snapshots.live.is_empty() {
+                    if snapshots.retired_orphan_set.insert(guid) {
+                        snapshots.retired_orphans.push_back(guid);
+                        wake = true;
+                    }
+                } else {
+                    snapshots.structural_orphans.insert(guid);
+                }
+            }
+            wake
+        };
+        if wake {
+            self.wake_checkpointer();
+        }
     }
 
     /// Retire the snapshot at `epoch`: lower the fork barrier to the
-    /// highest remaining live snapshot epoch (or `0`), free the
-    /// snapshot's root frame, and reclaim every orphan whose forked-away
-    /// version is now newer than the barrier — no live snapshot can
-    /// reference it. Idempotent for an unknown epoch.
+    /// highest remaining live snapshot epoch (or `0`), evict the
+    /// snapshot's root frame, and stop tracking every orphan whose
+    /// forked-away version is now newer than the barrier.
+    ///
+    /// Persisted blobs are deliberately retained. The live parent that
+    /// stopped referencing a copy-on-write child may still have its older
+    /// image on stable storage. Retirement only moves eligible COW and
+    /// structural GUIDs into the exact-reclaim FIFO; physical deletion
+    /// requires a clean durable checkpoint frontier or a full reachability
+    /// sweep. Idempotent for an unknown epoch.
     pub(crate) fn retire_snapshot(&self, epoch: u64) {
-        let (root, to_free) = {
+        let (root, wake) = {
             let mut snaps = self.snapshots.lock().expect("snapshot registry poisoned");
             let root = snaps.live.remove(&epoch);
             let barrier = snaps.live.keys().next_back().copied().unwrap_or(0);
             self.fork_barrier.store(barrier, Ordering::Release);
-            let mut to_free = Vec::new();
-            snaps.orphans.retain(|&(guid, created_epoch)| {
-                let still_referenced = created_epoch <= barrier;
-                if !still_referenced {
-                    to_free.push(guid);
+            let mut active = Vec::with_capacity(snaps.orphans.len());
+            for (guid, created_epoch) in std::mem::take(&mut snaps.orphans) {
+                if barrier != 0 && created_epoch <= barrier {
+                    active.push((guid, created_epoch));
+                } else if snaps.retired_orphan_set.insert(guid) {
+                    snaps.retired_orphans.push_back(guid);
                 }
-                still_referenced
-            });
-            (root, to_free)
+            }
+            snaps.orphans = active;
+            if barrier == 0 {
+                let structural = std::mem::take(&mut snaps.structural_orphans);
+                for guid in structural {
+                    if snaps.retired_orphan_set.insert(guid) {
+                        snaps.retired_orphans.push_back(guid);
+                    }
+                }
+            }
+            (root, !snaps.retired_orphans.is_empty())
         };
         if let Some(root) = root {
-            self.reclaim_blob(root);
+            self.discard_snapshot_root(root.guid);
         }
-        for guid in to_free {
-            self.reclaim_blob(guid);
+        if wake {
+            self.wake_checkpointer();
         }
+        // Persistent detachments deliberately keep their cache and dirty
+        // bookkeeping. A clean checkpoint may reclaim their exact FIFO GUIDs;
+        // a full GC additionally handles crash leftovers by reachability.
     }
 
-    /// Free a copy-on-write frame no longer referenced by the live tree
-    /// or any live snapshot. Checkpoint-owned or pending-delete frames
-    /// are still load-bearing for checkpoint correctness, so reclamation
-    /// is best-effort: those frames are left for a later DB-wide GC after
-    /// their checkpoint owner has retired.
-    fn reclaim_blob(&self, guid: BlobGuid) {
+    /// Discard an ephemeral snapshot root from process-local state.
+    ///
+    /// This must never call `store.delete_blob`: snapshot reachability is
+    /// based on the current in-memory parent, which can be newer than the last
+    /// durable parent. Persisted space is reclaimed only after a clean exact
+    /// frontier or by [`Self::gc_sweep_unreachable_with_canonical`] under a
+    /// durable reachability barrier.
+    pub(crate) fn discard_snapshot_root(&self, guid: BlobGuid) {
+        let _ = self.evict_reclaimable_blob(guid);
+    }
+
+    /// Evict all process-local state for `guid` when no pin, checkpoint,
+    /// or pending delete still owns it. Returns `true` when a subsequent
+    /// reachability-proven physical delete may proceed.
+    fn evict_reclaimable_blob(&self, guid: BlobGuid) -> bool {
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected_or_pending(&guid) {
-                return;
+                return false;
             }
         }
         if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
@@ -570,7 +896,7 @@ impl BufferManager {
         }) {
             entry.clear_dirty_hint();
         } else if self.cache.contains_key(&guid) {
-            return;
+            return false;
         }
         self.route_resident.remove(guid);
         let mut state = self.mutation_shard(guid).lock().unwrap();
@@ -578,35 +904,316 @@ impl BufferManager {
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
         self.decrement_candidate_totals(removed);
-        let _ = self.store.delete_blob(guid);
-        self.remove_read_index_token_if_unreachable(guid);
+        true
     }
 
-    /// GUIDs of every live snapshot's frozen root frame.
-    pub(crate) fn snapshot_roots(&self) -> Vec<BlobGuid> {
+    /// Whether an API handle or in-flight reader still owns `guid` beyond
+    /// the cache's own reference. Reachability GC uses this on a Dropping
+    /// tree root to retain the whole closure until the old handle releases.
+    pub(crate) fn blob_is_pinned(&self, guid: BlobGuid) -> bool {
+        self.cache
+            .get(&guid)
+            .is_some_and(|entry| Arc::strong_count(entry.value()) > 1)
+    }
+
+    /// Physically delete one blob that a durability-barrier-protected
+    /// reachability walk proved unreachable.
+    fn reclaim_unreachable_blob(&self, guid: BlobGuid) -> Result<bool> {
+        {
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            if state.is_protected_or_pending(&guid) {
+                return Ok(false);
+            }
+            state.gc_deleting.insert(guid);
+            self.delete_fence_total.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let result = (|| {
+            // Publish invalidation before eviction/delete. A cold indexed
+            // reader either observes this token change or the delete fence;
+            // a delayed reader that outlives both is covered by `gc_epoch`.
+            self.invalidate_indexed_reads(guid);
+            if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+                if Arc::strong_count(entry) > 1 {
+                    return false;
+                }
+                let state = self.mutation_shard(guid).lock().unwrap();
+                !state.is_protected(&guid)
+                    && !state.pending_deletes.contains_key(&guid)
+                    && !state.deleting.contains_key(&guid)
+            }) {
+                entry.clear_dirty_hint();
+            } else if self.cache.contains_key(&guid) {
+                return Ok(false);
+            }
+            self.route_resident.remove(guid);
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            state.remove_unclaimed_dirty(&guid);
+            let removed = state.remove_maintenance_candidates(&guid);
+            drop(state);
+            self.decrement_candidate_totals(removed);
+            self.store.delete_blob(guid)?;
+            Ok(true)
+        })();
+
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        if state.gc_deleting.remove(&guid) {
+            self.delete_fence_total.fetch_sub(1, Ordering::AcqRel);
+        }
+        drop(state);
+        // The helper treats every delete fence as reachability protection.
+        // Run token cleanup after retiring our GC-owned fence for every
+        // result. A custom store may physically remove the GUID and then
+        // report an I/O error; the helper rechecks cache/protection/store
+        // reachability fail-closed, so it removes only truly dead tokens.
+        self.remove_read_index_token_if_unreachable(guid);
+        result
+    }
+
+    /// Pinned roots of every live snapshot epoch.
+    ///
+    /// Upgrading each weak pin while holding the registry lock closes the
+    /// race with the last derived `View`/cursor dropping its epoch lease:
+    /// GC either omits an already-retired root or owns a strong pin for the
+    /// full reachability walk.
+    pub(crate) fn snapshot_roots_pinned(self: &Arc<Self>) -> Result<Vec<PinnedSnapshotRoot>> {
         self.snapshots
             .lock()
             .expect("snapshot registry poisoned")
             .live
             .values()
-            .copied()
+            .map(|root| {
+                root.pin
+                    .upgrade()
+                    .map(|pin| PinnedSnapshotRoot {
+                        store: Arc::clone(self),
+                        guid: root.guid,
+                        pin: Some(pin),
+                    })
+                    .ok_or(Error::Internal("live snapshot registry lost its root pin"))
+            })
             .collect()
     }
 
     /// Free every persisted frame not in `reachable`, returning the count
     /// reclaimed. The recovery-time sweep for copy-on-write frames
     /// orphaned by a crash that lost the in-memory orphan list. The
-    /// caller must hold the tree quiescent and pass the full reachable
-    /// set (live root ∪ every live snapshot root).
+    /// caller must hold the tree quiescent, establish a durable checkpoint
+    /// of the same root image, and pass the full reachable set (live root
+    /// ∪ every live snapshot root).
+    #[cfg(test)]
     pub(crate) fn gc_sweep_unreachable(&self, reachable: &HashSet<BlobGuid>) -> Result<usize> {
-        let mut freed = 0;
-        for guid in self.list_blobs()? {
-            if !reachable.contains(&guid) {
-                self.reclaim_blob(guid);
+        self.gc_sweep_unreachable_bounded(reachable, usize::MAX)
+            .map(|outcome| outcome.freed)
+    }
+
+    /// Sweep unreachable blobs while distinguishing the durable canonical
+    /// topology from frames kept alive only by captured snapshot roots. Both
+    /// closures protect physical deletion during this pass, but only
+    /// canonical-live GUIDs invalidate retired-orphan FIFO entries.
+    pub(crate) fn gc_sweep_unreachable_with_canonical(
+        &self,
+        reachable: &HashSet<BlobGuid>,
+        canonical_reachable: &HashSet<BlobGuid>,
+    ) -> Result<usize> {
+        self.gc_sweep_unreachable_with_canonical_bounded(reachable, canonical_reachable, usize::MAX)
+            .map(|outcome| outcome.freed)
+    }
+
+    /// Delete at most `limit` reachability-proven blobs after the caller has
+    /// frozen and durably checkpointed the topology used for `reachable`.
+    /// Pins are fail-closed: skipped blobs remain available to the next pass.
+    #[cfg(test)]
+    pub(crate) fn gc_sweep_unreachable_bounded(
+        &self,
+        reachable: &HashSet<BlobGuid>,
+        limit: usize,
+    ) -> Result<GcSweepOutcome> {
+        self.gc_sweep_unreachable_with_canonical_bounded(reachable, reachable, limit)
+    }
+
+    /// Bounded sweep variant with a separate canonical-live closure.
+    /// `reachable` is the union used to protect deletion; snapshot-only
+    /// members remain in the retired FIFO so the ordinary exact-reclaim path
+    /// can free them immediately after the GC-owned snapshot pins retire.
+    pub(crate) fn gc_sweep_unreachable_with_canonical_bounded(
+        &self,
+        reachable: &HashSet<BlobGuid>,
+        canonical_reachable: &HashSet<BlobGuid>,
+        limit: usize,
+    ) -> Result<GcSweepOutcome> {
+        debug_assert!(canonical_reachable.is_subset(reachable));
+        let _epoch = self.begin_gc_epoch();
+        let mut freed = 0usize;
+        let mut deferred = 0usize;
+        let mut reclaimed = HashSet::new();
+        // The GC epoch already owns `physical_gc`; bypass this type's public
+        // BlobStore wrapper here so that wrapper can serialize external
+        // enumerations without recursively taking the same mutex.
+        let present = self.store.list_blobs()?;
+        for guid in present.iter().copied() {
+            if reachable.contains(&guid) {
+                continue;
+            }
+            if freed >= limit {
+                deferred = deferred.saturating_add(1);
+                continue;
+            }
+            if self.reclaim_unreachable_blob(guid)? {
                 freed += 1;
+                reclaimed.insert(guid);
+            } else {
+                deferred = deferred.saturating_add(1);
             }
         }
+        if freed != 0 {
+            self.store.flush()?;
+            self.gc_reclaimed_count
+                .fetch_add(freed as u64, Ordering::Relaxed);
+        }
+        self.gc_last_full_sweep_deferred_count
+            .store(deferred, Ordering::Relaxed);
+
+        // A missing candidate was already reclaimed by an earlier pass or
+        // recovery. Remove it without requiring another full sweep.
+        let present: HashSet<_> = present.into_iter().collect();
+        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        snapshots.retired_orphans.retain(|guid| {
+            present.contains(guid)
+                && !reclaimed.contains(guid)
+                && !canonical_reachable.contains(guid)
+        });
+        snapshots.retired_orphan_set = snapshots.retired_orphans.iter().copied().collect();
+        Ok(GcSweepOutcome {
+            freed,
+            complete: deferred == 0,
+        })
+    }
+
+    /// Reclaim a FIFO batch of COW or structural frames that are no longer
+    /// protected by a snapshot lease. The caller must have completed a clean
+    /// durable checkpoint; that frontier proves current parents no longer
+    /// reference these exact GUIDs, so the normal path needs no all-store scan.
+    pub(crate) fn reclaim_retired_orphans_bounded(&self, limit: usize) -> Result<usize> {
+        let candidates = self.take_retired_orphans_bounded(limit);
+        self.reclaim_retired_orphan_batch(candidates)
+    }
+
+    /// Move one FIFO batch out of the backlog while the caller owns the
+    /// clean-frontier commit/maintenance barrier. Separating capture from
+    /// I/O closes the race where a post-checkpoint writer could enqueue a
+    /// not-yet-durable orphan between the clean test and queue drain.
+    pub(crate) fn take_retired_orphans_bounded(&self, limit: usize) -> Vec<BlobGuid> {
+        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        let take = limit.min(snapshots.retired_orphans.len());
+        let mut candidates = Vec::with_capacity(take);
+        for _ in 0..take {
+            let guid = snapshots
+                .retired_orphans
+                .pop_front()
+                .expect("bounded retired orphan count");
+            snapshots.retired_orphan_set.remove(&guid);
+            candidates.push(guid);
+        }
+        candidates
+    }
+
+    pub(crate) fn reclaim_retired_orphan_batch(&self, candidates: Vec<BlobGuid>) -> Result<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let _epoch = self.begin_gc_epoch();
+        let mut freed = 0usize;
+        let mut retry = Vec::new();
+        for (index, guid) in candidates.iter().copied().enumerate() {
+            match self.store.has_blob(guid) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    retry.extend(candidates[index..].iter().copied());
+                    self.restore_retired_orphans(retry);
+                    return Err(error);
+                }
+            }
+            match self.reclaim_unreachable_blob(guid) {
+                Ok(true) => freed += 1,
+                Ok(false) => retry.push(guid),
+                Err(error) => {
+                    retry.extend(candidates[index..].iter().copied());
+                    self.restore_retired_orphans(retry);
+                    return Err(error);
+                }
+            }
+        }
+        if freed != 0 {
+            if let Err(error) = self.store.flush() {
+                self.restore_retired_orphans(candidates);
+                return Err(error);
+            }
+            self.gc_reclaimed_count
+                .fetch_add(freed as u64, Ordering::Relaxed);
+        }
+        self.restore_retired_orphans(retry);
         Ok(freed)
+    }
+
+    fn restore_retired_orphans(&self, guids: impl IntoIterator<Item = BlobGuid>) {
+        let mut snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        for guid in guids {
+            if snapshots.retired_orphan_set.insert(guid) {
+                snapshots.retired_orphans.push_back(guid);
+            }
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn gc_orphan_backlog_count(&self) -> usize {
+        let snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        snapshots.cow_pending.values().map(Vec::len).sum::<usize>()
+            + snapshots.orphans.len()
+            + snapshots
+                .structural_pending
+                .values()
+                .map(HashSet::len)
+                .sum::<usize>()
+            + snapshots.structural_orphans.len()
+            + snapshots.retired_orphans.len()
+    }
+
+    pub(crate) fn orphan_staging_count(&self) -> usize {
+        let snapshots = self.snapshots.lock().expect("snapshot registry poisoned");
+        snapshots.cow_pending.values().map(Vec::len).sum::<usize>()
+            + snapshots
+                .structural_pending
+                .values()
+                .map(HashSet::len)
+                .sum::<usize>()
+    }
+
+    pub(crate) fn register_checkpoint_waker(&self, thread: std::thread::Thread) {
+        *self
+            .checkpoint_waker
+            .lock()
+            .expect("checkpoint waker lock poisoned") = Some(thread);
+    }
+
+    pub(crate) fn clear_checkpoint_waker(&self) {
+        self.checkpoint_waker
+            .lock()
+            .expect("checkpoint waker lock poisoned")
+            .take();
+    }
+
+    fn wake_checkpointer(&self) {
+        if let Some(thread) = self
+            .checkpoint_waker
+            .lock()
+            .expect("checkpoint waker lock poisoned")
+            .as_ref()
+        {
+            thread.unpark();
+        }
     }
 
     pub(crate) fn vacuum_storage(&self) -> Result<VacuumStats> {
@@ -667,6 +1274,7 @@ impl BufferManager {
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
             write_delta: WriteDelta::default(),
             write_delta_flush: Mutex::new(()),
+            checkpoint_io: Mutex::new(()),
             delete_fence_total: AtomicUsize::new(0),
             compact_candidate_cursor: AtomicUsize::new(0),
             merge_candidate_cursor: AtomicUsize::new(0),
@@ -677,11 +1285,27 @@ impl BufferManager {
             current_epoch: AtomicU64::new(1),
             fork_barrier: AtomicU64::new(0),
             snapshots: Mutex::new(SnapshotState::default()),
+            gc_epoch: AtomicU64::new(0),
+            physical_gc: Mutex::new(()),
+            gc_reclaimed_count: AtomicU64::new(0),
+            gc_last_full_sweep_deferred_count: AtomicUsize::new(0),
+            checkpoint_waker: Mutex::new(None),
         }
     }
 
     fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
         (self.alloc_uninit)()
+    }
+
+    /// Enter the global checkpoint I/O phase.
+    ///
+    /// Lock order: capture/CommitGate first, release it, then acquire this
+    /// guard before any child-first writes or pending deletes. The guard must
+    /// cover the complete data-write → sync → delete → sync phase.
+    pub(crate) fn enter_checkpoint_io(&self) -> MutexGuard<'_, ()> {
+        self.checkpoint_io
+            .lock()
+            .expect("checkpoint I/O lock poisoned")
     }
 
     /// Current logical clock value. Read by the eviction
@@ -782,9 +1406,8 @@ impl BufferManager {
     }
 
     /// Current number of cached blobs.
-    #[cfg(test)]
     #[must_use]
-    pub fn cached_count(&self) -> usize {
+    pub(crate) fn cached_count(&self) -> usize {
         self.cache.len()
     }
 
@@ -794,6 +1417,11 @@ impl BufferManager {
         BufferStats {
             dirty_count: self.dirty_count(),
             pending_delete_count: self.pending_delete_count(),
+            gc_orphan_backlog_count: self.gc_orphan_backlog_count(),
+            gc_reclaimed_count: self.gc_reclaimed_count.load(Ordering::Relaxed),
+            gc_last_full_sweep_deferred_count: self
+                .gc_last_full_sweep_deferred_count
+                .load(Ordering::Relaxed),
             read_index_token_count: self.read_index_tokens.len(),
             read_index_cache_entries: read_index_cache.entries,
             read_index_cache_bytes: read_index_cache.bytes,
@@ -929,14 +1557,6 @@ impl BufferManager {
             std::io::ErrorKind::NotFound,
             format!("blob {:02x?} is pending delete", &guid[..4]),
         ))
-    }
-
-    /// Internal: insert a freshly-loaded blob into the cache.
-    /// Idempotent under concurrent inserts. Stamps the new entry's
-    /// `last_touched` so it doesn't look cold to the eviction
-    /// thread on its very next sweep.
-    fn insert_into_cache(&self, guid: BlobGuid, contents: &AlignedBlobBuf) {
-        self.insert_owned_into_cache(guid, contents.clone(), PinAccess::Point);
     }
 
     /// Internal: insert a freshly-loaded owned blob into the cache
@@ -1131,6 +1751,7 @@ impl BufferManager {
     /// `delete_blob`, where the blob is going away entirely and
     /// any pending dirty write would race with the delete in the
     /// store.
+    #[cfg(test)]
     fn evict_from_cache(&self, guid: BlobGuid) -> bool {
         {
             let state = self.mutation_shard(guid).lock().unwrap();
@@ -1158,6 +1779,11 @@ impl BufferManager {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn evict_from_cache_for_test(&self, guid: BlobGuid) -> bool {
+        self.evict_from_cache(guid)
+    }
+
     /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
     ///
     /// On a cache miss, the blob is loaded from the inner store
@@ -1183,10 +1809,7 @@ impl BufferManager {
     /// reading the backing store, so callers can decide whether to use
     /// read-index/page reads or fall back to a full [`Self::pin`].
     pub(crate) fn pin_cached(&self, guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        Ok(self.get_cached_with_access(guid, PinAccess::Point))
+        self.pin_resident_stable(guid, PinAccess::Point)
     }
 
     /// Pin for range/list scans. Hits and misses remain visible in
@@ -1223,13 +1846,16 @@ impl BufferManager {
         let mut miss_guids: Vec<BlobGuid> = Vec::new();
         let mut miss_slots: Vec<usize> = Vec::new();
         for &guid in guids {
-            if self.is_pending_delete(guid) {
-                out.push(None);
-                continue;
-            }
-            if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Scan) {
-                out.push(Some(entry));
-                continue;
+            match self.pin_resident_stable(guid, PinAccess::Scan) {
+                Ok(Some(entry)) => {
+                    out.push(Some(entry));
+                    continue;
+                }
+                Err(_) => {
+                    out.push(None);
+                    continue;
+                }
+                Ok(None) => {}
             }
             out.push(None);
             miss_slots.push(out.len() - 1);
@@ -1238,6 +1864,7 @@ impl BufferManager {
         if miss_guids.is_empty() {
             return out;
         }
+        let gc_epoch = self.gc_stable_read_epoch();
 
         // Phase 2 — read the cold frames in one batched store call.
         // SAFETY: `read_blobs` fills every PAGE_SIZE frame whose slot
@@ -1257,10 +1884,10 @@ impl BufferManager {
             }
             self.note_full_blob_read(PinAccess::Scan);
             let guid = miss_guids[i];
-            if self.is_pending_delete(guid) {
-                continue;
-            }
-            out[miss_slots[i]] = Some(self.insert_owned_into_cache(guid, buf, PinAccess::Scan));
+            out[miss_slots[i]] = self
+                .insert_loaded_after_gc(guid, buf, PinAccess::Scan, gc_epoch)
+                .ok()
+                .flatten();
         }
         out
     }
@@ -1282,21 +1909,73 @@ impl BufferManager {
     }
 
     fn pin_with_access(&self, guid: BlobGuid, access: PinAccess) -> Result<Arc<CachedBlob>> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
+        loop {
+            if let Some(entry) = self.pin_resident_stable(guid, access)? {
+                return Ok(entry);
+            }
+            let gc_epoch = self.gc_stable_read_epoch();
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+            // SAFETY: a successful read_blob fills the full PAGE_SIZE frame
+            // before `scratch` is inserted into the cache or read.
+            let mut scratch = self.alloc_blob_buf_uninit();
+            let read = self.store.read_blob(guid, &mut scratch);
+            let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
+            if self.gc_raced_since(gc_epoch) {
+                continue;
+            }
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+            read?;
+            self.note_full_blob_read(access);
+            return Ok(self.insert_owned_into_cache(guid, scratch, access));
         }
-        if let Some(entry) = self.get_cached_with_access(guid, access) {
+    }
+
+    /// Return a resident Arc only after revalidating the physical-GC epoch
+    /// captured before the delete-fence check. Once cloned, the Arc itself
+    /// makes a later delete fail closed; the terminal epoch check covers a
+    /// delete that detached the map entry in the check-to-clone window.
+    fn pin_resident_stable(
+        &self,
+        guid: BlobGuid,
+        access: PinAccess,
+    ) -> Result<Option<Arc<CachedBlob>>> {
+        loop {
+            let gc_epoch = self.gc_stable_read_epoch();
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+            #[cfg(test)]
+            pause_resident_pin_after_fence_check();
+            let entry = self.get_cached_with_access(guid, access);
+            if self.gc_raced_since(gc_epoch) {
+                continue;
+            }
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
             return Ok(entry);
         }
-        // SAFETY: read_blob fills the full PAGE_SIZE frame before
-        // `scratch` is inserted into the cache or read.
-        let mut scratch = self.alloc_blob_buf_uninit();
-        self.store.read_blob(guid, &mut scratch)?;
-        self.note_full_blob_read(access);
+    }
+
+    fn insert_loaded_after_gc(
+        &self,
+        guid: BlobGuid,
+        contents: AlignedBlobBuf,
+        access: PinAccess,
+        captured_gc_epoch: u64,
+    ) -> Result<Option<Arc<CachedBlob>>> {
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
+        if self.gc_raced_since(captured_gc_epoch) {
+            return Ok(None);
+        }
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        Ok(self.insert_owned_into_cache(guid, scratch, access))
+        Ok(Some(self.insert_owned_into_cache(guid, contents, access)))
     }
 
     /// Whether `guid` may be served by a cold, page-granular read
@@ -1327,7 +2006,21 @@ impl BufferManager {
         byte_offset: u64,
         dst: &mut [u8],
     ) -> Result<()> {
-        self.store.read_blob_range(guid, byte_offset, dst)
+        loop {
+            let gc_epoch = self.gc_stable_read_epoch();
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+            let read = self.store.read_blob_range(guid, byte_offset, dst);
+            let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
+            if self.gc_raced_since(gc_epoch) {
+                continue;
+            }
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+            return read;
+        }
     }
 
     /// Fill `dst` with a cached 4 KiB indexed-read page. The caller must
@@ -1740,32 +2433,40 @@ impl BufferManager {
     /// [`Self::snapshot_dirty`].
     pub fn mark_dirty(&self, guid: BlobGuid, seq: u64) {
         let cached = self.get_cached_with_access(guid, PinAccess::Silent);
-        self.mark_dirty_with_hint(guid, seq, cached.as_deref());
+        if self.mark_dirty_with_hint(guid, seq, cached.as_deref()) {
+            self.publish_parent_orphans(guid);
+        }
     }
 
     /// Same contract as [`Self::mark_dirty`], but the caller
     /// already holds the cached blob pin from the walker descent.
     /// This avoids a second DashMap lookup on the mutation hot path.
     pub(crate) fn mark_dirty_cached(&self, guid: BlobGuid, seq: u64, entry: &CachedBlob) {
-        self.mark_dirty_with_hint(guid, seq, Some(entry));
+        if self.mark_dirty_with_hint(guid, seq, Some(entry)) {
+            self.publish_parent_orphans(guid);
+        }
     }
 
-    fn mark_dirty_with_hint(&self, guid: BlobGuid, seq: u64, cached: Option<&CachedBlob>) {
+    fn mark_dirty_with_hint(&self, guid: BlobGuid, seq: u64, cached: Option<&CachedBlob>) -> bool {
         let Some(cached) = cached else {
             // No dirty entry without the newer cache image: that
             // would violate I1 and make checkpoint unable to
             // snapshot the bytes it is asked to flush.
-            return;
+            return false;
         };
         self.invalidate_indexed_reads(guid);
         let hint_covers_seq = !cached.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        if state.has_delete_fence(&guid) {
+        // Logical unlink owns visibility and discards late writes. A
+        // transient physical-GC fence is different: GC may defer because
+        // this writer still pins the frame, so its acknowledged bytes must
+        // remain dirty for the next checkpoint.
+        if state.has_logical_delete_fence(&guid) {
             cached.clear_dirty_hint();
-            return;
+            return false;
         }
         if hint_covers_seq && matches!(state.dirty.get(&guid), Some(cur) if *cur <= seq) {
-            return;
+            return true;
         }
         if hint_covers_seq {
             cached.clear_dirty_hint();
@@ -1776,6 +2477,7 @@ impl BufferManager {
             .entry(guid)
             .and_modify(|cur| *cur = (*cur).min(seq))
             .or_insert(seq);
+        true
     }
 
     /// Drain the current dirty entries from every bookkeeping shard,
@@ -1793,24 +2495,40 @@ impl BufferManager {
     pub fn snapshot_dirty(&self) -> HashMap<BlobGuid, u64> {
         let mut out = HashMap::new();
         for shard in &self.mutation {
-            let mut state = shard.lock().unwrap();
-            for (guid, seq) in &mut state.dirty {
-                if let Some(hinted_seq) = self
-                    .get_cached_with_access(*guid, PinAccess::Silent)
-                    .and_then(|entry| entry.take_dirty_hint())
-                {
-                    *seq = (*seq).min(hinted_seq);
+            let (claimed, logically_deleted) = {
+                let mut state = shard.lock().unwrap();
+                let snap = std::mem::take(&mut state.dirty);
+                let mut claimed = Vec::new();
+                let mut logically_deleted = Vec::new();
+                for (guid, seq) in snap {
+                    if state.has_logical_delete_fence(&guid) {
+                        logically_deleted.push(guid);
+                    } else if state.gc_deleting.contains(&guid) {
+                        // Transient physical GC may still defer on a pin.
+                        // Keep the row in `dirty` and out of flushing.
+                        state.dirty.insert(guid, seq);
+                    } else {
+                        state.add_flushing(guid);
+                        claimed.push((guid, seq));
+                    }
+                }
+                (claimed, logically_deleted)
+            };
+
+            // Never hold a mutation shard while touching DashMap: eviction
+            // and GC remove cache→mutation, so the inverse order deadlocks.
+            for guid in logically_deleted {
+                if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
+                    entry.clear_dirty_hint();
                 }
             }
-            let snap = std::mem::take(&mut state.dirty);
-            for (guid, seq) in snap {
-                if state.has_delete_fence(&guid) {
-                    if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
-                        entry.clear_dirty_hint();
-                    }
-                    continue;
+            for (guid, mut seq) in claimed {
+                if let Some(hinted_seq) = self
+                    .get_cached_with_access(guid, PinAccess::Silent)
+                    .and_then(|entry| entry.take_dirty_hint())
+                {
+                    seq = seq.min(hinted_seq);
                 }
-                state.add_flushing(guid);
                 out.insert(guid, seq);
             }
         }
@@ -1858,7 +2576,7 @@ impl BufferManager {
                 let _ = entry.dirty_hint_needs_map_publish(t);
             }
             let mut state = self.mutation_shard(guid).lock().unwrap();
-            if state.has_delete_fence(&guid) {
+            if state.has_logical_delete_fence(&guid) {
                 if let Some(entry) = cached {
                     entry.clear_dirty_hint();
                 }
@@ -1917,9 +2635,15 @@ impl BufferManager {
     ///
     /// The checkpoint round drains this set after Sync. User WAL
     /// deletes remove the blob from the store manifest and then
-    /// re-Sync; `STRUCTURAL_SEQ` deletes only retire the fence and
-    /// leave the old blob as an orphan for a future reachability GC.
+    /// re-Sync. `STRUCTURAL_SEQ` never enters this visibility fence:
+    /// a copied snapshot root may still lazily load the detached child.
+    /// Structural children instead wait in snapshot-protected orphan
+    /// state and become exact reclaim candidates at a clean frontier.
     pub fn mark_for_delete(&self, guid: BlobGuid, seq: u64) {
+        assert_ne!(
+            seq, STRUCTURAL_SEQ,
+            "STRUCTURAL_SEQ requires parent-scoped stage_structural_reclaim"
+        );
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if let Some(seq_ref) = state.deleting.get_mut(&guid) {
             *seq_ref = (*seq_ref).min(seq);
@@ -1992,7 +2716,11 @@ impl BufferManager {
         for (g, t) in entries {
             let mut state = self.mutation_shard(g).lock().unwrap();
             let mut seq = t;
-            let had_fence = state.has_delete_fence(&g);
+            // `delete_fence_total` counts the transient GC fence and the
+            // logical pending/deleting fence independently. Restoring a
+            // logical row while GC owns the same GUID must therefore add one;
+            // only an existing logical row suppresses the increment.
+            let had_logical_fence = state.has_logical_delete_fence(&g);
             if let Some(claimed) = state.deleting.remove(&g) {
                 seq = seq.min(claimed);
             }
@@ -2003,7 +2731,7 @@ impl BufferManager {
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(seq);
-                    if !had_fence {
+                    if !had_logical_fence {
                         self.delete_fence_total.fetch_add(1, Ordering::AcqRel);
                     }
                 }
@@ -2085,13 +2813,17 @@ impl BufferManager {
         self.merge_candidate_total.load(Ordering::Relaxed)
     }
 
-    /// Execute a queued delete fence. User WAL deletes mutate the
-    /// inner store manifest; `STRUCTURAL_SEQ` deletes only retire
-    /// the fence because structural merge/compact has no logical
-    /// WAL record proving that no durable parent still references
-    /// the child. Returns `Ok(false)` when the blob still has
-    /// dirty/flushing state and the caller should requeue it.
+    /// Execute a queued user-delete fence. Structural orphans must never enter
+    /// this queue: they use parent-scoped staging so a child cannot become
+    /// reclaimable before its rewritten parent is published dirty. Returns
+    /// `Ok(false)` when the blob still has dirty/flushing state and the caller
+    /// should requeue it.
     pub(crate) fn execute_pending_delete(&self, guid: BlobGuid, seq: u64) -> Result<bool> {
+        if seq == STRUCTURAL_SEQ {
+            return Err(Error::Internal(
+                "STRUCTURAL_SEQ bypassed parent-scoped staging",
+            ));
+        }
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected(&guid) {
@@ -2109,9 +2841,7 @@ impl BufferManager {
         } else if self.cache.contains_key(&guid) {
             return Ok(false);
         }
-        if seq != STRUCTURAL_SEQ {
-            self.store.delete_blob(guid)?;
-        }
+        self.store.delete_blob(guid)?;
         self.route_resident.remove(guid);
         self.finish_pending_delete(guid);
         self.remove_read_index_token_if_unreachable(guid);
@@ -2134,6 +2864,13 @@ impl BufferManager {
     /// memory.
     pub(crate) fn store_has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.store.has_blob(guid)
+    }
+
+    /// Snapshot the GUIDs known by the inner store, bypassing cache-only WAL
+    /// replay state. DB open uses this only to distinguish a truly fresh
+    /// store from a corrupted existing store whose catalog root is missing.
+    pub(crate) fn store_blob_guids(&self) -> Result<Vec<BlobGuid>> {
+        self.store.list_blobs()
     }
 
     /// `true` iff `guid` is visible in the store and the store does
@@ -2161,25 +2898,6 @@ impl BufferManager {
     pub(crate) fn has_unflushed_blob(&self, guid: BlobGuid) -> bool {
         let state = self.mutation_shard(guid).lock().unwrap();
         state.dirty.contains_key(&guid) || state.flushing.contains_key(&guid)
-    }
-
-    /// Snapshot the cached bytes for `guid` into a freshly allocated
-    /// `AlignedBlobBuf`. Returns `None` if the blob isn't cached.
-    ///
-    /// Used by the background checkpointer to hand off bytes to
-    /// the I/O worker thread without keeping the shared read guard
-    /// open across the actual `store.write_blob` call. The read
-    /// guard is held only for the duration of the 512 KB memcpy, so
-    /// writers don't block on long-running (especially io_uring)
-    /// I/O.
-    pub(crate) fn snapshot_bytes(&self, guid: BlobGuid) -> Option<AlignedBlobBuf> {
-        let entry = self.get_cached_with_access(guid, PinAccess::Silent)?;
-        let buf = entry.read();
-        // SAFETY: copy_from_slice below writes the full PAGE_SIZE
-        // frame before `out` is returned.
-        let mut out = self.alloc_blob_buf_uninit();
-        out.as_mut_slice().copy_from_slice(buf.as_slice());
-        Some(out)
     }
 
     /// Clone cached bytes only when the blob still has the
@@ -2256,8 +2974,9 @@ impl BufferManager {
         }
         for idx in write_indices {
             let entry = &entries[idx];
-            self.retire_write_through(entry.guid, entry.expected_seq);
-            statuses[idx] = WriteThroughStatus::Written;
+            if self.retire_write_through(entry.guid, entry.expected_seq, entry.content_version)? {
+                statuses[idx] = WriteThroughStatus::Written;
+            }
         }
         Ok(WriteThroughBatchReport { statuses })
     }
@@ -2274,8 +2993,30 @@ impl BufferManager {
         Ok(cached.validate_content_version(version))
     }
 
-    fn retire_write_through(&self, guid: BlobGuid, expected_seq: u64) {
+    fn retire_write_through(
+        &self,
+        guid: BlobGuid,
+        expected_seq: u64,
+        content_version: Option<u64>,
+    ) -> Result<bool> {
+        let cached =
+            if content_version.is_some() {
+                Some(self.get_cached_with_access(guid, PinAccess::Silent).ok_or(
+                    Error::Internal("retire_write_through: flushing entry lost cache image"),
+                )?)
+            } else {
+                None
+            };
         let mut state = self.mutation_shard(guid).lock().unwrap();
+        // Revalidate while serializing with dirty publication. The first
+        // check happens before store I/O; a writer can still update the
+        // cached frame and publish a lower WAL seq in that I/O window. Such
+        // bytes were not written by this batch and must remain dirty.
+        if let (Some(expected), Some(cached)) = (content_version, cached.as_ref()) {
+            if !cached.validate_content_version(expected) {
+                return Ok(false);
+            }
+        }
         if expected_seq != STRUCTURAL_SEQ {
             if let std::collections::hash_map::Entry::Occupied(e) = state.dirty.entry(guid) {
                 // Only retire the entry when no racing writer has
@@ -2296,6 +3037,7 @@ impl BufferManager {
                 entry.clear_dirty_hint();
             }
         }
+        Ok(true)
     }
 
     fn try_publish_read_index(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) {
@@ -2328,6 +3070,169 @@ impl BufferManager {
     /// phases.
     pub(crate) fn flush_inner(&self) -> Result<()> {
         self.store.flush()
+    }
+
+    /// Write one public `BlobStore` image through to the inner store while
+    /// preserving the cache's authoritative image on failure.
+    ///
+    /// The caller owns `checkpoint_io`. A resident frame is pinned and write
+    /// latched before entering the physical-GC epoch: a walker may hold that
+    /// same frame latch while pinning a child, so taking the locks in the
+    /// opposite order would deadlock it behind the odd GC generation.
+    fn write_blob_through_locked(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+        loop {
+            let _stable = self.gc_stable_read_epoch();
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+
+            if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
+                // The Arc prevents reachability GC from reclaiming this frame
+                // while we wait for its writer latch.
+                let mut cached = entry.write();
+                let captured_version = entry.content_version();
+                let _epoch = self.begin_gc_epoch();
+                if self.is_pending_delete(guid) {
+                    return Err(Self::pending_delete_not_found(guid));
+                }
+                self.invalidate_indexed_reads(guid);
+                self.store.write_blob(guid, src)?;
+
+                // No other cache writer can change the frame while the latch
+                // is held. Update it only after store success so a failed
+                // write never exposes bytes that did not reach the store.
+                debug_assert_eq!(entry.content_version(), captured_version);
+                cached.as_mut_slice().copy_from_slice(src.as_slice());
+                entry.clear_dirty_hint();
+                let mut state = self.mutation_shard(guid).lock().unwrap();
+                state.remove_unclaimed_dirty(&guid);
+                let removed = state.remove_maintenance_candidates(&guid);
+                drop(state);
+                self.decrement_candidate_totals(removed);
+                return Ok(());
+            }
+
+            // A cold reader can install the blob between the miss above and
+            // this epoch. Recheck under `physical_gc`; if it won that race,
+            // release the epoch and take its frame latch in the next attempt.
+            let _epoch = self.begin_gc_epoch();
+            if self.cache.contains_key(&guid) {
+                continue;
+            }
+            if self.is_pending_delete(guid) {
+                return Err(Self::pending_delete_not_found(guid));
+            }
+            self.invalidate_indexed_reads(guid);
+            self.store.write_blob(guid, src)?;
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            state.remove_unclaimed_dirty(&guid);
+            let removed = state.remove_maintenance_candidates(&guid);
+            drop(state);
+            self.decrement_candidate_totals(removed);
+            return Ok(());
+        }
+    }
+
+    /// Delete one public `BlobStore` GUID through an odd physical-GC epoch.
+    /// The cached Arc is detached before inner I/O, closing the window where
+    /// a reader that passed its first fence check could clone a soon-deleted
+    /// resident entry. Failure reinstalls the same Arc before retiring the
+    /// epoch and restores every dirty seq published behind the transient
+    /// fence.
+    fn delete_blob_through_locked(&self, guid: BlobGuid) -> Result<()> {
+        let _epoch = self.begin_gc_epoch();
+        let claimed_dirty = {
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            if state.checkpoint_owned_or_pending(&guid) {
+                return Err(Error::Internal(
+                    "delete_blob: checkpoint or delete fence owns blob",
+                ));
+            }
+            // Claim unflushed debt atomically with the delete fence. A
+            // concurrent checkpoint planner now sees neither a dirty row it
+            // could discard because of the fence nor an unfenced row it could
+            // write after this delete. Failure restores this exact seq.
+            let claimed_dirty = state.dirty.remove(&guid);
+            state.gc_deleting.insert(guid);
+            self.delete_fence_total.fetch_add(1, Ordering::AcqRel);
+            claimed_dirty
+        };
+
+        let detached_entry = self
+            .cache
+            .remove_if(&guid, |_, entry| Arc::strong_count(entry) == 1);
+        let cache_claim_failed = detached_entry.is_none() && self.cache.contains_key(&guid);
+        let result = (|| {
+            if cache_claim_failed {
+                return Err(Error::Internal(
+                    "delete_blob: protected cache image cannot be evicted",
+                ));
+            }
+            self.invalidate_indexed_reads(guid);
+            self.store.delete_blob(guid)?;
+
+            if let Some((_, entry)) = &detached_entry {
+                entry.clear_dirty_hint();
+            }
+            self.route_resident.remove(guid);
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            state.remove_unclaimed_dirty(&guid);
+            let removed = state.remove_maintenance_candidates(&guid);
+            drop(state);
+            self.decrement_candidate_totals(removed);
+            Ok(())
+        })();
+
+        // Do not take the DashMap shard while holding the mutation shard.
+        // A logical delete may win this gap; the final mutation-shard check
+        // below detects that handoff and suppresses dirty resurrection.
+        let logical_delete_before_reinsert = if result.is_err() {
+            self.mutation_shard(guid)
+                .lock()
+                .unwrap()
+                .has_logical_delete_fence(&guid)
+        } else {
+            false
+        };
+        if result.is_err() && !logical_delete_before_reinsert {
+            if let Some((_, entry)) = &detached_entry {
+                self.cache.entry(guid).or_insert_with(|| Arc::clone(entry));
+            }
+        }
+        let claimed_entry = if result.is_err() {
+            detached_entry
+                .as_ref()
+                .map(|(_, entry)| Arc::clone(entry))
+                .or_else(|| self.get_cached_with_access(guid, PinAccess::Silent))
+        } else {
+            None
+        };
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        if state.gc_deleting.remove(&guid) {
+            self.delete_fence_total.fetch_sub(1, Ordering::AcqRel);
+        }
+        let logical_delete_owned = state.has_logical_delete_fence(&guid);
+        if result.is_err() {
+            if let (Some(seq), false) = (claimed_dirty, logical_delete_owned) {
+                if let Some(entry) = &claimed_entry {
+                    let _ = entry.dirty_hint_needs_map_publish(seq);
+                }
+                state
+                    .dirty
+                    .entry(guid)
+                    .and_modify(|current| *current = (*current).min(seq))
+                    .or_insert(seq);
+            } else if logical_delete_owned {
+                if let Some(entry) = &claimed_entry {
+                    entry.clear_dirty_hint();
+                }
+            }
+        }
+        drop(state);
+        if result.is_ok() {
+            self.remove_read_index_token_if_unreachable(guid);
+        }
+        result
     }
 
     /// Stage a freshly-created blob in cache and tag it dirty at
@@ -2386,125 +3291,140 @@ impl BufferManager {
 
 impl BlobStore for BufferManager {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        // Cache hit?
-        if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Point) {
-            let buf = entry.read();
-            dst.as_mut_slice().copy_from_slice(buf.as_slice());
-            return Ok(());
-        }
-        // Cache miss — load from inner store and cache.
-        self.store.read_blob(guid, dst)?;
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        self.insert_into_cache(guid, dst);
+        // `pin` is the authoritative full-frame read path: a cold load is
+        // published only under a stable physical-GC generation, and the
+        // returned strong reference keeps GC from reclaiming the frame while
+        // its bytes are copied to the caller.
+        let pin = self.pin(guid)?;
+        let bytes = pin.read();
+        dst.as_mut_slice().copy_from_slice(bytes.as_slice());
         Ok(())
     }
 
     fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        self.store.read_blob_range(guid, byte_offset, dst)
+        // Public BlobStore reads must observe a newer dirty cache image. The
+        // inherent range helper is intentionally a cold-store fast path used
+        // only after indexed-read eligibility has ruled that case out.
+        let pin = self.pin(guid)?;
+        let bytes = pin.read();
+        let start = usize::try_from(byte_offset).map_err(|_| {
+            Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "blob range offset exceeds addressable memory",
+            ))
+        })?;
+        let end = start.checked_add(dst.len()).ok_or_else(|| {
+            Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "blob range end overflow",
+            ))
+        })?;
+        let src = bytes.as_slice().get(start..end).ok_or_else(|| {
+            Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "blob range exceeds frame",
+            ))
+        })?;
+        dst.copy_from_slice(src);
+        Ok(())
     }
 
     fn read_index_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<bool> {
-        self.store.read_index_range(guid, byte_offset, dst)
+        loop {
+            let gc_epoch = self.gc_stable_read_epoch();
+            if !self.read_index_eligible(guid, ReadIndexPolicy::PointRead) {
+                return Ok(false);
+            }
+            let read = self.store.read_index_range(guid, byte_offset, dst);
+            let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
+            if self.gc_raced_since(gc_epoch) {
+                continue;
+            }
+            if !self.read_index_eligible(guid, ReadIndexPolicy::PointRead) {
+                return Ok(false);
+            }
+            return read;
+        }
+    }
+
+    fn read_value_segment_range(
+        &self,
+        guid: BlobGuid,
+        byte_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<bool> {
+        loop {
+            let gc_epoch = self.gc_stable_read_epoch();
+            if !self.read_index_eligible(guid, ReadIndexPolicy::PointRead) {
+                return Ok(false);
+            }
+            let read = self.store.read_value_segment_range(guid, byte_offset, dst);
+            let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
+            if self.gc_raced_since(gc_epoch) {
+                continue;
+            }
+            if !self.read_index_eligible(guid, ReadIndexPolicy::PointRead) {
+                return Ok(false);
+            }
+            return read;
+        }
     }
 
     fn publish_read_index(&self, guid: BlobGuid, bytes: &[u8], values: &[u8]) -> Result<()> {
+        let _checkpoint_io = self.enter_checkpoint_io();
+        let _epoch = self.begin_gc_epoch();
+        if self.is_pending_delete(guid) {
+            return Err(Self::pending_delete_not_found(guid));
+        }
+        self.invalidate_indexed_reads(guid);
         self.store.publish_read_index(guid, bytes, values)
     }
 
     fn delete_read_index(&self, guid: BlobGuid) -> Result<()> {
+        let _checkpoint_io = self.enter_checkpoint_io();
+        let _epoch = self.begin_gc_epoch();
         self.invalidate_indexed_reads(guid);
         self.store.delete_read_index(guid)
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        self.invalidate_indexed_reads(guid);
-        // Transparent write-through: if cached, refresh the
-        // cached image; either way, always write to the inner
-        // store in the same call so durability is unchanged.
-        if let Some(entry) = self.get_cached_with_access(guid, PinAccess::Silent) {
-            let mut buf = entry.write();
-            buf.as_mut_slice().copy_from_slice(src.as_slice());
-            entry.clear_dirty_hint();
-        }
-        self.store.write_blob(guid, src)?;
-        // BlobStore now holds these exact bytes; any pending dirty
-        // entry for this blob is satisfied. Subsequent writes via
-        // the pin/write-guard path will re-mark it.
-        let mut state = self.mutation_shard(guid).lock().unwrap();
-        state.remove_unclaimed_dirty(&guid);
-        let removed = state.remove_maintenance_candidates(&guid);
-        drop(state);
-        self.decrement_candidate_totals(removed);
-        Ok(())
+        let _checkpoint_io = self.enter_checkpoint_io();
+        self.write_blob_through_locked(guid, src)
     }
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
-        for (guid, _) in writes {
-            if self.is_pending_delete(*guid) {
-                return Err(Self::pending_delete_not_found(*guid));
-            }
-        }
-        for (guid, _) in writes {
-            self.invalidate_indexed_reads(*guid);
-        }
+        let _checkpoint_io = self.enter_checkpoint_io();
+        // Preserve the trait's arbitrary-prefix failure contract while
+        // keeping each successful prefix entry's cache identical to store.
         for (guid, src) in writes {
-            if let Some(entry) = self.get_cached_with_access(*guid, PinAccess::Silent) {
-                let mut buf = entry.write();
-                buf.as_mut_slice().copy_from_slice(src.as_slice());
-                entry.clear_dirty_hint();
-            }
-        }
-        self.store.write_blobs(writes)?;
-        for (guid, _) in writes {
-            let mut state = self.mutation_shard(*guid).lock().unwrap();
-            state.remove_unclaimed_dirty(guid);
-            let removed = state.remove_maintenance_candidates(guid);
-            drop(state);
-            self.decrement_candidate_totals(removed);
+            self.write_blob_through_locked(*guid, src)?;
         }
         Ok(())
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
-        if self.is_pending_delete(guid) {
-            return Err(Self::pending_delete_not_found(guid));
-        }
-        self.invalidate_indexed_reads(guid);
-        if !self.evict_from_cache(guid) {
-            return Err(Error::Internal(
-                "delete_blob: protected cache image cannot be evicted",
-            ));
-        }
-        self.store.delete_blob(guid)?;
-        self.remove_read_index_token_if_unreachable(guid);
-        Ok(())
+        let _checkpoint_io = self.enter_checkpoint_io();
+        self.delete_blob_through_locked(guid)
     }
 
     fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
         self.store.list_blobs()
     }
 
     fn flush(&self) -> Result<()> {
-        // Write-through mode: nothing pending in cache.
+        let _checkpoint_io = self.enter_checkpoint_io();
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
         self.store.flush()
     }
 
     fn needs_flush(&self) -> bool {
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
         self.store.needs_flush()
     }
 
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
         if self.is_pending_delete(guid) {
             return Ok(false);
         }
@@ -2517,10 +3437,13 @@ impl BlobStore for BufferManager {
     }
 
     fn store_stats(&self) -> StoreStats {
+        let _gc = self.physical_gc.lock().expect("physical GC lock poisoned");
         self.store.store_stats()
     }
 
     fn vacuum(&self) -> Result<VacuumStats> {
+        let _checkpoint_io = self.enter_checkpoint_io();
+        let _epoch = self.begin_gc_epoch();
         self.store.vacuum()
     }
 }
@@ -2531,11 +3454,43 @@ mod tests {
     use crate::store::blob_store::{FileBlobStore, MemoryBlobStore};
     use crate::store::{BlobFrame, PAGE_4K};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Barrier;
 
     fn make_buf(byte_at_100: u8) -> AlignedBlobBuf {
         let mut b = AlignedBlobBuf::zeroed();
         b.as_mut_slice()[100] = byte_at_100;
         b
+    }
+
+    fn snapshot_current_bytes(bm: &BufferManager, guid: BlobGuid) -> AlignedBlobBuf {
+        let pin = bm.pin(guid).expect("test blob must be pinnable");
+        bm.snapshot_bytes_if_version(guid, pin.content_version())
+            .expect("test snapshot must keep its cache image")
+            .expect("test snapshot version must stay current")
+    }
+
+    fn persist_all_dirty_for_test(bm: &BufferManager) {
+        let dirty = bm.snapshot_dirty();
+        let versioned = bm.snapshot_dirty_versions(&dirty).unwrap();
+        let entries: Vec<_> = versioned
+            .into_iter()
+            .map(|snapshot| WriteThroughEntry {
+                guid: snapshot.guid,
+                bytes: bm
+                    .snapshot_bytes_if_version(snapshot.guid, snapshot.content_version)
+                    .unwrap()
+                    .unwrap(),
+                expected_seq: snapshot.expected_seq,
+                content_version: Some(snapshot.content_version),
+            })
+            .collect();
+        let _checkpoint_io = bm.enter_checkpoint_io();
+        let report = bm.write_through_batch(&entries).unwrap();
+        assert!(report
+            .statuses
+            .iter()
+            .all(|status| *status == WriteThroughStatus::Written),);
+        bm.flush_inner().unwrap();
     }
 
     struct FlushPendingStore {
@@ -2593,6 +3548,966 @@ mod tests {
         fn needs_flush(&self) -> bool {
             self.pending.load(Ordering::Acquire) || self.inner.needs_flush()
         }
+    }
+
+    struct BlockingReadStore {
+        inner: MemoryBlobStore,
+        block_once: AtomicBool,
+        entered: Barrier,
+        release: Barrier,
+    }
+
+    impl BlockingReadStore {
+        fn new(inner: MemoryBlobStore) -> Self {
+            Self {
+                inner,
+                block_once: AtomicBool::new(true),
+                entered: Barrier::new(2),
+                release: Barrier::new(2),
+            }
+        }
+    }
+
+    struct BlockingWriteStore {
+        inner: MemoryBlobStore,
+        block_once: AtomicBool,
+        entered: Barrier,
+        release: Barrier,
+    }
+
+    impl BlockingWriteStore {
+        fn new(inner: MemoryBlobStore) -> Self {
+            Self {
+                inner,
+                block_once: AtomicBool::new(true),
+                entered: Barrier::new(2),
+                release: Barrier::new(2),
+            }
+        }
+    }
+
+    impl BlobStore for BlockingWriteStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            self.inner.write_blobs(writes)?;
+            self.inner.flush()
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    impl BlobStore for BlockingReadStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)?;
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(())
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+    }
+
+    struct BlockingTraitWriteStore {
+        inner: MemoryBlobStore,
+        block_once: AtomicBool,
+        entered: Barrier,
+        release: Barrier,
+    }
+
+    impl BlockingTraitWriteStore {
+        fn new(inner: MemoryBlobStore) -> Self {
+            Self {
+                inner,
+                block_once: AtomicBool::new(true),
+                entered: Barrier::new(2),
+                release: Barrier::new(2),
+            }
+        }
+    }
+
+    impl BlobStore for BlockingTraitWriteStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    struct FailingMutationStore {
+        inner: MemoryBlobStore,
+        fail_writes: AtomicBool,
+        fail_deletes: AtomicBool,
+        block_delete_once: AtomicBool,
+        delete_entered: Barrier,
+        delete_release: Barrier,
+    }
+
+    impl FailingMutationStore {
+        fn new(inner: MemoryBlobStore) -> Self {
+            Self {
+                inner,
+                fail_writes: AtomicBool::new(false),
+                fail_deletes: AtomicBool::new(false),
+                block_delete_once: AtomicBool::new(false),
+                delete_entered: Barrier::new(2),
+                delete_release: Barrier::new(2),
+            }
+        }
+    }
+
+    impl BlobStore for FailingMutationStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            if self.fail_writes.load(Ordering::Acquire) {
+                return Err(Error::BlobStoreIo(std::io::Error::other(
+                    "injected write failure",
+                )));
+            }
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            if self.block_delete_once.swap(false, Ordering::AcqRel) {
+                self.delete_entered.wait();
+                self.delete_release.wait();
+            }
+            if self.fail_deletes.load(Ordering::Acquire) {
+                return Err(Error::BlobStoreIo(std::io::Error::other(
+                    "injected delete failure",
+                )));
+            }
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    struct FailNthWriteStore {
+        inner: MemoryBlobStore,
+        fail_on: usize,
+        writes: AtomicUsize,
+    }
+
+    struct FailAfterDeleteStore {
+        inner: MemoryBlobStore,
+        fail_once: AtomicBool,
+    }
+
+    impl FailAfterDeleteStore {
+        fn new(inner: MemoryBlobStore) -> Self {
+            Self {
+                inner,
+                fail_once: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl BlobStore for FailAfterDeleteStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)?;
+            if self.fail_once.swap(false, Ordering::AcqRel) {
+                return Err(Error::BlobStoreIo(std::io::Error::other(
+                    "injected post-delete failure",
+                )));
+            }
+            Ok(())
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    impl FailNthWriteStore {
+        fn new(inner: MemoryBlobStore, fail_on: usize) -> Self {
+            Self {
+                inner,
+                fail_on,
+                writes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlobStore for FailNthWriteStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            let ordinal = self.writes.fetch_add(1, Ordering::AcqRel) + 1;
+            if ordinal == self.fail_on {
+                return Err(Error::BlobStoreIo(std::io::Error::other(
+                    "injected batch-prefix failure",
+                )));
+            }
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    #[test]
+    fn cold_pin_does_not_reinsert_blob_after_gc_fence_retires() {
+        let guid = [0xA1; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let store = Arc::new(BlockingReadStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+
+        let reader_bm = Arc::clone(&bm);
+        let reader = std::thread::spawn(move || reader_bm.pin(guid));
+        store.entered.wait();
+
+        let outcome = bm
+            .gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+            .unwrap();
+        assert_eq!(outcome.freed, 1);
+        assert!(outcome.complete);
+        store.release.wait();
+
+        assert!(reader.join().unwrap().is_err());
+        assert_eq!(bm.cached_count(), 0, "stale read must not create a zombie");
+        assert!(!store.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn cold_pin_retries_after_unrelated_gc_epoch_change() {
+        let target = [0xA6; 16];
+        let unreachable = [0xA7; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(target, &make_buf(7)).unwrap();
+        inner.write_blob(unreachable, &make_buf(8)).unwrap();
+        let store = Arc::new(BlockingReadStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+
+        let reader_bm = Arc::clone(&bm);
+        let reader = std::thread::spawn(move || reader_bm.pin(target));
+        store.entered.wait();
+
+        let reachable = HashSet::from([target]);
+        let outcome = bm
+            .gc_sweep_unreachable_bounded(&reachable, usize::MAX)
+            .unwrap();
+        assert_eq!(outcome.freed, 1);
+        assert!(outcome.complete);
+        store.release.wait();
+
+        let pin = reader
+            .join()
+            .unwrap()
+            .expect("unrelated GC must be retried inside the cold pin");
+        assert_eq!(pin.read().as_slice()[100], 7);
+        assert!(store.has_blob(target).unwrap());
+        assert!(!store.has_blob(unreachable).unwrap());
+    }
+
+    #[test]
+    fn trait_full_read_does_not_publish_gc_zombie() {
+        let guid = [0xB1; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let store = Arc::new(BlockingReadStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+
+        let reader_bm = Arc::clone(&bm);
+        let reader = std::thread::spawn(move || {
+            let mut dst = AlignedBlobBuf::zeroed();
+            BlobStore::read_blob(reader_bm.as_ref(), guid, &mut dst)
+        });
+        store.entered.wait();
+
+        let outcome = bm
+            .gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+            .unwrap();
+        assert_eq!(outcome.freed, 1);
+        store.release.wait();
+
+        assert!(reader.join().unwrap().is_err());
+        assert_eq!(bm.cached_count(), 0);
+        assert!(!store.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn trait_range_read_does_not_publish_gc_zombie() {
+        let guid = [0xB2; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let store = Arc::new(BlockingReadStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+
+        let reader_bm = Arc::clone(&bm);
+        let reader = std::thread::spawn(move || {
+            let mut dst = [0u8; 8];
+            BlobStore::read_blob_range(reader_bm.as_ref(), guid, 96, &mut dst)
+        });
+        store.entered.wait();
+
+        let outcome = bm
+            .gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+            .unwrap();
+        assert_eq!(outcome.freed, 1);
+        store.release.wait();
+
+        assert!(reader.join().unwrap().is_err());
+        assert_eq!(bm.cached_count(), 0);
+        assert!(!store.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn trait_range_read_observes_dirty_cache_image() {
+        let guid = [0xB3; 16];
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let pin = bm.pin(guid).unwrap();
+        {
+            let mut bytes = pin.write();
+            bytes.as_mut_slice()[100] = 9;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+
+        let mut dst = [0u8; 1];
+        BlobStore::read_blob_range(&bm, guid, 100, &mut dst).unwrap();
+        assert_eq!(dst, [9]);
+    }
+
+    #[test]
+    fn trait_write_serializes_with_gc_epoch() {
+        let guid = [0xB4; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(BlockingTraitWriteStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+        drop(bm.pin(guid).unwrap());
+
+        let writer_bm = Arc::clone(&bm);
+        let writer = std::thread::spawn(move || {
+            BlobStore::write_blob(writer_bm.as_ref(), guid, &make_buf(9))
+        });
+        store.entered.wait();
+
+        let gc_bm = Arc::clone(&bm);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let gc = std::thread::spawn(move || {
+            let result = gc_bm.gc_sweep_unreachable_bounded(&HashSet::from([guid]), usize::MAX);
+            done_tx.send(result).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "GC must wait while the public write owns its odd physical epoch",
+        );
+
+        store.release.wait();
+        writer.join().unwrap().unwrap();
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        gc.join().unwrap();
+        assert_eq!(outcome.freed, 0);
+
+        let mut stored = AlignedBlobBuf::zeroed();
+        store.read_blob(guid, &mut stored).unwrap();
+        assert_eq!(stored.as_slice()[100], 9);
+        assert_eq!(bm.pin(guid).unwrap().read().as_slice()[100], 9);
+    }
+
+    #[test]
+    fn trait_write_failure_preserves_cached_bytes_and_dirty_debt() {
+        let guid = [0xB5; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(FailingMutationStore::new(inner));
+        let bm = BufferManager::new(store.clone(), 4);
+        let pin = bm.pin(guid).unwrap();
+        {
+            let mut bytes = pin.write();
+            bytes.as_mut_slice()[100] = 7;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        drop(pin);
+        store.fail_writes.store(true, Ordering::Release);
+
+        assert!(BlobStore::write_blob(&bm, guid, &make_buf(9)).is_err());
+        assert_eq!(bm.pin(guid).unwrap().read().as_slice()[100], 7);
+        assert_eq!(bm.dirty_count(), 1);
+        let mut stored = AlignedBlobBuf::zeroed();
+        store.inner.read_blob(guid, &mut stored).unwrap();
+        assert_eq!(stored.as_slice()[100], 1);
+    }
+
+    #[test]
+    fn trait_delete_failure_restores_planner_hidden_dirty_and_reopens_latest_bytes() {
+        let guid = [0xB6; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(FailingMutationStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+        let pin = bm.pin(guid).unwrap();
+        {
+            let mut bytes = pin.write();
+            bytes.as_mut_slice()[100] = 7;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        drop(pin);
+        store.fail_deletes.store(true, Ordering::Release);
+        store.block_delete_once.store(true, Ordering::Release);
+
+        let delete_bm = Arc::clone(&bm);
+        let delete = std::thread::spawn(move || BlobStore::delete_blob(delete_bm.as_ref(), guid));
+        store.delete_entered.wait();
+
+        assert!(
+            bm.snapshot_dirty().is_empty(),
+            "the public delete must hide its claimed dirty row from a planner",
+        );
+        store.delete_release.wait();
+        assert!(delete.join().unwrap().is_err());
+
+        assert_eq!(bm.pin(guid).unwrap().read().as_slice()[100], 7);
+        assert_eq!(bm.dirty_count(), 1);
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert!(store.inner.has_blob(guid).unwrap());
+
+        persist_all_dirty_for_test(&bm);
+        drop(bm);
+
+        let store_dyn: Arc<dyn BlobStore> = store;
+        let reopened = BufferManager::new(store_dyn, 4);
+        assert_eq!(reopened.pin(guid).unwrap().read().as_slice()[100], 7);
+    }
+
+    #[test]
+    fn trait_delete_failure_defers_to_concurrent_logical_delete() {
+        let guid = [0xB9; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(FailingMutationStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+        let pin = bm.pin(guid).unwrap();
+        {
+            let mut bytes = pin.write();
+            bytes.as_mut_slice()[100] = 7;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        drop(pin);
+        store.fail_deletes.store(true, Ordering::Release);
+        store.block_delete_once.store(true, Ordering::Release);
+
+        let delete_bm = Arc::clone(&bm);
+        let delete = std::thread::spawn(move || BlobStore::delete_blob(delete_bm.as_ref(), guid));
+        store.delete_entered.wait();
+        bm.mark_for_delete(guid, 20);
+        assert_eq!(
+            bm.pending_delete_count(),
+            2,
+            "generic and logical delete fences must be counted independently",
+        );
+        store.delete_release.wait();
+        assert!(delete.join().unwrap().is_err());
+
+        assert_eq!(bm.dirty_count(), 0, "logical deletion owns the old bytes");
+        assert_eq!(bm.pending_delete_count(), 1);
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&20));
+        bm.restore_pending_deletes(pending);
+        assert_eq!(bm.pending_delete_count(), 1);
+        assert!(store.inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn restored_logical_delete_counts_independently_from_transient_gc() {
+        let guid = [0xBE; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(FailingMutationStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+        drop(bm.pin(guid).unwrap());
+        store.fail_deletes.store(true, Ordering::Release);
+        store.block_delete_once.store(true, Ordering::Release);
+
+        let delete_bm = Arc::clone(&bm);
+        let transient_delete =
+            std::thread::spawn(move || BlobStore::delete_blob(delete_bm.as_ref(), guid));
+        store.delete_entered.wait();
+        assert_eq!(bm.pending_delete_count(), 1);
+
+        // Model a failed trailing checkpoint sync restoring a logical row
+        // while an unrelated transient delete fence still owns this GUID.
+        bm.restore_pending_deletes(HashMap::from([(guid, 17)]));
+        assert_eq!(
+            bm.pending_delete_count(),
+            2,
+            "logical and transient fences require separate references",
+        );
+
+        store.delete_release.wait();
+        assert!(transient_delete.join().unwrap().is_err());
+        assert_eq!(bm.pending_delete_count(), 1);
+
+        let claimed = bm.snapshot_pending_deletes();
+        assert_eq!(claimed.get(&guid), Some(&17));
+        store.fail_deletes.store(false, Ordering::Release);
+        assert!(bm.execute_pending_delete(guid, 17).unwrap());
+        assert_eq!(bm.pending_delete_count(), 0);
+    }
+
+    #[test]
+    fn trait_delete_success_never_returns_detached_resident_pin() {
+        let guid = [0xBA; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(FailingMutationStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+        drop(bm.pin(guid).unwrap());
+
+        let pin_barrier = Arc::new(ResidentPinBarrier::new());
+        let reader_bm = Arc::clone(&bm);
+        let reader_barrier = Arc::clone(&pin_barrier);
+        let reader = std::thread::spawn(move || {
+            set_resident_pin_barrier_for_current_thread(reader_barrier);
+            reader_bm.pin(guid)
+        });
+        pin_barrier.entered.wait();
+
+        store.block_delete_once.store(true, Ordering::Release);
+        let delete_bm = Arc::clone(&bm);
+        let delete = std::thread::spawn(move || BlobStore::delete_blob(delete_bm.as_ref(), guid));
+        store.delete_entered.wait();
+        pin_barrier.release.wait();
+        store.delete_release.wait();
+
+        delete.join().unwrap().unwrap();
+        assert!(
+            reader.join().unwrap().is_err(),
+            "a reader that passed the first fence check must not return the detached Arc",
+        );
+        assert!(!store.inner.has_blob(guid).unwrap());
+        assert_eq!(bm.cached_count(), 0);
+    }
+
+    #[test]
+    fn trait_delete_failure_reinstalls_resident_before_reader_retry() {
+        let guid = [0xBB; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(3)).unwrap();
+        let store = Arc::new(FailingMutationStore::new(inner));
+        let bm = Arc::new(BufferManager::new(store.clone(), 4));
+        drop(bm.pin(guid).unwrap());
+
+        let pin_barrier = Arc::new(ResidentPinBarrier::new());
+        let reader_bm = Arc::clone(&bm);
+        let reader_barrier = Arc::clone(&pin_barrier);
+        let reader = std::thread::spawn(move || {
+            set_resident_pin_barrier_for_current_thread(reader_barrier);
+            reader_bm.pin(guid)
+        });
+        pin_barrier.entered.wait();
+
+        store.fail_deletes.store(true, Ordering::Release);
+        store.block_delete_once.store(true, Ordering::Release);
+        let delete_bm = Arc::clone(&bm);
+        let delete = std::thread::spawn(move || BlobStore::delete_blob(delete_bm.as_ref(), guid));
+        store.delete_entered.wait();
+        pin_barrier.release.wait();
+        store.delete_release.wait();
+
+        assert!(delete.join().unwrap().is_err());
+        let pin = reader
+            .join()
+            .unwrap()
+            .expect("failed delete must make the reinstated resident visible on retry");
+        assert_eq!(pin.read().as_slice()[100], 3);
+        assert!(store.inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn trait_delete_protected_writer_keeps_gc_fence_dirty_debt_through_reopen() {
+        let guid = [0xBC; 16];
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 4));
+        let pin = bm.pin(guid).unwrap();
+        {
+            let mut bytes = pin.write();
+            bytes.as_mut_slice()[100] = 7;
+        }
+
+        // Hold the cache shard so generic delete installs gc_deleting but
+        // cannot complete its atomic remove_if before this writer publishes.
+        let cache_ref = bm.cache.get(&guid).unwrap();
+        let delete_bm = Arc::clone(&bm);
+        let delete = std::thread::spawn(move || BlobStore::delete_blob(delete_bm.as_ref(), guid));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bm.pending_delete_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "delete fence timeout");
+            std::thread::yield_now();
+        }
+
+        bm.mark_dirty_cached(guid, 30, pin.as_ref());
+        assert!(
+            bm.snapshot_dirty().is_empty(),
+            "planner must leave transient-GC dirty rows in place",
+        );
+        assert_eq!(bm.dirty_count(), 1);
+        drop(cache_ref);
+        assert!(delete.join().unwrap().is_err());
+        drop(pin);
+
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(bm.dirty_count(), 1);
+        persist_all_dirty_for_test(&bm);
+        drop(bm);
+
+        let reopened = BufferManager::new(inner, 4);
+        assert_eq!(reopened.pin(guid).unwrap().read().as_slice()[100], 7);
+    }
+
+    #[test]
+    fn reachability_gc_protected_writer_keeps_dirty_debt_through_reopen() {
+        let guid = [0xBD; 16];
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 4));
+        let pin = bm.pin(guid).unwrap();
+
+        // Hold the cache shard while reachability GC publishes its transient
+        // fence. This gives the protected writer a deterministic window to
+        // update and publish dirty debt before remove_if observes its pin.
+        let cache_ref = bm.cache.get(&guid).unwrap();
+        let gc_bm = Arc::clone(&bm);
+        let gc = std::thread::spawn(move || {
+            gc_bm.gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bm.pending_delete_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "GC fence timeout");
+            std::thread::yield_now();
+        }
+
+        {
+            let mut bytes = pin.write();
+            bytes.as_mut_slice()[100] = 9;
+        }
+        bm.mark_dirty_cached(guid, 31, pin.as_ref());
+        assert!(
+            bm.snapshot_dirty().is_empty(),
+            "planner must not claim a writer protected by transient GC",
+        );
+        assert_eq!(bm.dirty_count(), 1);
+
+        drop(cache_ref);
+        let outcome = gc.join().unwrap().unwrap();
+        assert_eq!(outcome.freed, 0);
+        assert!(!outcome.complete);
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(bm.cached_count(), 1);
+        assert!(inner.has_blob(guid).unwrap());
+        assert_eq!(bm.dirty_count(), 1);
+
+        drop(pin);
+        persist_all_dirty_for_test(&bm);
+        drop(bm);
+
+        let reopened = BufferManager::new(inner, 4);
+        assert_eq!(reopened.pin(guid).unwrap().read().as_slice()[100], 9);
+    }
+
+    #[test]
+    fn trait_batch_write_keeps_successful_prefix_cache_store_consistent() {
+        let first = [0xB7; 16];
+        let second = [0xB8; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(first, &make_buf(1)).unwrap();
+        inner.write_blob(second, &make_buf(2)).unwrap();
+        let store = Arc::new(FailNthWriteStore::new(inner, 2));
+        let bm = BufferManager::new(store.clone(), 4);
+        drop(bm.pin(first).unwrap());
+        drop(bm.pin(second).unwrap());
+        let first_new = make_buf(7);
+        let second_new = make_buf(8);
+
+        assert!(
+            BlobStore::write_blobs(&bm, &[(first, &first_new), (second, &second_new)]).is_err()
+        );
+        assert_eq!(bm.pin(first).unwrap().read().as_slice()[100], 7);
+        assert_eq!(bm.pin(second).unwrap().read().as_slice()[100], 2);
+        let mut stored = AlignedBlobBuf::zeroed();
+        store.inner.read_blob(first, &mut stored).unwrap();
+        assert_eq!(stored.as_slice()[100], 7);
+        store.inner.read_blob(second, &mut stored).unwrap();
+        assert_eq!(stored.as_slice()[100], 2);
+    }
+
+    #[test]
+    fn concurrent_gc_passes_keep_generation_serial_and_even() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob([0xA2; 16], &make_buf(1)).unwrap();
+        inner.write_blob([0xA3; 16], &make_buf(2)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 4));
+        let start = Arc::new(Barrier::new(3));
+
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let bm = Arc::clone(&bm);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                bm.gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+                    .unwrap()
+                    .freed
+            }));
+        }
+        start.wait();
+        let total: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+
+        assert_eq!(total, 2);
+        assert_eq!(bm.gc_read_epoch(), 4);
+        assert_eq!(bm.gc_read_epoch() & 1, 0);
+        assert!(inner.list_blobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_gc_reports_incomplete_until_all_candidates_are_visited() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob([0xA8; 16], &make_buf(1)).unwrap();
+        inner.write_blob([0xA9; 16], &make_buf(2)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+
+        let first = bm.gc_sweep_unreachable_bounded(&HashSet::new(), 1).unwrap();
+        assert_eq!(first.freed, 1);
+        assert!(!first.complete);
+        assert_eq!(inner.list_blobs().unwrap().len(), 1);
+        assert_eq!(bm.stats().gc_last_full_sweep_deferred_count, 1);
+
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 0);
+        assert_eq!(
+            bm.stats().gc_last_full_sweep_deferred_count,
+            1,
+            "an empty exact-reclaim batch must not clear full-sweep debt",
+        );
+
+        let second = bm.gc_sweep_unreachable_bounded(&HashSet::new(), 1).unwrap();
+        assert_eq!(second.freed, 1);
+        assert!(second.complete);
+        assert!(inner.list_blobs().unwrap().is_empty());
+        assert_eq!(bm.stats().gc_last_full_sweep_deferred_count, 0);
+    }
+
+    #[test]
+    fn gc_releases_read_index_tokens_after_delete_fence_retires() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for suffix in 0..64u8 {
+            let mut guid = [0xAB; 16];
+            guid[15] = suffix;
+            inner.write_blob(guid, &make_buf(suffix)).unwrap();
+        }
+        let bm = BufferManager::new(inner.clone(), 8);
+
+        let outcome = bm
+            .gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+            .unwrap();
+        assert_eq!(outcome.freed, 64);
+        assert!(outcome.complete);
+        assert!(inner.list_blobs().unwrap().is_empty());
+        assert_eq!(
+            bm.read_index_tokens.len(),
+            0,
+            "successful GC must not retain per-GUID indexed-read tokens",
+        );
+    }
+
+    #[test]
+    fn gc_post_delete_error_still_releases_unreachable_index_token() {
+        let guid = [0xAC; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        let store = Arc::new(FailAfterDeleteStore::new(inner));
+        let bm = BufferManager::new(store.clone(), 4);
+        drop(bm.pin(guid).unwrap());
+        let token = bm.ensure_read_index_token(guid);
+        assert_eq!(bm.read_index_tokens.len(), 1);
+
+        assert!(bm
+            .gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+            .is_err());
+        assert!(!store.inner.has_blob(guid).unwrap());
+        assert_eq!(bm.cached_count(), 0);
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(bm.read_index_tokens.len(), 0);
+        assert!(!bm.read_index_token_valid(guid, token));
+
+        let retry = bm
+            .gc_sweep_unreachable_bounded(&HashSet::new(), usize::MAX)
+            .unwrap();
+        assert_eq!(retry.freed, 0);
+        assert!(retry.complete);
+    }
+
+    #[test]
+    fn deferred_fifo_skips_pinned_head_then_reclaims_later_candidates() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let pinned_guid = [0xA4; 16];
+        let free_guid = [0xA5; 16];
+        inner.write_blob(pinned_guid, &make_buf(1)).unwrap();
+        inner.write_blob(free_guid, &make_buf(2)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 4);
+        let pin = bm.pin(pinned_guid).unwrap();
+        bm.restore_retired_orphans([pinned_guid, free_guid]);
+
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 0);
+        assert_eq!(bm.gc_orphan_backlog_count(), 2);
+        assert_eq!(bm.stats().gc_last_full_sweep_deferred_count, 0);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 1);
+        assert!(!inner.has_blob(free_guid).unwrap());
+        assert!(inner.has_blob(pinned_guid).unwrap());
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert_eq!(
+            bm.stats().gc_last_full_sweep_deferred_count,
+            0,
+            "exact reclaim must not overwrite the full-sweep gauge",
+        );
+
+        drop(pin);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 1);
+        assert_eq!(bm.gc_orphan_backlog_count(), 0);
+        assert_eq!(bm.stats().gc_last_full_sweep_deferred_count, 0);
+        assert!(!inner.has_blob(pinned_guid).unwrap());
     }
 
     struct CountingReadIndexStore {
@@ -3160,12 +5075,9 @@ mod tests {
             "dirty bookkeeping must not be touched by eviction",
         );
 
-        // And snapshot_bytes(A) must still return Some — the
-        // invariant downstream checkpoint code relies on.
-        assert!(
-            bm.snapshot_bytes(g_a).is_some(),
-            "dirty entry's cache image must be snapshottable",
-        );
+        // And a versioned snapshot of A must still succeed — the invariant
+        // downstream checkpoint code relies on.
+        let _ = snapshot_current_bytes(&bm, g_a);
     }
 
     #[test]
@@ -3368,22 +5280,137 @@ mod tests {
     }
 
     #[test]
-    fn structural_pending_delete_retires_fence_without_manifest_delete() {
+    fn structural_detach_waits_for_parent_dirty_before_fifo() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let guid = [0x5B; 16];
+        let parent_guid = [0x5A; 16];
         inner.write_blob(guid, &make_buf(7)).unwrap();
+        inner.write_blob(parent_guid, &make_buf(8)).unwrap();
         let bm = BufferManager::new(inner.clone(), 4);
+        let parent = bm.pin(parent_guid).unwrap();
 
-        bm.mark_for_delete(guid, STRUCTURAL_SEQ);
-        let pending = bm.snapshot_pending_deletes();
-        assert_eq!(pending.get(&guid), Some(&STRUCTURAL_SEQ));
-        assert!(bm.execute_pending_delete(guid, STRUCTURAL_SEQ).unwrap());
-
+        bm.stage_structural_reclaim(parent_guid, guid);
         assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert_eq!(bm.orphan_staging_count(), 1);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 0);
+        bm.mark_dirty_cached(parent_guid, STRUCTURAL_SEQ, parent.as_ref());
+        assert_eq!(bm.orphan_staging_count(), 0);
         assert!(
             inner.has_blob(guid).unwrap(),
-            "structural orphan cleanup must not mutate the store manifest"
+            "structural detach must not unlink before parent dirty publication"
         );
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 1);
+        assert_eq!(bm.gc_orphan_backlog_count(), 0);
+        assert!(!inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn structural_orphan_stays_visible_until_last_snapshot_lease_retires() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x5D; 16];
+        let root_guid = [0x5E; 16];
+        inner.write_blob(guid, &make_buf(7)).unwrap();
+        inner.write_blob(root_guid, &make_buf(8)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 4));
+        let root_pin = bm.pin(root_guid).unwrap();
+        let epoch = bm.register_snapshot(root_guid, &root_pin).unwrap();
+
+        bm.stage_structural_reclaim(root_guid, guid);
+        bm.mark_dirty_cached(root_guid, STRUCTURAL_SEQ, root_pin.as_ref());
+        assert_eq!(bm.pending_delete_count(), 0);
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert_eq!(bm.orphan_staging_count(), 0);
+        assert_eq!(
+            bm.pin(guid).unwrap().read().as_slice()[100],
+            7,
+            "structural detach must not fence a snapshot's first lazy child pin"
+        );
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 0);
+        assert!(inner.has_blob(guid).unwrap());
+
+        bm.retire_snapshot(epoch);
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 1);
+        assert!(!inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn snapshot_epoch_exhaustion_never_wraps_or_mutates_live_registry() {
+        let root_guid = [0x63; 16];
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob(root_guid, &make_buf(1)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner, 4));
+        let root = bm.pin(root_guid).unwrap();
+        bm.set_current_epoch(u64::MAX - 2);
+
+        let epoch = bm.register_snapshot(root_guid, &root).unwrap();
+        assert_eq!(epoch, u64::MAX - 2);
+        assert_eq!(bm.current_epoch(), u64::MAX - 1);
+        assert_eq!(bm.fork_barrier(), u64::MAX - 2);
+        assert_eq!(bm.snapshots.lock().unwrap().live.len(), 1);
+        let cached_before = bm.cached_count();
+        let dirty_before = bm.dirty_count();
+
+        let error = bm.register_snapshot(root_guid, &root).unwrap_err();
+        assert!(matches!(error, Error::SnapshotEpochExhausted));
+        assert_eq!(bm.current_epoch(), u64::MAX - 1);
+        assert_eq!(bm.fork_barrier(), u64::MAX - 2);
+        assert_eq!(bm.snapshots.lock().unwrap().live.len(), 1);
+        assert_eq!(bm.cached_count(), cached_before);
+        assert_eq!(bm.dirty_count(), dirty_before);
+
+        bm.retire_snapshot(epoch);
+        assert_eq!(bm.fork_barrier(), 0);
+        assert_eq!(bm.current_epoch(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn structural_last_lease_drop_before_parent_dirty_stays_staged() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let child_guid = [0x5F; 16];
+        let parent_guid = [0x60; 16];
+        inner.write_blob(child_guid, &make_buf(7)).unwrap();
+        inner.write_blob(parent_guid, &make_buf(8)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 4));
+        let parent = bm.pin(parent_guid).unwrap();
+        let epoch = bm.register_snapshot(parent_guid, &parent).unwrap();
+
+        bm.stage_structural_reclaim(parent_guid, child_guid);
+        bm.retire_snapshot(epoch);
+        assert_eq!(bm.orphan_staging_count(), 1);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 0);
+        assert!(inner.has_blob(child_guid).unwrap());
+
+        bm.mark_dirty_cached(parent_guid, STRUCTURAL_SEQ, parent.as_ref());
+        assert_eq!(bm.orphan_staging_count(), 0);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 1);
+        assert!(!inner.has_blob(child_guid).unwrap());
+    }
+
+    #[test]
+    fn cow_epoch_zero_last_lease_drop_before_parent_dirty_stays_staged() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let child_guid = [0x61; 16];
+        let parent_guid = [0x62; 16];
+        inner.write_blob(child_guid, &make_buf(7)).unwrap();
+        inner.write_blob(parent_guid, &make_buf(8)).unwrap();
+        let bm = Arc::new(BufferManager::new(inner.clone(), 4));
+        let parent = bm.pin(parent_guid).unwrap();
+        let epoch = bm.register_snapshot(parent_guid, &parent).unwrap();
+
+        // Epoch zero is valid for frames written by older Holt versions.
+        bm.stage_cow_reclaim(parent_guid, child_guid, 0);
+        bm.retire_snapshot(epoch);
+        assert_eq!(bm.orphan_staging_count(), 1);
+        assert_eq!(bm.gc_orphan_backlog_count(), 1);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 0);
+        assert!(inner.has_blob(child_guid).unwrap());
+
+        bm.mark_dirty_cached(parent_guid, 9, parent.as_ref());
+        assert_eq!(bm.orphan_staging_count(), 0);
+        assert_eq!(bm.reclaim_retired_orphans_bounded(1).unwrap(), 1);
+        assert!(!inner.has_blob(child_guid).unwrap());
     }
 
     #[test]
@@ -3626,9 +5653,7 @@ mod tests {
             !bm.try_evict_cold(guid),
             "checkpoint-owned flushing entries must stay cached until write-through",
         );
-        let bytes = bm
-            .snapshot_bytes(guid)
-            .expect("flushing protection must preserve cached bytes");
+        let bytes = snapshot_current_bytes(&bm, guid);
         assert_eq!(bytes.as_slice()[123], 0xAB);
 
         bm.write_through_batch(&[WriteThroughEntry {
@@ -3661,7 +5686,7 @@ mod tests {
         assert_eq!(snap[&guid], 10);
         drop(pin);
 
-        bm.reclaim_blob(guid);
+        bm.discard_snapshot_root(guid);
 
         let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
         let bytes = bm
@@ -3680,7 +5705,7 @@ mod tests {
         let bm = BufferManager::new(inner.clone(), 1);
         let pin = bm.pin(guid).unwrap();
 
-        bm.reclaim_blob(guid);
+        bm.discard_snapshot_root(guid);
 
         {
             let mut guard = pin.write();
@@ -4078,7 +6103,7 @@ mod tests {
         // Simulate the planner's drain by manually setting up the
         // "post-drain" state: dirty contains a NEW writer's entry.
         bm.mark_dirty([0xAA; 16], 200);
-        let snap_bytes = bm.snapshot_bytes([0xAA; 16]).unwrap();
+        let snap_bytes = snapshot_current_bytes(&bm, [0xAA; 16]);
 
         // The planner's snap had captured snap_seq=50 (a stale
         // pre-drain value). Pass that through.
@@ -4110,7 +6135,7 @@ mod tests {
         let _pin = bm.pin([0xA5; 16]).unwrap();
 
         bm.mark_dirty([0xA5; 16], STRUCTURAL_SEQ);
-        let snap_bytes = bm.snapshot_bytes([0xA5; 16]).unwrap();
+        let snap_bytes = snapshot_current_bytes(&bm, [0xA5; 16]);
 
         bm.write_through_batch(&[WriteThroughEntry {
             guid: [0xA5; 16],
@@ -4139,7 +6164,7 @@ mod tests {
         let _pin = bm.pin([0xBB; 16]).unwrap();
 
         bm.mark_dirty([0xBB; 16], 42);
-        let snap_bytes = bm.snapshot_bytes([0xBB; 16]).unwrap();
+        let snap_bytes = snapshot_current_bytes(&bm, [0xBB; 16]);
 
         // expected_seq matches the current entry → safe to retire.
         bm.write_through_batch(&[WriteThroughEntry {
@@ -4173,7 +6198,7 @@ mod tests {
             .iter()
             .map(|(guid, expected_seq)| WriteThroughEntry {
                 guid: *guid,
-                bytes: bm.snapshot_bytes(*guid).unwrap(),
+                bytes: snapshot_current_bytes(&bm, *guid),
                 expected_seq: *expected_seq,
                 content_version: None,
             })
@@ -4208,7 +6233,7 @@ mod tests {
         }
         bm.mark_dirty_cached(guid, 10, pin.as_ref());
         let snap = bm.snapshot_dirty();
-        let bytes = bm.snapshot_bytes(guid).unwrap();
+        let bytes = snapshot_current_bytes(&bm, guid);
 
         bm.write_through_batch(&[WriteThroughEntry {
             guid,
@@ -4330,7 +6355,7 @@ mod tests {
             .iter()
             .map(|(guid, expected_seq)| WriteThroughEntry {
                 guid: *guid,
-                bytes: bm.snapshot_bytes(*guid).unwrap(),
+                bytes: snapshot_current_bytes(&bm, *guid),
                 expected_seq: *expected_seq,
                 content_version: None,
             })
@@ -4340,6 +6365,80 @@ mod tests {
         let live = bm.snapshot_dirty();
         assert_eq!(live.len(), 1);
         assert_eq!(live[&g1], 200);
+    }
+
+    #[test]
+    fn write_through_revalidates_version_after_store_io() {
+        let guid = [0xC3; 16];
+        let inner = MemoryBlobStore::new();
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let store = Arc::new(BlockingWriteStore::new(inner));
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let bm = Arc::new(BufferManager::new(store_dyn, 4));
+        let pin = bm.pin(guid).unwrap();
+
+        bm.mark_dirty(guid, 100);
+        let first_dirty = bm.snapshot_dirty();
+        let first_version = bm.snapshot_dirty_versions(&first_dirty).unwrap()[0].content_version;
+        let first_bytes = bm
+            .snapshot_bytes_if_version(guid, first_version)
+            .unwrap()
+            .unwrap();
+        let write_bm = Arc::clone(&bm);
+        let writer = std::thread::spawn(move || {
+            write_bm.write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes: first_bytes,
+                expected_seq: 100,
+                content_version: Some(first_version),
+            }])
+        });
+
+        // The first content-version check has passed and the stale bytes are
+        // waiting at store I/O. Publish a lower-seq writer in that exact
+        // window; seq comparison alone would incorrectly retire it.
+        store.entered.wait();
+        {
+            let mut frame = pin.write();
+            frame.as_mut_slice()[100] = 2;
+        }
+        bm.mark_dirty_cached(guid, 50, pin.as_ref());
+        store.release.wait();
+
+        let report = writer.join().unwrap().unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Stale]);
+        bm.restore_dirty(first_dirty);
+        let retained = bm.snapshot_dirty();
+        assert_eq!(retained.get(&guid), Some(&50));
+        bm.restore_dirty(retained);
+
+        let second_dirty = bm.snapshot_dirty();
+        let second_version = bm.snapshot_dirty_versions(&second_dirty).unwrap()[0].content_version;
+        let second_bytes = bm
+            .snapshot_bytes_if_version(guid, second_version)
+            .unwrap()
+            .unwrap();
+        let report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes: second_bytes,
+                expected_seq: second_dirty[&guid],
+                content_version: Some(second_version),
+            }])
+            .unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Written]);
+        assert_eq!(bm.dirty_count(), 0);
+        assert_eq!(bm.flushing_count(), 0);
+
+        drop(pin);
+        drop(bm);
+        let store_dyn: Arc<dyn BlobStore> = store;
+        let reopened = BufferManager::new(store_dyn, 4);
+        assert_eq!(
+            reopened.pin(guid).unwrap().read().as_slice()[100],
+            2,
+            "the racing writer must survive the retry and reopen",
+        );
     }
 
     #[test]
@@ -4414,7 +6513,7 @@ mod tests {
         // After the production checkpoint primitive runs, the inner
         // store has the bytes and the dirty entry is cleared.
         let snap = bm.snapshot_dirty();
-        let bytes = bm.snapshot_bytes(new_guid).unwrap();
+        let bytes = snapshot_current_bytes(&bm, new_guid);
         bm.write_through_batch(&[WriteThroughEntry {
             guid: new_guid,
             bytes,
