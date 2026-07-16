@@ -12,14 +12,14 @@ minor release plus the previous minor.
 
 | Version | Supported |
 |---------|-----------|
-| `0.5.x` | Yes (current) |
-| `< 0.5` | No |
+| `0.8.2` | Yes (current) |
+| `< 0.8.2` | No |
 
 ## Reporting a vulnerability
 
 **Please do NOT open a public issue for security reports.**
 
-Use GitHub's **[private vulnerability reporting](https://github.com/feichai0017/holt/security/advisories/new)**
+Use GitHub's **[private vulnerability reporting](https://github.com/NoKV-Lab/holt/security/advisories/new)**
 (Security tab → "Report a vulnerability"). The maintainers
 receive a private advisory thread; you receive a CVE if one
 gets assigned during the fix.

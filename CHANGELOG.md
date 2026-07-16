@@ -7,7 +7,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
-## [Unreleased]
+## [0.8.2] — 2026-07-16
 
 ### Added
 
@@ -37,6 +37,18 @@ fine-grained per-commit history is in `git log`.
 
 ### Fixed
 
+- Made snapshot copy-on-write ownership durable through persisted leases and
+  epochs, preserving snapshot-shared frames across checkpoints and reopen
+  recovery.
+- Fenced physical GC against readers, writers, checkpoints, and reopen
+  recovery. Dropping-tree and structural-reclaim work is now persisted so a
+  crash cannot leak or resurrect blobs.
+- Enforced child-before-parent checkpoint durability and bounded FIFO
+  reclamation for crash-safe structural cleanup.
+- Fixed hot-update churn reaching spillover with only reclaimable dead bytes or
+  tombstoned leaves by compacting locally before migration.
+- Checkpoint retries now recapture a current snapshot after stale-snapshot
+  errors instead of reusing stale state.
 - File-backed stores now persist a reduced manifest high-water mark and
   truncate packed accelerator/data files after tail-slot reclamation. This
   prevents long-running delete/compact workloads from staying pinned to their
@@ -56,6 +68,30 @@ fine-grained per-commit history is in `git log`.
   readable by the flusher. The concurrent durability regression now checks the
   stable invariant (`syncs <= appends`) instead of assuming scheduler-dependent
   batching.
+
+### Upgrade notes
+
+- Forward upgrades from 0.7.3 retain the authoritative manifest v6, WAL v3,
+  blob-frame, DB catalog, and checkpoint-image formats. The new `read.idx` and
+  `value.seg` files are rebuildable accelerators rather than recovery truth.
+- In-place downgrade from 0.8.2 to 0.7.3 is not supported. Version 0.8.2 can
+  write a WAL batch encoding that 0.7.3 does not recognize, and downgrading
+  would also restore the older snapshot-reclamation behavior fixed here. Use a
+  logical checkpoint image and a fresh directory if rollback is required.
+
+### Validation
+
+- `cargo fmt --all --check`
+- `cargo fmt --manifest-path tools/soak/Cargo.toml --check`
+- `git diff --check`
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`
+- `cargo clippy --manifest-path tools/soak/Cargo.toml --locked -- -D warnings`
+- `cargo test --workspace --lib --tests --examples --locked`
+- `cargo test --workspace --doc --locked`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`
+- `cargo package --locked`
+- NoKV compatibility probe: 0.7.3 data-directory reopen, continued writes,
+  checkpoint/reopen, and 0.7.3 checkpoint-image restore under 0.8.2.
 
 ## [0.8.1] — 2026-07-01
 
