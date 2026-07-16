@@ -36,5 +36,5 @@ pub use walker::{
 };
 pub(crate) use walker::{
     collect_blob_children_from_frame, fresh_blob_guid, insert_multi_batch_conditional,
-    InsertBatchItem, PrefixListCache, SearchKey,
+    lookup_multi_with_snapshot, InsertBatchItem, PrefixListCache, SearchKey,
 };

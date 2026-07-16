@@ -21,8 +21,8 @@ pub(crate) use blob_frame::{
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
 pub(crate) use blob_store::IndexedBlobLookup;
 pub(crate) use buffer_manager::{
-    BlobWriteGuard, BufferStats, DirtySnapshotEntry, WriteDeltaEntry, WriteDeltaKeyState,
-    WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,
+    BlobWriteGuard, BufferStats, DirtySnapshotEntry, SnapshotLease, WriteDeltaEntry,
+    WriteDeltaKeyState, WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,
 };
 pub use buffer_manager::{BufferManager, CachedBlob};
 pub(crate) use read_index::{

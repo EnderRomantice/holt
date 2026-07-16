@@ -10,15 +10,12 @@
 //! Creation is O(one frame copy); the per-write cost is zero while no
 //! snapshot is live, and bounded by the root→leaf frame path length on
 //! the first write to each region while one is. Dropping the handle (or
-//! calling [`Snapshot::retire`]) retires the snapshot and lowers the
-//! global fork barrier.
-
-use std::ops::Deref;
-use std::sync::Arc;
-
-use crate::store::BufferManager;
+//! calling [`Snapshot::retire`]) releases its lease; the global fork
+//! barrier lowers after every cloned view and owned cursor derived from
+//! that snapshot has also been dropped.
 
 use super::view::View;
+use std::ops::Deref;
 
 /// A stable copy-on-write snapshot of a tree or prefix subtree.
 ///
@@ -27,22 +24,23 @@ use super::view::View;
 /// writes. All [`View`] read operations are available through `Deref`
 /// (`snapshot.get(..)`, `snapshot.range()`, `snapshot.scan(..)`, …).
 ///
-/// The snapshot is retired when the handle is dropped; hold it for as
-/// long as the stable view is needed.
+/// The snapshot epoch is retired after this handle and all cloned views or
+/// owned cursors derived from it are dropped.
+/// Persisted copy-on-write frames are not reclaimed inline on handle drop.
+/// A later standalone or DB checkpoint reclaims a bounded exact batch, while
+/// [`crate::Tree::gc`] and [`crate::DB::gc`] provide complete reachability
+/// sweeps; [`crate::StoreStats::live_blobs`] may therefore remain elevated
+/// until one of those maintenance frontiers completes.
 pub struct Snapshot {
     view: Option<View>,
-    store: Arc<BufferManager>,
     epoch: u64,
-    retired: bool,
 }
 
 impl Snapshot {
-    pub(crate) fn new(view: View, store: Arc<BufferManager>, epoch: u64) -> Self {
+    pub(crate) fn new(view: View, epoch: u64) -> Self {
         Self {
             view: Some(view),
-            store,
             epoch,
-            retired: false,
         }
     }
 
@@ -60,18 +58,11 @@ impl Snapshot {
         self.view.as_ref().expect("snapshot retired")
     }
 
-    /// Retire the snapshot now, releasing its hold on the fork barrier.
-    /// Equivalent to dropping the handle, but explicit. Idempotent.
+    /// Release this snapshot handle now. The fork-barrier epoch retires
+    /// after the last cloned [`View`] or owned range cursor derived from
+    /// it is also dropped.
     pub fn retire(mut self) {
-        self.retire_inner();
-    }
-
-    fn retire_inner(&mut self) {
-        if !self.retired {
-            self.retired = true;
-            drop(self.view.take());
-            self.store.retire_snapshot(self.epoch);
-        }
+        drop(self.view.take());
     }
 }
 
@@ -80,12 +71,6 @@ impl Deref for Snapshot {
 
     fn deref(&self) -> &View {
         self.view()
-    }
-}
-
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        self.retire_inner();
     }
 }
 

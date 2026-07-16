@@ -17,7 +17,7 @@ use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::snapshot::Snapshot;
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats, VacuumStats};
-use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
+use super::tree::{ensure_durable_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
@@ -37,6 +37,79 @@ const CATALOG_STATE_LIVE: u8 = 1;
 const CATALOG_STATE_DROPPING: u8 = 2;
 const CATALOG_VALUE_LEN: usize = 17;
 const CATALOG_NEXT_ID_LEN: usize = 16;
+const AUTO_GC_BATCH_SIZE: usize = 256;
+
+#[cfg(test)]
+struct OpenTreeCatalogBarrier {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl OpenTreeCatalogBarrier {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OPEN_TREE_CATALOG_BARRIER: std::cell::RefCell<Option<Arc<OpenTreeCatalogBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_open_tree_catalog_barrier_for_current_thread(barrier: Arc<OpenTreeCatalogBarrier>) {
+    OPEN_TREE_CATALOG_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_open_tree_after_catalog_lookup() {
+    let barrier = OPEN_TREE_CATALOG_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
+
+#[cfg(test)]
+struct ExportFirstEntryBarrier {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ExportFirstEntryBarrier {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static EXPORT_FIRST_ENTRY_BARRIER: std::cell::RefCell<Option<Arc<ExportFirstEntryBarrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_export_first_entry_barrier_for_current_thread(barrier: Arc<ExportFirstEntryBarrier>) {
+    EXPORT_FIRST_ENTRY_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
+#[cfg(test)]
+fn pause_export_after_first_entry() {
+    let barrier = EXPORT_FIRST_ENTRY_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
 
 #[derive(Clone)]
 struct OpenTree {
@@ -96,6 +169,17 @@ impl DB {
         cfg.checkpoint.auto_merge = false;
 
         let bm = Tree::open_buffer_manager(&cfg)?;
+        Self::open_with_buffer_manager(cfg, bm)
+    }
+
+    #[cfg(test)]
+    fn open_with_blob_store(mut cfg: TreeConfig, store: Arc<dyn BlobStore>) -> Result<Self> {
+        cfg.checkpoint.auto_merge = false;
+        let bm = Arc::new(BufferManager::new(store, cfg.buffer_pool_size));
+        Self::open_with_buffer_manager(cfg, bm)
+    }
+
+    fn open_with_buffer_manager(cfg: TreeConfig, bm: Arc<BufferManager>) -> Result<Self> {
         let mut open_stats = OpenStats::default();
 
         let (journal, next_seq) = match cfg.wal_path() {
@@ -122,28 +206,37 @@ impl DB {
 
         let maintenance_gate = Arc::new(Gate::new());
         let commit_gate = Arc::new(CommitGate::new());
-        let checkpointer = crate::checkpoint::Checkpointer::spawn(
-            Arc::clone(&bm),
-            journal.clone(),
-            Arc::clone(&maintenance_gate),
-            Arc::clone(&commit_gate),
-            cfg.checkpoint.clone(),
-        )
-        .map(Arc::new);
-
-        let db = Self {
+        let mut db = Self {
             cfg,
             store: bm,
             maintenance_gate,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             commit_gate,
             journal,
-            checkpointer,
+            checkpointer: None,
             open_stats,
             trees: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
         };
-        db.stage_dropped_trees()?;
+        // Replay restores logical parents but the BufferManager epoch starts
+        // at one in every process. Recover the maximum epoch across every
+        // frame reachable from the catalog before any snapshot or background
+        // delta flush can serve.
+        let epoch_recovery_start = std::time::Instant::now();
+        db.restore_epoch_high_water()?;
+        db.open_stats.epoch_recovery_micros = epoch_recovery_start
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        db.restore_dropping_runtime_fences()?;
+        db.checkpointer = crate::checkpoint::Checkpointer::spawn(
+            Arc::clone(&db.store),
+            db.journal.clone(),
+            Arc::clone(&db.maintenance_gate),
+            Arc::clone(&db.commit_gate),
+            db.cfg.checkpoint.clone(),
+        )
+        .map(Arc::new);
         Ok(db)
     }
 
@@ -161,6 +254,13 @@ impl DB {
             });
         }
         let tree_id = self.allocate_tree_id()?;
+        let root_guid = root_guid_for_tree_id(tree_id);
+
+        // Publish the deterministic empty root durably before making the
+        // catalog entry Live. If catalog publication later fails, the root is
+        // merely unreachable GC debt; the inverse ordering can leave a Live
+        // catalog entry pointing at a missing root and poison DB reopen.
+        ensure_durable_root_blob(&self.store, root_guid)?;
 
         self.apply_system_batch_unlocked(
             DB_CATALOG_TREE_ID,
@@ -209,11 +309,18 @@ impl DB {
     /// desired behavior.
     pub fn open_tree(&self, name: &str) -> Result<Tree> {
         let name_bytes = validate_tree_name(name)?;
+        // Serialize the catalog Live decision with drop_tree's exclusive
+        // maintenance transition through runtime lookup and Tree construction.
+        // Once this shared guard releases, a queued drop can mark the exact
+        // runtime returned below as dropped before it returns to its caller.
+        let _maintenance = self.maintenance_gate.enter_shared();
         let tree_id = self
             .catalog_lookup_live(name_bytes)?
             .ok_or_else(|| Error::TreeNotFound {
                 name: name.to_owned(),
             })?;
+        #[cfg(test)]
+        pause_open_tree_after_catalog_lookup();
         let open = self.open_tree_state(tree_id)?;
         self.tree_from_state(tree_id, open)
     }
@@ -244,14 +351,15 @@ impl DB {
         Ok(names)
     }
 
-    /// Drop a named tree from the catalog and stage its blobs for
-    /// checkpoint-time deletion.
+    /// Mark a named tree `Dropping` in the durable catalog.
     ///
     /// The catalog tombstone is hidden from [`Self::list_trees`] and
     /// from [`Self::open_tree`]. Existing handles are fenced before
-    /// this call returns. Physical cleanup completes in a later
-    /// [`Self::checkpoint`] after old handles/iterators have dropped
-    /// their cached root pins.
+    /// this call returns. A later [`Self::checkpoint`] or [`Self::gc`]
+    /// reclaims the unreachable closure and removes the catalog tombstone
+    /// after old handles and iterators release the exact live-root pin.
+    /// Snapshot roots are protected independently and do not by themselves
+    /// retain a `Dropping` family's live root.
     pub fn drop_tree(&self, name: &str) -> Result<()> {
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
@@ -263,8 +371,14 @@ impl DB {
                 });
             }
         };
-        let guids = self.collect_tree_guids(entry.tree_id)?;
-        let seq = self.apply_system_batch_unlocked(
+        // Publish every acknowledged deferred write before the tree becomes
+        // Dropping. Later cleanup is reachability-based and must not depend
+        // on a writer path that `mark_runtime_dropped` has fenced.
+        {
+            let _commit = self.commit_gate.enter_writer();
+            self.store.flush_write_deltas_for_tree(entry.tree_id)?;
+        }
+        self.apply_system_batch_unlocked(
             DB_CATALOG_TREE_ID,
             vec![BatchOp::Put {
                 key: name_bytes.to_vec(),
@@ -279,7 +393,6 @@ impl DB {
             },
         );
         self.mark_runtime_dropped(entry.tree_id);
-        self.stage_tree_delete_guids(&guids, seq);
         Ok(())
     }
 
@@ -338,70 +451,41 @@ impl DB {
                 .iter()
                 .map(|(_, gate)| gate.enter_exclusive())
                 .collect::<Vec<_>>();
-            {
-                let _commit = self.commit_gate.enter_writer();
-                for (tree_id, _, _, _) in &scoped {
-                    self.store.flush_write_deltas_for_tree(*tree_id)?;
-                }
+            let _commit = self.commit_gate.enter_writer();
+            for (tree_id, _, _, _) in &scoped {
+                self.store.flush_write_deltas_for_tree(*tree_id)?;
             }
             let mut trees = HashMap::with_capacity(scoped.len());
             for (_, name, prefix, tree) in scoped {
-                trees.insert(name, tree.snapshot_unlocked(prefix));
+                trees.insert(name, tree.snapshot_unlocked(prefix)?);
             }
             DBView { trees }
         };
         read(&view)
     }
 
-    /// Reclaim copy-on-write frames left unreachable by a crash that
-    /// happened while a snapshot was live — the DB-wide analog of
-    /// [`crate::Tree::gc`]. Marks every frame reachable from the catalog,
-    /// each live tree's root, and each live snapshot root, then frees the
-    /// rest from the shared buffer manager. Returns the count reclaimed.
-    /// Idempotent. Callers must not create or drop trees concurrently.
+    /// Reclaim persisted frames not reachable from the catalog, each live
+    /// tree's root, or a live snapshot root — the DB-wide analog of
+    /// [`crate::Tree::gc`].
+    ///
+    /// GC freezes every tree, checkpoints the exact parent images it will
+    /// walk, and only then deletes unreachable blobs. This prevents a
+    /// durable old parent from losing a child that only a newer in-memory
+    /// parent stopped referencing. Returns the count reclaimed and is
+    /// idempotent. Concurrent create/drop operations serialize behind the
+    /// same DB maintenance fence.
     pub fn gc(&self) -> Result<usize> {
-        // Read the live tree set gate-free (`catalog_entries` runs a range
-        // scan that manages its own shared maintenance gate — holding the
-        // gate here would deadlock against it). Then freeze every tree's
-        // writers via their mutation gates, taken in tree-id order to
-        // match `DB::view`/`apply_atomic` and avoid deadlock. Callers must
-        // not create or drop trees concurrently with gc.
-        let mut scoped: Vec<(u64, Tree)> = Vec::new();
-        for (_, entry) in self.catalog_entries()? {
-            if entry.state == CatalogState::Live {
-                let open = self.open_tree_state(entry.tree_id)?;
-                scoped.push((entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
-            }
+        self.restore_dropping_runtime_fences()?;
+        let (freed, cleanup_complete) = self.gc_reachability_pass(usize::MAX, true)?;
+        if cleanup_complete && self.finalize_dropped_trees()? {
+            Tree::checkpoint_shared_store(
+                &self.store,
+                self.journal.as_ref(),
+                &self.maintenance_gate,
+                &self.commit_gate,
+            )?;
         }
-        let mut gates: Vec<(u64, Arc<Gate>)> = scoped
-            .iter()
-            .map(|(id, t)| (*id, t.mutation_gate()))
-            .collect();
-        gates.sort_by_key(|(id, _)| *id);
-        gates.dedup_by_key(|(id, _)| *id);
-        let _guards: Vec<_> = gates
-            .iter()
-            .map(|(_, gate)| gate.enter_exclusive())
-            .collect();
-        {
-            let _commit = self.commit_gate.enter_writer();
-            for (tree_id, _) in &scoped {
-                self.store.flush_write_deltas_for_tree(*tree_id)?;
-            }
-        }
-
-        let mut reachable: HashSet<BlobGuid> = HashSet::new();
-        reachable.insert(root_guid_for_tree_id(DB_CATALOG_TREE_ID));
-        reachable.extend(self.collect_tree_guids(DB_CATALOG_TREE_ID)?);
-        for (tree_id, _) in &scoped {
-            reachable.insert(root_guid_for_tree_id(*tree_id));
-            reachable.extend(self.collect_tree_guids(*tree_id)?);
-        }
-        for snap_root in self.store.snapshot_roots() {
-            reachable.insert(snap_root);
-            reachable.extend(crate::engine::collect_blob_guids(&self.store, snap_root)?);
-        }
-        self.store.gc_sweep_unreachable(&reachable)
+        Ok(freed)
     }
 
     /// Reclaim logical garbage and physical space from free store slots.
@@ -415,7 +499,6 @@ impl DB {
     /// unchanged.
     pub fn vacuum(&self) -> Result<VacuumStats> {
         let unreachable = self.gc()?;
-        self.checkpoint()?;
         let mut stats = self.store.vacuum_storage()?;
         stats.unreachable_blobs = unreachable;
         Ok(stats)
@@ -428,33 +511,27 @@ impl DB {
     /// instant; serialization then runs *outside* the freeze while live
     /// applies continue (forking the frames the snapshots reference).
     pub fn export_checkpoint(&self) -> Result<CheckpointImage> {
-        // Enumerate live families gate-free (the catalog range scan manages
-        // its own maintenance gate; holding one here would deadlock it).
-        let mut families: Vec<(Vec<u8>, u64, Tree)> = Vec::new();
-        for (name, entry) in self.catalog_entries()? {
-            if entry.state == CatalogState::Live {
-                let open = self.open_tree_state(entry.tree_id)?;
-                families.push((
-                    name,
-                    entry.tree_id,
-                    self.tree_from_state(entry.tree_id, open)?,
-                ));
-            }
-        }
-
-        // Freeze every family's writers (tree-id order, matching
-        // DB::view/apply_atomic) and snapshot each — O(1) per snapshot.
+        // The DB maintenance fence covers catalog enumeration, deferred-write
+        // publication, and every O(1) snapshot capture. A concurrent create
+        // therefore lands wholly before or after this exported generation;
+        // it cannot be omitted after its data became visible.
         let snaps: Vec<(Vec<u8>, Snapshot)> = {
-            let mut gates: Vec<(u64, Arc<Gate>)> = families
-                .iter()
-                .map(|(_, id, t)| (*id, t.mutation_gate()))
-                .collect();
-            gates.sort_by_key(|(id, _)| *id);
-            gates.dedup_by_key(|(id, _)| *id);
-            let _guards: Vec<_> = gates
-                .iter()
-                .map(|(_, gate)| gate.enter_exclusive())
-                .collect();
+            let _maintenance = self.maintenance_gate.enter_exclusive();
+            {
+                let _commit = self.commit_gate.enter_writer();
+                self.store.flush_write_deltas_for_tree(DB_CATALOG_TREE_ID)?;
+            }
+            let mut families: Vec<(Vec<u8>, u64, Tree)> = Vec::new();
+            for (name, entry) in self.catalog_entries_unlocked()? {
+                if entry.state == CatalogState::Live {
+                    let open = self.open_tree_state(entry.tree_id)?;
+                    families.push((
+                        name,
+                        entry.tree_id,
+                        self.tree_from_state(entry.tree_id, open)?,
+                    ));
+                }
+            }
             {
                 let _commit = self.commit_gate.enter_writer();
                 for (_, tree_id, _) in &families {
@@ -464,7 +541,7 @@ impl DB {
 
             let mut snaps = Vec::with_capacity(families.len());
             for (name, _, tree) in &families {
-                snaps.push((name.clone(), tree.snapshot_unlocked_unfenced(b"")));
+                snaps.push((name.clone(), tree.snapshot_unlocked_unfenced(b"")?));
             }
             snaps
         };
@@ -476,6 +553,8 @@ impl DB {
             for entry in snap.range() {
                 if let RangeEntry::Key { key, value, .. } = entry? {
                     checkpoint::put_kv(&mut block, &key, &value);
+                    #[cfg(test)]
+                    pause_export_after_first_entry();
                 }
             }
             checkpoint::put_family(&mut buf, name, &block);
@@ -505,19 +584,25 @@ impl DB {
 
     /// Force one DB-wide checkpoint round.
     ///
-    /// This flushes the shared BufferManager, applies pending
-    /// deletes, and truncates the shared WAL when it is safe. It is
-    /// not tied to any one named tree.
+    /// This flushes the shared BufferManager, applies pending deletes, and
+    /// truncates the shared WAL when it is safe. It then performs one bounded
+    /// exact-orphan / Dropping-tree cleanup pass and durably finalizes any
+    /// catalog removals completed by that pass. It is not tied to any one
+    /// named tree.
     pub fn checkpoint(&self) -> Result<()> {
-        self.stage_dropped_trees()?;
-        Tree::checkpoint_shared_parts(
+        self.restore_dropping_runtime_fences()?;
+        Tree::checkpoint_shared_store(
             &self.store,
             self.journal.as_ref(),
             &self.maintenance_gate,
             &self.commit_gate,
         )?;
-        if self.store.pending_delete_count() == 0 && self.finalize_dropped_trees()? {
-            Tree::checkpoint_shared_parts(
+        let (_, cleanup_complete) = self.gc_reachability_pass(AUTO_GC_BATCH_SIZE, false)?;
+        if cleanup_complete
+            && self.store.pending_delete_count() == 0
+            && self.finalize_dropped_trees()?
+        {
+            Tree::checkpoint_shared_store(
                 &self.store,
                 self.journal.as_ref(),
                 &self.maintenance_gate,
@@ -582,6 +667,9 @@ impl DB {
                 .count(),
             bm_dirty_count: bm.dirty_count,
             bm_pending_delete_count: bm.pending_delete_count,
+            bm_gc_orphan_backlog_count: bm.gc_orphan_backlog_count,
+            bm_gc_reclaimed_count: bm.gc_reclaimed_count,
+            bm_gc_last_full_sweep_deferred_count: bm.gc_last_full_sweep_deferred_count,
             bm_write_delta_count: bm.write_delta_count,
             bm_read_index_token_count: bm.read_index_token_count,
             bm_read_index_cache_entries: bm.read_index_cache_entries,
@@ -639,6 +727,66 @@ impl DB {
         self.tree_from_state(DB_CATALOG_TREE_ID, open)
     }
 
+    fn restore_epoch_high_water(&self) -> Result<()> {
+        let catalog_root = root_guid_for_tree_id(DB_CATALOG_TREE_ID);
+        if !self.store.has_blob(catalog_root)? {
+            let durable = self.store.store_blob_guids()?;
+            let truly_fresh = durable.is_empty()
+                && self.store.cached_count() == 0
+                && self.store.dirty_count() == 0;
+            if !truly_fresh {
+                return Err(Error::node_corrupt(
+                    "db catalog root missing from an existing store",
+                ));
+            }
+            ensure_durable_root_blob(&self.store, catalog_root)?;
+        }
+        let mut roots = vec![catalog_root];
+        for (_, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Dropping {
+                // Bounded drop GC may durably remove descendants before the
+                // root itself. A crash in that intermediate state leaves an
+                // intentionally incomplete Dropping closure, which must not
+                // make DB open fail before cleanup can resume. No process-
+                // local handle or snapshot lease survives reopen, and this
+                // family can never become live again, so its epoch cannot
+                // constrain future COW decisions for surviving families.
+                continue;
+            }
+            let root_guid = root_guid_for_tree_id(entry.tree_id);
+            if !self.store.has_blob(root_guid)? {
+                return Err(Error::node_corrupt(
+                    "db catalog references a missing live tree root",
+                ));
+            }
+            roots.push(root_guid);
+        }
+
+        // Root high-water is the fast durable summary, but a DB epoch is
+        // shared across families: a high-epoch frame can be reachable from a
+        // different root than the snapshot that advanced the epoch. Walk the
+        // complete live closure so reopen is correct even after the family
+        // that originally advanced the epoch was dropped in an older session.
+        let mut frames = HashSet::new();
+        for root in roots {
+            frames.insert(root);
+            frames.extend(crate::engine::collect_blob_guids(&self.store, root)?);
+        }
+        let mut high_water = 1u64;
+        for guid in frames {
+            let pin = self.store.pin(guid)?;
+            let frame = pin.read();
+            let root_high_water = crate::layout::frame_epoch_high_water(frame.as_slice());
+            let created_epoch = crate::layout::frame_created_epoch(frame.as_slice());
+            if root_high_water == u64::MAX || created_epoch == u64::MAX {
+                return Err(Error::node_corrupt("snapshot epoch exhausted"));
+            }
+            high_water = high_water.max(root_high_water).max(created_epoch);
+        }
+        self.store.set_current_epoch(high_water);
+        Ok(())
+    }
+
     fn catalog_lookup_live(&self, name: &[u8]) -> Result<Option<u64>> {
         Ok(self
             .catalog_entry(name)?
@@ -683,23 +831,44 @@ impl DB {
         Ok(entries)
     }
 
-    fn stage_dropped_trees(&self) -> Result<()> {
+    fn catalog_entries_unlocked(&self) -> Result<Vec<(Vec<u8>, CatalogEntry)>> {
+        let catalog = self.catalog_tree()?;
+        let mut cursor = catalog.range_unlocked();
+        let mut entries = Vec::new();
+        while let Some(item) = cursor.next_unlocked() {
+            if let RangeEntry::Key { key, value, .. } = item? {
+                if key == CATALOG_NEXT_TREE_ID_KEY {
+                    continue;
+                }
+                let entry = decode_catalog_value(&key, &value)?;
+                let name = String::from_utf8(key.clone())
+                    .map_err(|_| Error::node_corrupt("db catalog key"))?;
+                self.catalog_cache.lock().unwrap().insert(name, entry);
+                entries.push((key, entry));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn restore_dropping_runtime_fences(&self) -> Result<()> {
         for (_, entry) in self.catalog_entries()? {
             if entry.state == CatalogState::Dropping {
-                let _maintenance = self.maintenance_gate.enter_exclusive();
                 self.mark_runtime_dropped(entry.tree_id);
-                let guids = self.collect_tree_guids(entry.tree_id)?;
-                self.stage_tree_delete_guids(&guids, self.next_seq.load(Ordering::Acquire));
             }
         }
         Ok(())
     }
 
     fn finalize_dropped_trees(&self) -> Result<bool> {
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        {
+            let _commit = self.commit_gate.enter_writer();
+            self.store.flush_write_deltas_for_tree(DB_CATALOG_TREE_ID)?;
+        }
         let mut ops = Vec::new();
         let mut finalized_tree_ids = Vec::new();
         let mut finalized_names = Vec::new();
-        for (name, entry) in self.catalog_entries()? {
+        for (name, entry) in self.catalog_entries_unlocked()? {
             if entry.state == CatalogState::Dropping
                 && !self
                     .store
@@ -715,7 +884,6 @@ impl DB {
         if ops.is_empty() {
             return Ok(false);
         }
-        let _maintenance = self.maintenance_gate.enter_exclusive();
         self.apply_system_batch_unlocked(DB_CATALOG_TREE_ID, ops)?;
         let mut cache = self.catalog_cache.lock().unwrap();
         for name in finalized_names {
@@ -729,18 +897,79 @@ impl DB {
         Ok(true)
     }
 
+    /// Freeze the catalog/tree set, make that exact topology durable, and
+    /// reclaim at most `limit` blobs outside its pinned-root closure.
+    /// `Dropping` roots with an exact live pin are treated as canonical for
+    /// this pass. Snapshot roots are walked independently, so a snapshot in
+    /// one family never forces traversal of an unrelated Dropping closure.
+    fn gc_reachability_pass(&self, limit: usize, force_full_scan: bool) -> Result<(usize, bool)> {
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        {
+            let _commit = self.commit_gate.enter_writer();
+            self.store.flush_write_deltas_for_tree(DB_CATALOG_TREE_ID)?;
+        }
+        let entries = self.catalog_entries_unlocked()?;
+        for (_, entry) in &entries {
+            if entry.state == CatalogState::Dropping {
+                self.mark_runtime_dropped(entry.tree_id);
+            }
+        }
+        {
+            let _commit = self.commit_gate.enter_writer();
+            for (_, entry) in &entries {
+                self.store.flush_write_deltas_for_tree(entry.tree_id)?;
+            }
+        }
+        Tree::checkpoint_shared_store_with_maintenance_held(
+            &self.store,
+            self.journal.as_ref(),
+            &self.commit_gate,
+        )?;
+
+        let mut reachable = HashSet::new();
+        let catalog_root = root_guid_for_tree_id(DB_CATALOG_TREE_ID);
+        reachable.insert(catalog_root);
+        reachable.extend(self.collect_tree_guids(DB_CATALOG_TREE_ID)?);
+        let snapshot_roots = self.store.snapshot_roots_pinned()?;
+        for (_, entry) in &entries {
+            let root = root_guid_for_tree_id(entry.tree_id);
+            let retain = entry.state == CatalogState::Live
+                || (entry.state == CatalogState::Dropping && self.store.blob_is_pinned(root));
+            if retain {
+                reachable.insert(root);
+                reachable.extend(self.collect_tree_guids(entry.tree_id)?);
+            }
+        }
+        let canonical_reachable = reachable.clone();
+        for snapshot_root in snapshot_roots {
+            let root = snapshot_root.guid();
+            reachable.insert(root);
+            reachable.extend(crate::engine::collect_blob_guids(&self.store, root)?);
+        }
+        if force_full_scan
+            || entries
+                .iter()
+                .any(|(_, entry)| entry.state == CatalogState::Dropping)
+        {
+            let outcome = self.store.gc_sweep_unreachable_with_canonical_bounded(
+                &reachable,
+                &canonical_reachable,
+                limit,
+            )?;
+            Ok((outcome.freed, outcome.complete))
+        } else {
+            self.store
+                .reclaim_retired_orphans_bounded(limit)
+                .map(|freed| (freed, true))
+        }
+    }
+
     fn collect_tree_guids(&self, tree_id: u64) -> Result<Vec<BlobGuid>> {
         let root_guid = root_guid_for_tree_id(tree_id);
         if !self.store.has_blob(root_guid)? {
             return Ok(Vec::new());
         }
         crate::engine::collect_blob_guids(&self.store, root_guid)
-    }
-
-    fn stage_tree_delete_guids(&self, guids: &[BlobGuid], seq: u64) {
-        for guid in guids {
-            self.store.mark_for_delete(*guid, seq);
-        }
     }
 
     fn mark_runtime_dropped(&self, tree_id: u64) {
@@ -758,7 +987,7 @@ impl DB {
             return Err(Error::TreeDropped);
         }
         let root_guid = root_guid_for_tree_id(tree_id);
-        ensure_root_blob(&self.store, root_guid)?;
+        ensure_durable_root_blob(&self.store, root_guid)?;
         let open = OpenTree {
             root_guid,
             runtime: TreeRuntime::new(),
@@ -886,6 +1115,7 @@ impl DB {
     }
 
     fn apply_batch_groups_in_memory(&self, groups: &[DBBatchGroup], base_seq: u64) -> Result<()> {
+        let commit = (self.store.fork_barrier() != 0).then(|| self.commit_gate.enter_writer());
         let mut group_base = base_seq;
         for group in groups {
             group
@@ -893,10 +1123,10 @@ impl DB {
                 .apply_batch_walker_inline(&group.ops, group_base, None)?;
             group_base += count_group_wal_ops(group);
         }
+        drop(commit);
         if self.cfg.memory_flush_on_write {
             if let Some(group) = groups.first() {
-                group.tree.flush_dirty_inline()?;
-                group.tree.flush_pending_deletes_inline()?;
+                group.tree.flush_inline()?;
             }
         }
         Ok(())
@@ -909,7 +1139,7 @@ impl DB {
                 open.clone()
             } else {
                 let root_guid = root_guid_for_tree_id(tree_id);
-                ensure_root_blob(&self.store, root_guid)?;
+                ensure_durable_root_blob(&self.store, root_guid)?;
                 let open = OpenTree {
                     root_guid,
                     runtime: TreeRuntime::new(),
@@ -1205,4 +1435,490 @@ fn next_allocated_tree_id(tree_id: u64) -> Result<u64> {
             .ok_or(Error::Internal("DB tree id space exhausted"))?;
     }
     Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::blob_store::{AlignedBlobBuf, MemoryBlobStore};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    struct FailFlushOnceStore {
+        inner: MemoryBlobStore,
+        fail_next_flush: AtomicBool,
+    }
+
+    impl FailFlushOnceStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                fail_next_flush: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl BlobStore for FailFlushOnceStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            if self.fail_next_flush.swap(false, AtomicOrdering::AcqRel) {
+                return Err(Error::BlobStoreIo(std::io::Error::other(
+                    "injected root flush failure",
+                )));
+            }
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
+
+        fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
+            self.inner.has_blob(guid)
+        }
+    }
+
+    #[test]
+    fn create_tree_durably_publishes_root_before_live_catalog() {
+        let store = Arc::new(FailFlushOnceStore::new());
+        let mut cfg = TreeConfig::memory();
+        cfg.checkpoint.enabled = false;
+        cfg.memory_flush_on_write = true;
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let db = DB::open_with_blob_store(cfg.clone(), store_dyn).unwrap();
+
+        store.fail_next_flush.store(true, AtomicOrdering::Release);
+        assert!(db.create_tree("empty").is_err());
+        assert!(db.catalog_lookup_live(b"empty").unwrap().is_none());
+        assert!(matches!(
+            db.open_tree("empty"),
+            Err(Error::TreeNotFound { .. })
+        ));
+        assert!(store
+            .inner
+            .has_blob(root_guid_for_tree_id(FIRST_USER_TREE_ID))
+            .unwrap());
+        drop(db);
+
+        // Reopen while the failed attempt's deterministic root is orphaned.
+        // The catalog stays healthy and retry flushes that root before Live.
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        let reopened = DB::open_with_blob_store(cfg.clone(), store_dyn).unwrap();
+        assert!(matches!(
+            reopened.open_tree("empty"),
+            Err(Error::TreeNotFound { .. })
+        ));
+        drop(reopened.create_tree("empty").unwrap());
+        drop(reopened);
+
+        // An empty tree has no user WAL record; its root+catalog ordering
+        // alone must be sufficient for a clean subsequent reopen.
+        let store_dyn: Arc<dyn BlobStore> = store;
+        let final_db = DB::open_with_blob_store(cfg, store_dyn).unwrap();
+        let empty = final_db.open_tree("empty").unwrap();
+        assert!(empty.get(b"missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn db_reopens_max_minus_one_as_exhausted_and_rejects_max() {
+        let dir = tempdir().unwrap();
+        let cfg = || {
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.checkpoint.enabled = false;
+            cfg.buffer_pool_size = 16;
+            cfg
+        };
+
+        let tree_id;
+        {
+            let db = DB::open(cfg()).unwrap();
+            let tree = db.create_tree("objects").unwrap();
+            tree.put(b"key", b"before").unwrap();
+            tree_id = db.catalog_lookup_live(b"objects").unwrap().unwrap();
+            db.store.set_current_epoch(u64::MAX - 2);
+
+            let snapshot = tree.snapshot(b"").unwrap();
+            assert_eq!(snapshot.epoch(), u64::MAX - 2);
+            assert_eq!(db.store.current_epoch(), u64::MAX - 1);
+            drop(snapshot);
+            db.checkpoint().unwrap();
+        }
+
+        {
+            let db = DB::open(cfg()).unwrap();
+            assert_eq!(db.store.current_epoch(), u64::MAX - 1);
+            let tree = db.open_tree("objects").unwrap();
+            let error = tree.snapshot(b"").unwrap_err();
+            assert!(matches!(error, Error::SnapshotEpochExhausted));
+            assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(&b"before"[..]));
+            tree.put(b"key", b"after").unwrap();
+
+            let root_guid = root_guid_for_tree_id(tree_id);
+            let root = db.store.pin(root_guid).unwrap();
+            {
+                let mut frame = root.write();
+                crate::layout::set_frame_epoch_high_water(frame.as_mut_slice(), u64::MAX);
+            }
+            db.store
+                .mark_dirty_cached(root_guid, crate::store::STRUCTURAL_SEQ, root.as_ref());
+            drop(root);
+            db.checkpoint().unwrap();
+        }
+
+        let error = DB::open(cfg()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::NodeCorrupt {
+                context: "snapshot epoch exhausted",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn open_tree_cannot_resurrect_runtime_after_concurrent_drop() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let existing = db.create_tree("objects").unwrap();
+        let tree_id = db.catalog_lookup_live(b"objects").unwrap().unwrap();
+        drop(existing);
+        db.trees.lock().unwrap().remove(&tree_id);
+
+        let barrier = Arc::new(OpenTreeCatalogBarrier::new());
+        let opener_db = db.clone();
+        let opener_barrier = Arc::clone(&barrier);
+        let opener = thread::spawn(move || {
+            set_open_tree_catalog_barrier_for_current_thread(opener_barrier);
+            opener_db.open_tree("objects")
+        });
+        barrier.entered.wait();
+
+        let drop_db = db.clone();
+        let (drop_done_tx, drop_done_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            let result = drop_db.drop_tree("objects");
+            drop_done_tx.send(()).unwrap();
+            result
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !db.maintenance_gate.writer_pending_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "drop_tree never queued behind open_tree's shared fence",
+            );
+            thread::yield_now();
+        }
+        assert!(
+            drop_done_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "drop_tree bypassed the in-flight open_tree construction",
+        );
+
+        barrier.release.wait();
+        let opened = opener.join().unwrap().unwrap();
+        dropper.join().unwrap().unwrap();
+        assert!(matches!(
+            opened.put(b"hidden", b"write"),
+            Err(Error::TreeDropped)
+        ));
+        assert!(matches!(
+            db.open_tree("objects"),
+            Err(Error::TreeNotFound { .. })
+        ));
+        assert!(db
+            .trees
+            .lock()
+            .unwrap()
+            .get(&tree_id)
+            .unwrap()
+            .runtime
+            .is_dropped());
+    }
+
+    #[test]
+    fn export_checkpoint_restarts_after_concurrent_compaction() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+        let mut expected = BTreeMap::new();
+        for index in 0..600u32 {
+            let key = format!("key/{index:06}").into_bytes();
+            let value = vec![(index % 251) as u8; 512];
+            tree.put(&key, &value).unwrap();
+            expected.insert(key, value);
+        }
+        for index in (0..600u32).step_by(4) {
+            let key = format!("key/{index:06}").into_bytes();
+            assert!(tree.delete(&key).unwrap());
+            expected.remove(&key);
+        }
+
+        let barrier = Arc::new(ExportFirstEntryBarrier::new());
+        let export_db = db.clone();
+        let export_barrier = Arc::clone(&barrier);
+        let exporter = thread::spawn(move || {
+            set_export_first_entry_barrier_for_current_thread(export_barrier);
+            export_db.export_checkpoint()
+        });
+        barrier.entered.wait();
+
+        let compactions_before = tree.stats().unwrap().total_compactions;
+        for _ in 0..4 {
+            tree.compact().unwrap();
+        }
+        let compactions_after = tree.stats().unwrap().total_compactions;
+        assert!(
+            compactions_after > compactions_before,
+            "test must rewrite at least one shared snapshot frame",
+        );
+        barrier.release.wait();
+
+        let image = exporter.join().unwrap().unwrap();
+        let decoded = checkpoint::decode(image.as_bytes()).unwrap();
+        let (_, records) = decoded
+            .families
+            .iter()
+            .find(|(name, _)| *name == b"objects")
+            .unwrap();
+        let exported = records
+            .iter()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(exported, expected);
+    }
+
+    #[test]
+    fn export_checkpoint_captures_family_created_before_its_fence() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let blocker = db.maintenance_gate.enter_shared();
+
+        let create_db = db.clone();
+        let (create_done_tx, create_done_rx) = mpsc::channel();
+        let creator = thread::spawn(move || {
+            let result = create_db.create_tree("created-before-export");
+            create_done_tx.send(()).unwrap();
+            result
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !db.maintenance_gate.writer_pending_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "create_tree never queued on the maintenance fence"
+            );
+            thread::yield_now();
+        }
+
+        let export_db = db.clone();
+        let (export_started_tx, export_started_rx) = mpsc::channel();
+        let exporter = thread::spawn(move || {
+            export_started_tx.send(()).unwrap();
+            export_db.export_checkpoint()
+        });
+        export_started_rx.recv().unwrap();
+        assert!(
+            create_done_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "create_tree bypassed an existing maintenance reader"
+        );
+
+        // The queued creator owns WRITE_BIT first. Export cannot enumerate
+        // until that catalog mutation is complete, so the family must be in
+        // the exported generation (its later user writes may validly fall on
+        // either side of the boundary).
+        drop(blocker);
+        drop(creator.join().unwrap().unwrap());
+        let image = exporter.join().unwrap().unwrap();
+        let decoded = checkpoint::decode(image.as_bytes()).unwrap();
+        assert!(
+            decoded
+                .families
+                .iter()
+                .any(|(name, _)| *name == b"created-before-export"),
+            "export omitted a family whose catalog commit preceded its fence"
+        );
+    }
+
+    #[test]
+    fn db_view_waits_for_checkpoint_delta_flush_before_registering_barrier() {
+        let db = DB::open(TreeConfig::memory()).unwrap();
+        let tree = db.create_tree("objects").unwrap();
+        tree.put(b"key", b"old").unwrap();
+        let tree_id = db
+            .catalog_lookup_live(b"objects")
+            .unwrap()
+            .expect("created tree id");
+        let root_guid = root_guid_for_tree_id(tree_id);
+        let seq = db.next_seq.fetch_add(1, Ordering::Relaxed);
+        db.store
+            .stage_write_delta_put(tree_id, root_guid, b"key", b"checkpoint-value", seq, false);
+
+        let root_pin = db.store.pin(root_guid).unwrap();
+        let root_guard = root_pin.write();
+        let checkpoint_db = db.clone();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+        let checkpoint = thread::spawn(move || {
+            checkpoint_tx.send(checkpoint_db.checkpoint()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !db.commit_gate.checkpoint_pending_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint never acquired commit-exclusive"
+            );
+            thread::yield_now();
+        }
+
+        let view_db = db.clone();
+        let (view_tx, view_rx) = mpsc::channel();
+        let view_worker = thread::spawn(move || {
+            let result = view_db.view(&[("objects", b"".as_slice())], |view| {
+                view.tree("objects")
+                    .expect("captured objects tree")
+                    .get(b"key")
+            });
+            view_tx.send(result).unwrap();
+        });
+        assert!(
+            view_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "DB view must not register between delta shared-check and write",
+        );
+
+        drop(root_guard);
+        drop(root_pin);
+        checkpoint_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        checkpoint.join().unwrap();
+        let value = view_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        view_worker.join().unwrap();
+        assert_eq!(value.as_deref(), Some(&b"checkpoint-value"[..]));
+    }
+
+    #[test]
+    fn reopen_skips_partially_reclaimed_dropping_closure() {
+        let dir = tempdir().unwrap();
+        let cfg = || {
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.checkpoint.enabled = false;
+            cfg.buffer_pool_size = 32;
+            cfg
+        };
+
+        let tree_id;
+        {
+            let db = DB::open(cfg()).unwrap();
+            let doomed = db.create_tree("doomed").unwrap();
+            tree_id = db
+                .catalog_lookup_live(b"doomed")
+                .unwrap()
+                .expect("created doomed tree id");
+            let value = vec![0x5A; 1024];
+            for i in 0..1200u32 {
+                doomed
+                    .put(format!("drop/{i:08}").as_bytes(), &value)
+                    .unwrap();
+            }
+            db.checkpoint().unwrap();
+
+            let root = root_guid_for_tree_id(tree_id);
+            let closure = crate::engine::collect_blob_guids(&db.store, root).unwrap();
+            assert!(
+                closure.len() > 1,
+                "partial-drop recovery test requires a non-root child",
+            );
+            let child = closure[1];
+
+            db.drop_tree("doomed").unwrap();
+            drop(doomed);
+            // Persist the Dropping catalog state without invoking DB's drop
+            // sweep, then deterministically reclaim exactly one child while
+            // retaining the still-referencing root. This is the durable
+            // intermediate state a bounded sweep can leave at crash time.
+            Tree::checkpoint_shared_store(
+                &db.store,
+                db.journal.as_ref(),
+                &db.maintenance_gate,
+                &db.commit_gate,
+            )
+            .unwrap();
+            let mut retain: HashSet<_> = db.store.list_blobs().unwrap().into_iter().collect();
+            assert!(retain.remove(&child));
+            let outcome = db.store.gc_sweep_unreachable_bounded(&retain, 1).unwrap();
+            assert_eq!(outcome.freed, 1);
+            assert!(db.store.store_has_blob(root).unwrap());
+            assert!(!db.store.store_has_blob(child).unwrap());
+            assert!(
+                crate::engine::collect_blob_guids(&db.store, root).is_err(),
+                "test did not create a partially reclaimed Dropping closure",
+            );
+        }
+
+        // Open must ignore the intentionally incomplete Dropping family's
+        // epoch metadata so the normal recovery sweep can finish it.
+        {
+            let db = DB::open(cfg()).unwrap();
+            assert!(db.list_trees().unwrap().is_empty());
+
+            // An unrelated live snapshot must not make the incomplete
+            // Dropping closure canonical again. Snapshot roots are protected
+            // by their own pinned closure.
+            let unrelated = db.create_tree("unrelated").unwrap();
+            unrelated.put(b"live", b"value").unwrap();
+            let unrelated_snapshot = unrelated.snapshot(b"").unwrap();
+            db.gc().unwrap();
+            assert!(
+                !db.store
+                    .store_has_blob(root_guid_for_tree_id(tree_id))
+                    .unwrap(),
+                "an unrelated family snapshot must not retain the Dropping root",
+            );
+            assert!(
+                db.catalog_entry(b"doomed").unwrap().is_none(),
+                "the completed Dropping family must leave the catalog while the unrelated snapshot is live",
+            );
+            assert!(matches!(
+                db.open_tree("doomed"),
+                Err(Error::TreeNotFound { .. })
+            ));
+            assert_eq!(
+                unrelated_snapshot.get(b"live").unwrap().as_deref(),
+                Some(&b"value"[..]),
+            );
+            drop(unrelated_snapshot);
+            db.drop_tree("unrelated").unwrap();
+            drop(unrelated);
+            db.gc().unwrap();
+        }
+
+        let db = DB::open(cfg()).unwrap();
+        assert!(db.list_trees().unwrap().is_empty());
+        assert!(!db
+            .store
+            .store_has_blob(root_guid_for_tree_id(tree_id))
+            .unwrap());
+    }
 }

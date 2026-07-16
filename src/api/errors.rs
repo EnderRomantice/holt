@@ -120,6 +120,10 @@ pub enum Error {
     /// DB trees share one buffer manager, so reclaiming unreachable
     /// frames safely needs a DB-wide pass rather than a single tree's.
     GcRequiresStandaloneTree,
+    /// The monotonic copy-on-write snapshot epoch reached its largest
+    /// durable value. Existing data remains valid, but no new snapshot can
+    /// be registered without wrapping the counter.
+    SnapshotEpochExhausted,
 }
 
 impl Error {
@@ -221,6 +225,7 @@ impl std::fmt::Display for Error {
                 f,
                 "gc is only supported on standalone trees; trees opened through a DB share a buffer manager"
             ),
+            Self::SnapshotEpochExhausted => write!(f, "snapshot epoch exhausted"),
         }
     }
 }
@@ -326,6 +331,10 @@ mod tests {
                 "invalid DB tree name: empty",
             ),
             (Error::TreeDropped.to_string(), "DB tree has been dropped"),
+            (
+                Error::SnapshotEpochExhausted.to_string(),
+                "snapshot epoch exhausted",
+            ),
         ];
 
         for (actual, expected) in cases {
@@ -355,5 +364,6 @@ mod tests {
             .source()
             .is_none());
         assert!(Error::TreeDropped.source().is_none());
+        assert!(Error::SnapshotEpochExhausted.source().is_none());
     }
 }

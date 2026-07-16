@@ -553,6 +553,18 @@ fn try_insert_batch_from_first_blob(
                 Err(e) => return Err(e),
             };
             child_pin.prefetch_header();
+            if child_is_snapshot_shared(bm, child_pin.as_ref()) {
+                // The batch fast path only owns a shared parent latch and
+                // cannot repoint its BlobNode. Fall back to the root-led
+                // single-item walker, which performs parent-scoped COW before
+                // acquiring the child's write latch.
+                drop(child_pin);
+                drop(root_read);
+                return Ok(InsertBatchOutcome {
+                    root_dirty: false,
+                    applied: 0,
+                });
+            }
             let child_guard = child_pin.write();
             drop(root_read);
 
@@ -635,6 +647,14 @@ fn try_insert_batch_from_route(
         Err(e) => return Err(e),
     };
     child_pin.prefetch_header();
+    if child_is_snapshot_shared(bm, child_pin.as_ref()) {
+        // Route fast paths cannot repoint the parent edge under their shared
+        // latch. Returning a miss routes the operation through the root-led
+        // COW walker before any child bytes are mutated.
+        drop(child_pin);
+        drop(parent_guard);
+        return Ok(None);
+    }
     let child_guard = child_pin.write();
     drop(parent_guard);
     let outcome = insert_batch_in_pinned_blob(
@@ -801,8 +821,8 @@ fn should_compact_before_spillover(miss: InsertAllocMiss, before: ReclaimSnapsho
 fn reclaim_or_spillover(
     bm: &BufferManager,
     guard: &mut BlobWriteGuard<'_>,
+    current_entry: &CachedBlob,
     current_guid: crate::layout::BlobGuid,
-    seq: u64,
     miss: InsertAllocMiss,
 ) -> Result<()> {
     let before = reclaim_snapshot(guard);
@@ -816,11 +836,15 @@ fn reclaim_or_spillover(
 
     {
         let mut frame = guard.frame();
-        spillover_blob(bm, &mut frame, seq).map_err(|e| e.with_blob_guid(current_guid))?;
+        spillover_blob(bm, &mut frame, crate::store::STRUCTURAL_SEQ)
+            .map_err(|e| e.with_blob_guid(current_guid))?;
     }
+    // `spillover_blob` prepared and compacted the complete parent before it
+    // installed the fresh child, so publication here cannot be bypassed by
+    // a later fallible structural step.
+    bm.mark_dirty_cached(current_guid, crate::store::STRUCTURAL_SEQ, current_entry);
     bm.note_merge_candidate(current_guid);
     bm.note_spillover();
-    compact_blob(guard).map_err(|e| e.with_blob_guid(current_guid))?;
     Ok(())
 }
 
@@ -893,12 +917,29 @@ fn lock_coupled_insert_in_blob(
                 );
             }
             Err(Error::Alloc(AllocError::OutOfSpace { .. })) => {
-                reclaim_or_spillover(bm, &mut guard, current_guid, seq, InsertAllocMiss::Space)?;
-                current_dirty = true;
+                reclaim_or_spillover(
+                    bm,
+                    &mut guard,
+                    current_entry,
+                    current_guid,
+                    InsertAllocMiss::Space,
+                )?;
+                // Compaction/spillover is logically neutral. Publish it now so
+                // a later deep pin/read error cannot strand parent-scoped COW
+                // staging or leave an untracked rewritten edge.
+                bm.mark_dirty_cached(current_guid, crate::store::STRUCTURAL_SEQ, current_entry);
+                current_dirty = false;
             }
             Err(Error::Alloc(AllocError::OutOfSlots)) => {
-                reclaim_or_spillover(bm, &mut guard, current_guid, seq, InsertAllocMiss::Slots)?;
-                current_dirty = true;
+                reclaim_or_spillover(
+                    bm,
+                    &mut guard,
+                    current_entry,
+                    current_guid,
+                    InsertAllocMiss::Slots,
+                )?;
+                bm.mark_dirty_cached(current_guid, crate::store::STRUCTURAL_SEQ, current_entry);
+                current_dirty = false;
             }
             Err(e) => return Err(e.with_blob_guid(current_guid)),
         }
@@ -955,9 +996,14 @@ fn cross_and_insert(
         crossing.child_guid,
         child_guard.as_slice(),
         crossing.parent_off,
-        seq,
     )? {
-        parent_dirty = true;
+        // The fork is byte-identical and the edge repoint is logically
+        // neutral, so it is safe to publish immediately as STRUCTURAL_SEQ.
+        // Any recursive error can then return without leaking cow_pending;
+        // successful user mutation lowers the fork's dirty seq inside the
+        // recursive walker.
+        bm.mark_dirty_cached(current_guid, crate::store::STRUCTURAL_SEQ, current_entry);
+        parent_dirty = false;
         drop(child_guard);
         drop(child_pin);
         let fork_guard = fork_pin.write();

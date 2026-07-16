@@ -106,12 +106,44 @@ pub fn lookup_multi_with<R, F>(
 where
     F: FnMut(LookupHit<'_>) -> R,
 {
+    lookup_multi_with_gc_policy(bm, root_pin, route_cache, key, &mut consume, true)
+}
+
+/// Snapshot/view lookup variant. Its root closure is pinned for the full
+/// lease, so a missing descendant is stable corruption rather than a GC
+/// race and must not be hidden behind an optimistic restart.
+pub(crate) fn lookup_multi_with_snapshot<R, F>(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    mut consume: F,
+) -> Result<Option<R>>
+where
+    F: FnMut(LookupHit<'_>) -> R,
+{
+    lookup_multi_with_gc_policy(bm, root_pin, route_cache, key, &mut consume, false)
+}
+
+fn lookup_multi_with_gc_policy<R, F>(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    key: SearchKey<'_>,
+    consume: &mut F,
+    restart_on_gc: bool,
+) -> Result<Option<R>>
+where
+    F: FnMut(LookupHit<'_>) -> R,
+{
     // Outer loop: each iteration is one full attempt; we restart
     // here when an optimistic snapshot is invalidated.
     'restart: loop {
+        let gc_epoch = restart_on_gc.then(|| bm.gc_read_epoch());
         if let Some(cache) = route_cache {
             if let Some(route) = cache.lookup(key) {
-                match lookup_from_cached_route(bm, root_pin, cache, key, route, &mut consume)? {
+                match lookup_from_cached_route(bm, root_pin, cache, key, route, consume, gc_epoch)?
+                {
                     RouteLookup::Done(result) => return Ok(result),
                     RouteLookup::Stale => {}
                     RouteLookup::Restart => {
@@ -153,23 +185,31 @@ where
             bm.note_optimistic_restart();
             continue 'restart;
         };
-        let (child_pin, child_depth) = match indexed_lookup_or_pin(bm, key, crossing, &mut consume)?
-        {
-            IndexedLookupOrPin::Done(result) => return Ok(result),
-            IndexedLookupOrPin::Pin { pin, depth } => (pin, depth),
-            IndexedLookupOrPin::Restart => {
-                if let Some(cache) = route_cache {
-                    cache.clear();
+        let (child_pin, child_depth) =
+            match indexed_lookup_or_pin(bm, key, crossing, consume, gc_epoch)? {
+                IndexedLookupOrPin::Done(result) => return Ok(result),
+                IndexedLookupOrPin::Pin { pin, depth } => (pin, depth),
+                IndexedLookupOrPin::Restart => {
+                    if let Some(cache) = route_cache {
+                        cache.clear();
+                    }
+                    bm.note_optimistic_restart();
+                    continue 'restart;
                 }
-                bm.note_optimistic_restart();
-                continue 'restart;
-            }
-        };
+            };
 
         // Cross-blob hops. Same pattern; on a torn read we restart
         // the whole walk from the root (the parent BlobNode that
         // pointed us here may also have moved).
-        match lookup_from_pinned_blob(bm, route_cache, key, child_pin, child_depth, &mut consume)? {
+        match lookup_from_pinned_blob(
+            bm,
+            route_cache,
+            key,
+            child_pin,
+            child_depth,
+            consume,
+            gc_epoch,
+        )? {
             CrossBlobLookup::Done(result) => return Ok(result),
             CrossBlobLookup::Restart => {
                 bm.note_optimistic_restart();
@@ -196,6 +236,7 @@ fn lookup_from_cached_route<R, F>(
     key: SearchKey<'_>,
     route: RouteHit,
     consume: &mut F,
+    gc_epoch: Option<u64>,
 ) -> Result<RouteLookup<R>>
 where
     F: FnMut(LookupHit<'_>) -> R,
@@ -227,6 +268,7 @@ where
             child_depth: route.child_depth,
         },
         consume,
+        gc_epoch,
     ) {
         Ok(IndexedLookupOrPin::Done(result)) => return Ok(RouteLookup::Done(result)),
         Ok(IndexedLookupOrPin::Pin { pin, .. }) => pin,
@@ -272,15 +314,24 @@ where
         else {
             return Ok(RouteLookup::Restart);
         };
-        let (next_pin, next_depth) = match indexed_lookup_or_pin(bm, key, crossing, consume)? {
-            IndexedLookupOrPin::Done(result) => return Ok(RouteLookup::Done(result)),
-            IndexedLookupOrPin::Pin { pin, depth } => (pin, depth),
-            IndexedLookupOrPin::Restart => {
-                cache.clear();
-                return Ok(RouteLookup::Restart);
-            }
-        };
-        match lookup_from_pinned_blob(bm, Some(cache), key, next_pin, next_depth, consume)? {
+        let (next_pin, next_depth) =
+            match indexed_lookup_or_pin(bm, key, crossing, consume, gc_epoch)? {
+                IndexedLookupOrPin::Done(result) => return Ok(RouteLookup::Done(result)),
+                IndexedLookupOrPin::Pin { pin, depth } => (pin, depth),
+                IndexedLookupOrPin::Restart => {
+                    cache.clear();
+                    return Ok(RouteLookup::Restart);
+                }
+            };
+        match lookup_from_pinned_blob(
+            bm,
+            Some(cache),
+            key,
+            next_pin,
+            next_depth,
+            consume,
+            gc_epoch,
+        )? {
             CrossBlobLookup::Done(result) => Ok(RouteLookup::Done(result)),
             CrossBlobLookup::Restart => Ok(RouteLookup::Restart),
         }
@@ -294,6 +345,7 @@ fn lookup_from_pinned_blob<R, F>(
     mut pin: Arc<CachedBlob>,
     mut depth: usize,
     consume: &mut F,
+    gc_epoch: Option<u64>,
 ) -> Result<CrossBlobLookup<R>>
 where
     F: FnMut(LookupHit<'_>) -> R,
@@ -323,7 +375,7 @@ where
         else {
             return Ok(CrossBlobLookup::Restart);
         };
-        match indexed_lookup_or_pin(bm, key, crossing, consume)? {
+        match indexed_lookup_or_pin(bm, key, crossing, consume, gc_epoch)? {
             IndexedLookupOrPin::Done(result) => return Ok(CrossBlobLookup::Done(result)),
             IndexedLookupOrPin::Restart => {
                 if let Some(cache) = route_cache {
@@ -392,6 +444,7 @@ fn indexed_lookup_or_pin<R, F>(
     key: SearchKey<'_>,
     crossing: BlobNodeCrossing,
     consume: &mut F,
+    gc_epoch: Option<u64>,
 ) -> Result<IndexedLookupOrPin<R>>
 where
     F: FnMut(LookupHit<'_>) -> R,
@@ -405,7 +458,10 @@ where
             });
         }
         Ok(None) => {}
-        Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) => {
+        Err(e)
+            if is_blob_store_not_found(&e)
+                && missing_child_is_retryable(bm, crossing.child_guid, gc_epoch) =>
+        {
             return Ok(IndexedLookupOrPin::Restart);
         }
         Err(e) => return Err(e),
@@ -416,7 +472,10 @@ where
     if key.user_bytes().is_none() {
         let pin = match bm.pin(crossing.child_guid) {
             Ok(pin) => pin,
-            Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) => {
+            Err(e)
+                if is_blob_store_not_found(&e)
+                    && missing_child_is_retryable(bm, crossing.child_guid, gc_epoch) =>
+            {
                 return Ok(IndexedLookupOrPin::Restart);
             }
             Err(e) => return Err(e),
@@ -437,7 +496,8 @@ where
             let pin = match bm.pin(crossing.child_guid) {
                 Ok(pin) => pin,
                 Err(e)
-                    if is_blob_store_not_found(&e) && bm.has_delete_fence(crossing.child_guid) =>
+                    if is_blob_store_not_found(&e)
+                        && missing_child_is_retryable(bm, crossing.child_guid, gc_epoch) =>
                 {
                     return Ok(IndexedLookupOrPin::Restart);
                 }
@@ -449,13 +509,34 @@ where
                 depth: crossing.child_depth,
             })
         }
-        IndexedBlobLookup::NotFound => Ok(IndexedLookupOrPin::Done(None)),
+        IndexedBlobLookup::NotFound => {
+            if gc_epoch.is_some_and(|captured| !bm.gc_epoch_still_stable(captured)) {
+                Ok(IndexedLookupOrPin::Restart)
+            } else {
+                Ok(IndexedLookupOrPin::Done(None))
+            }
+        }
         IndexedBlobLookup::Found { value, seq } => {
-            let out = consume(LookupHit { value: &value, seq });
-            Ok(IndexedLookupOrPin::Done(Some(out)))
+            let mut hit = || consume(LookupHit { value: &value, seq });
+            if let Some(captured) = gc_epoch {
+                match bm.with_stable_gc_epoch(captured, hit) {
+                    Some(out) => Ok(IndexedLookupOrPin::Done(Some(out))),
+                    None => Ok(IndexedLookupOrPin::Restart),
+                }
+            } else {
+                Ok(IndexedLookupOrPin::Done(Some(hit())))
+            }
         }
         IndexedBlobLookup::Crossing { .. } => Ok(IndexedLookupOrPin::Restart),
     }
+}
+
+fn missing_child_is_retryable(
+    bm: &BufferManager,
+    child_guid: BlobGuid,
+    gc_epoch: Option<u64>,
+) -> bool {
+    gc_epoch.is_some_and(|captured| bm.has_delete_fence(child_guid) || bm.gc_raced_since(captured))
 }
 
 // ---------- indexed routed read ----------
@@ -1692,6 +1773,92 @@ mod tests {
         assert_eq!(stats.read_index_value_hits, 1);
         assert_eq!(stats.read_index_value_read_bytes, value.len() as u64);
         assert_eq!(stats.read_index_offset_hits, 0);
+    }
+
+    #[test]
+    fn stale_gc_epoch_does_not_consume_indexed_hit() {
+        let dir = tempdir().unwrap();
+        let guid = [0x49; 16];
+        let value = vec![0xC4; 128];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        {
+            BlobFrame::init(bytes.as_mut_slice(), guid).unwrap();
+            let mut frame = BlobFrame::wrap(bytes.as_mut_slice());
+            install_exact_leaf(&mut frame, b"consumer-key\0", &value, 21);
+        }
+
+        let store = Arc::new(FileBlobStore::open(dir.path()).unwrap());
+        let store_dyn: Arc<dyn BlobStore> = store.clone();
+        {
+            let bm = BufferManager::new_file(store_dyn.clone(), 128, AlignedBlobBuf::zeroed);
+            bm.write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes,
+                expected_seq: 21,
+                content_version: None,
+            }])
+            .unwrap();
+            bm.flush_inner().unwrap();
+        }
+
+        let bm = BufferManager::new_file(store_dyn, 128, AlignedBlobBuf::zeroed);
+        let captured = bm.gc_read_epoch();
+        bm.gc_sweep_unreachable(&std::collections::HashSet::from([guid]))
+            .unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let mut consume = |hit: LookupHit<'_>| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            hit.value.to_vec()
+        };
+        let crossing = BlobNodeCrossing {
+            child_guid: guid,
+            child_depth: 0,
+        };
+        assert!(matches!(
+            indexed_lookup_or_pin(
+                &bm,
+                SearchKey::user(b"consumer-key"),
+                crossing,
+                &mut consume,
+                Some(captured),
+            )
+            .unwrap(),
+            IndexedLookupOrPin::Restart
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let stable = bm.gc_read_epoch();
+        let result = indexed_lookup_or_pin(
+            &bm,
+            SearchKey::user(b"consumer-key"),
+            crossing,
+            &mut consume,
+            Some(stable),
+        )
+        .unwrap();
+        match result {
+            IndexedLookupOrPin::Done(Some(got)) => assert_eq!(got, value),
+            _ => panic!("stable indexed hit was not published"),
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stable_point_lookup_never_retries_missing_child_from_delete_fence() {
+        let child = [0x47; 16];
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 4);
+        bm.mark_for_delete(child, 1);
+
+        assert!(
+            !missing_child_is_retryable(&bm, child, None),
+            "stable point lookup must surface a missing referenced child",
+        );
+        assert!(
+            missing_child_is_retryable(&bm, child, Some(bm.gc_read_epoch())),
+            "GC-fenced readers may restart while the delete fence is live",
+        );
     }
 
     #[test]

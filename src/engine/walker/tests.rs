@@ -3,21 +3,25 @@
 //! BlobNode descent) + `compact_blob`.
 
 use super::cast;
+use super::cow::fork_child_if_shared;
 use super::erase::erase;
 use super::insert::insert;
-use super::lookup::{indexed_read_into, lookup, lookup_at};
+use super::lookup::{indexed_read_into, lookup, lookup_at, lookup_multi_with};
+use super::merge::{fail_next_merge_rewire, try_merge_children};
 use super::migrate::{blob_needs_compaction, blob_would_route, compact_blob, make_blob_from_node};
 use super::readers::{
     child_offset, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
 use super::types::LookupResult;
+use super::writers::write_struct_at;
 use super::SearchKey;
 use crate::api::errors::Error;
 use crate::layout::{BlobGuid, BlobNode, NodeType, DATA_AREA_START, PAGE_SIZE};
-use crate::store::blob_store::AlignedBlobBuf;
-use crate::store::{decode_child_off, page_align_up, BlobFrame};
+use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
+use crate::store::{decode_child_off, page_align_up, BlobFrame, BlobFrameRef, BufferManager};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Decode `header.root_slot` (the encoded root offset) into the root
 /// node body's absolute byte offset.
@@ -80,6 +84,197 @@ fn replace_root_with_blob_node(buf: &mut AlignedBlobBuf, child_guid: BlobGuid) {
     };
     body.copy_from_slice(bytes);
     frame.header_mut().root_slot = crate::store::encode_child_off(off);
+}
+
+#[test]
+fn cow_validates_parent_edge_before_allocating_fork() {
+    let parent_guid = [0xC1; 16];
+    let child_guid = [0xC2; 16];
+    let mut parent_buf = AlignedBlobBuf::zeroed();
+    BlobFrame::init(parent_buf.as_mut_slice(), parent_guid).unwrap();
+    replace_root_with_blob_node(&mut parent_buf, child_guid);
+    let mut child_buf = AlignedBlobBuf::zeroed();
+    BlobFrame::init(child_buf.as_mut_slice(), child_guid).unwrap();
+
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    inner.write_blob(parent_guid, &parent_buf).unwrap();
+    inner.write_blob(child_guid, &child_buf).unwrap();
+    let bm = Arc::new(BufferManager::new(Arc::clone(&inner), 8));
+    let parent = bm.pin(parent_guid).unwrap();
+    let child = bm.pin(child_guid).unwrap();
+    let epoch = bm.register_snapshot(parent_guid, &parent).unwrap();
+    let dirty_before = bm.dirty_count();
+
+    let mut parent_guard = parent.write();
+    let child_guard = child.read();
+    let Err(error) = fork_child_if_shared(
+        &bm,
+        &mut parent_guard,
+        child_guid,
+        child_guard.as_slice(),
+        crate::layout::PAGE_SIZE - 1,
+    ) else {
+        panic!("invalid parent edge allocated a COW fork");
+    };
+    assert!(matches!(error, Error::NodeCorrupt { .. }));
+    assert_eq!(bm.dirty_count(), dirty_before);
+    assert_eq!(bm.orphan_staging_count(), 0);
+    assert_eq!(inner.list_blobs().unwrap().len(), 2);
+    drop(child_guard);
+    drop(parent_guard);
+    bm.retire_snapshot(epoch);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failed_merge_ancestor_rewire_never_hands_child_to_reclaim() {
+    let parent_guid = [0xD1; 16];
+    let child_guid = [0xD2; 16];
+
+    let mut child_buf = AlignedBlobBuf::zeroed();
+    {
+        let mut child = BlobFrame::init(child_buf.as_mut_slice(), child_guid).unwrap();
+        let root = child.header().root_slot;
+        insert(&mut child, root, b"pkey", b"value", 1).unwrap();
+    }
+
+    let mut parent_buf = AlignedBlobBuf::zeroed();
+    {
+        let mut parent = BlobFrame::init(parent_buf.as_mut_slice(), parent_guid).unwrap();
+        let root = parent.header().root_slot;
+        insert(&mut parent, root, b"pkey", &[0xA5; 112], 1).unwrap();
+        for i in 0..60u8 {
+            let root = parent.header().root_slot;
+            insert(
+                &mut parent,
+                root,
+                &[b'q', i],
+                &vec![i; 5000],
+                u64::from(i) + 2,
+            )
+            .unwrap();
+        }
+
+        // Replace the sole `p` leaf with a same-address BlobNode. Its leaf
+        // allocation is larger than BlobNode, so this is a valid synthetic
+        // crossing and compaction will rebuild the bookkeeping canonically.
+        let root_off = decode_child_off(parent.header().root_slot);
+        let root_node = read_node4(parent.as_ref(), root_off).unwrap();
+        let p_index = root_node.keys[..root_node.count as usize]
+            .iter()
+            .position(|byte| *byte == b'p')
+            .unwrap();
+        let p_leaf_off = child_offset(root_node.children[p_index]);
+        write_struct_at(&mut parent, p_leaf_off, &BlobNode::new(b"", child_guid)).unwrap();
+        parent.header_mut().num_ext_blobs = 1;
+    }
+    assert!(
+        blob_would_route(BlobFrameRef::wrap(parent_buf.as_slice())),
+        "test parent must be eligible for a real routed compaction",
+    );
+    compact_blob(&mut parent_buf).unwrap();
+    let (ancestor_off, blob_node_off) = {
+        let parent = BlobFrameRef::wrap(parent_buf.as_slice());
+        assert!(parent.header().routing_region().is_some());
+        let ancestor_off = decode_child_off(parent.header().root_slot);
+        let root_node = read_node4(parent, ancestor_off).unwrap();
+        let p_index = root_node.keys[..root_node.count as usize]
+            .iter()
+            .position(|byte| *byte == b'p')
+            .unwrap();
+        (ancestor_off, child_offset(root_node.children[p_index]))
+    };
+
+    let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    inner.write_blob(parent_guid, &parent_buf).unwrap();
+    inner.write_blob(child_guid, &child_buf).unwrap();
+    let bm = BufferManager::new(Arc::clone(&inner), 8);
+    let parent_pin = bm.pin(parent_guid).unwrap();
+
+    let before = lookup_multi_with(&bm, &parent_pin, None, SearchKey::exact(b"pkey"), |hit| {
+        hit.value.to_vec()
+    })
+    .unwrap();
+    assert_eq!(before.as_deref(), Some(&b"value"[..]));
+
+    fail_next_merge_rewire();
+    let error = {
+        let mut guard = parent_pin.write();
+        let mut parent = guard.frame();
+        try_merge_children(&bm, &mut parent, crate::store::STRUCTURAL_SEQ).unwrap_err()
+    };
+    assert!(matches!(error, Error::NodeCorrupt { .. }));
+
+    // The prepared clone may consume unreachable scratch space, but the old
+    // crossing and its accounting stay authoritative until an edge commit.
+    {
+        let guard = parent_pin.read();
+        let parent = BlobFrameRef::wrap(guard.as_slice());
+        assert_eq!(decode_child_off(parent.header().root_slot), ancestor_off);
+        let root_node = read_node4(parent, ancestor_off).unwrap();
+        let p_index = root_node.keys[..root_node.count as usize]
+            .iter()
+            .position(|byte| *byte == b'p')
+            .unwrap();
+        assert_eq!(child_offset(root_node.children[p_index]), blob_node_off);
+        assert_eq!(parent.header().num_ext_blobs, 1);
+        assert_eq!(parent.header().routing_len, 0);
+    }
+
+    // Match the production error path, which publishes a partially-mutated
+    // parent. A failed edge must still never promote the referenced child.
+    bm.mark_dirty(parent_guid, crate::store::STRUCTURAL_SEQ);
+    assert_eq!(bm.orphan_staging_count(), 0);
+    assert_eq!(bm.gc_orphan_backlog_count(), 0);
+    assert_eq!(bm.pending_delete_count(), 0);
+    assert!(bm.has_blob(child_guid).unwrap());
+
+    let value = lookup_multi_with(&bm, &parent_pin, None, SearchKey::exact(b"pkey"), |hit| {
+        hit.value.to_vec()
+    })
+    .unwrap();
+    assert_eq!(value.as_deref(), Some(&b"value"[..]));
+
+    // Persist through the same dirty snapshot/write-through protocol used by
+    // checkpoint, then prove the authoritative legacy path survives reopen.
+    let dirty = bm.snapshot_dirty();
+    let versioned = bm.snapshot_dirty_versions(&dirty).unwrap();
+    let entries: Vec<_> = versioned
+        .into_iter()
+        .map(|snapshot| crate::store::WriteThroughEntry {
+            guid: snapshot.guid,
+            bytes: bm
+                .snapshot_bytes_if_version(snapshot.guid, snapshot.content_version)
+                .unwrap()
+                .unwrap(),
+            expected_seq: snapshot.expected_seq,
+            content_version: Some(snapshot.content_version),
+        })
+        .collect();
+    {
+        let _checkpoint_io = bm.enter_checkpoint_io();
+        let report = bm.write_through_batch(&entries).unwrap();
+        assert!(report
+            .statuses
+            .iter()
+            .all(|status| { *status == crate::store::WriteThroughStatus::Written }));
+        bm.flush_inner().unwrap();
+    }
+    drop(parent_pin);
+    drop(bm);
+
+    let reopened = BufferManager::new(Arc::clone(&inner), 8);
+    let reopened_parent = reopened.pin(parent_guid).unwrap();
+    let reopened_value = lookup_multi_with(
+        &reopened,
+        &reopened_parent,
+        None,
+        SearchKey::exact(b"pkey"),
+        |hit| hit.value.to_vec(),
+    )
+    .unwrap();
+    assert_eq!(reopened_value.as_deref(), Some(&b"value"[..]));
+    assert!(reopened.has_blob(child_guid).unwrap());
 }
 
 #[test]
@@ -992,6 +1187,32 @@ fn compact_blob_is_noop_on_empty_tree() {
         "empty-tree compact grew unexpectedly: {before} -> {after}",
     );
     assert_eq!(frame.header().blob_guid, guid);
+}
+
+#[test]
+fn compact_blob_preserves_snapshot_epoch_fields_exactly() {
+    let (buf_vec, _) = fresh_blob();
+    let mut buf = aligned_from_vec(&buf_vec);
+    let expected_created = 4_294_967_301_u64;
+    let expected_high_water = expected_created + 97;
+    {
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        let h = frame.header_mut();
+        h.created_epoch = expected_created;
+        h.epoch_high_water = expected_high_water;
+        let root = h.root_slot;
+        insert(&mut frame, root, b"epoch-key", b"epoch-value", 1).unwrap();
+    }
+
+    compact_blob(&mut buf).unwrap();
+
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert_eq!(frame.header().created_epoch, expected_created);
+    assert_eq!(frame.header().epoch_high_water, expected_high_water);
+    assert_eq!(
+        get(&frame, b"epoch-key").as_deref(),
+        Some(&b"epoch-value"[..])
+    );
 }
 
 #[test]

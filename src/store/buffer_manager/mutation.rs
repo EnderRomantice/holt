@@ -24,6 +24,10 @@ pub(super) struct MutationState {
     /// in flight, so stale walkers cannot reload or dirty a blob
     /// that has already been logically unlinked.
     pub(super) deleting: HashMap<BlobGuid, u64>,
+    /// Transient fence owned by reachability GC between cache eviction and
+    /// durable manifest deletion. Readers that raced the fence restart via
+    /// the GC generation instead of reinserting a zombie cache entry.
+    pub(super) gc_deleting: HashSet<BlobGuid>,
     /// In-memory maintenance hints for blobs whose local garbage
     /// is worth checking before the next online compact pass.
     ///
@@ -67,6 +71,10 @@ impl MutationState {
     }
 
     pub(super) fn has_delete_fence(&self, guid: &BlobGuid) -> bool {
+        self.has_logical_delete_fence(guid) || self.gc_deleting.contains(guid)
+    }
+
+    pub(super) fn has_logical_delete_fence(&self, guid: &BlobGuid) -> bool {
         self.pending_deletes.contains_key(guid) || self.deleting.contains_key(guid)
     }
 
